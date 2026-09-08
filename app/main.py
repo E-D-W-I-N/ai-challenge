@@ -1,7 +1,7 @@
 """FastAPI-стенд: список сценариев, запуск, SSE-поток живой статистики.
 
-Файл заморожен для воркеров дней. Сценарии подключаются автоматически
-из day-*/scenario.py — трогать app/ ради нового дня не нужно.
+Сценарии берутся из day.py в корне ветки: ветка — это один день, и стенд
+в ней ровно один. Сценарий адресуется его позицией в SCENARIOS.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -17,12 +18,33 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import catalog, registry
-from .config import has_key
+from . import catalog
+from .config import ROOT, has_key
 from .llm import MissingKeyError, stream_completion
 from .schema import Scenario, Session
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# day.py лежит в корне ветки, рядом с app/. Кладём корень в sys.path сами,
+# чтобы стенд поднимался и не из корня тоже.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from day import SCENARIOS
+except Exception as exc:  # noqa: BLE001 — без дня стенду нечего показывать
+    raise RuntimeError(
+        f"day.py не загрузился ({type(exc).__name__}: {exc}). "
+        "День в ветке один, прятать ошибку не от кого — почините day.py."
+    ) from exc
+
+if not isinstance(SCENARIOS, list) or not SCENARIOS:
+    raise RuntimeError("day.py: SCENARIOS должен быть непустым списком Scenario")
+_wrong = next((s for s in SCENARIOS if not isinstance(s, Scenario)), None)
+if _wrong is not None:
+    raise RuntimeError(
+        f"day.py: SCENARIOS содержит {type(_wrong).__name__}, а должен — только Scenario"
+    )
 
 app = FastAPI(title="AI Challenge Bench", version="1.0.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -33,11 +55,9 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
-def _scenario_public(scenario: Scenario, day: str = "", day_title: str = "") -> dict:
+def _scenario_public(index: int, scenario: Scenario) -> dict:
     return {
-        "id": scenario.id,
-        "day": day,
-        "day_title": day_title,
+        "index": index,
         "title": scenario.title,
         "description": scenario.description,
         "layout": scenario.layout,
@@ -47,25 +67,10 @@ def _scenario_public(scenario: Scenario, day: str = "", day_title: str = "") -> 
 
 @app.get("/api/scenarios")
 async def list_scenarios() -> dict:
-    """Плоский список в порядке дней плюс группировка: сайдбар рисует дни заголовками."""
-    days = registry.discover_days()
-    scenarios = [
-        _scenario_public(scenario, day.id, day.title)
-        for day in days
-        for scenario in day.scenarios
-    ]
+    """Сценарии дня в порядке из SCENARIOS — этот же порядок задаёт index."""
     return {
         "has_key": has_key(),
-        "scenarios": scenarios,
-        "days": [
-            {
-                "id": day.id,
-                "title": day.title,
-                "scenario_ids": [s.id for s in day.scenarios],
-            }
-            for day in days
-        ],
-        "errors": registry.errors(),
+        "scenarios": [_scenario_public(i, s) for i, s in enumerate(SCENARIOS)],
     }
 
 
@@ -595,7 +600,7 @@ def _judge_messages(
 ) -> list[dict]:
     questions = "\n".join(f"{i}. {q}" for i, q in enumerate(scenario.judge_questions, 1))
     # Судье уходят description сценария, вопросы дня и результаты колонок —
-    # но не промпты колонок и не разбор из day-NN/README.md. Разбор содержит
+    # но не промпты колонок и не разбор из README.md. Разбор содержит
     # эталонный ответ и предсказание, какая колонка ошибётся: отдать его
     # судье — значит показать ему ответ до того, как он посмотрит на данные.
     blocks = [
@@ -700,13 +705,14 @@ async def _cancel_sessions(tasks: list[asyncio.Task]) -> None:
         await asyncio.gather(*unfinished, return_exceptions=True)
 
 
-@app.get("/api/run/{scenario_id}")
-async def run_scenario(
-    request: Request, scenario_id: str, overrides: str = ""
-) -> StreamingResponse:
-    scenario = registry.get(scenario_id)
-    if scenario is None:
-        raise HTTPException(status_code=404, detail=f"сценарий {scenario_id} не найден")
+@app.get("/api/run/{index}")
+async def run_scenario(request: Request, index: int, overrides: str = "") -> StreamingResponse:
+    if not 0 <= index < len(SCENARIOS):
+        raise HTTPException(
+            status_code=404,
+            detail=f"сценария {index} нет: в дне их {len(SCENARIOS)}",
+        )
+    scenario = SCENARIOS[index]
 
     # overrides: {"<label колонки>": {"model": "...", "temperature": 0.7}}
     patch = _parse_overrides(overrides, scenario.sessions)
@@ -738,7 +744,7 @@ async def run_scenario(
             yield _sse(
                 {
                     "event": "run_start",
-                    "scenario": scenario.id,
+                    "scenario": index,
                     "title": scenario.title,
                     "layout": scenario.layout,
                     "sessions": [asdict(s) for s in sessions],

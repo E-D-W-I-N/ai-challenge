@@ -35,57 +35,35 @@ async function loadScenarios() {
   badge.textContent = data.has_key ? "OPENROUTER_API_KEY найден" : "нет .env с OPENROUTER_API_KEY";
   badge.className = "badge " + (data.has_key ? "ok" : "bad");
 
-  renderSidebar(data);
+  renderSidebar();
 
-  const errBox = $("#registry-errors");
-  const errs = Object.entries(data.errors || {});
-  errBox.textContent = errs.length
-    ? errs.map(([k, v]) => `${k}:\n${v}`).join("\n\n")
-    : "";
+  // Сценарий в дне часто один — выбирать не из чего, показываем сразу.
+  if (state.scenarios.length === 1) selectScenario(0);
 }
 
-// Сайдбар группирует сценарии по дням: заголовок дня, под ним его сценарии
-// в порядке из SCENARIOS. Дни приходят с бэка уже отсортированными по номеру.
-function renderSidebar(data) {
+// Сценарии дня простым списком, в порядке из SCENARIOS.
+function renderSidebar() {
   const list = $("#scenario-list");
   list.innerHTML = "";
-  if (!data.scenarios.length) {
-    list.innerHTML = '<p class="empty-hint">Сценариев нет — не нашлось ни одного файла day-*/scenario.py</p>';
+  if (!state.scenarios.length) {
+    list.innerHTML = '<p class="empty-hint">Сценариев нет — day.py не отдал ни одного</p>';
     return;
   }
 
-  const byDay = new Map();
-  data.scenarios.forEach((sc) => {
-    const key = sc.day || "";
-    if (!byDay.has(key)) byDay.set(key, { title: sc.day_title || sc.day || "Сценарии", items: [] });
-    byDay.get(key).items.push(sc);
+  const ul = document.createElement("ul");
+  ul.className = "scenarios";
+  state.scenarios.forEach((sc) => {
+    const li = document.createElement("li");
+    li.textContent = sc.title;
+    li.onclick = () => selectScenario(sc.index);
+    li.dataset.index = String(sc.index);
+    ul.appendChild(li);
   });
-
-  byDay.forEach((group) => {
-    const box = document.createElement("div");
-    box.className = "day-group";
-
-    const head = document.createElement("div");
-    head.className = "day-title";
-    head.textContent = group.title;
-
-    const ul = document.createElement("ul");
-    ul.className = "day-scenarios";
-    group.items.forEach((sc) => {
-      const li = document.createElement("li");
-      li.innerHTML = `${sc.title}<span class="sid">${sc.id}</span>`;
-      li.onclick = () => selectScenario(sc.id);
-      li.dataset.id = sc.id;
-      ul.appendChild(li);
-    });
-
-    box.append(head, ul);
-    list.appendChild(box);
-  });
+  list.appendChild(ul);
 }
 
-function selectScenario(id) {
-  const sc = state.scenarios.find((s) => s.id === id);
+function selectScenario(index) {
+  const sc = state.scenarios[index];
   if (!sc) return;
   // Переключение сценария обрывает текущий прогон. Иначе старый EventSource
   // остаётся открытым и продолжает слать события, а колонки он ищет по label —
@@ -94,7 +72,7 @@ function selectScenario(id) {
   state.current = sc;
   state.overrides = {};
   document.querySelectorAll("#scenario-list li").forEach((li) => {
-    li.classList.toggle("active", li.dataset.id === id);
+    li.classList.toggle("active", Number(li.dataset.index) === index);
   });
   renderScenarioBar(sc);
   renderColumns(sc.sessions, sc.layout);
@@ -731,7 +709,7 @@ function startRun() {
   const qs = Object.keys(state.overrides).length
     ? "?overrides=" + encodeURIComponent(JSON.stringify(state.overrides))
     : "";
-  const source = new EventSource(`/api/run/${state.current.id}${qs}`);
+  const source = new EventSource(`/api/run/${state.current.index}${qs}`);
   state.source = source;
 
   // Поток принадлежит тому сценарию, на котором его запустили. Если он больше
