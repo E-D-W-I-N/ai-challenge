@@ -95,21 +95,10 @@ body {
 .sidebar.collapsed { width: 44px; flex-basis: 44px; padding: 16px 9px; overflow: hidden; }
 .sidebar.collapsed .sidebar-head { flex-direction: column-reverse; gap: 12px; margin-bottom: 0; }
 .sidebar.collapsed h2 { writing-mode: vertical-rl; flex: 0 0 auto; }
-.sidebar.collapsed .scenario-list,
-.sidebar.collapsed .errors { display: none; }
+.sidebar.collapsed .scenario-list { display: none; }
 
 .scenario-list { list-style: none; margin: 0; padding: 0; }
-.day-group + .day-group { margin-top: 14px; }
-.day-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: .8px;
-  color: var(--muted);
-  padding: 0 12px 6px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 6px;
-}
-.day-scenarios { list-style: none; margin: 0; padding: 0; }
+.scenarios { list-style: none; margin: 0; padding: 0; }
 .empty-hint { font-size: 13px; color: var(--muted); margin: 0; }
 .scenario-list li {
   padding: 9px 12px;
@@ -122,9 +111,6 @@ body {
 }
 .scenario-list li:hover { background: var(--panel-2); }
 .scenario-list li.active { background: var(--panel-2); border-color: var(--accent); }
-.scenario-list .sid { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
-
-.errors { margin-top: 16px; font-size: 11px; color: var(--bad); white-space: pre-wrap; }
 
 /* --- рабочая область --- */
 
@@ -508,11 +494,8 @@ button.start:disabled { opacity: .5; cursor: default; }
   .sidebar.collapsed .sidebar-head { flex-direction: row; gap: 8px; }
   .sidebar.collapsed h2 { display: block; writing-mode: horizontal-tb; }
   .scenario-list { display: flex; gap: 14px; }
-  .day-group + .day-group { margin-top: 0; }
-  .day-title { border-bottom: 0; padding: 0 0 4px; }
-  .day-scenarios { display: flex; gap: 8px; }
+  .scenarios { display: flex; gap: 8px; }
   .scenario-list li { margin-bottom: 0; white-space: nowrap; }
-  .errors { display: none; }
 
   .content { padding: 12px; gap: 10px; }
   .stage { gap: 10px; }
