@@ -508,3 +508,129 @@ button.start:disabled { opacity: .5; cursor: default; }
   .column { flex: 0 0 100%; scroll-snap-align: start; }
   .summary { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
 }
+
+/* --- День 6: чат с агентом, реестр в сайдбаре, дорожки прогона --- */
+
+.topbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.sidebar-section { margin-top: 18px; }
+.sidebar.collapsed .sidebar-section { display: none; }
+.agent-list { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+.agent-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  border: 1px solid transparent;
+}
+.agent-row.active { border-color: var(--accent); background: var(--panel-2); }
+.agent-row-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-row-id { color: var(--muted); font-family: ui-monospace, SFMono-Regular, monospace; flex: 0 0 auto; }
+
+/* Главный экран — чат. Колонки живут ниже и появляются после «/прогон». */
+.chat-panel {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 260px;
+  max-height: 55vh;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.chat-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.roster { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+.roster select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 9px;
+  font-size: 13px;
+}
+.agent-id {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+button.ghost {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 9px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+button.ghost:hover { color: var(--text); border-color: var(--accent); }
+
+.chat-feed { flex: 1 1 auto; }
+.msg.system-note {
+  background: var(--bubble-system);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 9px 11px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.msg.failed { border-left: 2px solid var(--bad); padding: 2px 0 2px 12px; color: var(--bad); font-size: 13px; }
+
+/* Прогон в ленте чата — вложенный блок с дорожками по субагентам. */
+.run-block {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  animation: fade-in .18s ease;
+}
+.run-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.run-title { font-size: 13px; font-weight: 600; }
+.run-state { font-size: 11px; color: var(--muted); }
+.run-foot { font-size: 11px; color: var(--muted); margin-top: 8px; }
+.lanes { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.lane {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--panel);
+}
+.lane.failed { border-color: #5c2c2c; }
+.lane-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lane-label { font-size: 12px; font-weight: 600; }
+.lane-agent { font-size: 10px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, monospace; flex: 1 1 auto; }
+.lane-open { padding: 3px 9px; font-size: 11px; }
+.lane-body {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 90px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+.lane-foot { font-size: 11px; color: var(--muted); margin-top: 5px; font-family: ui-monospace, SFMono-Regular, monospace; }
+
+/* Колонка, которую только что открыли из дорожки: видно, куда мы попали. */
+.column.highlight { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+
+.column .agent-id { font-size: 10px; margin-top: 3px; }
+
+@media (max-width: 860px) {
+  .chat-panel { max-height: none; min-height: 220px; }
+}

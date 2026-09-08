@@ -5,12 +5,20 @@
 Общее правило для всех вызовов — provider.require_parameters = true.
 Без него OpenRouter вправе увести запрос к провайдеру, который молча
 проигнорирует temperature или stop, и день покажет неправду.
+
+HTTP-клиент на процесс один, и одновременных вызовов к модели не больше
+`LLM_MAX_CONCURRENCY`. До Дня 6 клиент создавался внутри каждого вызова:
+пока агент был один, это стоило лишнего рукопожатия, а на сотне агентов
+это сотня пулов соединений и сотня одновременных запросов к OpenRouter.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -18,9 +26,74 @@ from typing import AsyncIterator
 import httpx
 
 from .config import OPENROUTER_BASE_URL, api_key, attribution_headers
-from .schema import Session
+from .schema import AgentSpec
 
 _SPEED_WINDOW_SECONDS = 5.0
+
+_TIMEOUT = httpx.Timeout(180.0, connect=20.0)
+
+DEFAULT_MAX_CONCURRENCY = 16
+"""Сколько вызовов к модели идёт одновременно, если LLM_MAX_CONCURRENCY не задан."""
+
+
+def max_concurrency() -> int:
+    """LLM_MAX_CONCURRENCY: потолок одновременных вызовов к модели.
+
+    Спавн агентов бесплатен и мгновенен, а вот сто одновременных стримов —
+    это сто открытых соединений и счёт от OpenRouter. Лишние вызовы не
+    падают, а ждут в очереди на семафоре.
+    """
+    raw = os.environ.get("LLM_MAX_CONCURRENCY", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENCY
+    return max(1, value)
+
+
+# Клиент и семафор привязаны к циклу событий, в котором их создали: у httpx
+# внутри пул соединений этого цикла, а у asyncio.Semaphore — его ожидающие.
+# Ключ — сам цикл, слабой ссылкой, чтобы завершённый цикл не держался в памяти.
+_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
+    weakref.WeakKeyDictionary()
+)
+_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def shared_client() -> httpx.AsyncClient:
+    """Один httpx.AsyncClient на процесс — общий пул соединений для всех агентов."""
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None or client.is_closed:
+        limit = max_concurrency()
+        client = httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=max(10, limit * 2),
+                max_keepalive_connections=max(10, limit),
+            ),
+        )
+        _clients[loop] = client
+    return client
+
+
+def call_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _semaphores.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(max_concurrency())
+        _semaphores[loop] = semaphore
+    return semaphore
+
+
+async def aclose() -> None:
+    """Закрывает общий клиент текущего цикла. Зовётся на остановке приложения."""
+    loop = asyncio.get_running_loop()
+    client = _clients.pop(loop, None)
+    if client is not None and not client.is_closed:
+        await client.aclose()
 
 
 @dataclass
@@ -86,7 +159,7 @@ class _SpeedTracker:
         return (n1 - n0) / span if span > 0 else 0.0
 
 
-def build_payload(session: Session, prompt_override: list[dict] | None = None) -> dict:
+def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None) -> dict:
     """Тело запроса к OpenRouter. require_parameters — на каждом вызове."""
     payload: dict = {
         "model": session.model,
@@ -118,7 +191,7 @@ class MissingKeyError(RuntimeError):
 
 
 async def stream_completion(
-    session: Session,
+    session: AgentSpec,
     *,
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
@@ -146,7 +219,10 @@ async def stream_completion(
     text_parts: list[str] = []
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
+        # Клиент общий на процесс, а семафор держится на всё время стрима:
+        # ограничивать надо одновременные вызовы, а не их старты.
+        async with call_slots():
+            client = shared_client()
             async with client.stream(
                 "POST",
                 f"{OPENROUTER_BASE_URL}/chat/completions",

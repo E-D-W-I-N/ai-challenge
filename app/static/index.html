@@ -3,14 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Challenge — стенд сценариев</title>
+  <title>AI Challenge — агенты</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <div class="app">
     <header class="topbar">
-      <h1>AI Challenge — стенд сценариев</h1>
-      <div id="key-status" class="badge"></div>
+      <h1>AI Challenge — агенты</h1>
+      <div class="topbar-right">
+        <div id="registry-badge" class="badge" title="Живых агентов в процессе"></div>
+        <div id="key-status" class="badge"></div>
+      </div>
     </header>
 
     <main class="layout">
@@ -21,15 +24,33 @@
                   aria-controls="scenario-list" aria-expanded="true"></button>
         </div>
         <div id="scenario-list" class="scenario-list"></div>
+        <div class="sidebar-section">
+          <h2>Агенты процесса</h2>
+          <div id="agent-list" class="agent-list"></div>
+        </div>
       </aside>
 
       <section class="content">
-        <!-- Кадр прогона: всё, что должно оставаться в экране целиком. -->
-        <div class="stage">
-          <div id="scenario-bar" class="scenario-bar">
-            <p class="hint">Выберите сценарий слева.</p>
-          </div>
+        <!-- Главный экран — чат с агентом. Колонки появляются после «/прогон». -->
+        <div class="chat-panel">
+          <header class="chat-head">
+            <label class="roster">
+              <span class="picker-label">Агент</span>
+              <select id="roster-select"></select>
+            </label>
+            <div id="chat-agent-id" class="agent-id"></div>
+            <button id="chat-reset" class="ghost" type="button" title="Создать нового агента с тем же конфигом">Новый агент</button>
+          </header>
+          <div id="chat-feed" class="chat chat-feed"></div>
+          <form id="chat-form" class="composer">
+            <textarea id="chat-input" class="composer-input" rows="1"></textarea>
+            <button id="chat-send" class="send" type="submit">Отправить</button>
+          </form>
+        </div>
 
+        <!-- Кадр прогона: колонки-субагенты. До выбора сценария его нет. -->
+        <div id="stage" class="stage hidden">
+          <div id="scenario-bar" class="scenario-bar"></div>
           <div id="columns" class="columns"></div>
         </div>
 
