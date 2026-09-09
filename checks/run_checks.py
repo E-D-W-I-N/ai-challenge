@@ -33,6 +33,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _stub.install_offline()
 
+from dataclasses import replace  # noqa: E402
+
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
 import day  # noqa: E402
@@ -1731,6 +1733,111 @@ def check_renamed_chat_not_duplicated():
     return "переименованный чат один, история при нём, дубликата нет"
 
 
+@check("дописанная в day.py заготовка появляется и в существующей базе")
+def check_new_preset_appears():
+    """Отметка «всё заведено» закрывала бы дверь навсегда.
+
+    В базе помечено не «заготовки заведены», а какие именно: у каждой строки
+    в `day.py` есть ключ `preset`, и появление новой — это ключ, которого
+    в наборе ещё нет. Имя, настройки и порядок строк для этого не годятся:
+    их правят, и правка выглядела бы как новая заготовка.
+    """
+    path = _temp_db("new-preset")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    saved_presets = main.PRESET_CHATS
+    try:
+        _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+
+        # Дописали строку в day.py — и перезапустились.
+        main.PRESET_CHATS = [
+            *saved_presets,
+            AgentSpec(preset="day7-новая", label="Дописанная заготовка", model="stub/m"),
+        ]
+        _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+
+        # Второй запуск с тем же day.py второй копии не заводит.
+        _restart(store)
+        again = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.PRESET_CHATS = saved_presets
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "Дописанная заготовка" not in before, before[-1]
+    assert after == before + ["Дописанная заготовка"], after[-2:]
+    assert again == after, f"на втором запуске заготовка задвоилась: {again[-2:]}"
+    return f"{len(before)} чатов было, дописанная появилась, на следующем старте не задвоилась"
+
+
+@check("перестановка строк в day.py ничего не задваивает")
+def check_preset_order_changed():
+    """Порядок строк в файле — не признак: заказчик его меняет.
+
+    Ключ у заготовки свой, поэтому перетасованный `day.py` для базы тот же
+    самый. Проверяется и переименование прямо в файле: имя тоже не признак.
+    """
+    path = _temp_db("reorder")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    saved_presets = main.PRESET_CHATS
+    try:
+        _restart(store)
+        before = sorted(a["label"] for a in main._listing()["agents"])
+
+        # Строки переставлены местами, а одна заготовка ещё и переименована
+        # прямо в файле — для базы это те же самые заготовки.
+        shuffled = list(reversed(saved_presets))
+        shuffled[0] = replace(shuffled[0], label="Переименовано в файле")
+        main.PRESET_CHATS = shuffled
+        _restart(store)
+        after = sorted(a["label"] for a in main._listing()["agents"])
+    finally:
+        main.PRESET_CHATS = saved_presets
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert after == before, (
+        "перестановка строк завела чаты заново: "
+        f"лишние {sorted(set(after) - set(before))}"
+    )
+    return f"{len(before)} чатов до перестановки и столько же после, дубликатов нет"
+
+
+@check("база прошлой версии не насыпает дубликатов при переходе на ключи")
+def check_legacy_bootstrap_migrated():
+    """До этой правки в базе стояла одна отметка «заготовки заведены».
+
+    Прочитать её как «не заведено ни одной» значило бы завести все двадцать
+    два заново — поверх живой переписки заказчика.
+    """
+    path = _temp_db("legacy")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        # Так выглядит база, записанная прошлой версией: чаты есть, отметка
+        # старая, набора ключей нет.
+        registry = _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+        store.set_meta(main.LEGACY_BOOTSTRAP_KEY, "1")
+        with store.tx() as conn:
+            conn.execute("DELETE FROM meta WHERE key = ?", (main.PRESETS_KEY,))
+        assert store.get_meta(main.PRESETS_KEY) is None
+
+        _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+        seeded = json.loads(store.get_meta(main.PRESETS_KEY))
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert after == before, f"переход насыпал дубликатов: {len(after)} вместо {len(before)}"
+    assert sorted(seeded) == sorted(spec.preset for spec in day.CHATS), seeded
+    return f"старая отметка прочитана как {len(seeded)} заведённых ключей, дубликатов нет"
+
+
 @check("нумерация имён переживает перезапуск: занятый номер второй раз не выдаётся")
 def check_numbering_survives_restart():
     """Счётчик имён обязан жить в базе, а не в процессе.
@@ -2234,6 +2341,9 @@ CHECKS = [
     check_deleted_chat_stays_deleted,
     check_renamed_chat_not_duplicated,
     check_numbering_survives_restart,
+    check_new_preset_appears,
+    check_preset_order_changed,
+    check_legacy_bootstrap_migrated,
     check_list_not_truncated,
     check_list_beyond_cap,
     check_eviction_keeps_session,

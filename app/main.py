@@ -65,6 +65,19 @@ if len(set(_labels)) != len(_labels):
     raise RuntimeError(
         f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(_dupes)}"
     )
+_nameless = [a.label for a in PRESET_CHATS if not a.preset]
+if _nameless:
+    raise RuntimeError(
+        "day.py: у каждой заготовки должен быть preset — устойчивый ключ, по которому "
+        f"сервер помнит, что она заведена. Нет у: {', '.join(_nameless)}"
+    )
+_keys = [a.preset for a in PRESET_CHATS]
+if len(set(_keys)) != len(_keys):
+    _dupes = sorted({key for key in _keys if _keys.count(key) > 1})
+    raise RuntimeError(
+        f"day.py: ключи заготовок должны быть уникальны, а повторяются: {', '.join(_dupes)}. "
+        "Заготовка с чужим ключом молча не появится: сервер сочтёт её уже заведённой"
+    )
 
 NEW_CHAT_SPEC = AgentSpec(
     label="Новый чат",
@@ -122,26 +135,79 @@ async def index() -> FileResponse:
 # --- заранее заведённые чаты --------------------------------------------------
 
 
-BOOTSTRAP_KEY = "preset_chats_done"
-"""Отметка в базе: заготовленные чаты уже заведены, второй раз не надо."""
+PRESETS_KEY = "preset_chats_seeded"
+"""Ключи заготовок, которые база уже заводила. JSON-список строк.
+
+Не «всё заведено», а **что именно заведено**. Одна отметка на всю базу
+выполняла бы два требования из трёх: удалённый чат не возвращался бы,
+переименованный не задваивался бы — но дописать в `day.py` новую заготовку
+и увидеть её в существующей базе стало бы нельзя навсегда. А это тот самый
+файл, который заказчик открывает, чтобы дописать заготовку.
+"""
+
+LEGACY_BOOTSTRAP_KEY = "preset_chats_done"
+"""Отметка прошлой версии: «заготовки заведены», без уточнения каких.
+
+Базу с ней надо перевести на ключи, а не заводить всё заново: у заказчика
+в ней лежит переписка, и двадцать два дубликата он увидит первым делом.
+"""
+
+
+def _seeded_presets() -> set[str]:
+    """Какие заготовки база уже заводила.
+
+    База, записанная прошлой версией, знает только «заводила вообще». Считаем,
+    что заводила она сегодняшний `day.py`: заготовок в ней ровно столько,
+    сколько было на момент той записи, и отметить их все — единственный способ
+    не насыпать дубликатов. Заготовка, дописанная в `day.py` после этого,
+    в такой базе не появится ровно один раз, при переходе; дальше — как у всех.
+    """
+    store = REGISTRY.store
+    raw = store.get_meta(PRESETS_KEY)
+    if raw is not None:
+        seeded = _loads_presets(raw)
+        if seeded is not None:
+            return seeded
+    if store.get_meta(LEGACY_BOOTSTRAP_KEY):
+        return {spec.preset for spec in PRESET_CHATS}
+    return set()
+
+
+def _loads_presets(raw: str) -> set[str] | None:
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return {item for item in parsed if isinstance(item, str)}
 
 
 def bootstrap_chats() -> list[Agent]:
-    """Заводит чаты из day.py — один раз за жизнь базы, а не за запуск процесса.
+    """Заводит заготовки из day.py, которых база ещё не заводила.
 
     Дальше они живут наравне со всеми: их переименовывают, удаляют и правят.
     Никакой отдельной ветки обработки у них нет — только строчка в day.py
     вместо кнопки «Новый чат».
 
-    Отметка в `meta`, а не сверка по именам, потому что «обычный чат» значит
-    ровно это: переименованный остаётся переименованным, а удалённый не
-    воскресает на следующем старте. Сверка по имени вернула бы и то и другое —
-    первый как незнакомый, второй как отсутствующий.
+    Узнаёт их сервер по `preset` — ключу, который не делает больше ничего
+    и потому не меняется. Ни имя, ни настройки, ни порядок строк в `day.py`
+    для этого не годятся: их правят. Отсюда три обещания сразу:
+
+    * удалённый чат не возвращается — его ключ остался отмеченным;
+    * переименованный не задваивается — сверка не про имя;
+    * дописанная заготовка появляется и в существующей базе — её ключа
+      в наборе ещё нет.
     """
-    if REGISTRY.store.get_meta(BOOTSTRAP_KEY):
-        return []
-    created = [REGISTRY.create(spec) for spec in PRESET_CHATS]
-    REGISTRY.store.set_meta(BOOTSTRAP_KEY, "1")
+    seeded = _seeded_presets()
+    fresh = [spec for spec in PRESET_CHATS if spec.preset not in seeded]
+    created = [REGISTRY.create(spec) for spec in fresh]
+    # Отмечаем весь сегодняшний day.py, а не только заведённое сейчас: набор
+    # должен пережить и удаление строки из файла — иначе вернувшаяся строка
+    # завела бы второй чат рядом с живым.
+    REGISTRY.store.set_meta(
+        PRESETS_KEY, json.dumps(sorted(seeded | {spec.preset for spec in PRESET_CHATS}))
+    )
     return created
 
 
@@ -379,6 +445,9 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
         messages=messages,
         system=system,
         draft=text("draft"),
+        # Ключ заготовки снаружи не задаётся: чат, назвавшийся чужим ключом,
+        # отменил бы появление настоящей заготовки.
+        preset="",
         stop=stop or None,
         response_format=response_format,
         extra_body=extra_body,

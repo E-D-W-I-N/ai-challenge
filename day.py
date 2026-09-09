@@ -222,14 +222,28 @@ D5_TASK = """Курьерская служба формирует смену. Е
 измерения, без знака рубля и без пробелов внутри чисел."""
 
 
-def chat(label: str, model: str, *, draft: str = "", system: str = "", **params) -> AgentSpec:
-    """Заранее заведённый чат. Имя — обычное имя чата, его можно поменять."""
-    return AgentSpec(label=label, model=model, system=system, draft=draft, **params)
+def chat(
+    preset: str, label: str, model: str, *, draft: str = "", system: str = "", **params
+) -> AgentSpec:
+    """Заранее заведённый чат.
+
+    `preset` — устойчивый ключ заготовки, по которому сервер помнит, что она
+    уже заведена. Имя, настройки и порядок строк в этом файле для этого
+    не годятся: их правят. Ключ ничего больше не делает, поэтому и не меняется.
+
+    Дописали строку с новым ключом — чат появится и в уже существующей базе.
+    Удалили чат в интерфейсе — он не вернётся: ключ остался отмеченным.
+    Ключи должны быть уникальны, за этим следит `app/main.py` на старте.
+    """
+    return AgentSpec(
+        preset=preset, label=label, model=model, system=system, draft=draft, **params
+    )
 
 
 CHATS: list[AgentSpec] = [
     # ── из задания Дня 1 ───────────────────────────────────────────────────────────
     chat(
+        "day1-answer",
         "День 1: Ответ",
         "mistralai/mistral-small-3.2-24b-instruct",
         system=D1_SYSTEM,
@@ -237,33 +251,39 @@ CHATS: list[AgentSpec] = [
     ),
     # ── из задания Дня 2: три пары «без параметра / с параметром» ──────────────────
     chat(
+        "day2-format-plain",
         "День 2: A. Свободный ответ (формат)",
         D2_MODEL,
         draft=D2_QUESTION,
     ),
     chat(
+        "day2-format-json",
         "День 2: B. + response_format",
         D2_MODEL,
         draft=D2_QUESTION,
         response_format={"type": "json_object"},
     ),
     chat(
+        "day2-length-plain",
         "День 2: A. Свободный ответ (длина)",
         D2_MODEL,
         draft=D2_QUESTION,
     ),
     chat(
+        "day2-length-capped",
         "День 2: B. + max_tokens",
         D2_MODEL,
         draft=D2_QUESTION,
         max_tokens=D2_LIMIT,
     ),
     chat(
+        "day2-stop-plain",
         "День 2: A. Свободный ответ (стоп)",
         D2_MODEL,
         draft=D2_QUESTION,
     ),
     chat(
+        "day2-stop-marker",
         "День 2: B. + stop",
         D2_MODEL,
         draft=D2_QUESTION,
@@ -271,6 +291,7 @@ CHATS: list[AgentSpec] = [
     ),
     # ── из задания Дня 3: четыре техники ───────────────────────────────────────────
     chat(
+        "day3-direct-vs-steps",
         "День 3: Прямо (vs пошагово)",
         D3_MODEL,
         draft=D3_TASK,
@@ -278,6 +299,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-steps",
         "День 3: Пошагово",
         D3_MODEL,
         draft=D3_TASK + D3_STEPS,
@@ -285,6 +307,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-direct-vs-self-prompt",
         "День 3: Прямо (промпт себе)",
         D3_MODEL,
         draft=D3_TASK,
@@ -292,6 +315,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-writes-prompt",
         "День 3: Модель пишет промпт",
         D3_MODEL,
         draft=D3_WRITE_PROMPT.format(task=D3_TASK),
@@ -299,6 +323,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=450,
     ),
     chat(
+        "day3-by-own-prompt",
         "День 3: Ответ по своему промпту",
         D3_MODEL,
         draft=D3_BY_OWN_PROMPT,
@@ -306,6 +331,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-role-analyst",
         "День 3: Аналитик данных",
         D3_MODEL,
         system=f"{D3_ANALYST}\n\n{D3_PANEL_FORMAT}",
@@ -314,6 +340,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-role-courier",
         "День 3: Курьер-практик",
         D3_MODEL,
         system=f"{D3_COURIER}\n\n{D3_PANEL_FORMAT}",
@@ -322,6 +349,7 @@ CHATS: list[AgentSpec] = [
         max_tokens=D3_MAX_TOKENS,
     ),
     chat(
+        "day3-role-lawyer",
         "День 3: Юрист по рекламе",
         D3_MODEL,
         system=f"{D3_LAWYER}\n\n{D3_PANEL_FORMAT}",
@@ -331,6 +359,7 @@ CHATS: list[AgentSpec] = [
     ),
     # ── из задания Дня 4: три температуры ──────────────────────────────────────────
     chat(
+        "day4-t00",
         "День 4: t = 0.0",
         D4_MODEL,
         draft=D4_PROMPT,
@@ -339,6 +368,7 @@ CHATS: list[AgentSpec] = [
         extra_body=D4_PIN_PROVIDER,
     ),
     chat(
+        "day4-t07",
         "День 4: t = 0.7",
         D4_MODEL,
         draft=D4_PROMPT,
@@ -347,6 +377,7 @@ CHATS: list[AgentSpec] = [
         extra_body=D4_PIN_PROVIDER,
     ),
     chat(
+        "day4-t12",
         "День 4: t = 1.2",
         D4_MODEL,
         draft=D4_PROMPT,
@@ -356,6 +387,7 @@ CHATS: list[AgentSpec] = [
     ),
     # ── из задания Дня 5: три ступени моделей ──────────────────────────────────────
     chat(
+        "day5-weak",
         "День 5: Слабая · llama-3.1-8b",
         "meta-llama/llama-3.1-8b-instruct",
         system=D5_SYSTEM,
@@ -365,6 +397,7 @@ CHATS: list[AgentSpec] = [
         extra_body=D5_NO_FALLBACKS,
     ),
     chat(
+        "day5-medium",
         "День 5: Средняя · mistral-small-3.2-24b",
         "mistralai/mistral-small-3.2-24b-instruct",
         system=D5_SYSTEM,
@@ -374,6 +407,7 @@ CHATS: list[AgentSpec] = [
         extra_body=D5_NO_FALLBACKS,
     ),
     chat(
+        "day5-strong",
         "День 5: Сильная · gemini-3.1-flash-lite",
         "google/gemini-3.1-flash-lite",
         system=D5_SYSTEM,
@@ -384,6 +418,7 @@ CHATS: list[AgentSpec] = [
     ),
     # ── обычный чат без заготовленного вопроса ───────────────────────────
     chat(
+        "assistant",
         "Ассистент",
         "openai/gpt-4o-mini",
         system=(
