@@ -274,13 +274,6 @@ async function loadAgents(selectId) {
 function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
-  if (!state.agents.length) {
-    const empty = document.createElement("div");
-    empty.className = "list-empty";
-    empty.textContent = "чатов пока нет — начните с «Новый чат»";
-    box.appendChild(empty);
-    return;
-  }
   // Список плоский: все чаты равны, никаких групп и разделов.
   state.agents.forEach((agent) => box.appendChild(listItem(agent)));
 }
