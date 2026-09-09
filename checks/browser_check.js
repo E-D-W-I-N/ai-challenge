@@ -200,28 +200,40 @@ check(
     paramWarnings(plain, { history_limit: 0 }).length === 0);
 }
 
-// ── закреплённый провайдер: настройка, которую панель не правит ──
+// ── привязка к поставщику: говорим в момент смены модели ──
 
 {
-  const model = { id: "openai/gpt-4o-mini", supported_parameters: ["temperature"], temperature_capped: false };
-  const pinned = paramWarnings(model, {}, { provider: { order: ["openai"], allow_fallbacks: false } });
-  check("закреплённый провайдер предупреждает", pinned.length === 1, JSON.stringify(pinned));
-  check("в предупреждении назван провайдер", /openai/.test(pinned[0] || ""), pinned[0]);
-  check("сказано, чем кончится смена модели", /404/.test(pinned[0] || ""), pinned[0]);
+  const model = { id: "вторая/модель", supported_parameters: ["temperature"], temperature_capped: false };
+  const pinned = { provider: { order: ["openai"] } };
 
-  const noFallback = paramWarnings(model, {}, { provider: { allow_fallbacks: false } });
-  check("запрет фолбэка предупреждает отдельно", noFallback.length === 1, JSON.stringify(noFallback));
-  check("и говорит именно про фолбэк", /фолбэк/.test(noFallback[0] || ""), noFallback[0]);
-
-  check("без extra_body про провайдера молчим", paramWarnings(model, {}, {}).length === 0);
-  check("без extra_body вовсе — тоже молчим", paramWarnings(model, {}).length === 0);
   check(
-    "про провайдера говорим, даже если модели нет в каталоге",
-    paramWarnings(null, {}, { provider: { order: ["openai"] } }).length === 1
+    "пока модель прежняя — молчим",
+    paramWarnings(model, { model: "первая/модель" }, pinned, "первая/модель").length === 0
+  );
+  const changed = paramWarnings(model, { model: "вторая/модель" }, pinned, "первая/модель");
+  check("на смене модели предупреждаем", changed.length === 1, JSON.stringify(changed));
+  check("названы поставщик и обе модели",
+    /openai/.test(changed[0]) && /вторая\/модель/.test(changed[0]) && /первая\/модель/.test(changed[0]),
+    changed[0]);
+  check("без имён полей конфига и кодов ошибок",
+    !/provider|extra_body|order|404/.test(changed[0]), changed[0]);
+
+  check(
+    "чат без привязки молчит и на смене модели",
+    paramWarnings(model, { model: "вторая/модель" }, {}, "первая/модель").length === 0
   );
   check(
-    "закреплённый провайдер и незаявленный параметр — два повода",
-    paramWarnings(model, { top_k: 40 }, { provider: { order: ["openai"] } }).length === 2
+    "запрет фолбэка сам по себе не предупреждает: смену модели он не ломает",
+    paramWarnings(model, { model: "вторая/модель" }, { provider: { allow_fallbacks: false } }, "первая/модель")
+      .length === 0
+  );
+  check(
+    "без исходной модели молчим: сравнивать не с чем",
+    paramWarnings(model, { model: "вторая/модель" }, pinned, "").length === 0
+  );
+  check(
+    "привязка и незаявленный параметр — два повода",
+    paramWarnings(model, { model: "вторая/модель", top_k: 40 }, pinned, "первая/модель").length === 2
   );
 }
 
@@ -279,11 +291,240 @@ check("свой JSON пустым не отправляется", parseResponseF
   check("массив вместо объекта тоже ошибка", broke);
 }
 
+// ── маршрут целиком: правка в панели → отправка → тело запроса ──
+//
+// Смена системного промпта ломалась трижды, и все три раза сервер был
+// зелёным: расходились состояние панели и состояние агента. Значит проверять
+// надо не ручку, а тот код, который выполняется в браузере, и по всему
+// маршруту. `checks/dom.js` даёт минимальный DOM и минимальный сервер,
+// который записывает, с каким конфигом ушло каждое сообщение.
+//
+// Правку вносим **без события `change`** — просто ставим значение в поле,
+// как это делает пользователь, ещё не убрав из него курсор. Ровно так
+// баг и воспроизводился: событие — один-единственный шанс доставить правку,
+// и поводов его упустить сколько угодно.
+
+const fs = require("fs");
+const HTML = fs.readFileSync(path.join(__dirname, "..", "app", "static", "index.html"), "utf8");
+
+// Поле панели → каким оно уезжает в конфиг агента.
+const PANEL_ROUTE = [
+  ["f-system", "НОВЫЙ ПРОМПТ", "system", "НОВЫЙ ПРОМПТ"],
+  ["f-model", "вторая/модель", "model", "вторая/модель"],
+  ["f-temperature", "0.9", "temperature", 0.9],
+  ["f-max_tokens", "555", "max_tokens", 555],
+  ["f-top_p", "0.8", "top_p", 0.8],
+  ["f-top_k", "40", "top_k", 40],
+  ["f-min_p", "0.05", "min_p", 0.05],
+  ["f-repetition_penalty", "1.2", "repetition_penalty", 1.2],
+  ["f-presence_penalty", "0.4", "presence_penalty", 0.4],
+  ["f-frequency_penalty", "0.6", "frequency_penalty", 0.6],
+  ["f-history_limit", "0", "history_limit", 0],
+  ["f-stop", "КОНЕЦ\nСТОП", "stop", ["КОНЕЦ", "СТОП"]],
+];
+
+function freshClient(options) {
+  Object.keys(require.cache).forEach((key) => delete require.cache[key]);
+  const dom = require(path.join(__dirname, "dom.js"));
+  // Порядок важен: свои чаты добавляем ПОСЛЕ распаковки options, иначе
+  // options.chats затрёт список, а не дополнит его.
+  const env = dom.boot(HTML, {
+    ...options,
+    chats: [
+      { label: "первый чат", system: "СТАРЫЙ ПРОМПТ", model: "первая/модель" },
+      { label: "второй чат", system: "ЧУЖОЙ ПРОМПТ", model: "вторая/модель" },
+      ...((options && options.chats) || []),
+    ],
+  });
+  const client = require(path.join(__dirname, "..", "app", "static", "app.js"));
+  return { ...env, ...dom, client, $: (sel) => env.document.querySelector(sel) };
+}
+
+async function routeChecks() {
+  // ── каждое поле панели доезжает до запроса, даже без события change ──
+  for (const [field, typed, key, expected] of PANEL_ROUTE) {
+    const { client, server, $, settle } = freshClient();
+    client.init();
+    await settle(20);
+
+    $("#" + field).value = typed;          // правка есть на экране...
+    $("#input").value = "вопрос";          // ...а `change` не выстрелил
+    $("#composer").requestSubmit();
+    await settle(80);
+
+    const sent = server.state.sent[0];
+    check(`панель → запрос: ${key} без события change`, Boolean(sent), "сообщение не ушло вовсе");
+    if (sent) {
+      check(
+        `панель → запрос: ${key} доехал новым`,
+        JSON.stringify(sent.config[key]) === JSON.stringify(expected),
+        `ушло ${JSON.stringify(sent.config[key])}, ждали ${JSON.stringify(expected)}`
+      );
+    }
+  }
+
+  // ── формат ответа: список, а не поле ──
+  {
+    const { client, server, $, settle } = freshClient();
+    client.init();
+    await settle(20);
+    $("#f-response_format_kind").value = "json_object";
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+    const sent = server.state.sent[0];
+    check(
+      "панель → запрос: response_format доехал новым",
+      sent && JSON.stringify(sent.config.response_format) === JSON.stringify({ type: "json_object" }),
+      JSON.stringify(sent && sent.config.response_format)
+    );
+  }
+
+  // ── правка во время генерации ──
+  {
+    const { client, server, $, settle } = freshClient({ delay: 30 });
+    client.init();
+    await settle(20);
+    $("#input").value = "первый";
+    $("#composer").requestSubmit();
+    await settle(40);
+    check("во время генерации клиент занят", client.state.busy === true);
+    $("#f-system").value = "ПРАВКА НА ЛЕТУ";
+    await settle(200);
+    $("#input").value = "второй";
+    $("#composer").requestSubmit();
+    await settle(250);
+    const second = server.state.sent[1];
+    check(
+      "правка во время генерации уезжает со следующим сообщением",
+      second && second.config.system === "ПРАВКА НА ЛЕТУ",
+      JSON.stringify(server.state.sent.map((x) => x.config.system))
+    );
+    check(
+      "текущий ответ правка не задела",
+      server.state.sent[0].config.system === "СТАРЫЙ ПРОМПТ",
+      server.state.sent[0].config.system
+    );
+  }
+
+  // ── перегенерация подчиняется тому же правилу ──
+  {
+    const { client, server, $, settle } = freshClient();
+    client.init();
+    await settle(20);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+    $("#f-system").value = "ПРОМПТ ДЛЯ ПОВТОРА";
+    await client.state.applying;
+    const card = $("#feed").querySelector(".card");
+    const refresh = card.querySelectorAll(".icon-btn")[2];
+    refresh.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("click"));
+    await settle(120);
+    const last = server.state.sent[server.state.sent.length - 1];
+    check(
+      "перегенерация тоже идёт с тем, что показывает панель",
+      last && last.config.system === "ПРОМПТ ДЛЯ ПОВТОРА",
+      JSON.stringify(server.state.sent.map((x) => x.config.system))
+    );
+  }
+
+  // ── нераспознаваемое поле: сообщение не уходит вовсе ──
+  {
+    const { client, server, $, settle } = freshClient();
+    client.init();
+    await settle(20);
+    $("#f-temperature").value = "жарко";
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+    check("с нечитаемым полем сообщение не отправляется", server.state.sent.length === 0,
+      JSON.stringify(server.state.sent));
+    check("и клиент говорит почему", /не применились/.test($("#composer-hint").textContent),
+      $("#composer-hint").textContent);
+    check("текст сообщения остался в поле ввода", $("#input").value === "вопрос", $("#input").value);
+  }
+
+  // ── лента доматывается вниз, но не под руку читающему ──
+  {
+    const { client, $, settle } = freshClient({ delay: 5 });
+    client.init();
+    await settle(20);
+    const feed = $("#feed");
+    // Читатель внизу: лента доматывается сама.
+    feed.scrollHeight = 1000;
+    feed.clientHeight = 400;
+    feed.scrollTop = 600;
+    feed.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("scroll"));
+    $("#input").value = "первый";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("внизу — лента доматывается", client.state.stick === true);
+
+    // Читатель отмотал вверх: новые куски не должны дёргать ленту.
+    feed.scrollHeight = 2000;
+    feed.clientHeight = 400;
+    feed.scrollTop = 100;
+    feed.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("scroll"));
+    check("отмотал вверх — лента отвязалась", client.state.stick === false);
+    const before = feed.scrollTop;
+    $("#input").value = "второй";
+    $("#composer").requestSubmit();
+    await settle(120);
+    // Своё сообщение — исключение: его отправил сам читатель.
+    check("своё сообщение возвращает ленту вниз", client.state.stick === true, String(before));
+  }
+
+  // ── строка состояния гаснет ──
+  {
+    const { client, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(20);
+    $("#f-system").value = "правка";
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(30);
+    check("после применения есть строка состояния",
+      /Применено/.test($("#save-status").textContent), $("#save-status").textContent);
+    // Таймер настоящий, ждать пять секунд в проверке незачем — двигаем время.
+    const fade = client.state.statusTimer;
+    check("гашение назначено таймером", Boolean(fade), "таймера нет");
+    await new Promise((r) => setTimeout(r, 5100));
+    check("через пять секунд строка пуста", $("#save-status").textContent === "",
+      $("#save-status").textContent);
+  }
+
+  // ── предупреждение про поставщика: только при смене модели ──
+  {
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "закреплённый", model: "первая/модель",
+                extra_body: { provider: { order: ["openai"] } } }],
+    });
+    client.init();
+    await settle(20);
+    const rows = $("#agent-list").querySelectorAll(".item-open");
+    rows[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("на закреплённом чате предупреждения нет, пока модель прежняя",
+      $("#model-warn").children.length === 0, $("#model-warn").textContent);
+    $("#f-model").value = "вторая/модель";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await settle(40);
+    const text = $("#model-warn").textContent;
+    check("после смены модели предупреждение появляется", text.length > 0, text);
+    check("и говорит человеческими словами, без имён полей конфига",
+      /поставщик/i.test(text) && !/provider|extra_body|order|404/.test(text), text);
+  }
+}
+
 // ── итог ──
 
-if (failures.length) {
-  console.error(`ПРОВАЛЕНО ${failures.length} из ${passed + failures.length}:`);
-  failures.forEach((f) => console.error("  - " + f));
-  process.exit(1);
-}
-console.log(`ОК: ${passed} утверждений о клиенте`);
+routeChecks()
+  .catch((err) => failures.push("маршрут клиента упал: " + (err && err.stack)))
+  .then(() => {
+    if (failures.length) {
+      console.error(`ПРОВАЛЕНО ${failures.length} из ${passed + failures.length}:`);
+      failures.forEach((f) => console.error("  - " + f));
+      process.exit(1);
+    }
+    console.log(`ОК: ${passed} утверждений о клиенте`);
+  });

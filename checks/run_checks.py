@@ -921,6 +921,21 @@ def check_regenerate_disconnect():
 # --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
+@check("по умолчанию заведены только чаты дней 1–5")
+def check_default_chats():
+    with TestClient(main.app) as client:
+        labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+
+    assert len(labels) == 21, f"{len(labels)} чатов: {labels}"
+    assert "Ассистент" not in labels, "чат текущего дня должен быть удалён"
+    for label in labels:
+        assert label.startswith("День "), f"лишний чат по умолчанию: {label}"
+    days = sorted({label.split(":")[0] for label in labels})
+    assert days == ["День 1", "День 2", "День 3", "День 4", "День 5"], days
+    assert "Ассистент" not in read("day.py"), "в day.py остался чат текущего дня"
+    return f"{len(labels)} чатов, только дни 1–5"
+
+
 @check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
 def check_no_clear_all():
     with TestClient(main.app) as client:
@@ -1000,7 +1015,12 @@ def check_no_leftover_texts():
     assert "group=" not in day_source, "в day.py остались группы"
     for path in ("app/static/app.js", "app/static/index.html"):
         assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
-    return "ни note, ни group — ни в day.py, ни в ответах, ни в разметке"
+
+    # Подписи, объясняющие интерфейс сам себе, — тоже приписки: карандаш
+    # в списке виден и без пояснения под панелью.
+    html = read("app/static/index.html")
+    assert "карандаш" not in html, "приписка про карандаш осталась"
+    return "ни note, ни group, ни подписей к очевидному"
 
 
 @check("имени клиента-референса нет нигде в репозитории")
@@ -1116,18 +1136,13 @@ def check_catalog_capabilities():
 
     js = read("app/static/app.js")
     assert "function paramWarnings" in js, "панель не считает предупреждения"
-    # Закреплённый провайдер — не пояснение, а настройка, ломающая вызов:
-    # шесть чатов дней 4–5 роняют смену модели сырым 404 без подсказки.
-    assert "provider.order" in js, "панель молчит про закреплённого провайдера"
+    # Привязка к поставщику — настройка, которая ломает смену модели.
+    # Панель говорит о ней в момент смены; сам текст проверяется вызовами
+    # в checks/browser_check.js, здесь — что данные для него есть.
     assert "extra_body" in js, "панель не смотрит на extra_body"
+    assert "baseModel" in js, "панель не помнит, с какой модели начинали"
     pinned = [c.label for c in day.CHATS if (c.extra_body or {}).get("provider", {}).get("order")]
-    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым провайдером
-    no_fallback = [
-        c.label
-        for c in day.CHATS
-        if (c.extra_body or {}).get("provider", {}).get("allow_fallbacks") is False
-    ]
-    assert len(no_fallback) == 6, no_fallback  # плюс три чата Дня 5 без фолбэка
+    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым поставщиком
     for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
         assert field in js, f"клиент не смотрит на {field}"
     assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
@@ -1151,13 +1166,15 @@ def check_no_cdn():
     return "в статике только относительные пути и w3.org-неймспейс SVG"
 
 
-@check("поле ввода закреплено внизу и не уезжает вместе с лентой")
-def check_composer_pinned():
-    """Пункт 7: композер уезжал вниз, когда лента становилась длиннее.
+@check("лента прокручивается, а не сжимает карточки; композер закреплён")
+def check_feed_scrolls():
+    """Находка заказчика: карточки сплющивались в полоску вместо прокрутки.
 
-    Держится это на `min-height: 0` у колонки чата: без него автоматический
-    минимум grid- и flex-элемента считается по содержимому, лента распирает
-    колонку выше экрана и утаскивает поле ввода за собой.
+    Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
+    У карточки к тому же `overflow: hidden`, из-за чего её автоматический
+    минимальный размер равен нулю — сжаться она может до полосы. Прошлая
+    правка (`min-height: 0` у колонки чата) закрепила композер, но сжатие
+    шло по другой причине и осталось.
     """
     css = read("app/static/style.css")
     block = css[css.index(".chat {") : css.index(".chat-body")]
@@ -1165,8 +1182,15 @@ def check_composer_pinned():
         assert rule in block, f"у .chat нет правила {rule}"
     assert "min-height: 0" in css[css.index(".chat-body") : css.index(".feed {")]
     assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
-    assert ".feed {" in css and "overflow-y: auto" in css[css.index(".feed {") :]
-    return "колонка чата не растягивается содержимым, прокручивается лента"
+    assert "overflow-y: auto" in css[css.index(".feed {") :], "лента должна прокручиваться"
+
+    # Главное: элементам ленты запрещено сжиматься.
+    assert ".feed > * { flex: 0 0 auto; }" in css, "элементы ленты всё ещё сжимаются"
+    feed = css[css.index(".feed {") : css.index(".feed > *")]
+    assert "scroll-behavior: smooth" not in feed, (
+        "плавная прокрутка ленты дёргает её на каждом куске ответа"
+    )
+    return "элементы ленты не сжимаются, лента прокручивается, композер закреплён"
 
 
 @check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
@@ -1377,6 +1401,7 @@ CHECKS = [
     check_regenerate,
     check_regenerate_failure,
     check_regenerate_disconnect,
+    check_default_chats,
     check_no_clear_all,
     check_numbered_names,
     check_list_actions,
@@ -1385,7 +1410,7 @@ CHECKS = [
     check_no_key_leak,
     check_catalog_capabilities,
     check_no_cdn,
-    check_composer_pinned,
+    check_feed_scrolls,
     check_browser,
     check_spec_deep_copy,
     check_eviction,
