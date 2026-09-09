@@ -29,6 +29,9 @@ from .registry import REGISTRY
 from .schema import AgentSpec
 from .store import StoreBusyError
 
+SESSIONS_SHOWN = 30
+"""Сколько сессий печатает `/сессии`. Остальные не спрятаны — их число видно."""
+
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_SYSTEM = "Ты — агент стенда AI-челленджа. Отвечай по-русски, коротко и по делу."
 
@@ -101,7 +104,11 @@ async def ask(agent: Agent, text: str, out=sys.stdout) -> str:
             answer += event["text"]
             out.write(event["text"])
             out.flush()
-        elif kind in ("repeat_error", "error"):
+        elif kind == "reasoning":
+            # Рассуждение в консоли помечаем: иначе его не отличить от ответа.
+            out.write(f"\n[рассуждение] {event['text']}")
+            out.flush()
+        elif kind == "error":
             error = event["message"]
         elif kind == "done":
             answer = event["text"] or answer
@@ -123,12 +130,16 @@ def _print_history(agent: Agent, out=sys.stdout) -> None:
 
 def _print_sessions(out=sys.stdout) -> None:
     """Сохранённые сессии — те, что переживут перезапуск."""
-    sessions = REGISTRY.sessions(limit=30)
+    sessions = REGISTRY.sessions()
     if not sessions:
         out.write("[сохранённых сессий нет]\n")
         return
-    out.write(f"сохранённых сессий: {len(sessions)} · база {store.db_path()}\n")
-    for row in sessions:
+    # В консоль печатаем хвост, но говорим и общее число: молча показать
+    # тридцать из двухсот значит соврать про то, что сохранилось.
+    shown = sessions[:SESSIONS_SHOWN]
+    tail = f", показаны последние {len(shown)}" if len(sessions) > len(shown) else ""
+    out.write(f"сохранённых сессий: {len(sessions)}{tail} · база {store.db_path()}\n")
+    for row in shown:
         mark = "живая" if row["live"] else "в базе"
         out.write(
             f"  {row['id']}  {row['label']}  {row['config'].get('model', '')}  "

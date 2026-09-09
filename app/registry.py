@@ -11,22 +11,24 @@
 
 * **вытеснение по потолку — это выгрузка**: агент уходит из памяти, строка
   в базе остаётся, и `require()` поднимет сессию обратно с её историей;
-* **удаление — это удаление**: `kill()` стирает и из памяти, и из базы,
-  каскадом по детям в обоих слоях.
+* **удаление — это удаление**: `kill()` стирает и из памяти, и из базы.
+
+Список слева строится **по базе**, а не по памяти: `catalogue()` отдаёт все
+сохранённые сессии, подставляя живой объект там, где он есть. Иначе сессии
+сверх потолка реестра просто исчезли бы из списка, хотя лежат в базе целыми, —
+а список слева теперь единственный способ добраться до диалога. В память
+сессия поднимается при открытии, `require()`.
 
 Потолок на число живых агентов обязателен и после появления базы: процесс
-стенда живёт часами, каждый `/прогон` спавнит новый набор, и без вытеснения
-реестр течёт. Поднятая из базы сессия честно встаёт в очередь на вытеснение
-наравне с остальными.
+стенда живёт часами, новые чаты копятся, и без вытеснения реестр течёт.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import fields
 from typing import Iterable
 
-from .agent import Agent, reserve_ids
+from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config
 from .schema import AgentSpec
 from .store import Store, shared_store
 
@@ -52,15 +54,15 @@ class UnknownAgentError(KeyError):
 
 
 class AgentRegistry:
-    """Словарь id → Agent плюс родительские связи. Один на процесс."""
+    """Словарь id → Agent поверх хранилища сессий. Один на процесс."""
 
     def __init__(self, max_agents: int | None = None, store: Store | None = None) -> None:
         self._agents: dict[str, Agent] = {}
         self.max_agents = max_agents if max_agents is not None else _max_agents()
         self.evicted = 0
-        """Сколько агентов выгружено из памяти за жизнь процесса — видно в /api/agents.
+        """Сколько агентов выгружено из памяти за жизнь процесса.
 
-        Именно выгружено, а не удалено: сессии этих агентов в базе остались."""
+        Именно выгружено, а не удалено: их сессии в базе остались."""
 
         self.store = shared_store() if store is None else store
         # Счётчик id живёт в процессе и после перезапуска начинается с нуля.
@@ -76,24 +78,14 @@ class AgentRegistry:
 
     # --- создание ------------------------------------------------------------
 
-    def create(
-        self,
-        spec: AgentSpec,
-        *,
-        parent_id: str | None = None,
-        context_length: int | None = None,
-    ) -> Agent:
+    def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
         self._make_room(1)
-        agent = Agent(spec, parent_id=parent_id, context_length=context_length, store=self.store)
+        agent = Agent(spec, context_length=context_length, store=self.store)
         self._agents[agent.id] = agent
         return agent
 
     def create_many(
-        self,
-        specs: Iterable[AgentSpec],
-        *,
-        parent_id: str | None = None,
-        context_lengths: dict[str, int] | None = None,
+        self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
     ) -> list[Agent]:
         """Пачка агентов одним вызовом — сто конфигов, сто объектов, один процесс."""
         specs = list(specs)
@@ -105,7 +97,6 @@ class AgentRegistry:
             for spec in specs:
                 agent = Agent(
                     spec,
-                    parent_id=parent_id,
                     context_length=(context_lengths or {}).get(spec.model),
                     store=self.store,
                 )
@@ -130,25 +121,79 @@ class AgentRegistry:
         # Место освобождаем до создания: поднятая сессия встаёт в общую очередь
         # на вытеснение, а не живёт сверх потолка.
         self._make_room(1)
-        spec = _spec_from_config(saved["config"])
-        # context_length конструктор достанет из той же строки: каталог моделей
-        # — сетевой запрос, и восстановление сессии не должно его ждать.
-        agent = Agent(
-            spec,
-            agent_id=saved["id"],
-            parent_id=saved["parent_id"],
-            store=self.store,
-        )
+        agent = Agent(_spec_from_row(saved), agent_id=saved["id"], store=self.store)
         self._agents[agent.id] = agent
         return agent
 
-    def sessions(self, *, limit: int = 500) -> list[dict]:
+    def sessions(self, *, limit: int | None = None) -> list[dict]:
         """Все сохранённые сессии, а не только живые в процессе."""
         live = set(self._agents)
         rows = self.store.list_sessions(limit=limit)
         for row in rows:
             row["live"] = row["id"] in live
         return rows
+
+    def catalogue(self) -> list[dict]:
+        """Список слева: каждая сохранённая сессия одной записью, в порядке заведения.
+
+        Живой агент описывает себя сам — у него точные `busy` и длина истории.
+        Выгруженная сессия описывается по строке из базы тем же форматом:
+        клиент не должен различать «поднято в память» и «лежит в базе», для
+        него это один список, и открывается из него любая запись.
+
+        Потолка у списка нет намеренно. Любая обрезка здесь была бы молчаливой,
+        а резала бы по времени последней записи — то есть первыми исчезали бы
+        агенты дней 1–5, с которыми ещё не говорили. День про то, что ничего
+        не теряется, и список это обещание держит целиком.
+        """
+        entries = []
+        for row in self.store.list_sessions():
+            live = self._agents.get(row["id"])
+            if live is not None:
+                entries.append(live.as_dict())
+                continue
+            spec = _spec_from_row(row)
+            entries.append(
+                spec_as_dict(
+                    spec,
+                    agent_id=row["id"],
+                    history_len=row["history_len"],
+                    created_at=row["created_at"],
+                    last_used_at=row["updated_at"],
+                )
+            )
+        entries.sort(key=lambda entry: entry["created_at"])
+        return entries
+
+    def origins(self) -> set[str]:
+        """Какие конфиги ростера уже подняты — по всем сохранённым сессиям.
+
+        Именно по базе и именно по `origin`, а не по имени: имя правится
+        в панели справа, и переименованный агент дня перестал бы совпадать
+        со своим конфигом. На следующем старте рядом с ним завёлся бы второй.
+        """
+        found = set()
+        for row in self.store.list_sessions():
+            origin = (row["config"] or {}).get("origin")
+            if origin:
+                found.add(origin)
+        return found
+
+    def delete_where(self, keep_roster: bool = True) -> list[str]:
+        """Стирает чаты пользователя — все, а не только поднятые в память.
+
+        «Очистить все чаты» после перезапуска обязана дотянуться и до тех
+        сессий, которых сейчас нет в памяти: в списке слева они видны, значит
+        и уйти должны вместе с остальными.
+        """
+        killed = []
+        for row in self.store.list_sessions():
+            is_roster = bool((row["config"] or {}).get("group"))
+            if keep_roster and is_roster:
+                continue
+            if self.kill(row["id"]):
+                killed.append(row["id"])
+        return killed
 
     # --- чтение --------------------------------------------------------------
 
@@ -158,79 +203,42 @@ class AgentRegistry:
     def require(self, agent_id: str) -> Agent:
         """Агент по id: живой из памяти, иначе поднятый из базы.
 
-        Вытесненная сессия отсюда возвращается как ни в чём не бывало —
-        в этом и смысл базы. Нет её и в базе — значит, её удалили.
+        Выгруженная сессия отсюда возвращается как ни в чём не бывало — в этом
+        и смысл базы. Нет её и в базе — значит, её удалили.
         """
         agent = self.load(agent_id)
         if agent is None:
             raise UnknownAgentError(agent_id)
         return agent
 
-    def list(self, *, parent_id: str | None = None, only_children: bool = False) -> list[Agent]:
-        """Все агенты, в порядке создания. only_children — только дети parent_id."""
-        agents = sorted(self._agents.values(), key=lambda a: a.created_at)
-        if only_children:
-            return [a for a in agents if a.parent_id == parent_id]
-        return agents
-
-    def children(self, parent_id: str) -> list[Agent]:
-        return self.list(parent_id=parent_id, only_children=True)
+    def list(self) -> list[Agent]:
+        """Все агенты, в порядке создания."""
+        return sorted(self._agents.values(), key=lambda a: a.created_at)
 
     # --- удаление ------------------------------------------------------------
 
-    def kill(self, agent_id: str) -> list[str]:
-        """Удаляет агента и всех его детей — из памяти и из базы.
-
-        Каскад идёт по обоим слоям: в памяти по `parent_id` живых агентов,
-        в базе — по `parent_id` строк. Ребёнок, вытесненный из памяти раньше
-        родителя, иначе остался бы в базе сиротой навсегда.
-        """
-        known = agent_id in self._agents or self.store.load_session(agent_id) is not None
-        if not known:
-            return []
-        killed = self._unload(agent_id)
+    def kill(self, agent_id: str) -> bool:
+        """Удаляет сессию из памяти и из базы. False — её нигде нет."""
+        unloaded = self._unload(agent_id)
         removed = self.store.delete_session(agent_id)
-        for session_id in removed:
-            if session_id not in killed:
-                killed.append(session_id)
-        return killed
+        return unloaded or removed
 
-    def _unload(self, agent_id: str) -> list[str]:
-        """Убирает агента и его живых детей из памяти. Базу не трогает.
+    def _unload(self, agent_id: str) -> bool:
+        """Убирает агента из памяти и гасит его генерацию. Базу не трогает.
 
         Это и есть вытеснение: сессия остаётся сохранённой и поднимется
         обратно при первом же обращении.
         """
-        agent = self._agents.get(agent_id)
+        agent = self._agents.pop(agent_id, None)
         if agent is None:
-            return []
-        unloaded = [agent_id]
-        for child in self.children(agent_id):
-            unloaded.extend(self._unload(child.id))
+            return False
         agent.cancel()
-        self._agents.pop(agent_id, None)
         # Сессией владеет тот объект, что лежит в реестре. Выгруженный больше
-        # не владелец: иначе чужая ссылка на него пережила бы вытеснение,
-        # `require()` поднял бы из базы второй объект той же сессии,
-        # и `persist()` первого затёр бы реплики второго.
+        # не владелец: иначе придержанная кем-то ссылка пережила бы вытеснение,
+        # обращение подняло бы из базы второй объект той же сессии,
+        # и запись первого затёрла бы реплики второго.
         agent.detach()
-        return unloaded
-
-    def kill_children(self, parent_id: str) -> list[str]:
-        """Удаляет набор субагентов родителя. «Старт» зовёт это перед новым набором.
-
-        Именно удаляет, а не выгружает: прошлый набор колонок замещается новым,
-        и без этого база копила бы по набору на каждый «Старт». Плата за это
-        названа прямо — разговор, который успели завести с колонкой **до**
-        «Старта», уходит вместе с набором. Так было и в Дне 6, только там он
-        жил в памяти; теперь это сохранённая сессия, поэтому предупреждение
-        есть и в README, и в подсказке на самой кнопке.
-        """
-        killed: list[str] = []
-        children = {c.id for c in self.children(parent_id)} | set(self.store.children(parent_id))
-        for child_id in sorted(children):
-            killed.extend(self.kill(child_id))
-        return killed
+        return True
 
     def kill_all(self, *, purge: bool = True) -> list[str]:
         """Гасит всех живых. purge — заодно стереть базу (нужно только проверкам)."""
@@ -245,29 +253,15 @@ class AgentRegistry:
 
     # --- вытеснение ----------------------------------------------------------
 
-    def _evictable(self, agent: Agent) -> bool:
-        """Можно ли вытеснить агента вместе со всем его поддеревом.
+    def _make_room(self, need: int) -> None:
+        """Освобождает место под `need` новых агентов, вытесняя самых старых простаивающих.
 
         Занятый агент не вытесняется никогда: у него идёт обмен, и его ответа
-        кто-то прямо сейчас ждёт. Занятый **потомок** запрещает вытеснять
-        и родителя: вытеснение идёт каскадом, и иначе оно оборвало бы живой
-        прогон, начатый из родительской сессии.
-        """
-        if agent.busy:
-            return False
-        return all(self._evictable(child) for child in self.children(agent.id))
-
-    def _make_room(self, need: int) -> None:
-        """Освобождает место под `need` новых агентов, выгружая самых старых простаивающих.
-
-        Вытеснение каскадное, как и `kill`: субагенты прогона уходят вместе
-        с родителем. Иначе после вытеснения родителя дети остались бы в реестре
-        с `parent_id` в никуда — их не найти по родителю и не убить каскадом,
-        то есть потолок от них уже не защищает.
+        кто-то прямо сейчас ждёт.
 
         Вытеснение не удаляет сессию: строка в базе остаётся, и `require()`
-        поднимет разговор обратно с того же места. Потолок ограничивает
-        память процесса, а не срок жизни диалога.
+        поднимет разговор с того же места. Потолок ограничивает память
+        процесса, а не срок жизни диалога.
 
         Если простаивающих не хватило — новые агенты всё равно создаются:
         отказать в спавне хуже, чем на время превысить потолок, а следующий
@@ -276,39 +270,34 @@ class AgentRegistry:
         overflow = len(self._agents) + need - self.max_agents
         if overflow <= 0:
             return
-        # Сначала листья: у поддерева младший потомок и есть самый старый
-        # кандидат, а родителя каскад заберёт вместе с ним.
         idle = sorted(
-            (a for a in self._agents.values() if self._evictable(a)),
-            key=lambda a: a.last_used_at,
+            (a for a in self._agents.values() if not a.busy), key=lambda a: a.last_used_at
         )
-        for agent in idle:
-            if overflow <= 0:
-                break
-            if agent.id not in self._agents:
-                continue  # уже ушёл каскадом вместе с родителем
+        for agent in idle[:overflow]:
             # Именно выгрузка, а не удаление: строка сессии остаётся в базе,
-            # и разговор можно продолжить, открыв её заново.
-            unloaded = self._unload(agent.id)
-            self.evicted += len(unloaded)
-            overflow -= len(unloaded)
+            # и разговор можно продолжить, открыв его заново.
+            if self._unload(agent.id):
+                self.evicted += 1
 
 
-_SPEC_FIELDS = {f.name for f in fields(AgentSpec)}
+def _spec_from_row(saved: dict) -> AgentSpec:
+    """Конфиг сохранённой сессии из строки базы.
 
-
-def _spec_from_config(config: dict) -> AgentSpec:
-    """Конфиг из базы обратно в `AgentSpec`.
-
-    Лишние ключи отбрасываются молча: базу мог записать стенд другой версии,
-    и падать на незнакомом поле — значит потерять весь сохранённый диалог.
-    Обязательные поля подстраховываем дефолтом по той же причине.
+    Разбор конфига один на весь стенд — тот же, которым агент восстанавливает
+    себя в конструкторе: незнакомые ключи отбрасываются молча, потому что базу
+    мог записать стенд другой версии, и падать на чужом поле значит потерять
+    весь список.
     """
-    fields_ = {k: v for k, v in (config or {}).items() if k in _SPEC_FIELDS}
-    fields_.setdefault("label", "сессия")
-    fields_.setdefault("model", "")
-    fields_.setdefault("messages", [])
-    return AgentSpec(**fields_)
+    fallback = AgentSpec(label=saved.get("label") or "Чат", model=_UNKNOWN_MODEL)
+    return spec_from_config(saved.get("config") or {}, fallback=fallback)
+
+
+_UNKNOWN_MODEL = "openai/gpt-4o-mini"
+"""Чем заменить модель, если в сохранённом конфиге её нет.
+
+Строка сессии без модели — это или чужая версия схемы, или недописанная
+строка. Показать такую сессию в списке всё равно надо: в ней лежит переписка.
+"""
 
 
 REGISTRY = AgentRegistry()

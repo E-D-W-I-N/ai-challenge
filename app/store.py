@@ -6,8 +6,10 @@
 
 Две таблицы, потому что восстанавливать надо сессию целиком, а не только текст:
 
-* `sessions` — id, родитель, ярлык и **конфиг агента одним JSON-полем**
-  (модель, температура, системный промпт, `history_limit`, `extra_body`);
+* `sessions` — id, имя и **конфиг агента одним JSON-полем**: модель, системный
+  промпт, черновик, группа в списке слева, окно памяти и все параметры
+  сэмплирования. Одним полем — чтобы новое поле конфига сохранялось само,
+  а не требовало не забыть про колонку;
 * `messages` — реплики, у каждой обязателен `session_id` и порядковый номер
   внутри сессии.
 
@@ -65,12 +67,9 @@ MEMORY = ":memory:"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
-    parent_id   TEXT,
     label       TEXT NOT NULL DEFAULT '',
     config      TEXT NOT NULL DEFAULT '{}',
     seed        TEXT NOT NULL DEFAULT '[]',
-    overrides   TEXT NOT NULL DEFAULT '{}',
-    seed_used   INTEGER NOT NULL DEFAULT 0,
     context_length INTEGER,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
@@ -82,12 +81,12 @@ CREATE TABLE IF NOT EXISTS messages (
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     error       TEXT,
+    metrics     TEXT,
     at          REAL NOT NULL,
     PRIMARY KEY (session_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session_id);
-CREATE INDEX IF NOT EXISTS sessions_by_parent ON sessions(parent_id);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -288,6 +287,9 @@ class Store:
         have = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "context_length" not in have:
             conn.execute("ALTER TABLE sessions ADD COLUMN context_length INTEGER")
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "metrics" not in have:
+            conn.execute("ALTER TABLE messages ADD COLUMN metrics TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -353,42 +355,38 @@ class Store:
         self,
         session_id: str,
         *,
-        parent_id: str | None,
         label: str,
         config: dict,
         seed: list[dict],
-        overrides: dict,
-        seed_used: bool,
         created_at: float,
         context_length: int | None = None,
     ) -> None:
-        """Заводит сессию или обновляет её конфиг. `created_at` не перетирается."""
+        """Заводит сессию или обновляет её конфиг. `created_at` не перетирается.
+
+        Конфиг едет одним JSON-полем целиком, поэтому новое поле в `AgentSpec`
+        сохраняется само: имя, системный промпт, группа, черновик, окно памяти
+        и все параметры сэмплирования — это `asdict(spec)`, а не список колонок,
+        который надо не забыть дополнить.
+        """
         now = time.time()
         with self.tx() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions
-                    (id, parent_id, label, config, seed, overrides, seed_used,
-                     context_length, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, label, config, seed, context_length, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    parent_id = excluded.parent_id,
                     label     = excluded.label,
                     config    = excluded.config,
                     seed      = excluded.seed,
-                    overrides = excluded.overrides,
-                    seed_used = excluded.seed_used,
                     context_length = excluded.context_length,
                     updated_at = excluded.updated_at
                 """,
                 (
                     session_id,
-                    parent_id,
                     label,
                     _dumps(redact(config)),
                     _dumps(redact(seed)),
-                    _dumps(redact(overrides)),
-                    1 if seed_used else 0,
                     context_length,
                     created_at,
                     now,
@@ -404,31 +402,35 @@ class Store:
     def _session_row(row: sqlite3.Row) -> dict:
         return {
             "id": row["id"],
-            "parent_id": row["parent_id"],
             "label": row["label"],
             "config": _loads(row["config"], {}),
             "seed": _loads(row["seed"], []),
-            "overrides": _loads(row["overrides"], {}),
-            "seed_used": bool(row["seed_used"]),
             "context_length": row["context_length"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
 
-    def list_sessions(self, *, limit: int = 500) -> list[dict]:
-        """Сохранённые сессии, свежие сверху, с числом реплик у каждой."""
+    def list_sessions(self, *, limit: int | None = None) -> list[dict]:
+        """Сохранённые сессии, свежие сверху, с числом реплик у каждой.
+
+        `limit=None` — все до одной, и это режим по умолчанию: по этому списку
+        строится список слева, а он не вправе молча что-то скрывать. Обрезка
+        здесь резала бы по `updated_at`, то есть первыми выпали бы агенты
+        дней 1–5, с которыми ещё не говорили, — ровно то, ради чего список
+        и открывают. Запрос дешёвый: пять тысяч сессий читаются за 13 мс.
+        """
+        sql = """
+            SELECT s.*, (
+                SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
+            ) AS history_len
+            FROM sessions s
+            ORDER BY s.updated_at DESC
+        """
         with self.reading() as conn:
-            rows = conn.execute(
-                """
-                SELECT s.*, (
-                    SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
-                ) AS history_len
-                FROM sessions s
-                ORDER BY s.updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(sql).fetchall()
+            else:
+                rows = conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
         out = []
         for row in rows:
             data = self._session_row(row)
@@ -440,35 +442,16 @@ class Store:
         with self.reading() as conn:
             return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
-    def children(self, parent_id: str) -> list[str]:
-        with self.reading() as conn:
-            rows = conn.execute(
-                "SELECT id FROM sessions WHERE parent_id = ?", (parent_id,)
-            ).fetchall()
-        return [row["id"] for row in rows]
+    def delete_session(self, session_id: str) -> bool:
+        """Стирает сессию вместе с её репликами. False — её и не было.
 
-    def delete_session(self, session_id: str) -> list[str]:
-        """Удаляет сессию и её потомков — из базы, а не только из памяти.
-
-        Каскад по `parent_id` идёт по базе, а не по реестру: субагент прогона
-        мог быть вытеснен из памяти раньше родителя, и в реестре его уже нет,
-        а строка в базе осталась бы висеть навсегда.
+        Обе таблицы в одной транзакции: сессия без реплик и реплики без сессии
+        одинаково бессмысленны, и промежуточного состояния быть не должно.
         """
-        removed: list[str] = []
         with self.tx() as conn:
-            stack = [session_id]
-            seen = set()
-            while stack:
-                current = stack.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                stack.extend(self.children(current))
-                cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (current,))
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (current,))
-                if cursor.rowcount:
-                    removed.append(current)
-        return removed
+            cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            return bool(cursor.rowcount)
 
     def clear(self) -> None:
         """Стирает базу целиком. Нужно только проверкам между собой."""
@@ -481,9 +464,14 @@ class Store:
     def save_history(self, session_id: str, turns) -> None:
         """Переписывает историю сессии целиком, одной транзакцией.
 
-        Номера расставляются заново от нуля: откат несостоявшегося обмена и
-        кап хранимого укорачивают историю, и «дописать хвост» тут не годится —
-        в нумерации остались бы дыры, а по ним потом восстанавливать порядок.
+        Номера расставляются заново от нуля: откат несостоявшегося обмена,
+        снятая перегенерацией пара и кап хранимого укорачивают историю, и
+        «дописать хвост» тут не годится — в нумерации остались бы дыры, а по ним
+        потом восстанавливать порядок.
+
+        Рассуждение модели не пишется: в контекст оно не возвращается, а места
+        занимает больше самого ответа. Метрики пишутся — по ним клиент рисует
+        плитки под ответом, и после перезапуска лента должна выглядеть так же.
         """
         rows = [
             (
@@ -492,6 +480,7 @@ class Store:
                 turn.role,
                 redact(turn.content),
                 redact(turn.error),
+                _dumps(redact(turn.metrics)) if turn.metrics else None,
                 turn.at,
             )
             for seq, turn in enumerate(turns)
@@ -500,8 +489,8 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             if rows:
                 conn.executemany(
-                    "INSERT INTO messages (session_id, seq, role, content, error, at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages (session_id, seq, role, content, error, metrics, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
             conn.execute(
@@ -511,12 +500,18 @@ class Store:
     def load_messages(self, session_id: str) -> list[dict]:
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT role, content, error, at FROM messages "
+                "SELECT role, content, error, metrics, at FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
         return [
-            {"role": r["role"], "content": r["content"], "error": r["error"], "at": r["at"]}
+            {
+                "role": r["role"],
+                "content": r["content"],
+                "error": r["error"],
+                "metrics": _loads(r["metrics"], None) if r["metrics"] else None,
+                "at": r["at"],
+            }
             for r in rows
         ]
 
