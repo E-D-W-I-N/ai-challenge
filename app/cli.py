@@ -101,7 +101,11 @@ async def ask(agent: Agent, text: str, out=sys.stdout) -> str:
             answer += event["text"]
             out.write(event["text"])
             out.flush()
-        elif kind in ("repeat_error", "error"):
+        elif kind == "reasoning":
+            # Рассуждение в консоли помечаем: иначе его не отличить от ответа.
+            out.write(f"\n[рассуждение] {event['text']}")
+            out.flush()
+        elif kind == "error":
             error = event["message"]
         elif kind == "done":
             answer = event["text"] or answer

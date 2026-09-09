@@ -9,12 +9,12 @@
 `stream_completion` и дописывает ответ себе в историю. Наружу отдаёт поток
 событий — из него и SSE стенда, и вывод CLI.
 
-С Дня 7 у агента есть хранилище (`app/store.py`). Восстановление истории
-сделано **в конструкторе**: агенту, которому дали `store` и чужой `agent_id`,
-история приезжает сама. Отдельного `restore()`, который можно забыть позвать,
-нет и не должно быть. Запись идёт после каждого завершённого обмена — тем же
-правилом, что уже действует в памяти: несостоявшийся обмен не пишется вовсе,
-частичный ответ пишется с пометкой ошибки.
+С Дня 7 у агента есть хранилище (`app/store.py`), и память переживает
+перезапуск. Восстановление сделано **в конструкторе**: агенту, которому дали
+`store` и уже существующий `agent_id`, история приезжает сама. Отдельного
+метода «подними историю», который можно забыть позвать, нет. Запись идёт после
+каждого завершённого обмена — тем же правилом, что действует в памяти:
+несостоявшийся обмен не пишется вовсе, частичный ответ пишется с пометкой.
 
 Агент ничего не знает ни про FastAPI, ни про SSE, ни про реестр: сто агентов —
 это сто объектов в одном процессе, а не сто процессов.
@@ -27,10 +27,10 @@ import contextlib
 import copy
 import threading
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import AsyncIterator
 
-from .llm import MissingKeyError, stream_completion
+from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import AgentSpec
 from .store import Store
 
@@ -53,17 +53,8 @@ _last_id = 0
 _id_lock = threading.Lock()
 
 
-def effective_history_limit(limit: int | None) -> int:
-    """Окно памяти в сообщениях: None — дефолт агента, отрицательное — ноль.
-
-    Вынесено из свойства `Agent.history_limit`, потому что то же число надо
-    показывать в списке сохранённых сессий: там агента в памяти может не быть
-    вовсе, а окно у сессии всё равно действующее, а не «null».
-    """
-    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
-
-
 def new_agent_id() -> str:
+    """Следующий id по счётчику процесса. Для агента без хранилища — годится."""
     global _last_id
     with _id_lock:
         _last_id += 1
@@ -76,10 +67,17 @@ def reserve_ids(upto: int) -> None:
     Счётчик живёт в процессе и после перезапуска начинается с нуля. Без этой
     поправки второй запуск выдал бы `ag_00001` заново, а конструктор поднял бы
     под этим id чужую историю: свежий агент молча унаследовал бы прошлый диалог.
+    Настоящий арбитр — первичный ключ в базе (`Store.claim_agent_id`), а это
+    подсказка, которая экономит попытку.
     """
     global _last_id
     with _id_lock:
         _last_id = max(_last_id, int(upto))
+
+
+def effective_history_limit(limit: int | None) -> int:
+    """Окно памяти в сообщениях: None — дефолт агента, отрицательное — ноль."""
+    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
 
 
 class AgentBusyError(RuntimeError):
@@ -99,13 +97,45 @@ class Turn:
     error: str | None = None
     """Заполнен, если ответ оборвался: реплика в истории есть, но она неполная."""
 
+    reasoning: str = ""
+    """Рассуждение модели, если она его прислала. В модель обратно не уходит.
+
+    OpenRouter отдаёт его отдельным полем дельты, и в `content` оно не входит.
+    Клиент рисует его свёрнутым блоком над ответом — как «Thinking» в oMLX.
+    """
+
+    metrics: dict | None = None
+    """Метрики этого ответа: по ним рисуются плитки внизу справа."""
+
     at: float = field(default_factory=time.time)
 
     def as_message(self) -> dict:
+        """Реплика в том виде, в каком она уходит обратно в модель.
+
+        Ни рассуждения, ни метрик здесь нет: в контекст возвращается ответ,
+        а не то, как модель к нему шла.
+        """
         return {"role": self.role, "content": self.content}
 
     def as_dict(self) -> dict:
-        return {"role": self.role, "content": self.content, "error": self.error, "at": self.at}
+        return {
+            "role": self.role,
+            "content": self.content,
+            "error": self.error,
+            "reasoning": self.reasoning,
+            "metrics": self.metrics,
+            "at": self.at,
+        }
+
+
+@dataclass
+class Exchange:
+    """Снятая с истории пара «вопрос — ответ» — то, что можно вернуть назад."""
+
+    question: str
+    turns: list[Turn]
+    depth: int
+    """Длина истории сразу после снятия: по ней видно, занял ли место кто-то другой."""
 
 
 class Agent:
@@ -120,12 +150,11 @@ class Agent:
         spec: AgentSpec,
         *,
         agent_id: str | None = None,
-        parent_id: str | None = None,
         context_length: int | None = None,
         store: Store | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: spec может быть колонкой из SCENARIOS,
-        # общей на все прогоны, а `replace` копирует только верхний уровень —
+        # Копия конфига, и вглубь тоже: один и тот же spec из ростера может
+        # поднять несколько агентов, а `replace` копирует только верхний уровень —
         # messages, stop, response_format и extra_body остались бы одним
         # объектом на сотню агентов и на сам день. Правка любого из них
         # у одного агента задела бы всех остальных, а день ровно про то,
@@ -137,8 +166,8 @@ class Agent:
             response_format=copy.deepcopy(spec.response_format),
             extra_body=copy.deepcopy(spec.extra_body or {}),
         )
-        # Свежий id занимает база, а не процесс: стенд и CLI ходят в один файл,
-        # и локальный счётчик выдал бы обоим один номер (см. app/store.py).
+        # Свежий id занимает база, а не процесс: стенд и консоль ходят в один
+        # файл, и локальный счётчик выдал бы обоим один номер (см. app/store.py).
         # Без хранилища агент живёт только в памяти — там и счётчика хватает.
         claimed = False
         if agent_id is not None:
@@ -150,10 +179,10 @@ class Agent:
             self.id = new_agent_id()
 
         try:
-            self._setup(spec, agent_id, parent_id, context_length, store)
+            self._setup(spec, agent_id, context_length, store)
         except BaseException:
             # Строку сессии мы уже заняли под этот id. Если агент не достроился,
-            # убираем её за собой: иначе в списке сессий висел бы пустой ярлык
+            # убираем её за собой: иначе в списке слева висел бы пустой чат
             # от объекта, которого не существует.
             if claimed and store is not None:
                 with contextlib.suppress(Exception):
@@ -164,7 +193,6 @@ class Agent:
         self,
         spec: AgentSpec,
         agent_id: str | None,
-        parent_id: str | None,
         context_length: int | None,
         store: Store | None,
     ) -> None:
@@ -173,7 +201,6 @@ class Agent:
         Вынесено из `__init__` только ради уборки: конструктор оборачивает этот
         вызов и на любом исключении освобождает занятую строку сессии.
         """
-        self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at
         self.context_length = context_length
@@ -182,29 +209,13 @@ class Agent:
         """Только то, что наговорили в диалоге. Стартовые сообщения — в spec."""
 
         self.seed_messages: list[dict] = [dict(m) for m in (spec.messages or [])]
-        """Стартовый промпт агента. У колонки с depends_on подменяется на старте
-        прогона результатом подстановки — поэтому это поле, а не spec.messages."""
+        """Стартовые сообщения агента: заготовка диалога до первого вопроса.
 
-        self.overrides: dict = {}
-        """Поля, которые пользователь сменил руками через PATCH.
-
-        Нужны, чтобы выбор в дропдауне пережил «Старт»: прогон спавнит свежий
-        набор субагентов вместо предыдущего, и без этого списка он поднял бы
-        колонки на моделях из day.py, молча отменив выбор пользователя.
-        """
+        Отдельное поле, а не `spec.messages`, чтобы правка заготовки у одного
+        агента не задела конфиг, из которого его спавнили."""
 
         self.detached = False
         """Агента выгрузили из реестра: писать в сессию он больше не вправе."""
-
-        self.seed_used = False
-        """Стартовый вопрос уже лёг в историю обычным ходом.
-
-        До этого момента он подклеивается к промпту: колонка показывает его
-        в ленте ещё до «Старта», и промпт обязан сходиться с тем, что видно
-        на экране. После «Старта» вопрос приезжает окном истории, и второй раз
-        его подклеивать нельзя — иначе `history_limit=0` перестал бы значить
-        хоть что-нибудь.
-        """
 
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
@@ -214,28 +225,32 @@ class Agent:
         """Хранилище сессии. None — агент живёт только в памяти процесса.
 
         Обнуляется при выгрузке из реестра: с этого момента объект больше
-        не владелец сессии, и писать в неё ему нельзя (см. `detach`).
+        не владелец сессии и писать в неё ему нельзя (см. `detach`).
         """
 
         if store is not None:
-            # Восстановление — здесь, а не отдельным вызовом из UI: забыть
-            # позвать restore() должно быть невозможно. У свежего id в базе
-            # ничего нет, и агент просто заводит себе строку.
+            # Восстановление — здесь, а не отдельным вызовом из UI: забыть его
+            # позвать должно быть невозможно. У свежего id в базе ничего нет,
+            # и агент просто заводит себе строку.
             saved = store.load_session(self.id) if agent_id else None
             if saved is not None:
-                self.parent_id = saved["parent_id"]
+                self.spec = _spec_from_config(saved["config"], fallback=self.spec)
                 self.created_at = saved["created_at"]
                 self.last_used_at = saved["updated_at"]
                 self.seed_messages = [dict(m) for m in saved["seed"]]
-                self.overrides = dict(saved["overrides"])
-                self.seed_used = saved["seed_used"]
                 if saved.get("context_length") is not None and context_length is None:
                     # Длина контекста нужна метрикам для context_fill_pct.
                     # Каталог моделей — сетевой запрос, и восстановление сессии
                     # не должно его ждать: значение лежит рядом с конфигом.
                     self.context_length = saved["context_length"]
                 self.history = [
-                    Turn(role=m["role"], content=m["content"], error=m["error"], at=m["at"])
+                    Turn(
+                        role=m["role"],
+                        content=m["content"],
+                        error=m["error"],
+                        metrics=m["metrics"],
+                        at=m["at"],
+                    )
                     for m in store.load_messages(self.id)
                 ]
             self.save_config()
@@ -305,14 +320,14 @@ class Agent:
 
     @property
     def seed_question(self) -> str | None:
-        """Первый вопрос агента: его задаёт прогон, если своего вопроса нет."""
+        """Первый вопрос из `messages`, если он там есть."""
         return self._seed_split()[1]
 
     def starting_prompt(self) -> list[dict]:
         """Стартовый промпт целиком — системная инструкция и `messages`.
 
-        Не зависит от истории: это то, что показывают в колонке до «Старта»,
-        и то, с чего начинается стенограмма.
+        Не зависит от истории: с него начинается стенограмма, и он же виден
+        в ленте до первого вопроса.
         """
         messages: list[dict] = []
         has_system = any(m.get("role") == "system" for m in self.seed_messages)
@@ -324,21 +339,15 @@ class Agent:
     def build_prompt(self, user_text: str | None = None) -> list[dict]:
         """Обстановка + окно истории + вопрос этого хода.
 
-        `user_text=None` — прогон стартового промпта: с пустой историей это
-        ровно `spec.messages`, то есть в точности то, что уходило в модель
-        до появления агентов.
+        `user_text=None` — обмен стартовым промптом: с пустой историей это
+        ровно `spec.messages`.
 
         С заданным `user_text` первый вопрос из `messages` в промпт больше
-        не подклеивается — но только после того, как он **сам стал ходом**,
-        то есть после «Старта». Именно здесь `history_limit=0` и становится
-        правдой: колонка «без памяти» на втором вопросе не знает ни вопроса,
-        ни своего ответа.
-
-        Пока «Старта» не было, вопрос едет в каждом ходу: колонка показывает
-        его в ленте как стартовый, и промпт обязан сходиться с тем, что видно
-        на экране. Признак — `seed_used`, а не пустая история: разговор с
-        колонкой можно завести и до прогона, и после первого же ручного обмена
-        вводная иначе молча исчезала бы из промпта, оставаясь на экране.
+        не подклеивается: он либо приедет окном истории, либо забыт. Именно
+        здесь `history_limit=0` и становится правдой — агент без памяти
+        на втором вопросе не знает ни вопроса, ни своего ответа. Пока история
+        пуста, вопрос всё же едет: он часть заготовки, и промпт обязан
+        сходиться с тем, что показано в стенограмме.
         """
         setting, question = self._seed_split()
         messages: list[dict] = []
@@ -353,7 +362,7 @@ class Agent:
                 messages.append({"role": "user", "content": question})
             return messages
 
-        if question is not None and not self.seed_used:
+        if question is not None and not self.history:
             messages.append({"role": "user", "content": question})
         messages.extend(self.window())
         messages.append({"role": "user", "content": user_text})
@@ -362,38 +371,33 @@ class Agent:
     # --- история -------------------------------------------------------------
 
     def remember(
-        self, role: str, content: str, error: str | None = None, *, persist: bool = True
+        self,
+        role: str,
+        content: str,
+        error: str | None = None,
+        *,
+        reasoning: str = "",
+        metrics: dict | None = None,
+        persist: bool = True,
     ) -> None:
-        self.history.append(Turn(role=role, content=content, error=error))
+        self.history.append(
+            Turn(role=role, content=content, error=error, reasoning=reasoning, metrics=metrics)
+        )
         self._trim()
         if persist:
             self.persist()
 
-    def remember_exchange(
-        self, question: str | None, answer: str, error: str | None = None
-    ) -> None:
-        """Вопрос и ответ ложатся в историю парой и пишутся одной транзакцией.
-
-        Отдельная запись вопроса оставила бы в базе вопрос без ответа, если
-        процесс умрёт между двумя `remember`. В памяти такого не бывает —
-        в базе тоже не должно.
-        """
-        if question is not None:
-            self.remember("user", question, persist=False)
-        self.remember("assistant", answer, error=error)
-
     def detach(self) -> None:
         """Снимает с объекта право писать в сессию.
 
-        Зовётся при выгрузке из реестра. Сессию в базе владеет тот объект,
+        Зовётся при выгрузке из реестра. Сессией в базе владеет тот объект,
         который сейчас лежит в реестре; выгруженный — уже нет. Иначе чужая
-        ссылка на выгруженного агента пережила бы вытеснение, `require()`
-        поднял бы из базы **второй** объект той же сессии, и `persist()`
-        первого затёр бы реплики второго.
+        ссылка на выгруженного агента пережила бы вытеснение, обращение по id
+        подняло бы из базы **второй** объект той же сессии, и запись первого
+        затёрла бы реплики второго.
 
         Терять при этом нечего: история и конфиг пишутся сразу после каждого
-        обмена и после каждой правки, так что на момент выгрузки в базе уже
-        лежит всё. В памяти агент продолжает работать как обычно.
+        обмена и после каждой правки. В памяти агент работает как обычно.
         """
         self.store = None
         self.detached = True
@@ -404,23 +408,19 @@ class Agent:
             self.store.save_history(self.id, self.history)
 
     def save_config(self) -> None:
-        """Пишет конфиг сессии: модель, семплирование, стартовые сообщения, overrides.
+        """Пишет конфиг сессии целиком — одним JSON-полем.
 
-        Зовётся при создании и после каждой правки конфига — смены модели
-        через PATCH, подстановки depends_on, переноса overrides на «Старте».
-        Иначе после перезапуска сессия поднялась бы на модели из day.py,
-        молча отменив выбор пользователя.
+        Зовётся при создании и после каждой правки в панели справа. Конфиг едет
+        как `asdict(spec)`, поэтому новое поле сохраняется само: имя, системный
+        промпт, группа, черновик, окно памяти и все параметры сэмплирования.
         """
         if self.store is None:
             return
         self.store.save_session(
             self.id,
-            parent_id=self.parent_id,
             label=self.spec.label,
             config=asdict(self.spec),
             seed=[dict(m) for m in self.seed_messages],
-            overrides=dict(self.overrides),
-            seed_used=self.seed_used,
             created_at=self.created_at,
             context_length=self.context_length,
         )
@@ -444,25 +444,25 @@ class Agent:
     def as_dict(self, *, with_transcript: bool = False) -> dict:
         data = {
             "id": self.id,
-            "parent_id": self.parent_id,
             "label": self.spec.label,
             "model": self.spec.model,
-            "temperature": self.spec.temperature,
-            "max_tokens": self.spec.max_tokens,
             "stop": self.spec.stop,
             "response_format": self.spec.response_format,
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
+            "draft": self.spec.draft,
+            "group": self.spec.group,
             "note": self.spec.note,
-            "repeats": self.spec.repeats,
-            "depends_on": self.spec.depends_on,
             "history_limit": self.history_limit,
-            "overrides": dict(self.overrides),
             "history_len": len(self.history),
             "busy": self.busy,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
         }
+        # Параметры сэмплирования уходят наружу как есть, включая None:
+        # панель справа отличает «не задано» от нуля, и ей нужно и то и другое.
+        for name in SAMPLING_FIELDS:
+            data[name] = getattr(self.spec, name)
         if with_transcript:
             data["seed_messages"] = self.starting_prompt()
             data["transcript"] = self.transcript()
@@ -470,33 +470,17 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
-    @contextlib.asynccontextmanager
-    async def hold(self):
-        """Занимает агента, не делая вызова: под этим идёт `/прогон`.
-
-        Пока родитель раздаёт работу субагентам, он занят так же, как если бы
-        сам говорил с моделью, — второй `/прогон` в ту же сессию получит 409.
-        """
-        if self._lock.locked():
-            raise AgentBusyError(f"агент {self.id} уже занят: дождитесь текущего ответа")
-        async with self._lock:
-            self.last_used_at = time.time()
-            yield
-
     async def ask(self, user_text: str | None = None, *, commit: bool = True) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
-        События: start, repeat_start, delta, metrics, repeat_error, repeat_done,
-        error, done. Имена намеренно близки к событиям стенда: наверху к ним
-        добавляют label колонки и id агента, но не переводят.
+        События: `start`, `reasoning`, `delta`, `metrics`, `error`, `done`.
 
         История не трогается до конца обмена — откат получается по построению:
 
         * ответа не случилось вовсе → в историю не пишется ничего, вопрос
           возвращается в событии `done` полем `question`;
         * ответ частичный (обрыв, отмена) → пишутся обе реплики, у ответа
-          проставлен `error`;
-        * серия `repeats` коммитит только последний удачный прогон, а не все N.
+          проставлен `error`.
         """
         if self._lock.locked():
             raise AgentBusyError(f"агент {self.id} уже занят: дождитесь текущего ответа")
@@ -507,116 +491,66 @@ class Agent:
             self.last_used_at = time.time()
 
             prompt = self.build_prompt(user_text)
-            # Прогон задаёт стартовый вопрос из конфига — и коммитит его
-            # в историю как обычный ход: агент с памятью обязан помнить,
-            # на что он отвечал, а не только чем ответил.
+            # Вопрос коммитится в историю как обычный ход: агент с памятью
+            # обязан помнить, на что он отвечал, а не только чем ответил.
             question = user_text if user_text is not None else self.seed_question
-            is_seed = user_text is None
-            total = max(1, int(self.spec.repeats or 1))
 
-            yield {
-                "type": "start",
-                "resolved_messages": prompt,
-                "repeats": total,
-                "question": question,
-            }
+            yield {"type": "start", "resolved_messages": prompt, "question": question}
 
-            texts: list[str] = []
-            last_metrics: dict | None = None
+            text = ""
+            reasoning = ""
+            final_metrics: dict | None = None
             failure: str | None = None
-            partial = ""
             cancelled = False
 
-            for index in range(total):
-                if cancel.is_set():
-                    cancelled = True
-                    break
-
-                yield {"type": "repeat_start", "repeat": index, "repeats": total}
-
-                text = ""
-                final_metrics: dict | None = None
-                broken = False
-                try:
-                    stream = stream_completion(
-                        self.spec, prompt_override=prompt, context_length=self.context_length
-                    )
-                    async with contextlib.aclosing(stream):
-                        async for chunk in stream:
-                            kind = chunk["type"]
-                            if kind == "delta":
-                                text += chunk["text"]
-                                yield {
-                                    "type": "delta",
-                                    "repeat": index,
-                                    "text": chunk["text"],
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "metrics":
-                                yield {
-                                    "type": "metrics",
-                                    "repeat": index,
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "error":
-                                broken = True
-                                failure = chunk["message"]
-                                # Упавший прогон не отменяет остальные: серия идёт
-                                # дальше, агент жив, если удался хоть один прогон.
-                                yield {
-                                    "type": "repeat_error",
-                                    "repeat": index,
-                                    "message": chunk["message"],
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "done":
-                                text = chunk["text"]
-                                final_metrics = chunk["metrics"]
-                            if cancel.is_set():
-                                cancelled = True
-                                break
-                except MissingKeyError as exc:
-                    failure = str(exc)
-                    yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit, seed=is_seed)
-                    return
-                except asyncio.CancelledError:
-                    # Клиент ушёл: частичный ответ всё равно записываем — он уже
-                    # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                    self._commit(question, texts, partial or text, "вызов прерван", commit, seed=is_seed)
-                    raise
-                except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
-                    failure = f"{type(exc).__name__}: {exc}"
-                    yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit, seed=is_seed)
-                    return
-
-                if text:
-                    partial = text
-                if cancelled:
-                    break
-                if not broken:
-                    texts.append(text)
-                    last_metrics = final_metrics or last_metrics
-                    yield {
-                        "type": "repeat_done",
-                        "repeat": index,
-                        "text": text,
-                        "metrics": final_metrics,
-                    }
+            try:
+                stream = stream_completion(
+                    self.spec, prompt_override=prompt, context_length=self.context_length
+                )
+                async with contextlib.aclosing(stream):
+                    async for chunk in stream:
+                        kind = chunk["type"]
+                        if kind == "delta":
+                            text += chunk["text"]
+                            yield chunk
+                        elif kind == "reasoning":
+                            reasoning += chunk["text"]
+                            yield chunk
+                        elif kind == "metrics":
+                            yield chunk
+                        elif kind == "error":
+                            failure = chunk["message"]
+                            final_metrics = chunk["metrics"]
+                            yield chunk
+                        elif kind == "done":
+                            text = chunk["text"]
+                            reasoning = chunk.get("reasoning") or reasoning
+                            final_metrics = chunk["metrics"]
+                        if cancel.is_set():
+                            cancelled = True
+                            break
+            except MissingKeyError as exc:
+                failure = str(exc)
+                yield {"type": "error", "message": failure, "metrics": None}
+            except asyncio.CancelledError:
+                # Клиент ушёл: частичный ответ всё равно записываем — он уже
+                # оплачен, а следующий вопрос должен видеть, чем кончилось.
+                self._commit(question, text, "вызов прерван", commit, reasoning, final_metrics)
+                raise
+            except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
+                failure = f"{type(exc).__name__}: {exc}"
+                yield {"type": "error", "message": failure, "metrics": None}
 
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            committed = self._commit(question, texts, partial, failure, commit, seed=is_seed)
+            committed = self._commit(question, text, failure, commit, reasoning, final_metrics)
 
             done: dict = {
                 "type": "done",
-                "text": texts[-1] if texts else "",
-                "metrics": last_metrics,
-                "repeats": total,
-                "texts": list(texts),
-                "unique": len({t.strip() for t in texts}),
+                "text": text,
+                "reasoning": reasoning,
+                "metrics": final_metrics,
                 "cancelled": cancelled,
                 "error": failure,
                 "committed": committed,
@@ -630,36 +564,89 @@ class Agent:
     def _commit(
         self,
         user_text: str | None,
-        texts: list[str],
-        partial: str,
+        answer: str,
         failure: str | None,
         commit: bool,
-        *,
-        seed: bool = False,
+        reasoning: str = "",
+        metrics: dict | None = None,
     ) -> bool:
-        """Пишет обмен в историю и в базу. Возвращает False, если писать было нечего.
-
-        `seed=True` — обмен был стартовым вопросом из конфига: с этого момента
-        он живёт в истории обычным ходом и в промпт отдельно не подклеивается.
-        """
-        if not commit:
+        """Пишет обмен в историю. Возвращает False, если писать было нечего."""
+        if not commit or not answer.strip():
             return False
 
-        answer = texts[-1] if texts else ""
-        error = None
-        if not answer and partial.strip():
-            answer, error = partial, (failure or "ответ не дописан")
-        if not answer.strip():
-            return False
-
-        # Флаг и обмен пишутся одной транзакцией: иначе процесс, умерший между
-        # ними, оставил бы колонку с поднятым seed_used и без записанного хода —
-        # и стартовый вопрос исчез бы из промпта, ни разу не прозвучав.
+        # Вопрос и ответ ложатся в базу парой, одной транзакцией: отдельная
+        # запись вопроса оставила бы в базе вопрос без ответа, умри процесс
+        # между ними. В памяти такого не бывает — в базе тоже не должно.
         with self.store.tx() if self.store is not None else contextlib.nullcontext():
-            if seed and not self.seed_used:
-                # Флаг — часть конфига сессии: после перезапуска колонка
-                # не должна заново считать стартовый вопрос незаданным.
-                self.seed_used = True
-                self.save_config()
-            self.remember_exchange(user_text, answer, error=error)
+            if user_text is not None:
+                self.remember("user", user_text, persist=False)
+            # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
+            # следующий вопрос должен видеть, что предыдущий ответ неполный.
+            self.remember(
+                "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics
+            )
         return True
+
+    def take_last_exchange(self) -> Exchange | None:
+        """Снимает с истории последнюю пару «вопрос — ответ» целиком.
+
+        Нужна перегенерации: она должна **заменить** последний ответ, а не
+        дописать второй, поэтому пара уходит из истории до вызова — модель
+        обязана увидеть тот же контекст, что и в первый раз.
+
+        Возвращает снятое целиком, а не только вопрос: если вызов не отдаст
+        ни одного токена, возвращать в чат будет нечего, и пользователь
+        потеряет и свой вопрос, и уже полученный ответ. `restore` кладёт
+        снятое обратно.
+
+        Снятое **не** пишется в базу: пока перегенерация не удалась, в файле
+        должна лежать ровно исходная пара. Если вызов не отдаст ни токена,
+        `restore` вернёт её на место, и база даже не заметит попытки; если
+        отдаст — запись нового обмена перепишет историю целиком, и старая пара
+        уйдёт вместе с ней. Ни дублей, ни дыр в нумерации ни в одном исходе.
+        """
+        if not self.history or self.history[-1].role != "assistant":
+            return None
+        taken = [self.history.pop()]
+        if self.history and self.history[-1].role == "user":
+            taken.insert(0, self.history.pop())
+        question = taken[0].content if taken[0].role == "user" else None
+        if question is None:
+            # Ответ без вопроса переспрашивать нечем — кладём обратно.
+            self.history.extend(taken)
+            return None
+        return Exchange(question=question, turns=taken, depth=len(self.history))
+
+    def restore(self, exchange: Exchange) -> bool:
+        """Кладёт снятую пару обратно, если её место никто не занял.
+
+        Новый обмен успел записаться — значит перегенерация удалась (или
+        оборвалась с частичным ответом, что тоже записано), и возвращать
+        старое поверх нельзя: в ленте оказалось бы два ответа на один вопрос.
+        """
+        if len(self.history) != exchange.depth:
+            return False
+        self.history.extend(exchange.turns)
+        # Пишем на всякий случай: в норме база и так не менялась с момента
+        # снятия, но если новый обмен успел записаться и откатиться, файл
+        # обязан сойтись с памятью.
+        self.persist()
+        return True
+
+
+_SPEC_FIELDS = {f.name for f in fields(AgentSpec)}
+
+
+def _spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
+    """Конфиг из базы обратно в `AgentSpec`.
+
+    Незнакомые ключи отбрасываются молча: базу мог записать стенд другой
+    версии, и падать на чужом поле — значит потерять весь сохранённый диалог.
+    Если из базы не прочиталось ничего осмысленного, остаётся тот конфиг,
+    с которым агента поднимали.
+    """
+    known = {key: value for key, value in (config or {}).items() if key in _SPEC_FIELDS}
+    if not known.get("model"):
+        return fallback
+    known.setdefault("label", fallback.label)
+    return AgentSpec(**known)

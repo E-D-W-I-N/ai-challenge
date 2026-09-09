@@ -98,9 +98,20 @@ async def aclose() -> None:
 
 @dataclass
 class Metrics:
-    """Живая статистика одного прогона одной сессии."""
+    """Живая статистика одного вызова к модели."""
 
     ttft_ms: float | None = None
+    """Время до первого токена **ответа**. Токены рассуждения его не двигают."""
+
+    first_token_ms: float | None = None
+    """Время до первого токена от модели вообще — рассуждения или ответа.
+
+    На обычной модели совпадает с `ttft_ms`. На думающей — это момент, когда
+    модель заговорила, а `ttft_ms` наступает позже, когда она додумала.
+    Без этой цифры плитка «TTFT» на reasoning-модели показывала бы время
+    вместе со всем размышлением и удивляла бы на записи.
+    """
+
     elapsed_ms: float = 0.0
     tokens_out: int = 0
     tokens_per_second: float = 0.0
@@ -122,6 +133,9 @@ class Metrics:
     def as_dict(self) -> dict:
         return {
             "ttft_ms": round(self.ttft_ms, 1) if self.ttft_ms is not None else None,
+            "first_token_ms": (
+                round(self.first_token_ms, 1) if self.first_token_ms is not None else None
+            ),
             "elapsed_ms": round(self.elapsed_ms, 1),
             "tokens_out": self.tokens_out,
             "tokens_per_second": round(self.tokens_per_second, 2),
@@ -159,6 +173,22 @@ class _SpeedTracker:
         return (n1 - n0) / span if span > 0 else 0.0
 
 
+SAMPLING_FIELDS = (
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+)
+"""Параметры сэмплирования, которые уходят в тело запроса как есть.
+
+Порядок только ради читаемости тела: OpenRouter на него не смотрит.
+"""
+
+
 def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None) -> dict:
     """Тело запроса к OpenRouter. require_parameters — на каждом вызове."""
     payload: dict = {
@@ -169,10 +199,15 @@ def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None)
         "usage": {"include": True},
         "provider": {"require_parameters": True},
     }
-    if session.temperature is not None:
-        payload["temperature"] = session.temperature
-    if session.max_tokens is not None:
-        payload["max_tokens"] = session.max_tokens
+    # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль.
+    # Пустое поле в панели справа значит «пусть решает провайдер»; отправить
+    # 0 вместо «не отправлять» — это другой запрос, а с
+    # provider.require_parameters=true ещё и другой список провайдеров.
+    for name in SAMPLING_FIELDS:
+        value = getattr(session, name, None)
+        if value is not None:
+            payload[name] = value
+
     if session.stop:
         payload["stop"] = session.stop
     if session.response_format is not None:
@@ -196,7 +231,7 @@ async def stream_completion(
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
 ) -> AsyncIterator[dict]:
-    """Отдаёт события: {"type": "delta"|"metrics"|"done"|"error", ...}.
+    """Отдаёт события: {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}.
 
     Метрики обновляются по мере генерации, финальный usage приходит последним чанком.
     """
@@ -217,6 +252,7 @@ async def stream_completion(
     speed = _SpeedTracker()
     started = time.monotonic()
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
 
     try:
         # Клиент общий на процесс, а семафор держится на всё время стрима:
@@ -259,10 +295,29 @@ async def stream_completion(
 
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
+
+                        # Рассуждение приходит отдельным полем дельты и в ответ
+                        # не входит: клиент рисует его свёрнутым блоком над
+                        # ответом. В счётчик токенов не идёт — его считает
+                        # usage.completion_tokens_details.reasoning_tokens,
+                        # и удваивать эту цифру своей оценкой нельзя.
+                        thought = delta.get("reasoning") or ""
+                        if thought:
+                            if metrics.first_token_ms is None:
+                                metrics.first_token_ms = (now - started) * 1000
+                            reasoning_parts.append(thought)
+                            yield {
+                                "type": "reasoning",
+                                "text": thought,
+                                "metrics": metrics.as_dict(),
+                            }
+
                         piece = delta.get("content") or ""
                         if piece:
                             if metrics.ttft_ms is None:
                                 metrics.ttft_ms = (now - started) * 1000
+                            if metrics.first_token_ms is None:
+                                metrics.first_token_ms = metrics.ttft_ms
                             text_parts.append(piece)
                             # оценка «на глаз», пока не пришёл usage: ~4 символа на токен
                             metrics.tokens_out = max(
@@ -289,7 +344,12 @@ async def stream_completion(
         return
 
     metrics.elapsed_ms = (time.monotonic() - started) * 1000
-    yield {"type": "done", "text": "".join(text_parts), "metrics": metrics.as_dict()}
+    yield {
+        "type": "done",
+        "text": "".join(text_parts),
+        "reasoning": "".join(reasoning_parts),
+        "metrics": metrics.as_dict(),
+    }
 
 
 def _apply_usage(metrics: Metrics, usage: dict) -> None:
