@@ -453,17 +453,23 @@ async function routeChecks() {
   // содержимое пересоздаётся и браузер обнуляет прокрутку. Смотреть надо
   // на то, что видит читатель.
   {
-    const TALK = [
-      { role: "user", content: "первый вопрос", seed: false },
-      { role: "assistant", content: "первый ответ", seed: false, metrics: null, reasoning: "" },
-    ];
-    const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: 2 });
+    // Разговор должен быть длиннее экрана — иначе прокручивать нечего.
+    // Высоту стенд считает по числу узлов, так что «длиннее» здесь значит
+    // «больше сообщений», как и в браузере.
+    const TALK = [];
+    for (let i = 1; i <= 6; i += 1) {
+      TALK.push({ role: "user", content: `вопрос ${i}`, seed: false });
+      TALK.push({ role: "assistant", content: `ответ ${i}`, seed: false, metrics: null, reasoning: "" });
+    }
+    const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: TALK.length });
     const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
+    // Экран — единственное, что задаёт проверка: высоту содержимого считает
+    // стенд, как браузер считал бы её раскладкой.
     const measure = (feed) => {
-      feed.scrollHeight = 4000;
-      feed.clientHeight = 400;
+      feed.clientHeight = 120;
       return feed;
     };
+    const UP = 40;   // куда отматывает читатель
 
     // 1. Чат открывают, чтобы увидеть последнее сообщение.
     {
@@ -480,7 +486,7 @@ async function routeChecks() {
         `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
 
       // 2. Отмотал вверх в одном чате — другой всё равно открывается внизу.
-      feed.scrollTop = 200;
+      feed.scrollTop = UP;
       feed.dispatchEvent(new Evt("scroll"));
       $("#agent-list").querySelectorAll(".item-open")[3].dispatchEvent(new Evt("click"));
       await settle(40);
@@ -488,7 +494,7 @@ async function routeChecks() {
         `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
 
       // ...и возврат в первый чат тоже показывает конец разговора.
-      feed.scrollTop = 200;
+      feed.scrollTop = UP;
       feed.dispatchEvent(new Evt("scroll"));
       $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
       await settle(40);
@@ -504,7 +510,7 @@ async function routeChecks() {
       const feed = measure($("#feed"));
       $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
       await settle(40);
-      feed.scrollTop = 150;
+      feed.scrollTop = UP;
       feed.dispatchEvent(new Evt("scroll"));
       const card = feed.querySelector(".card");
       card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
@@ -519,14 +525,17 @@ async function routeChecks() {
       client.init();
       await settle(30);
       const feed = measure($("#feed"));
+      // Открываем именно чат с историей: в пустом отматывать нечего.
+      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+      await settle(40);
       $("#input").value = "вопрос";
       $("#composer").requestSubmit();
       await settle(40);
-      feed.scrollTop = 300;
+      feed.scrollTop = UP;
       feed.dispatchEvent(new Evt("scroll"));
       await settle(300);
-      check("отмотанная во время ответа лента остаётся на месте", feed.scrollTop === 300,
-        `лента на ${feed.scrollTop}, ждали 300`);
+      check("отмотанная во время ответа лента остаётся на месте", feed.scrollTop === UP,
+        `лента на ${feed.scrollTop}, ждали ${UP}`);
       check("и уж точно не в начале разговора", feed.scrollTop !== 0, String(feed.scrollTop));
     }
 
@@ -587,7 +596,179 @@ async function routeChecks() {
   }
 }
 
+// ── сам стенд ──
+//
+// Стенд теперь единственная страховка от целого класса ошибок, и его
+// собственное поведение закреплено так же, как поведение клиента. Стенд,
+// тихо расходящийся с браузером, — тот же капкан, из-за которого проверка
+// трижды смотрела не туда: утверждение зелёное, а в браузере сломано.
+// Где повторить браузер дёшево — повторяем; где нельзя — падаем с текстом.
+
+function stubChecks() {
+  const dom = require(path.join(__dirname, "dom.js"));
+  const fresh = () => {
+    const env = dom.boot(HTML, { chats: [{ label: "чат" }] });
+    return { env, doc: env.document, make: (tag) => env.document.createElement(tag) };
+  };
+  const throws = (body, pattern) => {
+    try {
+      body();
+      return false;
+    } catch (err) {
+      return pattern.test(err.message);
+    }
+  };
+
+  // 1. Высота растёт от содержимого, а присвоить её нельзя.
+  {
+    const { make } = fresh();
+    const box = make("div");
+    check("пустой узел не имеет высоты", box.scrollHeight === 0, String(box.scrollHeight));
+    box.appendChild(make("div"));
+    const one = box.scrollHeight;
+    box.appendChild(make("div"));
+    check("высота растёт от содержимого", box.scrollHeight > one, `${one} → ${box.scrollHeight}`);
+    check(
+      "присвоить высоту нельзя — стенд падает с объяснением",
+      throws(() => { box.scrollHeight = 4000; }, /не присваивают/),
+      "присвоение прошло молча"
+    );
+    box.clientHeight = 1000;
+    check("высота не меньше экрана", box.scrollHeight >= 1000, String(box.scrollHeight));
+  }
+
+  // 2. Прокрутка зажата, как в браузере.
+  {
+    const { make } = fresh();
+    const box = make("div");
+    for (let i = 0; i < 10; i += 1) box.appendChild(make("div"));
+    box.clientHeight = 100;
+    const limit = box.scrollHeight - box.clientHeight;
+    box.scrollTop = 1e6;
+    check("вниз дальше края не уедешь", box.scrollTop === limit, `${box.scrollTop} при пределе ${limit}`);
+    box.scrollTop = -50;
+    check("вверх за ноль тоже", box.scrollTop === 0, String(box.scrollTop));
+    box.scrollTop = 40;
+    check("обычное значение принимается как есть", box.scrollTop === 40, String(box.scrollTop));
+  }
+
+  // 3. Составной селектор либо работает, либо падает — но не молчит.
+  {
+    const { doc, make } = fresh();
+    const box = make("div");
+    const btn = make("button");
+    btn.className = "mini danger";
+    btn.id = "цель";
+    box.appendChild(btn);
+    check("тег с классами находится", box.querySelector("button.mini.danger") === btn);
+    check("класс с id находится", box.querySelector("#цель.mini") === btn);
+    check("несовпадение по одному из классов — не находится", box.querySelector("button.mini.нет") === null);
+    for (const bad of [".a .b", ".a > .b", ".a, .b", "[data-x]", "div:first-child", "*"]) {
+      check(
+        `селектор «${bad}» роняет стенд, а не отдаёт пустоту`,
+        throws(() => box.querySelector(bad), /не умеет селектор|пустой селектор/),
+        "вернул пустоту молча"
+      );
+    }
+    check("документ ведёт себя так же", throws(() => doc.querySelector(".a .b"), /не умеет селектор/));
+  }
+
+  // 4. textContent видит то, что положили через innerHTML.
+  {
+    const { make } = fresh();
+    const box = make("div");
+    box.innerHTML = "<p>первый</p><p>второй</p>";
+    check("текст читается сквозь разметку", box.textContent === "первыйвторой", box.textContent);
+    box.innerHTML = "&lt;script&gt; &amp; кавычка &quot;";
+    check("сущности разворачиваются", box.textContent === '<script> & кавычка "', box.textContent);
+    box.innerHTML = "";
+    check("после очистки текст пуст", box.textContent === "", box.textContent);
+  }
+
+  // 5. Событие всплывает до документа.
+  {
+    const { doc, make } = fresh();
+    const deep = make("span");
+    const middle = make("div");
+    middle.appendChild(deep);
+    doc.body.appendChild(middle);
+    const seen = [];
+    doc.addEventListener("click", (ev) => seen.push(ev.target === deep ? "документ" : "не тот target"));
+    deep.dispatchEvent(new dom.Evt("click"));
+    check("событие с глубокого узла доходит до документа", seen.join() === "документ", seen.join());
+
+    const stopped = [];
+    doc.addEventListener("keydown", () => stopped.push("документ"));
+    const input = make("input");
+    doc.body.appendChild(input);
+    input.addEventListener("keydown", (ev) => ev.stopPropagation());
+    input.dispatchEvent(new dom.Evt("keydown"));
+    check("остановленное событие до документа не доходит", stopped.length === 0, stopped.join());
+  }
+
+  // 6. Потеря фокуса шлёт change — и только если значение поменялось.
+  {
+    const { make } = fresh();
+    const field = make("textarea");
+    const events = [];
+    field.addEventListener("blur", () => events.push("blur"));
+    field.addEventListener("change", () => events.push("change"));
+
+    field.focus();
+    field.blur();
+    check("без правки change не шлётся", events.join() === "blur", events.join());
+
+    events.length = 0;
+    field.focus();
+    field.value = "новое";
+    field.blur();
+    check("после правки идут blur и change, в этом порядке", events.join() === "blur,change", events.join());
+  }
+
+  // 7. Обработчики идут в порядке подписки, инлайновый — не исключение.
+  {
+    const { make } = fresh();
+    const box = make("div");
+    const order = [];
+    box.onclick = () => order.push("инлайн");
+    box.addEventListener("click", () => order.push("подписка"));
+    box.dispatchEvent(new dom.Evt("click"));
+    check("инлайновый раньше, если назначен раньше", order.join() === "инлайн,подписка", order.join());
+
+    const other = make("div");
+    const second = [];
+    other.addEventListener("click", () => second.push("подписка"));
+    other.onclick = () => second.push("инлайн");
+    other.dispatchEvent(new dom.Evt("click"));
+    check("и позже, если назначен позже", second.join() === "подписка,инлайн", second.join());
+
+    const third = make("div");
+    const replaced = [];
+    third.onclick = () => replaced.push("первый");
+    third.onclick = () => replaced.push("второй");
+    third.dispatchEvent(new dom.Evt("click"));
+    check("инлайновый один: переприсвоение заменяет", replaced.join() === "второй", replaced.join());
+  }
+
+  // 8. Подмена содержимого обнуляет прокрутку — то, ради чего всё затевалось.
+  {
+    const { make } = fresh();
+    const box = make("div");
+    for (let i = 0; i < 10; i += 1) box.appendChild(make("div"));
+    box.clientHeight = 100;
+    box.scrollTop = 60;
+    box.innerHTML = "";
+    check("после подмены содержимого прокрутка в нуле", box.scrollTop === 0, String(box.scrollTop));
+  }
+}
+
 // ── итог ──
+
+try {
+  stubChecks();
+} catch (err) {
+  failures.push("проверка стенда упала: " + (err && err.stack));
+}
 
 routeChecks()
   .catch((err) => failures.push("маршрут клиента упал: " + (err && err.stack)))

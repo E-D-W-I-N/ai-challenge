@@ -9,8 +9,19 @@
 // Здесь ровно столько DOM, сколько трогает app.js, и ровно столько сервера,
 // сколько нужно, чтобы записать, с каким конфигом ушло сообщение. Ничего
 // из этого не попадает в приложение: файл живёт в checks/.
+//
+// Правило стенда: **лучше упасть, чем соврать**. Стенд, тихо расходящийся
+// с браузером, — тот же капкан, из-за которого проверка трижды смотрела
+// не туда, только уровнем ниже: утверждение будет зелёным, а в браузере
+// сломано. Поэтому там, где повторить браузер дёшево, стенд его повторяет,
+// а где нельзя — бросает с внятным текстом вместо неправдоподобного ответа.
+// Его собственное поведение закреплено утверждениями в browser_check.js.
 
 const { TextEncoder } = require("util");
+
+// Условная высота одного узла. Пикселей стенд не считает — ему довольно
+// того, что содержимое имеет высоту, а пустота не имеет.
+const NODE_HEIGHT = 40;
 
 // ── события ───────────────────────────────────────────────────────────────
 
@@ -50,9 +61,9 @@ class El {
     this.open = false;
     this._text = "";
     this._html = "";
-    this.scrollTop = 0;
-    this.scrollHeight = 0;
+    this._scrollTop = 0;
     this.clientHeight = 0;
+    this._valueAtFocus = null;
 
     const self = this;
     this.classList = {
@@ -66,6 +77,41 @@ class El {
         return on;
       },
     };
+  }
+
+  // Высоту содержимого браузер считает раскладкой, стенд — числом узлов.
+  // Точных пикселей это не даёт и не должно: важно другое — лента без
+  // сообщений не может оказаться выше экрана, а с сообщениями может.
+  // Раньше высота была обычным полем, и проверка выставляла пустой ленте
+  // 4000 — числа, которого в браузере не бывает.
+  get scrollHeight() {
+    return Math.max(this.clientHeight, this.contentHeight());
+  }
+
+  set scrollHeight(_value) {
+    throw new Error(
+      "scrollHeight в браузере не присваивают: он считается по содержимому. " +
+        "Добавьте узлов в ленту или задайте clientHeight."
+    );
+  }
+
+  contentHeight() {
+    if (!this.children.length) {
+      return this._text || this._html ? NODE_HEIGHT : 0;
+    }
+    return this.children.reduce((sum, child) => sum + Math.max(NODE_HEIGHT, child.contentHeight()), 0);
+  }
+
+  // Прокрутка зажата между нулём и «дальше некуда», как в браузере: без
+  // этого проверка могла бы поставить ленту туда, куда та не доезжает,
+  // и утверждение о положении стало бы бессмысленным.
+  get scrollTop() {
+    return this._scrollTop;
+  }
+
+  set scrollTop(value) {
+    const limit = Math.max(0, this.scrollHeight - this.clientHeight);
+    this._scrollTop = Math.min(Math.max(0, Number(value) || 0), limit);
   }
 
   // У <select> значение — это значение выбранного <option>, как в браузере:
@@ -94,6 +140,10 @@ class El {
 
   get textContent() {
     if (this.children.length) return this.children.map((c) => c.textContent).join("");
+    // В браузере textContent видит и то, что положили через innerHTML:
+    // разметка там разобрана в узлы. Стенд её не разбирает, поэтому снимает
+    // теги — иначе утверждение о показанном тексте молча смотрело бы в пустоту.
+    if (this._html) return stripTags(this._html);
     return this._text;
   }
   set textContent(value) {
@@ -163,9 +213,11 @@ class El {
   }
 
   matches(sel) {
-    if (sel.startsWith("#")) return this.id === sel.slice(1);
-    if (sel.startsWith(".")) return this.classes.has(sel.slice(1));
-    return this.tagName === sel.toUpperCase();
+    return parseSelector(sel).every((part) => {
+      if (part.startsWith("#")) return this.id === part.slice(1);
+      if (part.startsWith(".")) return this.classes.has(part.slice(1));
+      return this.tagName === part.toUpperCase();
+    });
   }
 
   walk(visit) {
@@ -191,31 +243,51 @@ class El {
   }
 
   addEventListener(type, handler) {
-    (this.listeners[type] = this.listeners[type] || []).push(handler);
+    (this.listeners[type] = this.listeners[type] || []).push({ handler });
   }
   removeEventListener(type, handler) {
     const list = this.listeners[type] || [];
-    const i = list.indexOf(handler);
+    const i = list.findIndex((entry) => entry.handler === handler);
     if (i >= 0) list.splice(i, 1);
   }
 
-  // Событие всплывает: на этом держится делегирование `change` на #panel-body.
+  // Событие всплывает по дереву и доходит до документа: на первом держится
+  // делегирование `change` на #panel-body, на втором — Escape, который
+  // приложение слушает на document.
   dispatchEvent(event) {
     if (!event.target) event.target = this;
     let node = this;
     while (node) {
-      (node.listeners[event.type] || []).slice().forEach((h) => h.call(node, event));
-      const inline = node["on" + event.type];
-      if (typeof inline === "function") inline.call(node, event);
+      // Обработчики идут в порядке подписки, и инлайновый `on...` —
+      // такой же обработчик, а не всегда последний: браузер их не
+      // переставляет, и стенд не должен.
+      (node.listeners[event.type] || []).slice().forEach((entry) => {
+        if (entry.handler) entry.handler.call(node, event);
+      });
       if (event.stopped) break;
       node = node.parentElement;
     }
+    if (!event.stopped && documentRef) documentRef.fire(event);
     return !event.defaultPrevented;
   }
 
   focus() {
     documentRef.activeElement = this;
+    this._valueAtFocus = this.value;
   }
+
+  // Потеря фокуса, как в браузере: сначала blur, а следом change — но
+  // только если значение поменялось. Без этого проверка вынуждена была
+  // дёргать `change` руками, то есть проверять не жест пользователя,
+  // а собственную догадку о том, когда браузер его пошлёт.
+  blur() {
+    if (documentRef.activeElement === this) documentRef.activeElement = null;
+    const changed = this._valueAtFocus !== null && this._valueAtFocus !== this.value;
+    this._valueAtFocus = null;
+    this.dispatchEvent(new Evt("blur"));
+    if (changed) this.dispatchEvent(new Evt("change"));
+  }
+
   select() {}
   scrollIntoView() {}
   requestSubmit() {
@@ -232,9 +304,65 @@ class El {
   }
 }
 
+// Инлайновый обработчик (`el.onclick = ...`) — такой же слушатель, только
+// в единственном экземпляре. Держим его в общем списке, чтобы порядок
+// вызова совпадал с браузерным.
+const INLINE_EVENTS = ["click", "change", "keydown", "keyup", "submit", "input", "scroll", "blur", "focus"];
+
+INLINE_EVENTS.forEach((type) => {
+  Object.defineProperty(El.prototype, "on" + type, {
+    get() {
+      const entry = (this.listeners[type] || []).find((e) => e.inline);
+      return entry ? entry.handler : null;
+    },
+    set(handler) {
+      const list = (this.listeners[type] = this.listeners[type] || []);
+      const entry = list.find((e) => e.inline);
+      if (entry) entry.handler = handler;
+      else list.push({ handler, inline: true });
+    },
+    configurable: true,
+  });
+});
+
+// ── разбор селекторов ─────────────────────────────────────────────────────
+
+// Стенд понимает одиночный селектор: тег, #id, .класс и их сочетание
+// (`button.mini.danger`). Комбинаторы и всё остальное он повторить не может
+// и потому бросает: селектор, молча нашедший ноль, — это зелёное утверждение
+// о том, чего никто не проверил.
+function parseSelector(sel) {
+  const text = String(sel).trim();
+  if (!text) throw new Error("пустой селектор");
+  if (/[\s>+~,[\]:()*]/.test(text)) {
+    throw new Error(
+      `стенд не умеет селектор «${text}»: только тег, #id, .класс и их сочетание. ` +
+        "Найдите узел иначе — например по ближайшему id, а потом обходом детей."
+    );
+  }
+  // Режем по границам # и . — не по \w: имена классов бывают и не латиницей,
+  // а класс, которого разбор не увидел, молча расширил бы совпадение.
+  const parts = text.match(/[#.]?[^#.]+/g) || [];
+  if (!parts.length || parts.some((part) => !part.replace(/^[#.]/, "").length)) {
+    throw new Error(`не разобрать селектор «${text}»`);
+  }
+  return parts;
+}
+
+function stripTags(html) {
+  return String(html)
+    .replace(/<[^>]*>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&");
+}
+
 // ── документ ──────────────────────────────────────────────────────────────
 
 let documentRef = null;
+
+const type_of = (event) => event.type;
 
 function buildDocument(html) {
   const root = new El("html");
@@ -286,10 +414,16 @@ function buildDocument(html) {
       const i = list.indexOf(handler);
       if (i >= 0) list.splice(i, 1);
     },
+    // Событие, всплывшее с элемента, и событие, посланное самому документу, —
+    // одно и то же для слушателя на document.
+    fire: (event) => {
+      (document.listeners[type_of(event)] || []).slice().forEach((h) => h(event));
+      return event;
+    },
     dispatch: (type, extra) => {
       const event = new Evt(type, extra);
-      (document.listeners[type] || []).slice().forEach((h) => h(event));
-      return event;
+      if (!event.target) event.target = document;
+      return document.fire(event);
     },
   };
   documentRef = document;
