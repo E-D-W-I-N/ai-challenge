@@ -445,34 +445,105 @@ async function routeChecks() {
     check("текст сообщения остался в поле ввода", $("#input").value === "вопрос", $("#input").value);
   }
 
-  // ── лента доматывается вниз, но не под руку читающему ──
+  // ── где оказывается лента ──
+  //
+  // Утверждения здесь про **положение ленты**, а не про внутренний флаг.
+  // Прошлая версия проверяла флаг — и пропустила регресс: флаг вёл себя
+  // ровно как задумано, а лента при этом оставалась в нуле, потому что
+  // содержимое пересоздаётся и браузер обнуляет прокрутку. Смотреть надо
+  // на то, что видит читатель.
   {
-    const { client, $, settle } = freshClient({ delay: 5 });
-    client.init();
-    await settle(20);
-    const feed = $("#feed");
-    // Читатель внизу: лента доматывается сама.
-    feed.scrollHeight = 1000;
-    feed.clientHeight = 400;
-    feed.scrollTop = 600;
-    feed.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("scroll"));
-    $("#input").value = "первый";
-    $("#composer").requestSubmit();
-    await settle(120);
-    check("внизу — лента доматывается", client.state.stick === true);
+    const TALK = [
+      { role: "user", content: "первый вопрос", seed: false },
+      { role: "assistant", content: "первый ответ", seed: false, metrics: null, reasoning: "" },
+    ];
+    const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: 2 });
+    const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
+    const measure = (feed) => {
+      feed.scrollHeight = 4000;
+      feed.clientHeight = 400;
+      return feed;
+    };
 
-    // Читатель отмотал вверх: новые куски не должны дёргать ленту.
-    feed.scrollHeight = 2000;
-    feed.clientHeight = 400;
-    feed.scrollTop = 100;
-    feed.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("scroll"));
-    check("отмотал вверх — лента отвязалась", client.state.stick === false);
-    const before = feed.scrollTop;
-    $("#input").value = "второй";
-    $("#composer").requestSubmit();
-    await settle(120);
-    // Своё сообщение — исключение: его отправил сам читатель.
-    check("своё сообщение возвращает ленту вниз", client.state.stick === true, String(before));
+    // 1. Чат открывают, чтобы увидеть последнее сообщение.
+    {
+      const { client, $, settle, Evt } = freshClient({
+        chats: [withHistory("чат А"), withHistory("чат Б")],
+      });
+      client.init();
+      await settle(30);
+      const feed = measure($("#feed"));
+      // Два первых чата в стенде — без истории; наши с историей идут за ними.
+      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+      await settle(40);
+      check("открытый чат показывает конец разговора", atBottom(feed),
+        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
+
+      // 2. Отмотал вверх в одном чате — другой всё равно открывается внизу.
+      feed.scrollTop = 200;
+      feed.dispatchEvent(new Evt("scroll"));
+      $("#agent-list").querySelectorAll(".item-open")[3].dispatchEvent(new Evt("click"));
+      await settle(40);
+      check("отмотанная лента не переносится на другой чат", atBottom(feed),
+        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
+
+      // ...и возврат в первый чат тоже показывает конец разговора.
+      feed.scrollTop = 200;
+      feed.dispatchEvent(new Evt("scroll"));
+      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+      await settle(40);
+      check("и возврат в прежний чат — тоже", atBottom(feed),
+        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
+    }
+
+    // 3. Перегенерацию просит сам читатель — значит показать, что вышло.
+    {
+      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")] });
+      client.init();
+      await settle(30);
+      const feed = measure($("#feed"));
+      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+      await settle(40);
+      feed.scrollTop = 150;
+      feed.dispatchEvent(new Evt("scroll"));
+      const card = feed.querySelector(".card");
+      card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+      await settle(150);
+      check("перегенерация при отмотанной ленте показывает новый ответ", atBottom(feed),
+        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
+    }
+
+    // 4. Отмотал вверх во время ответа — лента остаётся там, где её оставили.
+    {
+      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")], delay: 25 });
+      client.init();
+      await settle(30);
+      const feed = measure($("#feed"));
+      $("#input").value = "вопрос";
+      $("#composer").requestSubmit();
+      await settle(40);
+      feed.scrollTop = 300;
+      feed.dispatchEvent(new Evt("scroll"));
+      await settle(300);
+      check("отмотанная во время ответа лента остаётся на месте", feed.scrollTop === 300,
+        `лента на ${feed.scrollTop}, ждали 300`);
+      check("и уж точно не в начале разговора", feed.scrollTop !== 0, String(feed.scrollTop));
+    }
+
+    // 5. Прижатая лента доматывается сама.
+    {
+      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")], delay: 5 });
+      client.init();
+      await settle(30);
+      const feed = measure($("#feed"));
+      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+      await settle(40);
+      $("#input").value = "вопрос";
+      $("#composer").requestSubmit();
+      await settle(200);
+      check("прижатая лента доматывается к новому ответу", atBottom(feed),
+        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
+    }
   }
 
   // ── строка состояния гаснет ──

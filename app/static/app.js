@@ -387,6 +387,10 @@ async function openAgent(agentId) {
   }
   state.current = agent;
   state.panelDirty = false;
+  // Чат открывают, чтобы увидеть последнее сообщение. Отмотанная лента
+  // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
+  // читатель выключил бы доматывание сразу для всех чатов.
+  state.stick = true;
   state.lastMetrics = lastAnswerMetrics(agent);
   renderList();
   renderFeed(agent);
@@ -415,6 +419,11 @@ function lastAnswerMetrics(agent) {
 
 function renderFeed(agent) {
   const feed = $("#feed");
+  // Подмена содержимого обнуляет прокрутку, поэтому положение после
+  // перерисовки задаётся здесь явно и всегда: либо низ, либо то место,
+  // где читатель остановился. Оставить на усмотрение браузера нельзя —
+  // он оставит ноль, то есть выбросит читателя в начало разговора.
+  const keep = state.stick ? null : feed.scrollTop;
   feed.innerHTML = "";
 
   const turns = agent.transcript.filter((t) => !t.seed);
@@ -428,6 +437,7 @@ function renderFeed(agent) {
     empty.append(h, p);
     feed.appendChild(empty);
     renderRail();
+    feed.scrollTop = 0;
     return;
   }
 
@@ -435,7 +445,7 @@ function renderFeed(agent) {
     feed.appendChild(turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn));
   });
   renderRail();
-  scrollFeed();
+  feed.scrollTop = keep === null ? feed.scrollHeight : keep;
 }
 
 function userBubble(text) {
@@ -617,27 +627,11 @@ async function send() {
   const text = (input.value || "").trim();
   if (!text || !state.current || !state.hasKey) return;
 
-  // Панель — источник правды. Проливаем её в агента перед каждой отправкой,
-  // чем бы ни кончилось событие `change`.
-  if (state.applying) await state.applying;
-  if (!(await ensurePanelApplied())) {
-    hint("Настройки панели не применились — сообщение не отправлено.", true);
-    return;
-  }
-
-  input.value = "";
-  autoGrow(input);
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
 async function regenerate() {
   if (state.busy || !state.current || !state.hasKey) return;
-  // Перегенерация — такая же отправка: тот же инвариант.
-  if (state.applying) await state.applying;
-  if (!(await ensurePanelApplied())) {
-    hint("Настройки панели не применились — перегенерация отменена.", true);
-    return;
-  }
   await exchange("/api/agents/" + state.current.id + "/regenerate", null, null);
 }
 
@@ -646,10 +640,29 @@ async function exchange(path, body, questionText) {
   const feed = $("#feed");
   const agent = state.current;
 
+  // Инвариант живёт здесь, а не у вызывающих: через `exchange` проходит
+  // всякая отправка, и третий путь к нему не сможет его обойти. Держать
+  // свойство дисциплиной двух вызывающих — значит ждать, пока появится
+  // третий и молча откроет дыру заново.
+  if (state.applying) await state.applying;
+  if (!(await ensurePanelApplied())) {
+    hint("Настройки панели не применились — сообщение не отправлено.", true);
+    return false;
+  }
+  // Текст забираем из поля только теперь: до этой строки отправка могла
+  // не состояться, и стирать написанное было бы не за что.
+  if (questionText !== null) {
+    const input = $("#input");
+    input.value = "";
+    autoGrow(input);
+  }
+
+  // Обмен затевает сам читатель — и своим сообщением, и повтором ответа:
+  // ленту к низу, чтобы увидеть, что из этого вышло.
+  state.stick = true;
   if (questionText !== null) {
     if (feed.querySelector(".empty")) feed.innerHTML = "";
     feed.appendChild(userBubble(questionText));
-    state.stick = true;
   } else {
     // Перегенерация заменяет последний ответ: карточку убираем с экрана,
     // а на сервере пара «вопрос — ответ» снимается с истории тем же запросом.
@@ -673,7 +686,7 @@ async function exchange(path, body, questionText) {
   card.append(head, bodyEl);
   feed.appendChild(card);
   renderRail();
-  scrollFeed(questionText !== null);
+  scrollFeed();
 
   setBusy(true);
   hint("");
