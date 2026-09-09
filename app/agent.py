@@ -44,6 +44,27 @@ MAX_STORED_MESSAGES = 400
 _ids = itertools.count(1)
 
 
+def copy_spec(spec: AgentSpec) -> AgentSpec:
+    """Копия конфига, и вглубь тоже.
+
+    `replace` копирует только верхний уровень: `messages`, `stop`,
+    `response_format` и `extra_body` остались бы одним объектом на всех, кого
+    подняли из этого конфига, — правка у одного задела бы остальных.
+    """
+    return replace(
+        spec,
+        messages=[dict(m) for m in (spec.messages or [])],
+        stop=list(spec.stop) if spec.stop else None,
+        response_format=copy.deepcopy(spec.response_format),
+        extra_body=copy.deepcopy(spec.extra_body or {}),
+    )
+
+
+def _history_limit(spec: AgentSpec) -> int:
+    limit = spec.history_limit
+    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+
+
 class AgentBusyError(RuntimeError):
     """У агента уже идёт обмен. Второй параллельный запрос — ошибка, а не очередь.
 
@@ -116,19 +137,10 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: один и тот же spec из day.py может
-        # поднять несколько агентов, а `replace` копирует только верхний уровень —
-        # messages, stop, response_format и extra_body остались бы одним
-        # объектом на сотню агентов и на сам день. Правка любого из них
-        # у одного агента задела бы всех остальных, а день ровно про то,
-        # что у ста агентов конфиги **разные**.
-        self.spec = replace(
-            spec,
-            messages=[dict(m) for m in (spec.messages or [])],
-            stop=list(spec.stop) if spec.stop else None,
-            response_format=copy.deepcopy(spec.response_format),
-            extra_body=copy.deepcopy(spec.extra_body or {}),
-        )
+        # Один и тот же spec из day.py может поднять несколько агентов —
+        # каждому нужна своя копия, иначе правка у одного задела бы всех,
+        # а день ровно про то, что у ста агентов конфиги **разные**.
+        self.spec = copy_spec(spec)
         self.id = agent_id or f"ag_{next(_ids):05d}"
         self.created_at = time.time()
         self.last_used_at = self.created_at
@@ -191,8 +203,7 @@ class Agent:
 
     @property
     def history_limit(self) -> int:
-        limit = self.spec.history_limit
-        return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+        return _history_limit(self.spec)
 
     def cancel(self) -> None:
         """Просит агента прекратить текущую генерацию.
@@ -205,9 +216,9 @@ class Agent:
 
     # --- сборка промпта ------------------------------------------------------
 
-    def window(self) -> list[dict]:
+    def window(self, spec: AgentSpec | None = None) -> list[dict]:
         """Хвост истории, который уезжает в модель. При history_limit=0 — пусто."""
-        limit = self.history_limit
+        limit = _history_limit(spec if spec is not None else self.spec)
         if not limit:
             return []
         return [turn.as_message() for turn in self.history[-limit:]]
@@ -247,7 +258,9 @@ class Agent:
         messages.extend(dict(m) for m in self.seed_messages)
         return messages
 
-    def build_prompt(self, user_text: str | None = None) -> list[dict]:
+    def build_prompt(
+        self, user_text: str | None = None, *, spec: AgentSpec | None = None
+    ) -> list[dict]:
         """Обстановка + окно истории + вопрос этого хода.
 
         `user_text=None` — обмен стартовым промптом: с пустой историей это
@@ -260,21 +273,25 @@ class Agent:
         пуста, вопрос всё же едет: он часть заготовки, и промпт обязан
         сходиться с тем, что показано в стенограмме.
         """
+        # `spec` передаёт обмен: он собирает промпт и тело запроса из одного
+        # слепка, чтобы правка панели не могла попасть между ними.
+        spec = spec if spec is not None else self.spec
+
         setting, question = self._seed_split()
         messages: list[dict] = []
-        if self.spec.system:
-            messages.append({"role": "system", "content": self.spec.system})
+        if spec.system:
+            messages.append({"role": "system", "content": spec.system})
         messages.extend(setting)
 
         if user_text is None:
-            messages.extend(self.window())
+            messages.extend(self.window(spec))
             if question is not None:
                 messages.append({"role": "user", "content": question})
             return messages
 
         if question is not None and not self.history:
             messages.append({"role": "user", "content": question})
-        messages.extend(self.window())
+        messages.extend(self.window(spec))
         messages.append({"role": "user", "content": user_text})
         return messages
 
@@ -356,7 +373,19 @@ class Agent:
             cancel = self._cancel
             self.last_used_at = time.time()
 
-            prompt = self.build_prompt(user_text)
+            # Слепок конфига на весь обмен. Промпт и тело запроса собираются
+            # в двух разных точках, и между ними стоит `yield` события `start`:
+            # правка панели, попавшая туда, дала бы смешанный запрос — новую
+            # модель со старым системным промптом. Сейчас через этот `yield`
+            # никто не приостанавливается, но держится это на устройстве
+            # доставки событий, а не на самом обмене: ограничат очередь или
+            # добавят один `await` — и окно откроется молча. Со слепком
+            # «текущий вызов идёт целиком на одном конфиге» верно
+            # по построению, а не по совпадению.
+            spec = copy_spec(self.spec)
+            context_length = self.context_length
+
+            prompt = self.build_prompt(user_text, spec=spec)
             # Вопрос коммитится в историю как обычный ход: агент с памятью
             # обязан помнить, на что он отвечал, а не только чем ответил.
             question = user_text if user_text is not None else self.seed_question
@@ -371,7 +400,7 @@ class Agent:
 
             try:
                 stream = stream_completion(
-                    self.spec, prompt_override=prompt, context_length=self.context_length
+                    spec, prompt_override=prompt, context_length=context_length
                 )
                 async with contextlib.aclosing(stream):
                     async for chunk in stream:

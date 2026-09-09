@@ -543,6 +543,70 @@ def check_patch_during_generation():
     return "PATCH во время генерации принят, текущий ответ цел, следующий — новый"
 
 
+@check("обмен идёт целиком на одном конфиге: смешанного запроса не бывает")
+def check_config_snapshot():
+    """Находка ревью: конфиг читается в двух точках, а не в одной.
+
+    Промпт собирает `build_prompt`, тело — `build_payload`, и между ними
+    стоит `yield` события `start`. Правка, попавшая туда, дала бы смешанный
+    запрос: новую модель со старым системным промптом. Сейчас через этот
+    `yield` никто не приостанавливается, но держится это на устройстве
+    доставки событий, а не на самом обмене.
+
+    Шагаем генератор руками — `__anext__` останавливает его ровно в окне —
+    и правим конфиг оттуда: со слепком в запрос уезжает один конфиг целиком.
+    """
+    _stub.install(reply="ок")
+
+    async def scenario():
+        agent = REGISTRY.create(
+            AgentSpec(
+                label="слепок",
+                model="старая/модель",
+                system="СТАРЫЙ ПРОМПТ",
+                temperature=0.1,
+                max_tokens=100,
+            )
+        )
+        stream = agent.ask("вопрос")
+        start = await stream.__anext__()
+
+        # Промпт уже собран, тело ещё нет — то самое окно.
+        agent.spec.model = "новая/модель"
+        agent.spec.system = "НОВЫЙ ПРОМПТ"
+        agent.spec.temperature = 0.9
+        agent.spec.max_tokens = 999
+
+        async for _ in stream:
+            pass
+        return agent, start
+
+    agent, start = asyncio.run(scenario())
+    assert start["type"] == "start", start
+
+    call = _stub.CALLS[0]
+    systems = [m["content"] for m in call["messages"] if m["role"] == "system"]
+    assert systems == ["СТАРЫЙ ПРОМПТ"], systems
+    assert call["payload"]["model"] == "старая/модель", call["payload"]["model"]
+    assert call["payload"]["temperature"] == 0.1, call["payload"]
+    assert call["payload"]["max_tokens"] == 100, call["payload"]
+    # Промпт в событии start — тот же, что уехал в модель.
+    assert start["resolved_messages"] == call["messages"], (start["resolved_messages"], call["messages"])
+
+    # А следующий обмен идёт уже целиком на новом конфиге.
+    _stub.reset()
+    _stub.install(reply="ок")
+    asyncio.run(drain(agent.ask("второй")))
+    call = _stub.CALLS[0]
+    assert call["payload"]["model"] == "новая/модель", call["payload"]["model"]
+    assert [m["content"] for m in call["messages"] if m["role"] == "system"] == ["НОВЫЙ ПРОМПТ"]
+    assert call["payload"]["temperature"] == 0.9, call["payload"]
+
+    source = read("app/agent.py")
+    assert "copy_spec(self.spec)" in source, "обмен собирает запрос из живого конфига"
+    return "правка в окне между промптом и телом не смешала конфиги"
+
+
 @check("системный промпт живёт в одном месте и не фиксируется при создании")
 def check_system_prompt_single_home():
     """Корень той же жалобы: промпт мог приехать внутри `messages`.
@@ -1304,6 +1368,7 @@ CHECKS = [
     check_new_params,
     check_panel_applies_next_message,
     check_patch_during_generation,
+    check_config_snapshot,
     check_system_prompt_single_home,
     check_stop_and_format,
     check_patch_panel,
