@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, commands, llm
@@ -34,6 +34,7 @@ from .config import ROOT, has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import AgentSpec, Scenario
+from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -93,6 +94,17 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="AI Challenge Bench", version="1.0.0", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(StoreBusyError)
+async def _store_busy(_request: Request, exc: StoreBusyError) -> JSONResponse:
+    """Занятая база — это 503 с объяснением, а не голый 500.
+
+    Два процесса на одной базе — режим штатный, и упереться в блокировку тут
+    не поломка, а очередь. Пользователю нужен текст «занято, повторите», а не
+    строка из драйвера sqlite.
+    """
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.get("/")
@@ -779,7 +791,8 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
                 yield _agent_event(event, agent)
     except AgentBusyError as exc:
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}
-    except MissingKeyError as exc:
+    except (MissingKeyError, StoreBusyError) as exc:
+        # У обеих текст уже человеческий — имя класса перед ним только мешает.
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}
     except asyncio.CancelledError:
         raise
@@ -1057,7 +1070,7 @@ async def _run_session(
             done_event["texts"] = list(texts)
             done_event["unique"] = len({t.strip() for t in texts})
         await queue.put(done_event)
-    except MissingKeyError as exc:
+    except (MissingKeyError, StoreBusyError) as exc:
         outcome = _Outcome(error=str(exc))
         await queue.put(
             {"event": "session_error", "session": label, "agent": agent.id, "message": str(exc)}

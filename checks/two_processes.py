@@ -1,6 +1,6 @@
 """Два процесса на одной базе: id не пересекаются, чужой диалог цел.
 
-    .venv/bin/python checks/concurrent.py
+    .venv/bin/python checks/two_processes.py
 
 Стенд и консоль по умолчанию работают с одним файлом `data/agents.db` — README
 прямо предлагает запустить `python -m app.cli` рядом с поднятым `uvicorn`.

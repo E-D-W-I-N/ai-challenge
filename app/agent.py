@@ -140,12 +140,39 @@ class Agent:
         # Свежий id занимает база, а не процесс: стенд и CLI ходят в один файл,
         # и локальный счётчик выдал бы обоим один номер (см. app/store.py).
         # Без хранилища агент живёт только в памяти — там и счётчика хватает.
+        claimed = False
         if agent_id is not None:
             self.id = agent_id
         elif store is not None:
             self.id = store.claim_agent_id()
+            claimed = True
         else:
             self.id = new_agent_id()
+
+        try:
+            self._setup(spec, agent_id, parent_id, context_length, store)
+        except BaseException:
+            # Строку сессии мы уже заняли под этот id. Если агент не достроился,
+            # убираем её за собой: иначе в списке сессий висел бы пустой ярлык
+            # от объекта, которого не существует.
+            if claimed and store is not None:
+                with contextlib.suppress(Exception):
+                    store.delete_session(self.id)
+            raise
+
+    def _setup(
+        self,
+        spec: AgentSpec,
+        agent_id: str | None,
+        parent_id: str | None,
+        context_length: int | None,
+        store: Store | None,
+    ) -> None:
+        """Всё, что собирается после того, как id уже занят.
+
+        Вынесено из `__init__` только ради уборки: конструктор оборачивает этот
+        вызов и на любом исключении освобождает занятую строку сессии.
+        """
         self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at

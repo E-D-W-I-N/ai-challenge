@@ -92,6 +92,14 @@ CREATE INDEX IF NOT EXISTS sessions_by_parent ON sessions(parent_id);
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
 
+BUSY_TIMEOUT_MS = 5000
+"""Сколько ждать освобождения базы, прежде чем признать её занятой.
+
+Пять секунд с запасом покрывают любую запись стенда — самая долгая, спавн сотни
+сессий, укладывается в единицы миллисекунд. Ждать дольше нельзя: ожидание
+блокировки блокирует и цикл событий, так что стенд на это время замирает.
+"""
+
 _CLAIM_ATTEMPTS = 50
 """Сколько раз пробуем занять id, прежде чем признать, что что-то не так.
 
@@ -122,6 +130,19 @@ def _loads(raw: str, fallback):
         return fallback
 
 
+MIN_SECRET_LENGTH = 16
+"""Короче этого значение ключом не считается и не вырезается.
+
+Редакция работает подстрокой, а чистится **любой** строковый параметр запроса —
+включая `session_id`, роль реплики и имя колонки. С вырожденным
+`OPENROUTER_API_KEY` (скажем, буквально `1`) она изрезала бы `ag_00001`
+в `ag_***0000***` и развалила бы данные ради защиты от того, что ключом не
+является. Настоящий ключ OpenRouter — это `sk-or-v1-` плюс 64 шестнадцатеричных
+знака, то есть 73 символа; шестнадцать взяты с большим запасом вниз и всё ещё
+длиннее любого идентификатора, который мы пишем в базу.
+"""
+
+
 def redact(value):
     """Вырезает ключ OpenRouter из всего, что уезжает в базу.
 
@@ -132,7 +153,7 @@ def redact(value):
     обычный файл: дешевле вырезать, чем потом отзывать ключ.
     """
     key = api_key()
-    if not key:
+    if not key or len(key) < MIN_SECRET_LENGTH:
         return value
     if isinstance(value, str):
         return value.replace(key, "***")
@@ -141,6 +162,45 @@ def redact(value):
     if isinstance(value, list):
         return [redact(v) for v in value]
     return value
+
+
+class StoreBusyError(RuntimeError):
+    """База занята другим процессом дольше, чем `busy_timeout`.
+
+    Отдельный класс, а не голый `sqlite3.OperationalError`: наверху из него
+    делают внятный ответ пользователю, а не «HTTP 500». Ситуация штатная —
+    два процесса на одной базе поддержаны, — и текст должен объяснять, что
+    произошло и что делать, а не показывать строку из драйвера.
+    """
+
+
+def _busy(exc: sqlite3.OperationalError, path) -> StoreBusyError | None:
+    """Переводит «database is locked» в человеческий текст.
+
+    None — ошибка не про блокировку: «no such table» это баг схемы, а не
+    очередь, и подменять его успокаивающим текстом нельзя.
+    """
+    text = str(exc).lower()
+    if "locked" not in text and "busy" not in text:
+        return None
+    return StoreBusyError(
+        f"база {path} занята другим процессом дольше {BUSY_TIMEOUT_MS} мс. "
+        "Так бывает, если рядом идёт длинная запись из второй копии стенда "
+        "или из консоли: подождите пару секунд и повторите. Ничего не потеряно — "
+        "незавершённая запись откатывается целиком."
+    )
+
+
+@contextlib.contextmanager
+def _translating(path):
+    """Переводит занятую базу в StoreBusyError, остальное пропускает как есть."""
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        busy = _busy(exc, path)
+        if busy is None:
+            raise
+        raise busy from exc
 
 
 class _Writer:
@@ -153,10 +213,11 @@ class _Writer:
     параметром запроса.
     """
 
-    __slots__ = ("_conn",)
+    __slots__ = ("_conn", "_path")
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, path) -> None:
         self._conn = conn
+        self._path = path
 
     @staticmethod
     def _clean(params):
@@ -165,10 +226,12 @@ class _Writer:
         return tuple(redact(value) for value in params)
 
     def execute(self, sql: str, params=()):
-        return self._conn.execute(sql, self._clean(params))
+        with _translating(self._path):
+            return self._conn.execute(sql, self._clean(params))
 
     def executemany(self, sql: str, rows):
-        return self._conn.executemany(sql, (self._clean(row) for row in rows))
+        with _translating(self._path):
+            return self._conn.executemany(sql, (self._clean(row) for row in rows))
 
 
 class Store:
@@ -208,7 +271,7 @@ class Store:
         if target != MEMORY:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.executescript(SCHEMA)
         self._conn = conn
         self._migrate(conn)
@@ -240,6 +303,12 @@ class Store:
         return self._conn
 
     @contextlib.contextmanager
+    def reading(self):
+        """Соединение для чтения. Занятую базу переводит в StoreBusyError."""
+        with self._lock, _translating(self.path):
+            yield self.conn
+
+    @contextlib.contextmanager
     def tx(self):
         """Одна транзакция. Вложенные вызовы коммитятся один раз, самым внешним.
 
@@ -258,10 +327,13 @@ class Store:
                 # попытке записи получила бы SQLITE_BUSY без ретрая по
                 # busy_timeout. Блокировку берём сразу — тогда второй писатель
                 # честно ждёт своей очереди.
-                conn.execute("BEGIN IMMEDIATE")
+                # Ждать блокировку — нормально; не дождаться — тоже штатный
+                # исход, и наверху из него делают внятный ответ.
+                with _translating(self.path):
+                    conn.execute("BEGIN IMMEDIATE")
             self._depth += 1
             try:
-                yield _Writer(conn)
+                yield _Writer(conn, self.path)
             except BaseException:
                 self._depth -= 1
                 if outer:
@@ -324,10 +396,8 @@ class Store:
             )
 
     def load_session(self, session_id: str) -> dict | None:
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
+        with self.reading() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return self._session_row(row) if row is not None else None
 
     @staticmethod
@@ -347,8 +417,8 @@ class Store:
 
     def list_sessions(self, *, limit: int = 500) -> list[dict]:
         """Сохранённые сессии, свежие сверху, с числом реплик у каждой."""
-        with self._lock:
-            rows = self.conn.execute(
+        with self.reading() as conn:
+            rows = conn.execute(
                 """
                 SELECT s.*, (
                     SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
@@ -367,12 +437,12 @@ class Store:
         return out
 
     def count_sessions(self) -> int:
-        with self._lock:
-            return self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        with self.reading() as conn:
+            return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def children(self, parent_id: str) -> list[str]:
-        with self._lock:
-            rows = self.conn.execute(
+        with self.reading() as conn:
+            rows = conn.execute(
                 "SELECT id FROM sessions WHERE parent_id = ?", (parent_id,)
             ).fetchall()
         return [row["id"] for row in rows]
@@ -439,8 +509,8 @@ class Store:
             )
 
     def load_messages(self, session_id: str) -> list[dict]:
-        with self._lock:
-            rows = self.conn.execute(
+        with self.reading() as conn:
+            rows = conn.execute(
                 "SELECT role, content, error, at FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
@@ -452,8 +522,8 @@ class Store:
 
     def message_rows(self, session_id: str) -> list[tuple]:
         """(seq, role, content) как они лежат в базе — этим проверяют нумерацию."""
-        with self._lock:
-            rows = self.conn.execute(
+        with self.reading() as conn:
+            rows = conn.execute(
                 "SELECT seq, role, content FROM messages WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
@@ -503,8 +573,8 @@ class Store:
         Без этой поправки второй запуск выдал бы `ag_00001` заново — и новый
         агент молча унаследовал бы чужую историю из базы.
         """
-        with self._lock:
-            rows = self.conn.execute("SELECT id FROM sessions").fetchall()
+        with self.reading() as conn:
+            rows = conn.execute("SELECT id FROM sessions").fetchall()
         best = 0
         for row in rows:
             match = _ID_RE.match(row["id"] or "")

@@ -27,6 +27,7 @@ from .agent import Agent, AgentBusyError
 from .config import has_key
 from .registry import REGISTRY
 from .schema import AgentSpec
+from .store import StoreBusyError
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_SYSTEM = "Ты — агент стенда AI-челленджа. Отвечай по-русски, коротко и по делу."
@@ -191,6 +192,9 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
             await ask(agent, text, out)
         except AgentBusyError as exc:
             out.write(f"[занят] {exc}\n")
+        except StoreBusyError as exc:
+            # Текст уже объясняет, что делать: имя класса ничего не добавит.
+            out.write(f"[база занята] {exc}\n")
         except Exception as exc:  # noqa: BLE001 — консоль не должна падать стеком
             out.write(f"[ошибка] {type(exc).__name__}: {exc}\n")
 

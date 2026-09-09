@@ -1586,6 +1586,138 @@ def check_context_length_restored():
     return "после выгрузки и после переоткрытия файла context_fill_pct снова считается"
 
 
+@check("вырожденный ключ не режет идентификаторы: у редакции есть нижний порог")
+def check_redact_floor():
+    """Редакция работает подстрокой и чистит **любой** строковый параметр.
+
+    С однобуквенным OPENROUTER_API_KEY она изрезала бы `ag_00001` и роли реплик,
+    то есть развалила бы данные ради защиты от того, что ключом не является.
+    Ключ короче порога ключом не считается; настоящий — 73 символа.
+    """
+    from app.agent import Agent
+    from app.store import MIN_SECRET_LENGTH, redact
+
+    saved_key = os.environ.get("OPENROUTER_API_KEY")
+    path = _temp_db("floor")
+    store = Store(path).init()
+    try:
+        os.environ["OPENROUTER_API_KEY"] = "1"
+        assert redact("ag_00001") == "ag_00001", redact("ag_00001")
+        assert redact("assistant") == "assistant"
+        assert redact("1 января в 11:10") == "1 января в 11:10"
+
+        agent = Agent(AgentSpec(label="порог", model="stub/m", messages=[]), store=store)
+        agent.remember_exchange("встретимся 1 числа", "хорошо, 1 числа")
+        rows = store.message_rows(agent.id)
+        assert [r[2] for r in rows] == ["встретимся 1 числа", "хорошо, 1 числа"], rows
+        assert store.load_session(agent.id) is not None, "id сессии изрезан редакцией"
+        assert store.load_session(agent.id)["label"] == "порог"
+
+        # Порог не должен превратиться в дыру: настоящий ключ по-прежнему режется.
+        real = "sk-or-v1-" + "a" * 64
+        assert len(real) >= MIN_SECRET_LENGTH
+        os.environ["OPENROUTER_API_KEY"] = real
+        agent.remember_exchange(f"мой ключ {real}", "не надо")
+        stored = " ".join(r[2] for r in store.message_rows(agent.id))
+        assert real not in stored, "настоящий ключ перестал вырезаться"
+        assert "***" in stored, stored
+    finally:
+        if saved_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+        store.close()
+    return f"ключ короче {MIN_SECRET_LENGTH} символов данные не трогает, настоящий — режется"
+
+
+@check("недостроенный агент не оставляет пустую строку сессии")
+def check_claim_rolled_back():
+    """`claim_agent_id` занимает строку до того, как объект собран.
+
+    Если конструктор упадёт дальше, строка осталась бы висеть в базе с пустым
+    ярлыком — и была бы видна в списке сессий как диалог, которого нет.
+    """
+    from app.agent import Agent
+
+    path = _temp_db("claim-rollback")
+    store = Store(path).init()
+    good = Agent(AgentSpec(label="живой", model="stub/m", messages=[]), store=store)
+    before = store.count_sessions()
+
+    saved = store.save_session
+    store.save_session = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("бум на записи"))
+    try:
+        Agent(AgentSpec(label="недостроенный", model="stub/m", messages=[]), store=store)
+        raise AssertionError("конструктор должен был упасть")
+    except RuntimeError as exc:
+        assert "бум" in str(exc), exc
+    finally:
+        store.save_session = saved
+
+    assert store.count_sessions() == before, (
+        f"после падения в базе {store.count_sessions()} сессий вместо {before}: "
+        "занятая строка не убрана"
+    )
+    labels = [row["label"] for row in store.list_sessions()]
+    assert labels == ["живой"], labels
+    assert store.load_session(good.id) is not None, "уборка задела чужую сессию"
+    store.close()
+    return "строка, занятая под упавший конструктор, убрана; соседняя цела"
+
+
+@check("занятая база — внятный 503, а не голый 500")
+def check_busy_message():
+    """`database is locked` — штатный исход при двух процессах, а не поломка.
+
+    Пользователю нужен текст «занято, повторите», поэтому ошибка драйвера
+    переводится в StoreBusyError, а ручка отвечает 503.
+    """
+    import sqlite3
+
+    from app.store import StoreBusyError, _busy
+
+    translated = _busy(sqlite3.OperationalError("database is locked"), "/tmp/agents.db")
+    assert isinstance(translated, StoreBusyError), type(translated)
+    text = str(translated)
+    assert "занята другим процессом" in text, text
+    assert "повторите" in text and "откатывается" in text, text
+    # Чужие OperationalError не подменяем: «no such table» — это баг, а не очередь.
+    assert _busy(sqlite3.OperationalError("no such table: sessions"), "/tmp/a.db") is None
+
+    # Настоящая блокировка: второе соединение держит запись дольше busy_timeout.
+    path = _temp_db("busy")
+    store = Store(path).init()
+    blocker = sqlite3.connect(str(path), isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_99999', 1, 1)"
+    )
+    store.conn.execute("PRAGMA busy_timeout=50")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            saved_store = main.REGISTRY.store
+            main.REGISTRY.store = store
+            try:
+                response = client.post(
+                    "/api/agents", json={"agent": {"model": "stub/m", "label": "в очереди"}}
+                )
+            finally:
+                main.REGISTRY.store = saved_store
+        assert response.status_code == 503, (response.status_code, response.text)
+        assert "занята другим процессом" in response.json()["detail"], response.text
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        store.close()
+
+    # Память и база не разъехались: сессия, которую не записали, не создана.
+    reopened = Store(path).init()
+    assert [r["label"] for r in reopened.list_sessions()] == [], reopened.list_sessions()
+    reopened.close()
+    return "HTTP 503 с объяснением; сессию, которую не записали, база не завела"
+
+
 @check("ручка сессий показывает действующее окно памяти, а не null")
 def check_sessions_effective_window():
     from app.agent import DEFAULT_HISTORY_LIMIT
@@ -1801,6 +1933,9 @@ CHECKS = [
     check_waiting_column_is_busy,
     check_context_length_restored,
     check_sessions_effective_window,
+    check_redact_floor,
+    check_claim_rolled_back,
+    check_busy_message,
 ]
 
 
