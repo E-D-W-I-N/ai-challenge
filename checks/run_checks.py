@@ -1825,6 +1825,104 @@ def check_preset_order_changed():
     return f"{len(before)} чатов до перестановки и столько же после, дубликатов нет"
 
 
+@check("противоречия в заготовках ловятся на старте, а не в работе")
+def check_presets_validated():
+    """Пять поломок конфига, каждая — с внятным текстом при запуске.
+
+    Последняя из них — ключ, который и отозван, и есть в `day.py`: такой чат
+    удалялся бы на каждом старте и молча не заводился обратно. Это
+    противоречие в данных, а не рабочее состояние.
+    """
+    good = [
+        AgentSpec(preset="a", label="Первый", model="stub/m"),
+        AgentSpec(preset="b", label="Второй", model="stub/m"),
+    ]
+    # Рабочие значения проходят — иначе проверка ловила бы что угодно.
+    main.validate_presets(good, ("отозванный",))
+    main.validate_presets(main.PRESET_CHATS, main.RETIRED_PRESETS)
+
+    cases = [
+        ("не AgentSpec", [*good, "просто строка"], (), "только AgentSpec"),
+        (
+            "повтор имени",
+            [*good, AgentSpec(preset="c", label="Первый", model="stub/m")],
+            (),
+            "имена чатов должны быть уникальны",
+        ),
+        (
+            "пустой preset",
+            [*good, AgentSpec(preset="", label="Третий", model="stub/m")],
+            (),
+            "у каждой заготовки должен быть preset",
+        ),
+        (
+            "повтор ключа",
+            [*good, AgentSpec(preset="a", label="Третий", model="stub/m")],
+            (),
+            "ключи заготовок должны быть уникальны",
+        ),
+        ("отозван и есть в day.py", good, ("b",), "и отозваны, и есть в day.py"),
+    ]
+    for name, chats, retired, expected in cases:
+        try:
+            main.validate_presets(chats, retired)
+        except RuntimeError as exc:
+            assert expected in str(exc), f"{name}: текст ошибки не объясняет — {exc}"
+        else:
+            raise AssertionError(f"{name}: поломка прошла молча")
+
+    # И на самом старте это тоже проверяется, а не только в тестах.
+    source = read("app/main.py")
+    assert "validate_presets(PRESET_CHATS, RETIRED_PRESETS)" in source, (
+        "проверка есть, но на импорте не зовётся"
+    )
+    return f"{len(cases)} поломок конфига падают на старте с объяснением"
+
+
+@check("«Ассистент» отозван по-настоящему: рабочий RETIRED_PRESETS, без подстановок")
+def check_assistant_retired_for_real():
+    """Стережёт саму константу, а не свою подстановку.
+
+    Проверка механизма рядом выставляет `RETIRED_PRESETS` сама, поэтому она
+    останется зелёной, даже если из рабочего набора убрать `assistant`, —
+    и «Ассистент» будет жить в базе заказчика вечно. Здесь подстановки нет:
+    чат с ключом `assistant` заводится напрямую, а удаляет его код с тем
+    набором, который лежит в `app/main.py`.
+    """
+    assert "assistant" in main.RETIRED_PRESETS, (
+        "из рабочего RETIRED_PRESETS пропал ключ «assistant» — «Ассистент» "
+        "останется в базе заказчика навсегда"
+    )
+
+    path = _temp_db("retired-real")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        registry = _restart(store)
+        # Так этот чат лежит в базе заказчика: заведён прошлой версией day.py,
+        # с тех пор переименован. PRESET_CHATS и RETIRED_PRESETS не трогаем.
+        stale = registry.create(
+            AgentSpec(preset="assistant", label="Мой ассистент", model="stub/m")
+        )
+        stale.remember("user", "привет")
+        stale.remember("assistant", "здравствуйте")
+        assert store.load_session(stale.id) is not None
+
+        before = len(main._listing()["agents"])
+        second = _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "Мой ассистент" not in after, "рабочий отзыв не убрал «Ассистента» из базы"
+    assert len(after) == before - 1, (len(after), before)
+    assert store.load_session(stale.id) is None, "строка чата осталась в базе"
+    assert second.get(stale.id) is None, "чат остался в памяти"
+    assert sorted(after) == sorted(spec.label for spec in day.CHATS), after
+    return "чат с ключом assistant удалён рабочим набором, подстановки в проверке нет"
+
+
 @check("нечитаемая отметка о заготовках не заводит их заново")
 def check_broken_presets_marker():
     """«Не читается» — это не «пусто».
@@ -2377,11 +2475,15 @@ def check_cli_session():
 
 @check("отозванная заготовка удаляется из существующей базы и не возвращается")
 def check_retired_preset_removed():
-    """«Ассистент» ушёл из day.py, но в базе заказчика он уже заведён.
+    """Механика отзыва: заготовка, убранная из day.py насовсем, уходит из базы.
 
     Просто убрать строку мало: правило «удаление строки живой чат не трогает»
-    оставило бы его сиротой, а просили удалить. Отзыв — это удаление,
-    и ключ при этом остаётся в наборе, поэтому обратно чат не заводится.
+    оставило бы её сиротой. Отзыв — это удаление, и ключ при этом остаётся
+    в наборе, поэтому обратно чат не заводится.
+
+    Ключ здесь нарочно свой, выдуманный: эта проверка про механизм, а не про
+    то, что отозвано на самом деле. За рабочую константу отвечает
+    `check_assistant_retired_for_real` — и там подстановки нет.
     """
     path = _temp_db("retired")
     store = Store(path).init()
@@ -2393,7 +2495,7 @@ def check_retired_preset_removed():
         main.RETIRED_PRESETS = ()
         main.PRESET_CHATS = [
             *saved_presets,
-            AgentSpec(preset="assistant", label="Ассистент", model="stub/m"),
+            AgentSpec(preset="отозванная-заготовка", label="Ассистент", model="stub/m"),
         ]
         registry = _restart(store)
         before = [a["label"] for a in main._listing()["agents"]]
@@ -2405,7 +2507,7 @@ def check_retired_preset_removed():
 
         # Обновились: строки в day.py больше нет, ключ отозван.
         main.PRESET_CHATS = saved_presets
-        main.RETIRED_PRESETS = ("assistant",)
+        main.RETIRED_PRESETS = ("отозванная-заготовка",)
         _restart(store)
         after = [a["label"] for a in main._listing()["agents"]]
 
@@ -2423,7 +2525,7 @@ def check_retired_preset_removed():
     assert "Ассистент" not in after, after
     assert sorted(after) == sorted(spec.label for spec in day.CHATS), after
     assert again == after, f"на следующем запуске список изменился: {again}"
-    assert "assistant" in seeded, "ключ отозванной заготовки должен остаться отмеченным"
+    assert "отозванная-заготовка" in seeded, "ключ отозванной заготовки должен остаться отмеченным"
     return f"{len(before)} чатов было, после отзыва {len(after)}, обратно не заводится"
 
 
@@ -2484,6 +2586,8 @@ CHECKS = [
     check_new_preset_appears,
     check_preset_order_changed,
     check_retired_preset_removed,
+    check_assistant_retired_for_real,
+    check_presets_validated,
     check_broken_presets_marker,
     check_legacy_bootstrap_migrated,
     check_numbering_survives_restart,
