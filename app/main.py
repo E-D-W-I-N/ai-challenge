@@ -58,30 +58,67 @@ except Exception as exc:  # noqa: BLE001 — без day.py серверу неч
         "День в ветке один, прятать ошибку не от кого — почините day.py."
     ) from exc
 
-_wrong = next((a for a in PRESET_CHATS if not isinstance(a, AgentSpec)), None)
-if _wrong is not None:
-    raise RuntimeError(
-        f"day.py: CHATS содержит {type(_wrong).__name__}, а должен — только AgentSpec"
-    )
-_labels = [a.label for a in PRESET_CHATS]
-if len(set(_labels)) != len(_labels):
-    _dupes = sorted({label for label in _labels if _labels.count(label) > 1})
-    raise RuntimeError(
-        f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(_dupes)}"
-    )
-_nameless = [a.label for a in PRESET_CHATS if not a.preset]
-if _nameless:
-    raise RuntimeError(
-        "day.py: у каждой заготовки должен быть preset — устойчивый ключ, по которому "
-        f"сервер помнит, что она заведена. Нет у: {', '.join(_nameless)}"
-    )
-_keys = [a.preset for a in PRESET_CHATS]
-if len(set(_keys)) != len(_keys):
-    _dupes = sorted({key for key in _keys if _keys.count(key) > 1})
-    raise RuntimeError(
-        f"day.py: ключи заготовок должны быть уникальны, а повторяются: {', '.join(_dupes)}. "
-        "Заготовка с чужим ключом молча не появится: сервер сочтёт её уже заведённой"
-    )
+RETIRED_PRESETS = ("assistant",)
+"""Ключи заготовок, которых в `day.py` больше нет и быть не должно.
+
+Просто убрать строку из файла для этого мало. Правило «удаление строки живой
+чат не трогает» — то, ради чего ключи и заводились: заказчик правит `day.py`,
+и заготовка, временно закомментированная там, не должна уносить переписку.
+Но «Ассистент» заказчик попросил именно удалить, а не оставить сиротой,
+и отличить одно от другого может только автор дня — здесь, в этом списке.
+
+Ключ при этом остаётся в наборе заведённых, поэтому обратно чат не заводится:
+отзыв — это удаление, а не забывание. Проход идемпотентный: после первого
+запуска удалять уже нечего.
+"""
+
+
+def validate_presets(chats: list, retired: tuple[str, ...]) -> None:
+    """Проверяет, что заготовки и отзывы не противоречат друг другу.
+
+    Отдельной функцией, а не пятью `if` на уровне модуля: так это можно
+    позвать с любыми входами и увидеть, что каждая поломка действительно
+    ловится, а не поверить, что ловится.
+    """
+    wrong = next((a for a in chats if not isinstance(a, AgentSpec)), None)
+    if wrong is not None:
+        raise RuntimeError(
+            f"day.py: CHATS содержит {type(wrong).__name__}, а должен — только AgentSpec"
+        )
+
+    labels = [a.label for a in chats]
+    if len(set(labels)) != len(labels):
+        dupes = sorted({label for label in labels if labels.count(label) > 1})
+        raise RuntimeError(
+            f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(dupes)}"
+        )
+
+    nameless = [a.label for a in chats if not a.preset]
+    if nameless:
+        raise RuntimeError(
+            "day.py: у каждой заготовки должен быть preset — устойчивый ключ, по которому "
+            f"сервер помнит, что она заведена. Нет у: {', '.join(nameless)}"
+        )
+
+    keys = [a.preset for a in chats]
+    if len(set(keys)) != len(keys):
+        dupes = sorted({key for key in keys if keys.count(key) > 1})
+        raise RuntimeError(
+            f"day.py: ключи заготовок должны быть уникальны, а повторяются: {', '.join(dupes)}. "
+            "Заготовка с чужим ключом молча не появится: сервер сочтёт её уже заведённой"
+        )
+
+    contradictory = sorted(set(keys) & set(retired))
+    if contradictory:
+        raise RuntimeError(
+            f"ключи {', '.join(contradictory)} и отозваны, и есть в day.py. Такой чат "
+            "удалялся бы на каждом старте и молча не заводился обратно: отзыв сильнее "
+            "строки в файле. Уберите ключ из RETIRED_PRESETS, если заготовка нужна, "
+            "или строку из day.py, если нет"
+        )
+
+
+validate_presets(PRESET_CHATS, RETIRED_PRESETS)
 
 NEW_CHAT_SPEC = AgentSpec(
     label="Новый чат",
@@ -198,6 +235,32 @@ def _loads_presets(raw: str) -> set[str] | None:
     return set(parsed)
 
 
+def retire_presets() -> list[str]:
+    """Удаляет чаты отозванных заготовок — из памяти и из базы.
+
+    Ищет их по `preset` в сохранённом конфиге, а не по имени: чат могли
+    переименовать, и он всё равно тот самый.
+    """
+    if not RETIRED_PRESETS:
+        return []
+    store = REGISTRY.store
+    removed = []
+    for row in store.list_sessions():
+        preset = (row["config"] or {}).get("preset")
+        if preset in RETIRED_PRESETS and REGISTRY.kill(row["id"]):
+            removed.append(row["id"])
+    if removed:
+        # warning, а не info: это единственное место, где сервер удаляет чужие
+        # чаты сам, и в терминале uvicorn это должно быть видно. INFO туда
+        # не доходит — у корневого логгера нет обработчика.
+        LOG.warning(
+            "заготовки %s отозваны — удалено чатов: %d",
+            ", ".join(sorted(RETIRED_PRESETS)),
+            len(removed),
+        )
+    return removed
+
+
 def bootstrap_chats() -> list[Agent]:
     """Заводит заготовки из day.py, которых база ещё не заводила.
 
@@ -215,6 +278,8 @@ def bootstrap_chats() -> list[Agent]:
       в наборе ещё нет.
 
     Если набор не читается, не заводится ничего: см. `_seeded_presets`.
+    Заготовки, отозванные из `day.py` насовсем, убираются здесь же:
+    см. `RETIRED_PRESETS`.
     """
     seeded = _seeded_presets()
     if seeded is None:
@@ -233,6 +298,7 @@ def bootstrap_chats() -> list[Agent]:
         )
         return []
 
+    retire_presets()
     fresh = [spec for spec in PRESET_CHATS if spec.preset not in seeded]
     created = [REGISTRY.create(spec) for spec in fresh]
     # Отмечаем весь сегодняшний day.py, а не только заведённое сейчас: набор
