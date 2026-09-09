@@ -1188,17 +1188,17 @@ def check_list_survives_restart():
         # Перезапуск: новый реестр на том же файле, как новый процесс.
         second = AgentRegistry(max_agents=1000, store=store)
         main.REGISTRY = second
-        second.restore_all()
         main.ensure_roster()
+        listing = main._listing()
     finally:
         main.REGISTRY = saved_registry
 
-    labels = [a.spec.label for a in second.list()]
+    labels = [a["label"] for a in listing["agents"]]
     assert len(labels) == len(set(labels)), f"ростер задвоился: {sorted(labels)}"
-    assert len(second) == roster_count + 1, (len(second), roster_count)
+    assert len(labels) == roster_count + 1, (len(labels), roster_count)
     assert "Мой чат" in labels and labels.count("День 3 · Пошагово") == 1, labels
 
-    revived_chat = next(a for a in second.list() if a.spec.label == "Мой чат")
+    revived_chat = second.require(next(a["id"] for a in listing["agents"] if a["label"] == "Мой чат"))
     assert [t.content for t in revived_chat.history] == ["привет", "и тебе привет"]
     revived_day = second.require(talked)
     assert revived_day.spec.top_p == 0.42, revived_day.spec.top_p
@@ -1207,7 +1207,115 @@ def check_list_survives_restart():
     # Порядок списка тот же: группы дней не перемешались.
     assert labels[: len(day.AGENTS)] == [a.label for a in day.AGENTS], labels[:3]
     store.close()
-    return f"{len(second)} агентов после рестарта, дубликатов нет, правки и переписка на месте"
+    return f"{len(labels)} агентов после рестарта, дубликатов нет, правки и переписка на месте"
+
+
+@check("переименованный агент ростера не задваивается на следующем запуске")
+def check_renamed_roster_not_duplicated():
+    """Заказчик открывает агента дня, правит имя в панели — и перезапускает стенд.
+
+    По имени ростер своих больше не узнаёт: имя правится. Опознавательный знак —
+    `origin`, его снаружи не задать и в панели не поменять.
+    """
+    from app.registry import AgentRegistry
+
+    _stub.install(reply="ответ дня три")
+    path = _temp_db("rename")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        first = AgentRegistry(max_agents=1000, store=store)
+        main.REGISTRY = first
+        main.ensure_roster()
+        before = len(main._listing()["agents"])
+
+        with TestClient(main.app) as client:
+            target = next(
+                a for a in client.get("/api/agents").json()["agents"]
+                if a["label"] == "День 3 · Прямо (vs пошагово)"
+            )
+            renamed = client.patch(
+                f"/api/agents/{target['id']}", json={"label": "Мой любимый агент"}
+            )
+            assert renamed.status_code == 200, renamed.text
+            client.post(f"/api/agents/{target['id']}/messages", json={"text": "вопрос"})
+
+        # Перезапуск процесса: новый реестр на том же файле.
+        second = AgentRegistry(max_agents=1000, store=store)
+        main.REGISTRY = second
+        main.ensure_roster()
+        listing = main._listing()
+    finally:
+        main.REGISTRY = saved_registry
+
+    labels = [a["label"] for a in listing["agents"]]
+    assert len(labels) == before, (
+        f"после переименования список вырос с {before} до {len(labels)}: "
+        f"лишние {sorted(set(labels) - {spec.label for spec in day.AGENTS})}"
+    )
+    assert "День 3 · Прямо (vs пошагово)" not in labels, "рядом завёлся второй, пустой"
+    assert labels.count("Мой любимый агент") == 1, labels
+
+    survivor = second.require(target["id"])
+    assert survivor.spec.label == "Мой любимый агент"
+    assert survivor.spec.origin == "День 3 · Прямо (vs пошагово)", survivor.spec.origin
+    assert [t.content for t in survivor.history] == ["вопрос", "ответ дня три"], survivor.history
+
+    # И подсунуть origin снаружи нельзя: иначе чат притворился бы агентом дня.
+    with TestClient(main.app) as client:
+        sneaky = client.post(
+            "/api/agents",
+            json={"agent": {"model": "stub/m", "label": "х", "origin": "День 1 · Ответ"}},
+        )
+        assert sneaky.status_code == 200, sneaky.text
+    store.close()
+    return "переименованный агент один, история при нём, origin снаружи не задать"
+
+
+@check("сессий больше потолка реестра: все видны в списке и любая открывается")
+def check_list_beyond_cap():
+    """Список слева — единственный способ добраться до диалога.
+
+    Если строить его по памяти, всё, что не поместилось в реестр, пропадёт
+    с экрана, хотя в базе лежит целым. Молча потерянный чат — ровно то,
+    против чего этот день.
+    """
+    from app.registry import AgentRegistry
+
+    _stub.install(reply="ответ")
+    path = _temp_db("beyond-cap")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        registry = AgentRegistry(max_agents=3, store=store)
+        main.REGISTRY = registry
+        made = []
+        for i in range(10):
+            agent = registry.create(AgentSpec(label=f"чат {i}", model="stub/m"))
+            asyncio.run(drain(agent.ask(f"вопрос {i}")))
+            made.append(agent.id)
+
+        assert len(registry) <= 3, f"в памяти {len(registry)} при потолке 3"
+        assert registry.evicted >= 7, registry.evicted
+
+        listing = main._listing()
+        ids = [a["id"] for a in listing["agents"]]
+        assert ids == made, f"в списке {len(ids)} из {len(made)} сессий: {ids}"
+        assert listing["stored"] == 10 and listing["live"] <= 3, listing["stored"]
+        # Длина истории у выгруженных берётся из базы, а не обнуляется.
+        assert all(a["history_len"] == 2 for a in listing["agents"]), [
+            a["history_len"] for a in listing["agents"]
+        ]
+
+        # Любую можно открыть — она поднимется из базы вместе с перепиской.
+        with TestClient(main.app) as client:
+            body = client.get(f"/api/agents/{made[0]}").json()
+        texts = [t["content"] for t in body["transcript"] if not t.get("seed")]
+        assert texts == ["вопрос 0", "ответ"], texts
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+    return "10 сессий при потолке 3: все в списке, длина истории на месте, любая открывается"
 
 
 @check("вытеснение — выгрузка, а не удаление: сессия остаётся в базе")
@@ -1596,6 +1704,8 @@ CHECKS = [
     check_reasoning_not_stored,
     check_regenerate_failure_db,
     check_list_survives_restart,
+    check_renamed_roster_not_duplicated,
+    check_list_beyond_cap,
     check_eviction_keeps_session,
     check_detached_does_not_clobber,
     check_parallel_writes,

@@ -13,9 +13,11 @@
   в базе остаётся, и `require()` поднимет сессию обратно с её историей;
 * **удаление — это удаление**: `kill()` стирает и из памяти, и из базы.
 
-`restore_all()` на старте процесса поднимает сохранённые сессии обратно
-в память — именно поэтому список слева после перезапуска выглядит так же,
-как до него, и переписка в нём на месте.
+Список слева строится **по базе**, а не по памяти: `catalogue()` отдаёт все
+сохранённые сессии, подставляя живой объект там, где он есть. Иначе сессии
+сверх потолка реестра просто исчезли бы из списка, хотя лежат в базе целыми, —
+а список слева теперь единственный способ добраться до диалога. В память
+сессия поднимается при открытии, `require()`.
 
 Потолок на число живых агентов обязателен и после появления базы: процесс
 стенда живёт часами, новые чаты копятся, и без вытеснения реестр течёт.
@@ -26,7 +28,7 @@ from __future__ import annotations
 import os
 from typing import Iterable
 
-from .agent import Agent, reserve_ids
+from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config
 from .schema import AgentSpec
 from .store import Store, shared_store
 
@@ -119,29 +121,74 @@ class AgentRegistry:
         # Место освобождаем до создания: поднятая сессия встаёт в общую очередь
         # на вытеснение, а не живёт сверх потолка.
         self._make_room(1)
-        agent = Agent(_placeholder(saved), agent_id=saved["id"], store=self.store)
+        agent = Agent(_spec_from_row(saved), agent_id=saved["id"], store=self.store)
         self._agents[agent.id] = agent
         return agent
 
-    def restore_all(self) -> list[Agent]:
-        """Поднимает сохранённые сессии в память — на старте процесса.
-
-        Без этого список слева после перезапуска был бы пуст: он строится по
-        живым агентам. Порядок сохраняется через `created_at`, поэтому и группы
-        дней, и чаты пользователя встают на прежние места. Свежие сессии идут
-        первыми: если сохранённого больше потолка, в памяти окажутся те, с
-        которыми говорили недавно, а остальные поднимутся при обращении.
-        """
-        rows = self.store.list_sessions(limit=self.max_agents)
-        return [agent for row in rows if (agent := self.load(row["id"])) is not None]
-
-    def sessions(self, *, limit: int = 500) -> list[dict]:
+    def sessions(self, *, limit: int = 1000) -> list[dict]:
         """Все сохранённые сессии, а не только живые в процессе."""
         live = set(self._agents)
         rows = self.store.list_sessions(limit=limit)
         for row in rows:
             row["live"] = row["id"] in live
         return rows
+
+    def catalogue(self, *, limit: int = 1000) -> list[dict]:
+        """Список слева: каждая сохранённая сессия одной записью, в порядке заведения.
+
+        Живой агент описывает себя сам — у него точные `busy` и длина истории.
+        Выгруженная сессия описывается по строке из базы тем же форматом:
+        клиент не должен различать «поднято в память» и «лежит в базе», для
+        него это один список, и открывается из него любая запись.
+        """
+        entries = []
+        for row in self.store.list_sessions(limit=limit):
+            live = self._agents.get(row["id"])
+            if live is not None:
+                entries.append(live.as_dict())
+                continue
+            spec = _spec_from_row(row)
+            entries.append(
+                spec_as_dict(
+                    spec,
+                    agent_id=row["id"],
+                    history_len=row["history_len"],
+                    created_at=row["created_at"],
+                    last_used_at=row["updated_at"],
+                )
+            )
+        entries.sort(key=lambda entry: entry["created_at"])
+        return entries
+
+    def origins(self) -> set[str]:
+        """Какие конфиги ростера уже подняты — по всем сохранённым сессиям.
+
+        Именно по базе и именно по `origin`, а не по имени: имя правится
+        в панели справа, и переименованный агент дня перестал бы совпадать
+        со своим конфигом. На следующем старте рядом с ним завёлся бы второй.
+        """
+        found = set()
+        for row in self.store.list_sessions(limit=10_000):
+            origin = (row["config"] or {}).get("origin")
+            if origin:
+                found.add(origin)
+        return found
+
+    def delete_where(self, keep_roster: bool = True) -> list[str]:
+        """Стирает чаты пользователя — все, а не только поднятые в память.
+
+        «Очистить все чаты» после перезапуска обязана дотянуться и до тех
+        сессий, которых сейчас нет в памяти: в списке слева они видны, значит
+        и уйти должны вместе с остальными.
+        """
+        killed = []
+        for row in self.store.list_sessions(limit=10_000):
+            is_roster = bool((row["config"] or {}).get("group"))
+            if keep_roster and is_roster:
+                continue
+            if self.kill(row["id"]):
+                killed.append(row["id"])
+        return killed
 
     # --- чтение --------------------------------------------------------------
 
@@ -228,17 +275,24 @@ class AgentRegistry:
                 self.evicted += 1
 
 
-def _placeholder(saved: dict) -> AgentSpec:
-    """Минимальный конфиг под восстановление: настоящий приедет из базы.
+def _spec_from_row(saved: dict) -> AgentSpec:
+    """Конфиг сохранённой сессии из строки базы.
 
-    `Agent` в конструкторе перечитывает конфиг сохранённой сессии сам, но
-    что-то передать ему надо: датакласс требует модель и имя.
+    Разбор конфига один на весь стенд — тот же, которым агент восстанавливает
+    себя в конструкторе: незнакомые ключи отбрасываются молча, потому что базу
+    мог записать стенд другой версии, и падать на чужом поле значит потерять
+    весь список.
     """
-    config = saved.get("config") or {}
-    return AgentSpec(
-        label=saved.get("label") or "Чат",
-        model=str(config.get("model") or "openai/gpt-4o-mini"),
-    )
+    fallback = AgentSpec(label=saved.get("label") or "Чат", model=_UNKNOWN_MODEL)
+    return spec_from_config(saved.get("config") or {}, fallback=fallback)
+
+
+_UNKNOWN_MODEL = "openai/gpt-4o-mini"
+"""Чем заменить модель, если в сохранённом конфиге её нет.
+
+Строка сессии без модели — это или чужая версия схемы, или недописанная
+строка. Показать такую сессию в списке всё равно надо: в ней лежит переписка.
+"""
 
 
 REGISTRY = AgentRegistry()

@@ -234,7 +234,7 @@ class Agent:
             # и агент просто заводит себе строку.
             saved = store.load_session(self.id) if agent_id else None
             if saved is not None:
-                self.spec = _spec_from_config(saved["config"], fallback=self.spec)
+                self.spec = spec_from_config(saved["config"], fallback=self.spec)
                 self.created_at = saved["created_at"]
                 self.last_used_at = saved["updated_at"]
                 self.seed_messages = [dict(m) for m in saved["seed"]]
@@ -442,27 +442,14 @@ class Agent:
         return seed + [turn.as_dict() for turn in self.history]
 
     def as_dict(self, *, with_transcript: bool = False) -> dict:
-        data = {
-            "id": self.id,
-            "label": self.spec.label,
-            "model": self.spec.model,
-            "stop": self.spec.stop,
-            "response_format": self.spec.response_format,
-            "extra_body": self.spec.extra_body,
-            "system": self.spec.system,
-            "draft": self.spec.draft,
-            "group": self.spec.group,
-            "note": self.spec.note,
-            "history_limit": self.history_limit,
-            "history_len": len(self.history),
-            "busy": self.busy,
-            "created_at": self.created_at,
-            "last_used_at": self.last_used_at,
-        }
-        # Параметры сэмплирования уходят наружу как есть, включая None:
-        # панель справа отличает «не задано» от нуля, и ей нужно и то и другое.
-        for name in SAMPLING_FIELDS:
-            data[name] = getattr(self.spec, name)
+        data = spec_as_dict(
+            self.spec,
+            agent_id=self.id,
+            history_len=len(self.history),
+            created_at=self.created_at,
+            last_used_at=self.last_used_at,
+            busy=self.busy,
+        )
         if with_transcript:
             data["seed_messages"] = self.starting_prompt()
             data["transcript"] = self.transcript()
@@ -637,7 +624,7 @@ class Agent:
 _SPEC_FIELDS = {f.name for f in fields(AgentSpec)}
 
 
-def _spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
+def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
     """Конфиг из базы обратно в `AgentSpec`.
 
     Незнакомые ключи отбрасываются молча: базу мог записать стенд другой
@@ -650,3 +637,44 @@ def _spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
         return fallback
     known.setdefault("label", fallback.label)
     return AgentSpec(**known)
+
+
+def spec_as_dict(
+    spec: AgentSpec,
+    *,
+    agent_id: str,
+    history_len: int,
+    created_at: float,
+    last_used_at: float,
+    busy: bool = False,
+) -> dict:
+    """Конфиг агента в том виде, в каком его ждёт список слева и панель справа.
+
+    Отдельной функцией, а не методом, потому что тем же форматом описывается
+    и сессия, которой сейчас нет в памяти: список слева строится по базе,
+    и строка выгруженной сессии обязана выглядеть ровно так же, как строка
+    живого агента, — иначе клиенту пришлось бы знать про два разных вида
+    записи и различать их.
+    """
+    data = {
+        "id": agent_id,
+        "label": spec.label,
+        "model": spec.model,
+        "stop": spec.stop,
+        "response_format": spec.response_format,
+        "extra_body": spec.extra_body,
+        "system": spec.system,
+        "draft": spec.draft,
+        "group": spec.group,
+        "note": spec.note,
+        "history_limit": effective_history_limit(spec.history_limit),
+        "history_len": history_len,
+        "busy": busy,
+        "created_at": created_at,
+        "last_used_at": last_used_at,
+    }
+    # Параметры сэмплирования уходят наружу как есть, включая None:
+    # панель справа отличает «не задано» от нуля, и ей нужно и то и другое.
+    for name in SAMPLING_FIELDS:
+        data[name] = getattr(spec, name)
+    return data
