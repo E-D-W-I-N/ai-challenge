@@ -1199,7 +1199,7 @@ def check_spec_deep_copy():
     assert "order" not in shared.extra_body["provider"], shared.extra_body
     assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
     assert shared.messages[0]["content"] == "СИС", shared.messages
-    return "правка у одного агента не задела ни день, ни соседа"
+    return "правка у одного агента не задела ни общий конфиг, ни соседа"
 
 
 @check("вытеснение по потолку берёт самых старых простаивающих и щадит занятых")
