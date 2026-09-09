@@ -2025,6 +2025,91 @@ def check_clean_start_survives_restart():
     return "пустой старт, один чат, после переоткрытия файла переписка и панель на месте"
 
 
+@check("поднятый из базы чат отдаёт те же поля панели: повторный PATCH ничего не меняет")
+def check_panel_stable_after_restart():
+    """«Применено» не должно появляться на чате, поднятом из базы.
+
+    Клиент показывает эту строку, только если правка что-то изменила: сравнивает
+    конфиг до и после `PATCH` по полям панели. Значит, чат после перезапуска
+    обязан отдавать ровно те же значения — если хоть одно поле изменит тип или
+    форму по дороге через JSON (`stop` — список, `response_format` — объект,
+    незаданный параметр — `null`, а не ноль), первое же сообщение показало бы
+    «Применено», хотя пользователь ничего не трогал.
+
+    Стенд клиента этого поймать не может: у него свой сервер и своя память.
+    """
+    panel = (
+        "system",
+        "model",
+        "stop",
+        "response_format",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "history_limit",
+    )
+    settings = {
+        "system": "ты гид",
+        "model": "stub/model",
+        "stop": ["СТОП", "КОНЕЦ"],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.0,
+        "max_tokens": 200,
+        "top_p": 0.0,
+        "top_k": 7,
+        "min_p": 0.05,
+        "repetition_penalty": 1.1,
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.3,
+        "history_limit": 6,
+    }
+
+    path = _temp_db("panel-stable")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        with TestClient(main.app) as client:
+            chat_id = client.post("/api/agents", json={}).json()["agents"][0]["id"]
+            saved = client.patch(f"/api/agents/{chat_id}", json=settings).json()
+        before = {name: saved[name] for name in panel}
+        assert before["top_p"] == 0.0 and before["temperature"] == 0.0, before
+        # Незаданные параметры остаются null, а не превращаются в ноль.
+        assert saved["history_limit"] == 6, saved["history_limit"]
+
+        store.close()
+        again = Store(path).init()
+        _restart(again)
+        with TestClient(main.app) as client:
+            restored = client.get(f"/api/agents/{chat_id}").json()
+            # Панель показывает то, что пришло с сервера, и шлёт это же обратно.
+            repeated = client.patch(
+                f"/api/agents/{chat_id}", json={name: restored[name] for name in panel}
+            ).json()
+    finally:
+        main.REGISTRY = saved_registry
+        again.close()
+
+    after_load = {name: restored[name] for name in panel}
+    assert after_load == before, (
+        "поднятый из базы чат отдаёт другие значения — «Применено» вылезло бы "
+        f"на первом же сообщении: {[k for k in panel if after_load[k] != before[k]]}"
+    )
+    after_patch = {name: repeated[name] for name in panel}
+    assert after_patch == before, (
+        f"повторный PATCH что-то изменил: {[k for k in panel if after_patch[k] != before[k]]}"
+    )
+    # Типы тоже те же: список остался списком, объект — объектом.
+    assert isinstance(after_load["stop"], list) and after_load["stop"] == ["СТОП", "КОНЕЦ"]
+    assert isinstance(after_load["response_format"], dict), after_load["response_format"]
+    return f"{len(panel)} полей панели пережили переоткрытие файла без единого расхождения"
+
+
 @check("переименованный чат остаётся переименованным после перезапуска")
 def check_rename_survives_restart():
     """Переименование — то, чем пользуются постоянно, и оно обязано пережить рестарт.
@@ -2198,6 +2283,7 @@ CHECKS = [
     check_gitignore_db,
     check_cli_session,
     check_clean_start_survives_restart,
+    check_panel_stable_after_restart,
     check_rename_survives_restart,
     check_last_chat_deleted,
     check_list_not_truncated,

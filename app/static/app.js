@@ -1001,6 +1001,39 @@ function saveStatus(text, isError) {
 // выбор в списке. Отдельной кнопки «Сохранить» нет намеренно: про неё легко
 // забыть, и тогда правка системного промпта молча не доезжает до модели —
 // ровно на это и жаловались.
+// Одинаковы ли два значения конфига. Не `==` и не `JSON.stringify`:
+// у полей панели разные типы, и каждый врёт по-своему.
+//
+// `null` — это «параметр не отправлять», и он не равен ни нулю, ни пустой
+// строке: `provider.require_parameters` включён, и заданный `top_p: 0`
+// сужает список провайдеров, а незаданный — нет. `==` их бы уравнял.
+// Стоп-строки — список, формат ответа — объект; их сравнивают поэлементно,
+// а не по ссылке. Порядок ключей в объекте от провайдера не гарантирован,
+// поэтому `JSON.stringify` тоже не годится.
+function sameValue(a, b) {
+  const empty = (v) => v === null || v === undefined;
+  if (empty(a) || empty(b)) return empty(a) && empty(b);
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, i) => sameValue(item, b[i]));
+  }
+  if (typeof a === "object" || typeof b === "object") {
+    if (typeof a !== "object" || typeof b !== "object") return false;
+    const keys = Object.keys(a);
+    if (keys.length !== Object.keys(b).length) return false;
+    return keys.every((k) => Object.prototype.hasOwnProperty.call(b, k) && sameValue(a[k], b[k]));
+  }
+  return a === b;
+}
+
+// Изменила ли правка хоть что-нибудь. Сравниваются только поля панели:
+// в ответе ручки едет ещё и то, что живёт своей жизнью, — стенограмма,
+// длина истории, занятость, — и по ним «изменилось» было бы правдой всегда.
+function configChanged(before, after, fields) {
+  if (!before) return true;
+  return fields.some((name) => !sameValue(before[name], after[name]));
+}
+
 // Что сейчас набрано в панели. Бросает, если поле не разобрать.
 function readPanel() {
   const patch = {
@@ -1083,6 +1116,12 @@ function applySettings() {
   renderWarnings();
 
   const id = state.current.id;
+  // Слепок до правки: пролив теперь идёт перед каждой отправкой, и без него
+  // «Применено» появлялось бы на каждое сообщение, даже когда пользователь
+  // ничего не трогал. Инвариант тут ни при чём — проливать надо всегда,
+  // сообщать не о чем.
+  const before = { ...state.current };
+  const fields = Object.keys(patch);
   state.applying = (async () => {
     try {
       const updated = await api("/api/agents/" + id, json("PATCH", patch));
@@ -1092,7 +1131,13 @@ function applySettings() {
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
       state.panelDirty = false;
-      saveStatus("Применено — со следующего сообщения.");
+      // Сравнивается не панель с панелью, а конфиг агента до и после:
+      // сервер по дороге нормализует (пустой список стоп-строк становится
+      // `null`), и панель, разошедшаяся с агентом только формой записи,
+      // изменением не является.
+      if (configChanged(before, updated, fields)) {
+        saveStatus("Применено — со следующего сообщения.");
+      }
     } catch (err) {
       // Правка не доехала. Забыть про неё нельзя: в панели у пользователя
       // одно, у агента другое, а `change` уже отработал и сам не повторится.
@@ -1410,5 +1455,7 @@ if (typeof module === "undefined") {
     readStopLines,
     parseResponseFormat,
     paramWarnings,
+    sameValue,
+    configChanged,
   };
 }
