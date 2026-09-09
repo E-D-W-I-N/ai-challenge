@@ -125,7 +125,7 @@ class AgentRegistry:
         self._agents[agent.id] = agent
         return agent
 
-    def sessions(self, *, limit: int = 1000) -> list[dict]:
+    def sessions(self, *, limit: int | None = None) -> list[dict]:
         """Все сохранённые сессии, а не только живые в процессе."""
         live = set(self._agents)
         rows = self.store.list_sessions(limit=limit)
@@ -133,16 +133,21 @@ class AgentRegistry:
             row["live"] = row["id"] in live
         return rows
 
-    def catalogue(self, *, limit: int = 1000) -> list[dict]:
+    def catalogue(self) -> list[dict]:
         """Список слева: каждая сохранённая сессия одной записью, в порядке заведения.
 
         Живой агент описывает себя сам — у него точные `busy` и длина истории.
         Выгруженная сессия описывается по строке из базы тем же форматом:
         клиент не должен различать «поднято в память» и «лежит в базе», для
         него это один список, и открывается из него любая запись.
+
+        Потолка у списка нет намеренно. Любая обрезка здесь была бы молчаливой,
+        а резала бы по времени последней записи — то есть первыми исчезали бы
+        агенты дней 1–5, с которыми ещё не говорили. День про то, что ничего
+        не теряется, и список это обещание держит целиком.
         """
         entries = []
-        for row in self.store.list_sessions(limit=limit):
+        for row in self.store.list_sessions():
             live = self._agents.get(row["id"])
             if live is not None:
                 entries.append(live.as_dict())
@@ -168,7 +173,7 @@ class AgentRegistry:
         со своим конфигом. На следующем старте рядом с ним завёлся бы второй.
         """
         found = set()
-        for row in self.store.list_sessions(limit=10_000):
+        for row in self.store.list_sessions():
             origin = (row["config"] or {}).get("origin")
             if origin:
                 found.add(origin)
@@ -182,7 +187,7 @@ class AgentRegistry:
         и уйти должны вместе с остальными.
         """
         killed = []
-        for row in self.store.list_sessions(limit=10_000):
+        for row in self.store.list_sessions():
             is_roster = bool((row["config"] or {}).get("group"))
             if keep_roster and is_roster:
                 continue

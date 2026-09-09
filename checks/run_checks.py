@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1318,6 +1319,63 @@ def check_list_beyond_cap():
     return "10 сессий при потолке 3: все в списке, длина истории на месте, любая открывается"
 
 
+@check("список не обрезается: тысяча с лишним сессий видна целиком, ростер на месте")
+def check_list_not_truncated():
+    """Обрезка списка была бы молчаливой, а резала бы по времени записи.
+
+    Первыми выпали бы агенты дней 1–5, с которыми ещё не говорили: у них самый
+    старый `updated_at`. То есть ровно то, ради чего список и открывают.
+    """
+    from app.registry import AgentRegistry
+
+    path = _temp_db("no-cap")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        registry = AgentRegistry(max_agents=5, store=store)
+        main.REGISTRY = registry
+        roster = main.ensure_roster()
+        assert roster, "ростер должен подняться"
+
+        # Тысяча с лишним чатов поверх ростера. Пишем прямо в базу: проверяем
+        # список, а не спавн, и тысяча живых агентов ей для этого не нужна.
+        made = 1200
+        now = time.time()
+        with store.bulk():
+            for i in range(made):
+                store.save_session(
+                    f"chat_{i:05d}",
+                    label=f"чат {i}",
+                    config={"model": "stub/m", "label": f"чат {i}"},
+                    seed=[],
+                    created_at=now + i,
+                )
+
+        entries = main._listing()["agents"]
+        assert len(entries) == made + len(day.AGENTS), (
+            f"в списке {len(entries)} из {made + len(day.AGENTS)} сессий — список обрезан"
+        )
+
+        # Агенты дней 1–5 никуда не делись: у них самый старый updated_at,
+        # и любая обрезка снесла бы именно их.
+        labels = {entry["label"] for entry in entries}
+        for group_labels in PAST_DAYS.values():
+            for label in group_labels:
+                assert label in labels, f"«{label}» вытеснен из списка обрезкой"
+        # И они по-прежнему первые: порядок держится на created_at.
+        assert [e["label"] for e in entries[: len(day.AGENTS)]] == [
+            spec.label for spec in day.AGENTS
+        ], [e["label"] for e in entries[:3]]
+
+        # Любая из дальних сессий открывается — она не декорация в списке.
+        far = entries[-1]
+        assert main.REGISTRY.require(far["id"]).spec.label == far["label"]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+    return f"{made} чатов плюс ростер — в списке все, агенты дней 1–5 первыми"
+
+
 @check("вытеснение — выгрузка, а не удаление: сессия остаётся в базе")
 def check_eviction_keeps_session():
     from app.registry import AgentRegistry
@@ -1706,6 +1764,7 @@ CHECKS = [
     check_list_survives_restart,
     check_renamed_roster_not_duplicated,
     check_list_beyond_cap,
+    check_list_not_truncated,
     check_eviction_keeps_session,
     check_detached_does_not_clobber,
     check_parallel_writes,

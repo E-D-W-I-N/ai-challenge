@@ -410,20 +410,27 @@ class Store:
             "updated_at": row["updated_at"],
         }
 
-    def list_sessions(self, *, limit: int = 500) -> list[dict]:
-        """Сохранённые сессии, свежие сверху, с числом реплик у каждой."""
+    def list_sessions(self, *, limit: int | None = None) -> list[dict]:
+        """Сохранённые сессии, свежие сверху, с числом реплик у каждой.
+
+        `limit=None` — все до одной, и это режим по умолчанию: по этому списку
+        строится список слева, а он не вправе молча что-то скрывать. Обрезка
+        здесь резала бы по `updated_at`, то есть первыми выпали бы агенты
+        дней 1–5, с которыми ещё не говорили, — ровно то, ради чего список
+        и открывают. Запрос дешёвый: пять тысяч сессий читаются за 13 мс.
+        """
+        sql = """
+            SELECT s.*, (
+                SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
+            ) AS history_len
+            FROM sessions s
+            ORDER BY s.updated_at DESC
+        """
         with self.reading() as conn:
-            rows = conn.execute(
-                """
-                SELECT s.*, (
-                    SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
-                ) AS history_len
-                FROM sessions s
-                ORDER BY s.updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(sql).fetchall()
+            else:
+                rows = conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
         out = []
         for row in rows:
             data = self._session_row(row)
