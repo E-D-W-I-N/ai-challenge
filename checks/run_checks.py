@@ -4,7 +4,7 @@
 
 Главные критерии вынесены в отдельные скрипты и запускаются отсюда же:
 `checks/spawn_100.py` — сотня агентов в одном процессе, `checks/restart.py` —
-диалог, переживший перезапуск программы, `checks/two_processes.py` — стенд
+диалог, переживший перезапуск программы, `checks/two_processes.py` — сервер
 и консоль на одной базе.
 
 База каждой проверке достаётся своя: `_stub.install_offline()` уводит
@@ -33,6 +33,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _stub.install_offline()
 
+from dataclasses import replace  # noqa: E402
+
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
 import day  # noqa: E402
@@ -48,7 +50,7 @@ def check(name):
         def run():
             _stub.reset()
             REGISTRY.kill_all()
-            main.ensure_roster()
+            main.bootstrap_chats()
             try:
                 detail = fn() or ""
                 RESULTS.append((name, True, detail))
@@ -101,33 +103,33 @@ def check_spawn_100():
 
 # --- 2. агенты дней 1–5 -------------------------------------------------------
 
-# Имя агента ростера → колонка того дня. Порядок в списке значим: он и есть
+# Имя заготовленного чата → колонка того дня. Порядок в списке значим: он и есть
 # соответствие «колонка ↔ агент», по нему идёт сверка.
 PAST_DAYS = {
-    "origin/day-01": ["День 1 · Ответ"],
+    "origin/day-01": ["День 1: Ответ"],
     "origin/day-02": [
-        "День 2 · A. Свободный ответ (формат)",
-        "День 2 · B. + response_format",
-        "День 2 · A. Свободный ответ (длина)",
-        "День 2 · B. + max_tokens",
-        "День 2 · A. Свободный ответ (стоп)",
-        "День 2 · B. + stop",
+        "День 2: A. Свободный ответ (формат)",
+        "День 2: B. + response_format",
+        "День 2: A. Свободный ответ (длина)",
+        "День 2: B. + max_tokens",
+        "День 2: A. Свободный ответ (стоп)",
+        "День 2: B. + stop",
     ],
     "origin/day-03": [
-        "День 3 · Прямо (vs пошагово)",
-        "День 3 · Пошагово",
-        "День 3 · Прямо (промпт себе)",
-        "День 3 · Модель пишет промпт",
-        "День 3 · Ответ по своему промпту",
-        "День 3 · Аналитик данных",
-        "День 3 · Курьер-практик",
-        "День 3 · Юрист по рекламе",
+        "День 3: Прямо (vs пошагово)",
+        "День 3: Пошагово",
+        "День 3: Прямо (промпт себе)",
+        "День 3: Модель пишет промпт",
+        "День 3: Ответ по своему промпту",
+        "День 3: Аналитик данных",
+        "День 3: Курьер-практик",
+        "День 3: Юрист по рекламе",
     ],
-    "origin/day-04": ["День 4 · t = 0.0", "День 4 · t = 0.7", "День 4 · t = 1.2"],
+    "origin/day-04": ["День 4: t = 0.0", "День 4: t = 0.7", "День 4: t = 1.2"],
     "origin/day-05": [
-        "День 5 · Слабая · llama-3.1-8b",
-        "День 5 · Средняя · mistral-small-3.2-24b",
-        "День 5 · Сильная · gemini-3.1-flash-lite",
+        "День 5: Слабая · llama-3.1-8b",
+        "День 5: Средняя · mistral-small-3.2-24b",
+        "День 5: Сильная · gemini-3.1-flash-lite",
     ],
 }
 
@@ -136,7 +138,7 @@ TRANSFERRED = ("model", "temperature", "max_tokens", "stop", "response_format", 
 
 @check("конфиги дней 1–5 перенесены дословно: сверка с day.py каждой ветки")
 def check_past_days_transfer():
-    roster = {spec.label: spec for spec in day.AGENTS}
+    preset = {spec.label: spec for spec in day.CHATS}
     checked = 0
     for branch, labels in PAST_DAYS.items():
         columns = _daysrc.columns(branch)
@@ -145,8 +147,8 @@ def check_past_days_transfer():
             "колонка потерялась или добавилась лишняя"
         )
         for column, label in zip(columns, labels):
-            spec = roster.get(label)
-            assert spec is not None, f"в ростере нет агента «{label}»"
+            spec = preset.get(label)
+            assert spec is not None, f"в day.py нет чата «{label}»"
             for field in TRANSFERRED:
                 assert getattr(spec, field) == getattr(column, field), (
                     f"{label} :: {field}: у нас {getattr(spec, field)!r}, "
@@ -159,20 +161,37 @@ def check_past_days_transfer():
     return f"{checked} колонок из пяти веток, по {len(TRANSFERRED) + 2} поля — совпало всё"
 
 
-@check("агенты дней 1–5 подняты на старте процесса и сгруппированы по дням")
-def check_roster_live():
+@check("список плоский: чаты дней 1–5 подняты и ничем не отличаются от прочих")
+def check_flat_list():
     with TestClient(main.app) as client:
         data = client.get("/api/agents").json()
-    live = {a["label"]: a for a in data["agents"]}
-    for labels in PAST_DAYS.values():
-        for label in labels:
-            assert label in live, f"агент «{label}» не поднялся"
-            assert live[label]["group"], f"у «{label}» нет группы — он потеряется в списке"
-    # Порядок групп задаёт day.py, а не сортировка: «День 10» не должен
-    # оказаться между первым и вторым.
-    assert data["groups"] == list(dict.fromkeys(s.group for s in day.AGENTS if s.group))
-    assert data["groups"][0] == "День 1" and data["groups"][-1] == "День 7", data["groups"]
-    return f"{len(live)} агентов, группы: {', '.join(data['groups'])}"
+        assert "groups" not in data, "групп в ответе быть не должно"
+        live = {a["label"]: a for a in data["agents"]}
+        for labels in PAST_DAYS.values():
+            for label in labels:
+                assert label in live, f"чат «{label}» не поднялся"
+
+        # Ни признака особости, ни пояснений: в списке все чаты равны.
+        for agent in data["agents"]:
+            for gone in ("group", "note", "origin"):
+                assert gone not in agent, f"наружу торчит поле {gone}"
+
+        # Заготовленный чат правится и удаляется как любой другой.
+        first = data["agents"][0]
+        renamed = client.patch(f"/api/agents/{first['id']}", json={"label": "Просто чат"})
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["label"] == "Просто чат"
+        assert client.delete(f"/api/agents/{first['id']}").status_code == 200
+        assert client.get(f"/api/agents/{first['id']}").status_code == 404
+        after = client.get("/api/agents").json()["agents"]
+        assert len(after) == len(data["agents"]) - 1, len(after)
+
+    js = read("app/static/app.js")
+    for gone in ("list-group", "state.groups", "agent.note"):
+        assert gone not in js, f"в клиенте осталась группировка: {gone}"
+    # Стиль без селектора — тот же мёртвый код, только в другом файле.
+    assert "list-group" not in read("app/static/style.css"), "в стилях остался .list-group"
+    return f"{len(live)} чатов одним списком, переименование и удаление работают"
 
 
 @check("вопрос дня лежит черновиком и сам не отправляется")
@@ -180,7 +199,7 @@ def check_draft_not_sent():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         listed = client.get("/api/agents").json()["agents"]
-        agent_id = next(a["id"] for a in listed if a["label"] == "День 1 · Ответ")
+        agent_id = next(a["id"] for a in listed if a["label"] == "День 1: Ответ")
         full = client.get(f"/api/agents/{agent_id}").json()
         assert full["draft"].startswith("Объясни, почему первый токен"), full["draft"][:60]
         # Открытие агента не делает ни одного вызова к модели.
@@ -417,7 +436,287 @@ def check_new_params():
     return "шесть новых параметров едут, незаданные отсутствуют, ноль отличим от пустоты"
 
 
-@check("панель правит живого агента: модель, промпт, имя, окно памяти")
+# Каждое поле панели вместе с тем, во что оно должно превратиться в теле
+# запроса. `system` проверяется отдельно: он едет не в теле, а сообщением.
+PANEL_FIELDS = {
+    "model": "новая/модель",
+    "temperature": 0.9,
+    "max_tokens": 555,
+    "top_p": 0.11,
+    "top_k": 7,
+    "min_p": 0.02,
+    "repetition_penalty": 1.3,
+    "presence_penalty": 0.4,
+    "frequency_penalty": 0.6,
+    "stop": ["СТОП"],
+    "response_format": {"type": "json_object"},
+}
+
+
+@check("правка в панели применяется к следующему сообщению, а не к следующему чату")
+def check_panel_applies_next_message():
+    """Жалоба заказчика: сменил системный промпт — уезжает старый.
+
+    Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
+    и каждое поле панели, и окно памяти.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, model="старая/модель", system="СТАРЫЙ ПРОМПТ")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+        assert _stub.CALLS[-1]["messages"][0]["content"] == "СТАРЫЙ ПРОМПТ"
+
+        patched = client.patch(
+            f"/api/agents/{agent_id}",
+            json={"system": "НОВЫЙ ПРОМПТ", "history_limit": 0, **PANEL_FIELDS},
+        )
+        assert patched.status_code == 200, patched.text
+
+        _stub.reset()
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+
+    call = _stub.CALLS[-1]
+    sent, payload = call["messages"], call["payload"]
+    assert sent[0]["role"] == "system", sent
+    assert sent[0]["content"] == "НОВЫЙ ПРОМПТ", sent[0]["content"]
+    assert call["model"] == "новая/модель", call["model"]
+    for name, value in PANEL_FIELDS.items():
+        if name == "model":
+            continue
+        assert payload.get(name) == value, (name, payload.get(name), value)
+    # history_limit=0 — окно тоже применилось: в промпте только промпт и вопрос.
+    assert [m["role"] for m in sent] == ["system", "user"], sent
+    return "промпт, модель, окно и все параметры уехали новыми"
+
+
+@check("правка панели во время генерации не теряется")
+def check_patch_during_generation():
+    """Находка ревью: PATCH на занятом агенте отдавал 409 и правка пропадала.
+
+    Повторить её было нечем — единственный триггер применения уже отработал,
+    и следующее сообщение уезжало со старым промптом при новом тексте
+    в панели. Ровно та жалоба, с которой начинался девятый пункт.
+
+    Запрет был не нужен: `stream_completion` собирает тело запроса и метрики
+    синхронно, до первого await, поэтому правка конфига текущий ответ
+    и не могла бы исказить.
+    """
+
+    async def scenario():
+        from httpx import ASGITransport, AsyncClient
+
+        _stub.install(reply="д" * 400, chunks=40, delay=0.02)
+        transport = ASGITransport(app=main.app)
+        async with AsyncClient(transport=transport, base_url="http://bench") as client:
+            created = await client.post(
+                "/api/agents",
+                json={"agent": {"model": "stub/model", "label": "п", "system": "СТАРЫЙ ПРОМПТ"}},
+            )
+            agent_id = created.json()["agents"][0]["id"]
+
+            generating = asyncio.create_task(
+                client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+            )
+            await asyncio.sleep(0.15)
+            patched = await client.patch(
+                f"/api/agents/{agent_id}",
+                json={"system": "НОВЫЙ ПРОМПТ", "temperature": 0.9},
+            )
+            await generating
+            current = list(_stub.CALLS)
+
+            _stub.reset()
+            _stub.install(reply="ок")
+            await client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+            return patched, current, list(_stub.CALLS)
+
+    patched, current, following = asyncio.run(scenario())
+
+    assert patched.status_code == 200, f"правку во время генерации отвергли: {patched.text}"
+
+    # Текущий ответ правка не задела: тело запроса снято слепком на старте.
+    assert [m["content"] for m in current[0]["messages"] if m["role"] == "system"] == [
+        "СТАРЫЙ ПРОМПТ"
+    ], current[0]["messages"]
+    assert "temperature" not in current[0]["payload"], current[0]["payload"]
+
+    # А следующее сообщение ушло уже новым.
+    assert [m["content"] for m in following[0]["messages"] if m["role"] == "system"] == [
+        "НОВЫЙ ПРОМПТ"
+    ], following[0]["messages"]
+    assert following[0]["payload"]["temperature"] == 0.9, following[0]["payload"]
+
+    # Клиент, кроме того, не отправит сообщение, пока правка не доехала.
+    js = read("app/static/app.js")
+    assert "panelDirty" in js, "клиент не помнит о недоехавшей правке"
+    assert "сообщение не отправлено" in js, "клиент отправляет при непринятой правке"
+    return "PATCH во время генерации принят, текущий ответ цел, следующий — новый"
+
+
+@check("обмен идёт целиком на одном конфиге: смешанного запроса не бывает")
+def check_config_snapshot():
+    """Находка ревью: конфиг читается в двух точках, а не в одной.
+
+    Промпт собирает `build_prompt`, тело — `build_payload`, и между ними
+    стоит `yield` события `start`. Правка, попавшая туда, дала бы смешанный
+    запрос: новую модель со старым системным промптом. Сейчас через этот
+    `yield` никто не приостанавливается, но держится это на устройстве
+    доставки событий, а не на самом обмене.
+
+    Шагаем генератор руками — `__anext__` останавливает его ровно в окне —
+    и правим конфиг оттуда: со слепком в запрос уезжает один конфиг целиком.
+    """
+    _stub.install(reply="ок")
+
+    async def scenario():
+        agent = REGISTRY.create(
+            AgentSpec(
+                label="слепок",
+                model="старая/модель",
+                system="СТАРЫЙ ПРОМПТ",
+                temperature=0.1,
+                max_tokens=100,
+            )
+        )
+        stream = agent.ask("вопрос")
+        start = await stream.__anext__()
+
+        # Промпт уже собран, тело ещё нет — то самое окно.
+        agent.spec.model = "новая/модель"
+        agent.spec.system = "НОВЫЙ ПРОМПТ"
+        agent.spec.temperature = 0.9
+        agent.spec.max_tokens = 999
+
+        async for _ in stream:
+            pass
+        return agent, start
+
+    agent, start = asyncio.run(scenario())
+    assert start["type"] == "start", start
+
+    call = _stub.CALLS[0]
+    systems = [m["content"] for m in call["messages"] if m["role"] == "system"]
+    assert systems == ["СТАРЫЙ ПРОМПТ"], systems
+    assert call["payload"]["model"] == "старая/модель", call["payload"]["model"]
+    assert call["payload"]["temperature"] == 0.1, call["payload"]
+    assert call["payload"]["max_tokens"] == 100, call["payload"]
+    # Промпт в событии start — тот же, что уехал в модель.
+    assert start["resolved_messages"] == call["messages"], (start["resolved_messages"], call["messages"])
+
+    # А следующий обмен идёт уже целиком на новом конфиге.
+    _stub.reset()
+    _stub.install(reply="ок")
+    asyncio.run(drain(agent.ask("второй")))
+    call = _stub.CALLS[0]
+    assert call["payload"]["model"] == "новая/модель", call["payload"]["model"]
+    assert [m["content"] for m in call["messages"] if m["role"] == "system"] == ["НОВЫЙ ПРОМПТ"]
+    assert call["payload"]["temperature"] == 0.9, call["payload"]
+
+    source = read("app/agent.py")
+    assert "copy_spec(self.spec)" in source, "обмен собирает запрос из живого конфига"
+    return "правка в окне между промптом и телом не смешала конфиги"
+
+
+@check("системный промпт живёт в одном месте и не фиксируется при создании")
+def check_system_prompt_single_home():
+    """Корень той же жалобы: промпт мог приехать внутри `messages`.
+
+    Тогда панель правила бы `spec.system`, а в модель уезжала бы копия
+    из заготовки, снятая в момент создания агента. Теперь системные
+    сообщения переезжают в `spec.system` сразу, и дом у промпта один.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(
+            client,
+            messages=[
+                {"role": "system", "content": "ИЗ ЗАГОТОВКИ"},
+                {"role": "user", "content": "первый вопрос"},
+            ],
+        )
+        full = client.get(f"/api/agents/{agent_id}").json()
+        assert full["system"] == "ИЗ ЗАГОТОВКИ", full["system"]
+
+        client.patch(f"/api/agents/{agent_id}", json={"system": "ПРАВЛЕНЫЙ"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+
+    sent = _stub.CALLS[-1]["messages"]
+    systems = [m["content"] for m in sent if m["role"] == "system"]
+    assert systems == ["ПРАВЛЕНЫЙ"], systems
+    assert "ИЗ ЗАГОТОВКИ" not in " ".join(m["content"] for m in sent), sent
+
+    # Два дома сразу — ошибка, а не молчаливая потеря одного из промптов.
+    with TestClient(main.app) as client:
+        both = client.post(
+            "/api/agents",
+            json={
+                "agent": {
+                    "model": "stub/m",
+                    "system": "полем",
+                    "messages": [{"role": "system", "content": "сообщением"}],
+                }
+            },
+        )
+        assert both.status_code == 400, both.text
+        assert "одно место" in both.json()["detail"], both.text
+
+    # Тот же запрет и в конструкторе: ошибку в day.py видно на старте.
+    try:
+        REGISTRY.create(
+            AgentSpec(
+                label="двойной",
+                model="stub/m",
+                system="полем",
+                messages=[{"role": "system", "content": "сообщением"}],
+            )
+        )
+        raise AssertionError("конструктор проглотил два системных промпта")
+    except ValueError as exc:
+        assert "одно" in str(exc), exc
+    return "промпт из messages переехал в конфиг; два дома сразу — 400 и ValueError"
+
+
+@check("stop и response_format правятся из панели и доезжают до тела запроса")
+def check_stop_and_format():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "раз"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert "stop" not in payload and "response_format" not in payload, payload
+
+        client.patch(
+            f"/api/agents/{agent_id}",
+            json={"stop": ["КОНЕЦ", "СТОП"], "response_format": {"type": "json_object"}},
+        )
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "два"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert payload["stop"] == ["КОНЕЦ", "СТОП"], payload["stop"]
+        assert payload["response_format"] == {"type": "json_object"}, payload["response_format"]
+
+        # Пустое значение снимает параметр: он перестаёт уходить вовсе.
+        client.patch(f"/api/agents/{agent_id}", json={"stop": None, "response_format": None})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "три"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert "stop" not in payload and "response_format" not in payload, payload
+
+        # Пустые строки в списке — не стоп-строки.
+        client.patch(f"/api/agents/{agent_id}", json={"stop": ["", "  "]})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четыре"})
+        assert "stop" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"]
+
+        assert client.patch(f"/api/agents/{agent_id}", json={"stop": "СТОП"}).status_code == 400
+        assert (
+            client.patch(f"/api/agents/{agent_id}", json={"response_format": "json"}).status_code
+            == 400
+        )
+
+    html = read("app/static/index.html")
+    assert 'id="f-stop"' in html and 'id="f-response_format"' in html, "полей нет в панели"
+    return "оба параметра задаются, снимаются и не уходят пустыми"
+
+
+@check("панель правит живого агента: модель, промпт, окно памяти")
 def check_patch_panel():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
@@ -436,12 +735,12 @@ def check_patch_panel():
         assert body["model"] == "stub/new" and body["label"] == "Переименован"
         assert body["history_limit"] == 4
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
-        assert client.patch(f"/api/agents/{agent_id}", json={"group": "День 9"}).status_code == 400
+        assert client.patch(f"/api/agents/{agent_id}", json={"draft": "х"}).status_code == 400
 
     call = _stub.CALLS[-1]
     assert call["model"] == "stub/new", call["model"]
     assert call["messages"][0]["content"] == "новый промпт", call["messages"][0]
-    return "PATCH меняет модель, промпт, имя и окно; group снаружи не правится"
+    return "PATCH меняет модель, промпт, имя и окно; чужие поля не принимаются"
 
 
 # --- 6. лента: рассуждение и перегенерация ------------------------------------
@@ -629,49 +928,115 @@ def check_regenerate_disconnect():
     return "0 кадров, пара на месте, бронь снята"
 
 
-# --- 7. чаты и ростер ---------------------------------------------------------
+# --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
-@check("«Очистить все чаты» не уносит агентов дней 1–5")
-def check_reset_keeps_roster():
+@check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
+def check_no_clear_all():
+    with TestClient(main.app) as client:
+        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
+        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
+    for path in ("app/static/app.js", "app/static/index.html"):
+        source = read(path)
+        for gone in ("Очистить все", "clear-all", "clearAll", "/api/agents/reset"):
+            assert gone not in source, f"{path}: остался {gone}"
+    return "ручки нет, кнопки нет, диалога очистки нет"
+
+
+@check("имена по умолчанию нумеруются, автоимени нет")
+def check_numbered_names():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
-        chat = client.post("/api/agents", json={}).json()["agents"][0]
-        client.post(f"/api/agents/{chat['id']}/messages", json={"text": "привет"})
-        before = client.get("/api/agents").json()
-        assert any(a["id"] == chat["id"] for a in before["agents"])
+        first = client.post("/api/agents", json={}).json()["agents"][0]
+        second = client.post("/api/agents", json={}).json()["agents"][0]
+        assert first["label"] != second["label"], (first["label"], second["label"])
+        import re as _re
 
-        reset = client.post("/api/agents/reset").json()
-        assert chat["id"] in reset["killed"], reset["killed"]
-        after = client.get("/api/agents").json()
+        for agent in (first, second):
+            assert _re.fullmatch(r"Новый чат \d+", agent["label"]), agent["label"]
+        numbers = [int(a["label"].split()[-1]) for a in (first, second)]
+        assert numbers[1] == numbers[0] + 1, numbers
 
-    labels = {a["label"] for a in after["agents"]}
-    for group_labels in PAST_DAYS.values():
-        for label in group_labels:
-            assert label in labels, f"«{label}» пропал после очистки"
-    assert not [a for a in after["agents"] if not a["group"]], "чаты пользователя должны уйти"
-    assert len(after["agents"]) == len(day.AGENTS), (len(after["agents"]), len(day.AGENTS))
-    return f"чат удалён, {len(day.AGENTS)} агентов ростера на месте"
+        # Номер удалённого чата второй раз не выдаётся: двух «Новых чатов N»
+        # одновременно быть не должно.
+        client.delete(f"/api/agents/{second['id']}")
+        third = client.post("/api/agents", json={}).json()["agents"][0]
+        assert third["label"] != second["label"], third["label"]
+        assert int(third["label"].split()[-1]) > numbers[1], third["label"]
+
+        # Первое сообщение имя не меняет — автоимени больше нет.
+        client.post(f"/api/agents/{first['id']}/messages", json={"text": "расскажи про кэш"})
+        again = client.get(f"/api/agents/{first['id']}").json()
+        assert again["label"] == first["label"], again["label"]
+
+        live = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+        assert len(live) == len(set(live)), "имена по умолчанию не должны повторяться"
+
+    js = read("app/static/app.js")
+    for gone in ("maybeAutoName", "chatTitle", "autoname"):
+        assert gone not in js, f"в клиенте осталось автоимя: {gone}"
+    assert "autoname" not in read("app/static/index.html"), "переключатель автоимени жив"
+    return f"{first['label']}, {second['label']}, после удаления — {third['label']}"
 
 
-@check("«Новый чат» создаётся пустым телом и попадает в чаты, а не в ростер")
-def check_new_chat():
+@check("переименование и удаление живут в списке слева")
+def check_list_actions():
+    js = read("app/static/app.js")
+    assert "function startRename" in js and "function askDelete" in js
+    assert "miniButton(\"pencil\"" in js, "карандаша в строке списка нет"
+    assert "miniButton(\"trash\"" in js, "корзины в строке списка нет"
+    assert "Escape" in js and "Enter" in js, "переименование должно слушать Enter и Escape"
+    assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
+
     with TestClient(main.app) as client:
-        created = client.post("/api/agents", json={})
-        assert created.status_code == 200, created.text
-        agent = created.json()["agents"][0]
-        assert agent["label"] == "Новый чат" and agent["group"] == "", agent
-        # Группу извне не подсунуть: иначе чат притворился бы агентом дня
-        # и пережил бы «Очистить все чаты».
-        sneaky = client.post(
-            "/api/agents", json={"agent": {"model": "stub/m", "label": "х", "group": "День 1"}}
-        )
-        assert sneaky.status_code == 200, sneaky.text
-        assert sneaky.json()["agents"][0]["group"] == "", sneaky.json()["agents"][0]
-    return "новый чат без группы, подсунуть группу снаружи нельзя"
+        agent_id = new_agent(client, label="Было")
+        renamed = client.patch(f"/api/agents/{agent_id}", json={"label": "Стало"})
+        assert renamed.status_code == 200 and renamed.json()["label"] == "Стало"
+        assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
+        assert client.delete(f"/api/agents/{agent_id}").status_code == 200
+        assert client.get(f"/api/agents/{agent_id}").status_code == 404
+    return "карандаш и корзина в строке, поля имени в панели нет"
 
 
-# --- 8. ключ и сеть -----------------------------------------------------------
+@check("пояснений прошлой постановки нет ни в данных, ни в разметке")
+def check_no_leftover_texts():
+    with TestClient(main.app) as client:
+        body = client.get("/api/agents").text
+    for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
+        assert leftover not in body, f"наружу уехало пояснение: {leftover}"
+
+    day_source = read("day.py")
+    assert "note=" not in day_source, "в day.py остались пояснения"
+    assert "group=" not in day_source, "в day.py остались группы"
+    for path in ("app/static/app.js", "app/static/index.html"):
+        assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
+    return "ни note, ни group — ни в day.py, ни в ответах, ни в разметке"
+
+
+@check("имени клиента-референса нет нигде в репозитории")
+def check_no_reference_name():
+    """Референс был инструментом разработки, а не частью продукта.
+
+    Имя собирается из кусков намеренно: иначе сама проверка стала бы
+    единственным местом, где оно осталось.
+    """
+    needle = ("o" + "mlx").encode()
+    tracked = subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
+    ).stdout.split()
+    hits = []
+    for name in tracked:
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        if needle.decode() in name.lower():
+            hits.append(name)
+            continue
+        with open(path, "rb") as handle:
+            if needle in handle.read().lower():
+                hits.append(name)
+    assert not hits, f"упоминания остались в: {', '.join(hits)}"
+    return f"проверено {len(tracked)} файлов под контролем версий"
 
 
 @check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
@@ -703,6 +1068,82 @@ def check_no_key_leak():
     return "в клиенте про ключ ни слова, ручки его не отдают"
 
 
+@check("каталог отдаёт данные, по которым панель предупреждает о параметрах")
+def check_catalog_capabilities():
+    """Отбор моделей в чате не нужен, а вот данные о них — нужны.
+
+    С `provider.require_parameters=true` параметр, которого модель не
+    заявляет, выкашивает провайдеров, и вместо ответа приходит невнятная
+    ошибка. Предупредить об этом заранее можно только по каталогу.
+    """
+    import app.catalog as catalog
+
+    plain = catalog._normalize(
+        {
+            "id": "openai/gpt-4o-mini",
+            "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
+            "supported_parameters": ["temperature", "max_tokens", "stop"],
+            "context_length": 128000,
+        }
+    )
+    assert plain["supported_parameters"] == ["temperature", "max_tokens", "stop"], plain
+    assert plain["is_free"] is False and plain["temperature_capped"] is False, plain
+    assert plain["temperature_cap"] is None, plain
+
+    # Ловушка, ради которой мало одного supported_parameters: температуру
+    # семейство заявляет, а на 1.2 всё равно отвечает 400.
+    capped = catalog._normalize(
+        {
+            "id": "anthropic/claude-sonnet-4",
+            "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+            "supported_parameters": ["temperature", "max_tokens"],
+        }
+    )
+    assert "temperature" in capped["supported_parameters"], capped
+    assert capped["temperature_capped"] is True, capped
+    assert capped["temperature_cap"] == catalog.TEMPERATURE_CAP, capped
+
+    free = catalog._normalize({"id": "x/y:free", "pricing": {"prompt": "0", "completion": "0"}})
+    assert free["is_free"] is True, free
+
+    # Отбор при этом не вернулся: чат показывает каталог целиком.
+    assert not hasattr(catalog, "filter_models"), "фильтры каталога вернулись"
+    assert "exclude_free" not in read("app/main.py"), "ручка снова отбирает модели"
+
+    async def catalog_stub():
+        return [plain, capped, free]
+
+    saved = catalog.fetch_models
+    catalog.fetch_models = catalog_stub
+    try:
+        with TestClient(main.app) as client:
+            models = client.get("/api/models").json()["models"]
+    finally:
+        catalog.fetch_models = saved
+    assert len(models) == 3, "каталог отдаётся целиком, включая :free"
+    assert all("supported_parameters" in m for m in models), models[0]
+    assert any(m["temperature_capped"] for m in models), models
+
+    js = read("app/static/app.js")
+    assert "function paramWarnings" in js, "панель не считает предупреждения"
+    # Закреплённый провайдер — не пояснение, а настройка, ломающая вызов:
+    # шесть чатов дней 4–5 роняют смену модели сырым 404 без подсказки.
+    assert "provider.order" in js, "панель молчит про закреплённого провайдера"
+    assert "extra_body" in js, "панель не смотрит на extra_body"
+    pinned = [c.label for c in day.CHATS if (c.extra_body or {}).get("provider", {}).get("order")]
+    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым провайдером
+    no_fallback = [
+        c.label
+        for c in day.CHATS
+        if (c.extra_body or {}).get("provider", {}).get("allow_fallbacks") is False
+    ]
+    assert len(no_fallback) == 6, no_fallback  # плюс три чата Дня 5 без фолбэка
+    for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
+        assert field in js, f"клиент не смотрит на {field}"
+    assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
+    return "три поля на месте, отбор не вернулся, панель их читает"
+
+
 @check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
 def check_no_cdn():
     html = read("app/static/index.html")
@@ -718,6 +1159,24 @@ def check_no_cdn():
     assert html.count("<script") == 1 and 'src="/static/app.js"' in html
     assert html.count("<link") == 1 and 'href="/static/style.css"' in html
     return "в статике только относительные пути и w3.org-неймспейс SVG"
+
+
+@check("поле ввода закреплено внизу и не уезжает вместе с лентой")
+def check_composer_pinned():
+    """Пункт 7: композер уезжал вниз, когда лента становилась длиннее.
+
+    Держится это на `min-height: 0` у колонки чата: без него автоматический
+    минимум grid- и flex-элемента считается по содержимому, лента распирает
+    колонку выше экрана и утаскивает поле ввода за собой.
+    """
+    css = read("app/static/style.css")
+    block = css[css.index(".chat {") : css.index(".chat-body")]
+    for rule in ("min-height: 0", "overflow: hidden", "flex-direction: column"):
+        assert rule in block, f"у .chat нет правила {rule}"
+    assert "min-height: 0" in css[css.index(".chat-body") : css.index(".feed {")]
+    assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
+    assert ".feed {" in css and "overflow-y: auto" in css[css.index(".feed {") :]
+    return "колонка чата не растягивается содержимым, прокручивается лента"
 
 
 @check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
@@ -933,13 +1392,12 @@ def check_store_reopen():
         "ag_00042",
         label="Нина",
         config={"model": "stub/m", "history_limit": 7, "top_p": 0.9},
-        seed=[{"role": "system", "content": "СИС"}],
+        seed=[{"role": "user", "content": "заготовка"}],
         created_at=100.0,
         context_length=128_000,
     )
     first.save_history(
-        "ag_00042",
-        [_Turn("user", "меня зовут Нина"), _Turn("assistant", "привет, Нина")],
+        "ag_00042", [_Turn("user", "меня зовут Нина"), _Turn("assistant", "привет, Нина")]
     )
     first.close()
 
@@ -947,11 +1405,10 @@ def check_store_reopen():
     # объект в памяти»: соединение закрыто, кеш sqlite ушёл вместе с ним.
     second = Store(path).init()
     saved = second.load_session("ag_00042")
-    assert saved is not None, "сессия не пережила закрытие файла"
-    assert saved["config"]["history_limit"] == 7, saved["config"]
-    assert saved["config"]["top_p"] == 0.9, saved["config"]
+    assert saved is not None, "чат не пережил закрытие файла"
+    assert saved["config"]["history_limit"] == 7 and saved["config"]["top_p"] == 0.9
     assert saved["created_at"] == 100.0 and saved["context_length"] == 128_000
-    assert saved["seed"] == [{"role": "system", "content": "СИС"}], saved["seed"]
+    assert saved["seed"] == [{"role": "user", "content": "заготовка"}], saved["seed"]
     rows = second.message_rows("ag_00042")
     assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
     assert second.max_agent_seq() == 42, second.max_agent_seq()
@@ -1002,10 +1459,7 @@ def check_restore_in_constructor():
     # сама, без единого дополнительного вызова.
     again = Store(path).init()
     revived = Agent(spec, agent_id=born.id, store=again)
-    assert [t.content for t in revived.history] == [
-        "меня зовут Нина",
-        "привет, Нина",
-    ], revived.history
+    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет, Нина"]
 
     _stub.install(reply="ок")
     asyncio.run(drain(revived.ask("как меня зовут?")))
@@ -1059,8 +1513,7 @@ def check_seq_renumbered():
     _stub.install(reply="ок")
     for i in range(3):
         asyncio.run(drain(agent.ask(f"вопрос {i}")))
-    seqs = [row[0] for row in store.message_rows(agent.id)]
-    assert seqs == list(range(6)), seqs
+    assert [row[0] for row in store.message_rows(agent.id)] == list(range(6))
 
     agent.history = agent.history[-2:]  # так выглядит история после кап-а окна
     agent.persist()
@@ -1072,8 +1525,9 @@ def check_seq_renumbered():
     agent._trim()
     agent.persist()
     rows = store.message_rows(agent.id)
-    assert len(rows) == MAX_STORED_MESSAGES, len(rows)
-    assert [r[0] for r in rows] == list(range(MAX_STORED_MESSAGES))
+    assert len(rows) == MAX_STORED_MESSAGES and [r[0] for r in rows] == list(
+        range(MAX_STORED_MESSAGES)
+    )
     store.close()
     return f"нет ответа — нет записи; после укорачивания seq = 0..N, потолок {MAX_STORED_MESSAGES}"
 
@@ -1125,7 +1579,6 @@ def check_reasoning_not_stored():
     assert stored[-1]["metrics"], "метрики ответа должны пережить перезапуск: по ним плитки"
     assert stored[-1]["metrics"]["provider"] == "stub", stored[-1]["metrics"]
 
-    # А в живой ленте рассуждение есть — оно просто не хранится.
     with TestClient(main.app) as client:
         full = client.get(f"/api/agents/{agent_id}").json()
     assert full["transcript"][-1]["reasoning"] == "я думаю про панду", full["transcript"][-1]
@@ -1144,15 +1597,12 @@ def check_regenerate_failure_db():
         _stub.install(fail=True)
         response = client.post(f"/api/agents/{agent_id}/regenerate")
         assert response.status_code == 200, response.text
-        events = sse(response.text)
-        done = next(e for e in events if e["event"] == "done")
+        done = next(e for e in sse(response.text) if e["event"] == "done")
         assert done.get("restored") is True, done
 
     after = REGISTRY.store.message_rows(agent_id)
     assert after == before, f"после неудачной перегенерации база разошлась: {after}"
-    assert [r[0] for r in after] == [0, 1], f"дыра в нумерации: {after}"
 
-    # И удачная перегенерация заменяет ответ, а не добавляет второй.
     _stub.install(reply="второй ответ")
     with TestClient(main.app) as client:
         client.post(f"/api/agents/{agent_id}/regenerate")
@@ -1161,126 +1611,380 @@ def check_regenerate_failure_db():
     return "неудача возвращает исходную пару, удача заменяет ответ — в обоих случаях seq 0,1"
 
 
-@check("список слева переживает перезапуск: чаты, переписка, без дубликатов ростера")
-def check_list_survives_restart():
+def _restart(store):
+    """Новый реестр на том же файле — так выглядит перезапуск процесса."""
     from app.registry import AgentRegistry
 
+    registry = AgentRegistry(max_agents=1000, store=store)
+    main.REGISTRY = registry
+    main.bootstrap_chats()
+    return registry
+
+
+@check("список слева переживает перезапуск: чаты, переписка, настройки панели")
+def check_list_survives_restart():
     _stub.install(reply="и тебе привет")
     path = _temp_db("listing")
     store = Store(path).init()
-
-    first = AgentRegistry(max_agents=1000, store=store)
     saved_registry = main.REGISTRY
-    main.REGISTRY = first
     try:
-        main.ensure_roster()
-        roster_count = len(first)
+        first = _restart(store)
+        preset = len(first)
+        assert preset == len(day.CHATS), (preset, len(day.CHATS))
+
         chat = first.create(AgentSpec(label="Мой чат", model="stub/m"))
         asyncio.run(drain(chat.ask("привет")))
-        # Правка из панели справа — она тоже обязана пережить рестарт.
-        day_three = next(a for a in first.list() if a.spec.label.startswith("День 3 · Пошагово"))
-        day_three.spec.top_p = 0.42
-        day_three.spec.history_limit = 4
-        day_three.spec.system = "переписанный промпт"
-        day_three.save_config()
-        talked = day_three.id
-        asyncio.run(drain(day_three.ask("вопрос агенту дня 3")))
 
-        # Перезапуск: новый реестр на том же файле, как новый процесс.
-        second = AgentRegistry(max_agents=1000, store=store)
-        main.REGISTRY = second
-        main.ensure_roster()
+        # Правка из панели — она тоже обязана пережить рестарт, вся.
+        target = next(a for a in first.list() if a.spec.label == "День 3: Пошагово")
+        target.spec.top_p = 0.42
+        target.spec.history_limit = 4
+        target.spec.system = "переписанный промпт"
+        target.spec.stop = ["СТОП"]
+        target.spec.response_format = {"type": "json_object"}
+        target.spec.min_p = 0.05
+        target.save_config()
+        edited = target.id
+        asyncio.run(drain(target.ask("вопрос третьему")))
+
+        second = _restart(store)
         listing = main._listing()
     finally:
         main.REGISTRY = saved_registry
 
     labels = [a["label"] for a in listing["agents"]]
-    assert len(labels) == len(set(labels)), f"ростер задвоился: {sorted(labels)}"
-    assert len(labels) == roster_count + 1, (len(labels), roster_count)
-    assert "Мой чат" in labels and labels.count("День 3 · Пошагово") == 1, labels
+    assert len(labels) == len(set(labels)), f"список задвоился: {sorted(labels)}"
+    assert len(labels) == preset + 1, (len(labels), preset)
+    assert "Мой чат" in labels
 
     revived_chat = second.require(next(a["id"] for a in listing["agents"] if a["label"] == "Мой чат"))
     assert [t.content for t in revived_chat.history] == ["привет", "и тебе привет"]
-    revived_day = second.require(talked)
-    assert revived_day.spec.top_p == 0.42, revived_day.spec.top_p
-    assert revived_day.spec.history_limit == 4 and revived_day.spec.system == "переписанный промпт"
-    assert [t.content for t in revived_day.history] == ["вопрос агенту дня 3", "и тебе привет"]
-    # Порядок списка тот же: группы дней не перемешались.
-    assert labels[: len(day.AGENTS)] == [a.label for a in day.AGENTS], labels[:3]
+
+    revived = second.require(edited)
+    assert revived.spec.top_p == 0.42 and revived.spec.min_p == 0.05
+    assert revived.spec.history_limit == 4 and revived.spec.system == "переписанный промпт"
+    assert revived.spec.stop == ["СТОП"], revived.spec.stop
+    assert revived.spec.response_format == {"type": "json_object"}, revived.spec.response_format
+    assert [t.content for t in revived.history] == ["вопрос третьему", "и тебе привет"]
+    # Порядок списка тот же: чаты day.py встают на прежние места.
+    assert labels[:len(day.CHATS)] == [spec.label for spec in day.CHATS], labels[:3]
     store.close()
-    return f"{len(labels)} агентов после рестарта, дубликатов нет, правки и переписка на месте"
+    return f"{len(labels)} чатов после рестарта, переписка и все правки панели на месте"
 
 
-@check("переименованный агент ростера не задваивается на следующем запуске")
-def check_renamed_roster_not_duplicated():
-    """Заказчик открывает агента дня, правит имя в панели — и перезапускает стенд.
-
-    По имени ростер своих больше не узнаёт: имя правится. Опознавательный знак —
-    `origin`, его снаружи не задать и в панели не поменять.
+@check("удалённый чат не возвращается на следующем запуске")
+def check_deleted_chat_stays_deleted():
+    """Чаты дней 1–5 теперь обычные. Обычный чат, удалённый пользователем,
+    воскресать не должен — а именно это делала сверка по именам при старте.
     """
-    from app.registry import AgentRegistry
-
-    _stub.install(reply="ответ дня три")
-    path = _temp_db("rename")
+    path = _temp_db("deleted")
     store = Store(path).init()
     saved_registry = main.REGISTRY
     try:
-        first = AgentRegistry(max_agents=1000, store=store)
-        main.REGISTRY = first
-        main.ensure_roster()
+        first = _restart(store)
         before = len(main._listing()["agents"])
+        victim = next(a for a in first.list() if a.spec.label == "День 1: Ответ")
+        assert first.kill(victim.id), "чат должен был удалиться"
+        assert store.load_session(victim.id) is None, "строка чата осталась в базе"
 
+        _restart(store)
+        labels = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "День 1: Ответ" not in labels, "удалённый чат вернулся после перезапуска"
+    assert len(labels) == before - 1, (len(labels), before)
+    return f"{before} чатов, один удалён — после рестарта {len(labels)}, воскресших нет"
+
+
+@check("переименованный чат остаётся переименованным и не задваивается")
+def check_renamed_chat_not_duplicated():
+    _stub.install(reply="ответ")
+    path = _temp_db("renamed")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        first = _restart(store)
+        before = len(main._listing()["agents"])
+        target = next(a for a in first.list() if a.spec.label == "День 4: t = 0.7")
         with TestClient(main.app) as client:
-            target = next(
-                a for a in client.get("/api/agents").json()["agents"]
-                if a["label"] == "День 3 · Прямо (vs пошагово)"
-            )
-            renamed = client.patch(
-                f"/api/agents/{target['id']}", json={"label": "Мой любимый агент"}
-            )
+            renamed = client.patch(f"/api/agents/{target.id}", json={"label": "Мой любимый чат"})
             assert renamed.status_code == 200, renamed.text
-            client.post(f"/api/agents/{target['id']}/messages", json={"text": "вопрос"})
+            client.post(f"/api/agents/{target.id}/messages", json={"text": "вопрос"})
 
-        # Перезапуск процесса: новый реестр на том же файле.
-        second = AgentRegistry(max_agents=1000, store=store)
-        main.REGISTRY = second
-        main.ensure_roster()
+        second = _restart(store)
         listing = main._listing()
+        survivor = second.require(target.id)
+        history = [t.content for t in survivor.history]
     finally:
         main.REGISTRY = saved_registry
 
     labels = [a["label"] for a in listing["agents"]]
     assert len(labels) == before, (
-        f"после переименования список вырос с {before} до {len(labels)}: "
-        f"лишние {sorted(set(labels) - {spec.label for spec in day.AGENTS})}"
+        f"список вырос с {before} до {len(labels)}: "
+        f"лишние {sorted(set(labels) - {spec.label for spec in day.CHATS})}"
     )
-    assert "День 3 · Прямо (vs пошагово)" not in labels, "рядом завёлся второй, пустой"
-    assert labels.count("Мой любимый агент") == 1, labels
-
-    survivor = second.require(target["id"])
-    assert survivor.spec.label == "Мой любимый агент"
-    assert survivor.spec.origin == "День 3 · Прямо (vs пошагово)", survivor.spec.origin
-    assert [t.content for t in survivor.history] == ["вопрос", "ответ дня три"], survivor.history
-
-    # И подсунуть origin снаружи нельзя: иначе чат притворился бы агентом дня.
-    with TestClient(main.app) as client:
-        sneaky = client.post(
-            "/api/agents",
-            json={"agent": {"model": "stub/m", "label": "х", "origin": "День 1 · Ответ"}},
-        )
-        assert sneaky.status_code == 200, sneaky.text
+    assert "День 4: t = 0.7" not in labels, "рядом завёлся второй, пустой"
+    assert labels.count("Мой любимый чат") == 1, labels
+    assert survivor.spec.label == "Мой любимый чат", survivor.spec.label
+    assert history == ["вопрос", "ответ"], history
     store.close()
-    return "переименованный агент один, история при нём, origin снаружи не задать"
+    return "переименованный чат один, история при нём, дубликата нет"
 
 
-@check("сессий больше потолка реестра: все видны в списке и любая открывается")
-def check_list_beyond_cap():
-    """Список слева — единственный способ добраться до диалога.
+@check("дописанная в day.py заготовка появляется и в существующей базе")
+def check_new_preset_appears():
+    """Отметка «всё заведено» закрывала бы дверь навсегда.
 
-    Если строить его по памяти, всё, что не поместилось в реестр, пропадёт
-    с экрана, хотя в базе лежит целым. Молча потерянный чат — ровно то,
-    против чего этот день.
+    В базе помечено не «заготовки заведены», а какие именно: у каждой строки
+    в `day.py` есть ключ `preset`, и появление новой — это ключ, которого
+    в наборе ещё нет. Имя, настройки и порядок строк для этого не годятся:
+    их правят, и правка выглядела бы как новая заготовка.
     """
+    path = _temp_db("new-preset")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    saved_presets = main.PRESET_CHATS
+    try:
+        _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+
+        # Дописали строку в day.py — и перезапустились.
+        main.PRESET_CHATS = [
+            *saved_presets,
+            AgentSpec(preset="day7-новая", label="Дописанная заготовка", model="stub/m"),
+        ]
+        _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+
+        # Второй запуск с тем же day.py второй копии не заводит.
+        _restart(store)
+        again = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.PRESET_CHATS = saved_presets
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "Дописанная заготовка" not in before, before[-1]
+    assert after == before + ["Дописанная заготовка"], after[-2:]
+    assert again == after, f"на втором запуске заготовка задвоилась: {again[-2:]}"
+    return f"{len(before)} чатов было, дописанная появилась, на следующем старте не задвоилась"
+
+
+@check("перестановка строк в day.py ничего не задваивает")
+def check_preset_order_changed():
+    """Порядок строк в файле — не признак: заказчик его меняет.
+
+    Ключ у заготовки свой, поэтому перетасованный `day.py` для базы тот же
+    самый. Проверяется и переименование прямо в файле: имя тоже не признак.
+    """
+    path = _temp_db("reorder")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    saved_presets = main.PRESET_CHATS
+    try:
+        _restart(store)
+        before = sorted(a["label"] for a in main._listing()["agents"])
+
+        # Строки переставлены местами, а одна заготовка ещё и переименована
+        # прямо в файле — для базы это те же самые заготовки.
+        shuffled = list(reversed(saved_presets))
+        shuffled[0] = replace(shuffled[0], label="Переименовано в файле")
+        main.PRESET_CHATS = shuffled
+        _restart(store)
+        after = sorted(a["label"] for a in main._listing()["agents"])
+    finally:
+        main.PRESET_CHATS = saved_presets
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert after == before, (
+        "перестановка строк завела чаты заново: "
+        f"лишние {sorted(set(after) - set(before))}"
+    )
+    return f"{len(before)} чатов до перестановки и столько же после, дубликатов нет"
+
+
+@check("нечитаемая отметка о заготовках не заводит их заново")
+def check_broken_presets_marker():
+    """«Не читается» — это не «пусто».
+
+    Пустой набор значит «не заводили ничего», и на нём сервер завёл бы все
+    заготовки заново: удалённые чаты вернулись бы, живые задвоились — ровно
+    та поломка, от которой набор ключей и защищает. Отличить испорченную
+    запись от пустой базы нельзя, поэтому сервер не заводит ничего, ничего
+    не перезаписывает и говорит об этом в лог.
+    """
+    import logging
+
+    path = _temp_db("broken-marker")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+        victim = next(a for a in main.REGISTRY.list() if a.spec.label == "День 1: Ответ")
+        main.REGISTRY.kill(victim.id)
+        before = [label for label in before if label != "День 1: Ответ"]
+
+        for broken in ('{"не": "список"}', "[1, 2, 3]", "не json вовсе", '["ключ", 7]'):
+            store.set_meta(main.PRESETS_KEY, broken)
+            records = []
+
+            class _Catch(logging.Handler):
+                def emit(self, record):
+                    records.append(record.getMessage())
+
+            handler = _Catch()
+            main.LOG.addHandler(handler)
+            try:
+                # `_restart` заводит заготовки сам — этот вызов и проверяем.
+                registry = _restart(store)
+            finally:
+                main.LOG.removeHandler(handler)
+
+            after = [a["label"] for a in main._listing()["agents"]]
+            assert len(registry) == 0, f"на {broken!r} заведено {len(registry)} заготовок"
+            assert after == before, (
+                f"на {broken!r} список изменился: "
+                f"лишние {sorted(set(after) - set(before))}"
+            )
+            assert "День 1: Ответ" not in after, f"на {broken!r} удалённый чат вернулся"
+            # Испорченное значение не перезаписано: его можно посмотреть и починить.
+            assert store.get_meta(main.PRESETS_KEY) == broken, store.get_meta(main.PRESETS_KEY)
+            # И это не молчание: в логе есть что показать.
+            assert any(main.PRESETS_KEY in text for text in records), records
+
+        # Починили запись — заготовки снова заводятся как обычно.
+        store.set_meta(main.PRESETS_KEY, json.dumps(sorted(before_keys())))
+        _restart(store)
+        healed = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "День 1: Ответ" not in healed, "починенная запись вернула удалённый чат"
+    assert sorted(healed) == sorted(before), (len(healed), len(before))
+    return "битая отметка: ничего не заведено, ничего не перезаписано, в логе сказано"
+
+
+def before_keys() -> set[str]:
+    """Ключи всех сегодняшних заготовок — то, что пишет здоровый сервер."""
+    return {spec.preset for spec in day.CHATS}
+
+
+@check("база прошлой версии не насыпает дубликатов при переходе на ключи")
+def check_legacy_bootstrap_migrated():
+    """До этой правки в базе стояла одна отметка «заготовки заведены».
+
+    Прочитать её как «не заведено ни одной» значило бы завести все двадцать
+    два заново — поверх живой переписки заказчика.
+    """
+    path = _temp_db("legacy")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        # Так выглядит база, записанная прошлой версией: чаты есть, отметка
+        # старая, набора ключей нет.
+        registry = _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+        store.set_meta(main.LEGACY_BOOTSTRAP_KEY, "1")
+        with store.tx() as conn:
+            conn.execute("DELETE FROM meta WHERE key = ?", (main.PRESETS_KEY,))
+        assert store.get_meta(main.PRESETS_KEY) is None
+
+        _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+        seeded = json.loads(store.get_meta(main.PRESETS_KEY))
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert after == before, f"переход насыпал дубликатов: {len(after)} вместо {len(before)}"
+    assert sorted(seeded) == sorted(spec.preset for spec in day.CHATS), seeded
+    return f"старая отметка прочитана как {len(seeded)} заведённых ключей, дубликатов нет"
+
+
+@check("нумерация имён переживает перезапуск: занятый номер второй раз не выдаётся")
+def check_numbering_survives_restart():
+    """Счётчик имён обязан жить в базе, а не в процессе.
+
+    Проверяется это не только поведением — в одном процессе счётчик в памяти
+    рестарт бы «пережил» сам собой, и проверка ничего бы не поймала, — а тем,
+    где лежит число: после каждой выдачи оно должно стоять в `meta`. Реальный
+    второй процесс на той же базе разбирает `checks/two_processes.py`.
+    """
+    path = _temp_db("numbers")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        with TestClient(main.app) as client:
+            first = client.post("/api/agents", json={}).json()["agents"][0]["label"]
+            second = client.post("/api/agents", json={}).json()["agents"][0]["label"]
+        assert store.get_meta(main.CHAT_NUMBER_KEY) == "2", (
+            "номер выдан не базой: после перезапуска счётчик начнётся заново "
+            f"и выдаст занятое имя (в meta {store.get_meta(main.CHAT_NUMBER_KEY)!r})"
+        )
+
+        # Перезапуск процесса: счётчик в памяти начался бы с единицы заново.
+        _restart(store)
+        with TestClient(main.app) as client:
+            third = client.post("/api/agents", json={}).json()["agents"][0]["label"]
+            labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+        assert store.get_meta(main.CHAT_NUMBER_KEY) == "3", store.get_meta(main.CHAT_NUMBER_KEY)
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    numbers = [int(name.split()[-1]) for name in (first, second, third)]
+    assert numbers == [1, 2, 3], numbers
+    assert len(labels) == len(set(labels)), f"имена повторились: {sorted(labels)}"
+    return f"до рестарта {first}, {second}; после — {third}, номер стоит в базе"
+
+
+@check("список не обрезается: тысяча с лишним чатов видна целиком")
+def check_list_not_truncated():
+    from app.registry import AgentRegistry
+
+    path = _temp_db("no-cap")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        registry = AgentRegistry(max_agents=5, store=store)
+        main.REGISTRY = registry
+        main.bootstrap_chats()
+        made = 1200
+        now = time.time()
+        with store.bulk():
+            for i in range(made):
+                store.save_session(
+                    f"chat_{i:05d}",
+                    label=f"чат {i}",
+                    config={"model": "stub/m", "label": f"чат {i}"},
+                    seed=[],
+                    created_at=now + i,
+                )
+        entries = main._listing()["agents"]
+        assert len(entries) == made + len(day.CHATS), (
+            f"в списке {len(entries)} из {made + len(day.CHATS)} чатов — список обрезан"
+        )
+        # Заготовленные чаты никуда не делись: у них самый старый updated_at,
+        # и любая обрезка снесла бы именно их.
+        labels = {entry["label"] for entry in entries}
+        for spec in day.CHATS:
+            assert spec.label in labels, f"«{spec.label}» вытеснен из списка обрезкой"
+        far = entries[-1]
+        assert main.REGISTRY.require(far["id"]).spec.label == far["label"]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+    return f"{made} чатов плюс заготовленные — в списке все, ни один не потерян"
+
+
+@check("чаты сверх потолка реестра: все видны в списке и любой открывается")
+def check_list_beyond_cap():
     from app.registry import AgentRegistry
 
     _stub.install(reply="ответ")
@@ -1300,15 +2004,10 @@ def check_list_beyond_cap():
         assert registry.evicted >= 7, registry.evicted
 
         listing = main._listing()
-        ids = [a["id"] for a in listing["agents"]]
-        assert ids == made, f"в списке {len(ids)} из {len(made)} сессий: {ids}"
-        assert listing["stored"] == 10 and listing["live"] <= 3, listing["stored"]
-        # Длина истории у выгруженных берётся из базы, а не обнуляется.
-        assert all(a["history_len"] == 2 for a in listing["agents"]), [
-            a["history_len"] for a in listing["agents"]
-        ]
+        assert [a["id"] for a in listing["agents"]] == made, listing["agents"]
+        assert listing["stored"] == 10 and listing["live"] <= 3
+        assert all(a["history_len"] == 2 for a in listing["agents"])
 
-        # Любую можно открыть — она поднимется из базы вместе с перепиской.
         with TestClient(main.app) as client:
             body = client.get(f"/api/agents/{made[0]}").json()
         texts = [t["content"] for t in body["transcript"] if not t.get("seed")]
@@ -1316,67 +2015,10 @@ def check_list_beyond_cap():
     finally:
         main.REGISTRY = saved_registry
         store.close()
-    return "10 сессий при потолке 3: все в списке, длина истории на месте, любая открывается"
+    return "10 чатов при потолке 3: все в списке, длина истории на месте, любой открывается"
 
 
-@check("список не обрезается: тысяча с лишним сессий видна целиком, ростер на месте")
-def check_list_not_truncated():
-    """Обрезка списка была бы молчаливой, а резала бы по времени записи.
-
-    Первыми выпали бы агенты дней 1–5, с которыми ещё не говорили: у них самый
-    старый `updated_at`. То есть ровно то, ради чего список и открывают.
-    """
-    from app.registry import AgentRegistry
-
-    path = _temp_db("no-cap")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        registry = AgentRegistry(max_agents=5, store=store)
-        main.REGISTRY = registry
-        roster = main.ensure_roster()
-        assert roster, "ростер должен подняться"
-
-        # Тысяча с лишним чатов поверх ростера. Пишем прямо в базу: проверяем
-        # список, а не спавн, и тысяча живых агентов ей для этого не нужна.
-        made = 1200
-        now = time.time()
-        with store.bulk():
-            for i in range(made):
-                store.save_session(
-                    f"chat_{i:05d}",
-                    label=f"чат {i}",
-                    config={"model": "stub/m", "label": f"чат {i}"},
-                    seed=[],
-                    created_at=now + i,
-                )
-
-        entries = main._listing()["agents"]
-        assert len(entries) == made + len(day.AGENTS), (
-            f"в списке {len(entries)} из {made + len(day.AGENTS)} сессий — список обрезан"
-        )
-
-        # Агенты дней 1–5 никуда не делись: у них самый старый updated_at,
-        # и любая обрезка снесла бы именно их.
-        labels = {entry["label"] for entry in entries}
-        for group_labels in PAST_DAYS.values():
-            for label in group_labels:
-                assert label in labels, f"«{label}» вытеснен из списка обрезкой"
-        # И они по-прежнему первые: порядок держится на created_at.
-        assert [e["label"] for e in entries[: len(day.AGENTS)]] == [
-            spec.label for spec in day.AGENTS
-        ], [e["label"] for e in entries[:3]]
-
-        # Любая из дальних сессий открывается — она не декорация в списке.
-        far = entries[-1]
-        assert main.REGISTRY.require(far["id"]).spec.label == far["label"]
-    finally:
-        main.REGISTRY = saved_registry
-        store.close()
-    return f"{made} чатов плюс ростер — в списке все, агенты дней 1–5 первыми"
-
-
-@check("вытеснение — выгрузка, а не удаление: сессия остаётся в базе")
+@check("вытеснение — выгрузка, а не удаление: чат остаётся в базе")
 def check_eviction_keeps_session():
     from app.registry import AgentRegistry
 
@@ -1391,16 +2033,16 @@ def check_eviction_keeps_session():
     registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(3)])
     assert registry.get(old_id) is None, "старый должен быть выгружен из памяти"
     assert registry.evicted >= 1, registry.evicted
-    assert registry.store.load_session(old_id) is not None, "выгрузка не должна удалять сессию"
+    assert registry.store.load_session(old_id) is not None, "выгрузка не должна удалять чат"
 
     revived = registry.require(old_id)
     assert revived is not old, "поднят новый объект, а не тот же самый"
-    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет"], revived.history
+    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет"]
     assert revived.spec.temperature == 0.9, revived.spec.temperature
 
     registry.kill(revived.id)
     assert registry.store.load_session(old_id) is None, "kill обязан стереть и строку в базе"
-    return "выгруженная сессия поднялась с историей и конфигом; kill стёр её из базы"
+    return "выгруженный чат поднялся с историей и конфигом; kill стёр его из базы"
 
 
 @check("выгруженный объект больше не пишет в сессию")
@@ -1427,7 +2069,7 @@ def check_detached_does_not_clobber():
     return "выгруженный объект пишет только в память, база остаётся за поднятым"
 
 
-@check("параллельная запись: восемь сессий пишут одновременно, ничего не теряется")
+@check("параллельная запись: восемь чатов пишут одновременно, ничего не теряется")
 def check_parallel_writes():
     from app.agent import Agent
 
@@ -1435,9 +2077,7 @@ def check_parallel_writes():
     store = Store(path).init()
     _stub.install(reply=lambda m, i: f"ответ-{i}", chunks=6, delay=0.002)
 
-    agents = [
-        Agent(AgentSpec(label=f"чат {i}", model="stub/m"), store=store) for i in range(8)
-    ]
+    agents = [Agent(AgentSpec(label=f"чат {i}", model="stub/m"), store=store) for i in range(8)]
 
     async def all_at_once():
         await asyncio.gather(*(drain(a.ask(f"вопрос {i}")) for i, a in enumerate(agents)))
@@ -1453,7 +2093,7 @@ def check_parallel_writes():
     total = reopened.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert total == 16, total
     reopened.close()
-    return "8 сессий писали одновременно, в базе 16 реплик, порядок в каждой свой"
+    return "8 чатов писали одновременно, в базе 16 реплик, порядок в каждом свой"
 
 
 @check("id выдаёт база: занятый номер не выдаётся второй раз")
@@ -1464,25 +2104,24 @@ def check_id_claimed_in_store():
     path = _temp_db("claim")
     store = Store(path).init()
 
-    stranger = Agent(AgentSpec(label="чужая", model="stub/m"), store=store)
+    stranger = Agent(AgentSpec(label="чужой", model="stub/m"), store=store)
     stranger.remember("user", "СЕКРЕТ соседа")
     stranger.remember("assistant", "ответ соседа")
     taken = stranger.id
 
     # Откатываем счётчик ровно на этот номер: так и выглядит давно поднятый
-    # стенд, мимо которого консоль успела занять следующий id.
+    # сервер, мимо которого консоль успела занять следующий id.
     agent_mod._last_id = int(taken.removeprefix("ag_")) - 1
-    mine = Agent(AgentSpec(label="моя", model="stub/m"), store=store)
+    mine = Agent(AgentSpec(label="мой", model="stub/m"), store=store)
     assert mine.id != taken, f"выдан занятый id {taken}"
 
-    survived = [row[2] for row in store.message_rows(taken)]
-    assert survived == ["СЕКРЕТ соседа", "ответ соседа"], survived
-    assert store.load_session(taken)["label"] == "чужая", "чужой конфиг перезаписан"
+    assert [row[2] for row in store.message_rows(taken)] == ["СЕКРЕТ соседа", "ответ соседа"]
+    assert store.load_session(taken)["label"] == "чужой", "чужой конфиг перезаписан"
     store.close()
     return f"{taken} остался за соседом, свежий агент получил {mine.id}"
 
 
-@check("недостроенный агент не оставляет пустую строку сессии")
+@check("недостроенный агент не оставляет пустую строку чата")
 def check_claim_rolled_back():
     from app.agent import Agent
 
@@ -1503,7 +2142,7 @@ def check_claim_rolled_back():
 
     assert store.count_sessions() == before, "занятая строка не убрана"
     assert [row["label"] for row in store.list_sessions()] == ["живой"]
-    assert store.load_session(good.id) is not None, "уборка задела чужую сессию"
+    assert store.load_session(good.id) is not None, "уборка задела чужой чат"
     store.close()
     return "строка, занятая под упавший конструктор, убрана; соседняя цела"
 
@@ -1517,8 +2156,7 @@ def check_context_length_restored():
     registry = AgentRegistry(max_agents=10, store=store)
     agent = registry.create(AgentSpec(label="контекст", model="stub/m"), context_length=128_000)
     registry._unload(agent.id)
-    revived = registry.require(agent.id)
-    assert revived.context_length == 128_000, revived.context_length
+    assert registry.require(agent.id).context_length == 128_000
 
     store.close()
     reopened = Store(path).init()
@@ -1542,11 +2180,10 @@ def check_no_key_in_db():
             AgentSpec(
                 label=f"утечка {key}",
                 model="stub/m",
-                messages=[{"role": "system", "content": f"ключ: {key}"}],
-                extra_body={"headers": {"Authorization": f"Bearer {key}"}},
                 system=key,
                 draft=key,
-                note=key,
+                extra_body={"headers": {"Authorization": f"Bearer {key}"}},
+                stop=[key],
             ),
             store=store,
         )
@@ -1558,9 +2195,10 @@ def check_no_key_in_db():
         # автор про redact() в этом конкретном методе.
         with store.tx() as conn:
             conn.execute("UPDATE sessions SET label = ? WHERE id = ?", (key, agent.id))
+            conn.execute("INSERT INTO meta (key, value) VALUES ('ловушка', ?)", (key,))
 
         leaked = []
-        for table in ("sessions", "messages"):
+        for table in ("sessions", "messages", "meta"):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 for name in row.keys():
                     if isinstance(row[name], str) and key in row[name]:
@@ -1596,13 +2234,11 @@ def check_redact_floor():
     store = Store(path).init()
     try:
         os.environ["OPENROUTER_API_KEY"] = "1"
-        assert redact("ag_00001") == "ag_00001", redact("ag_00001")
-        assert redact("assistant") == "assistant"
+        assert redact("ag_00001") == "ag_00001" and redact("assistant") == "assistant"
 
         agent = Agent(AgentSpec(label="порог", model="stub/m"), store=store)
         agent.remember("user", "встретимся 1 числа")
-        rows = store.message_rows(agent.id)
-        assert [r[2] for r in rows] == ["встретимся 1 числа"], rows
+        assert [r[2] for r in store.message_rows(agent.id)] == ["встретимся 1 числа"]
         assert store.load_session(agent.id)["label"] == "порог", "id или имя изрезаны редакцией"
 
         real = "sk-or-v1-" + "a" * 64
@@ -1630,7 +2266,6 @@ def check_busy_message():
     assert isinstance(translated, StoreBusyError), type(translated)
     text = str(translated)
     assert "занята другим процессом" in text and "повторите" in text, text
-    # Чужие OperationalError не подменяем: «no such table» — это баг, а не очередь.
     assert _busy(sqlite3.OperationalError("no such table: sessions"), "/tmp/a.db") is None
 
     path = _temp_db("busy")
@@ -1658,7 +2293,7 @@ def check_busy_message():
     reopened = Store(path).init()
     assert [r["label"] for r in reopened.list_sessions()] == [], reopened.list_sessions()
     reopened.close()
-    return "HTTP 503 с объяснением; сессию, которую не записали, база не завела"
+    return "HTTP 503 с объяснением; чат, который не записали, база не завела"
 
 
 @check(".gitignore ловит базу и её WAL-файлы")
@@ -1680,7 +2315,7 @@ def check_gitignore_db():
     return "git игнорирует *.db, *.db-wal, *.db-shm и каталог data/"
 
 
-@check("CLI продолжает сохранённую сессию: --session и /сессии")
+@check("CLI продолжает сохранённый чат: --session и /сессии")
 def check_cli_session():
     import io
 
@@ -1690,7 +2325,6 @@ def check_cli_session():
     first = cli.build_agent(cli._parse_args(["--model", "stub/m", "--label", "консоль"]))
     asyncio.run(cli.ask(first, "меня зовут Нина", io.StringIO()))
 
-    # Выгружаем из памяти: для второго запуска в памяти нет вообще ничего.
     REGISTRY._unload(first.id)
     assert REGISTRY.get(first.id) is None
 
@@ -1715,16 +2349,16 @@ def check_cli_session():
 
     try:
         cli.build_agent(cli._parse_args(["--session", "ag_99999"]))
-        raise AssertionError("несуществующая сессия должна честно падать")
+        raise AssertionError("несуществующий чат должен честно падать")
     except SystemExit:
         pass
-    return "--session поднимает сессию из базы, /сессии её показывает"
+    return "--session поднимает чат из базы, /сессии его показывает"
 
 
 CHECKS = [
     check_spawn_100,
     check_past_days_transfer,
-    check_roster_live,
+    check_flat_list,
     check_draft_not_sent,
     check_scenarios_gone,
     check_memory,
@@ -1733,16 +2367,26 @@ CHECKS = [
     check_rollback,
     check_disconnect,
     check_new_params,
+    check_panel_applies_next_message,
+    check_patch_during_generation,
+    check_config_snapshot,
+    check_system_prompt_single_home,
+    check_stop_and_format,
     check_patch_panel,
     check_reasoning,
     check_first_token,
     check_regenerate,
     check_regenerate_failure,
     check_regenerate_disconnect,
-    check_reset_keeps_roster,
-    check_new_chat,
+    check_no_clear_all,
+    check_numbered_names,
+    check_list_actions,
+    check_no_leftover_texts,
+    check_no_reference_name,
     check_no_key_leak,
+    check_catalog_capabilities,
     check_no_cdn,
+    check_composer_pinned,
     check_browser,
     check_spec_deep_copy,
     check_eviction,
@@ -1762,9 +2406,15 @@ CHECKS = [
     check_reasoning_not_stored,
     check_regenerate_failure_db,
     check_list_survives_restart,
-    check_renamed_roster_not_duplicated,
-    check_list_beyond_cap,
+    check_deleted_chat_stays_deleted,
+    check_renamed_chat_not_duplicated,
+    check_numbering_survives_restart,
+    check_new_preset_appears,
+    check_preset_order_changed,
+    check_legacy_bootstrap_migrated,
+    check_broken_presets_marker,
     check_list_not_truncated,
+    check_list_beyond_cap,
     check_eviction_keeps_session,
     check_detached_does_not_clobber,
     check_parallel_writes,
