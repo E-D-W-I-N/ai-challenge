@@ -11,7 +11,10 @@
   сэмплирования. Одним полем — чтобы новое поле конфига сохранялось само,
   а не требовало не забыть про колонку;
 * `messages` — реплики, у каждой обязателен `session_id` и порядковый номер
-  внутри сессии.
+  внутри сессии;
+* `meta` — две записи на всю базу: «заготовленные чаты уже заведены» и счётчик
+  имён по умолчанию. Обе про то, что должно случиться **один раз за жизнь
+  базы**, а не один раз за запуск процесса.
 
 `session_id` в ключе таблицы сообщений — не украшение. Без него после
 перезапуска все диалоги слились бы в одну ленту: два чата, поднятые из базы,
@@ -87,6 +90,11 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session_id);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -454,10 +462,16 @@ class Store:
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком. Нужно только проверкам между собой."""
+        """Стирает базу целиком, включая `meta`. Нужно только проверкам между собой.
+
+        Именно целиком: в `meta` лежит отметка «заготовленные чаты уже заведены»,
+        и оставить её значило бы отдать следующей проверке базу без чатов, но
+        с отметкой, что они есть.
+        """
         with self.tx() as conn:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM sessions")
+            conn.execute("DELETE FROM meta")
 
     # --- сообщения -----------------------------------------------------------
 
@@ -524,7 +538,43 @@ class Store:
             ).fetchall()
         return [(r["seq"], r["role"], r["content"]) for r in rows]
 
-    # --- идентификаторы ------------------------------------------------------
+    # --- meta: то, что живёт один раз на базу --------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        with self.reading() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+
+    def next_counter(self, key: str) -> int:
+        """Следующее число счётчика, хранимого в базе. Никогда не повторяется.
+
+        Счётчик в памяти процесса тут не годится дважды. После перезапуска он
+        начался бы с единицы, и следующий чат назвался бы «Новый чат 1», хотя
+        такой уже есть. А консоль, запущенная рядом со стендом, вела бы свой
+        счёт и выдала бы то же имя параллельно. Инкремент идёт одним запросом
+        внутри транзакции, поэтому два процесса получают разные числа.
+        """
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, '0') ON CONFLICT(key) DO NOTHING",
+                (key,),
+            )
+            row = conn.execute(
+                "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+                "WHERE key = ? RETURNING value",
+                (key,),
+            ).fetchone()
+        return int(row["value"])
+
+    # --- идентификаторы сессий -----------------------------------------------
 
     def claim_agent_id(self) -> str:
         """Занимает свободный id, вставляя пустую строку сессии.

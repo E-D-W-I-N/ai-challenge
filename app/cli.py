@@ -33,13 +33,13 @@ SESSIONS_SHOWN = 30
 """Сколько сессий печатает `/сессии`. Остальные не спрятаны — их число видно."""
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
-DEFAULT_SYSTEM = "Ты — агент стенда AI-челленджа. Отвечай по-русски, коротко и по делу."
+DEFAULT_SYSTEM = "Ты — полезный ассистент. Отвечай по-русски, коротко и по делу."
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
-        description="Разговор с агентом из консоли: тот же класс, что и в стенде.",
+        description="Разговор с агентом из консоли: тот же класс, что и в вебе.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"id модели (по умолчанию {DEFAULT_MODEL})")
     parser.add_argument("--system", default=DEFAULT_SYSTEM, help="системный промпт агента")

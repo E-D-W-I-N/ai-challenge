@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Challenge — агенты</title>
+  <title>AI Challenge — чат</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">агенты · день 7</span>
+            <span class="brand-sub">чат · день 7</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -31,15 +31,6 @@
 
       <footer class="sidebar-foot">
         <button class="foot-btn" id="theme-toggle" type="button"></button>
-        <label class="foot-btn switch-row">
-          <span class="foot-icon" aria-hidden="true">T</span>
-          <span class="foot-label">Автоимя чата</span>
-          <span class="switch"><input type="checkbox" id="autoname" checked><span class="knob"></span></span>
-        </label>
-        <button class="foot-btn danger" id="clear-all" type="button">
-          <span class="foot-icon" aria-hidden="true">⌫</span>
-          <span class="foot-label">Очистить все чаты</span>
-        </button>
       </footer>
     </aside>
 
@@ -78,7 +69,7 @@
             <span class="field-label">Модель</span>
             <select id="f-model" class="control"></select>
           </label>
-          <div class="field-note" id="model-note"></div>
+          <div class="warn hidden" id="model-warn" role="status"></div>
 
           <div class="grid2">
             <label class="field">
@@ -125,25 +116,40 @@
             <span class="field-label">Окно памяти, сообщений</span>
             <input id="f-history_limit" class="control" type="number" step="1" min="0" placeholder="по умолчанию">
           </label>
+
+          <label class="field">
+            <span class="field-label">Формат ответа</span>
+            <select id="f-response_format_kind" class="control">
+              <option value="">не задан</option>
+              <option value="json_object">JSON-объект</option>
+              <option value="custom">свой JSON…</option>
+            </select>
+          </label>
+          <label class="field hidden" id="response-format-custom">
+            <span class="field-label">response_format, JSON</span>
+            <textarea id="f-response_format" class="control area mono" rows="4"
+                      placeholder='{"type": "json_schema", "json_schema": {…}}'></textarea>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Стоп-строки, по одной в строке</span>
+            <textarea id="f-stop" class="control area mono" rows="3" placeholder="не заданы"></textarea>
+          </label>
+
           <p class="hint">Пустое поле — параметр не отправляется вовсе. Ноль в окне памяти —
-            агент забывает разговор и каждый вопрос отвечает как первый.</p>
+            чат забывает разговор и каждый вопрос отвечает как первый.</p>
         </section>
 
         <section class="tab-page hidden" id="tab-agent">
           <label class="field">
-            <span class="field-label">Имя агента</span>
-            <input id="f-label" class="control" type="text" placeholder="Новый чат">
-          </label>
-          <label class="field">
             <span class="field-label">Системный промпт</span>
-            <textarea id="f-system" class="control area" rows="12" placeholder="без системного промпта"></textarea>
+            <textarea id="f-system" class="control area" rows="16" placeholder="без системного промпта"></textarea>
           </label>
-          <div class="field-note" id="agent-note"></div>
+          <p class="hint">Имя чата меняется карандашом в списке слева.</p>
         </section>
       </div>
 
       <div class="panel-save">
-        <button class="save-btn" id="save-settings" type="button">Сохранить настройки</button>
         <div class="save-status" id="save-status"></div>
       </div>
 
