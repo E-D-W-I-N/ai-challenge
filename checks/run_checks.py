@@ -33,6 +33,13 @@ from app.schema import AgentSpec  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
+CHECKS: list = []
+"""Проверки в порядке объявления. Наполняет декоратор `check`.
+
+Списка руками нет намеренно: он дублировал объявления, и забыть в нём
+строчку значило тихо не запустить проверку.
+"""
+
 
 def check(name):
     def wrap(fn):
@@ -48,6 +55,7 @@ def check(name):
                 RESULTS.append((name, False, f"{type(exc).__name__}: {exc}"))
 
         run.__name__ = fn.__name__
+        CHECKS.append(run)
         return run
 
     return wrap
@@ -944,11 +952,14 @@ def check_numbered_names():
 
 @check("переименование и удаление живут в списке слева")
 def check_list_actions():
-    js = read("app/static/app.js")
-    assert "function startRename" in js and "function askDelete" in js
-    assert "miniButton(\"pencil\"" in js, "карандаша в строке списка нет"
-    assert "miniButton(\"trash\"" in js, "корзины в строке списка нет"
-    assert "Escape" in js and "Enter" in js, "переименование должно слушать Enter и Escape"
+    """Серверная половина: PATCH меняет имя, пустое имя отвергается, DELETE убирает.
+
+    Клиентская половина — в `checks/browser_check.js`, блоком «переименование
+    чата в списке слева»: клик по карандашу, Enter, Escape, потеря фокуса,
+    пустое имя. Раньше она была грепом по исходнику («в app.js есть строка
+    function startRename»), то есть описывала реализацию: переименование
+    ломалось, не тронув ни одной из тех строк, и греп оставался зелёным.
+    """
     assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
 
     with TestClient(main.app) as client:
@@ -958,7 +969,7 @@ def check_list_actions():
         assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
         assert client.delete(f"/api/agents/{agent_id}").status_code == 200
         assert client.get(f"/api/agents/{agent_id}").status_code == 404
-    return "карандаш и корзина в строке, поля имени в панели нет"
+    return "PATCH меняет имя, пустое отвергается, DELETE убирает; поля имени в панели нет"
 
 
 @check("пояснений прошлой постановки нет ни в данных, ни в разметке")
@@ -1298,48 +1309,6 @@ def check_cli():
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
     return "ответ напечатан, история записана, агент в реестре"
-
-
-CHECKS = [
-    check_spawn_100,
-    check_flat_list,
-    check_new_chat_is_blank,
-    check_no_presets,
-    check_scenarios_gone,
-    check_memory,
-    check_history_window,
-    check_parallel,
-    check_rollback,
-    check_disconnect,
-    check_new_params,
-    check_panel_applies_next_message,
-    check_patch_during_generation,
-    check_config_snapshot,
-    check_system_prompt_single_home,
-    check_stop_and_format,
-    check_patch_panel,
-    check_reasoning,
-    check_first_token,
-    check_regenerate,
-    check_regenerate_failure,
-    check_regenerate_disconnect,
-    check_no_clear_all,
-    check_numbered_names,
-    check_list_actions,
-    check_no_leftover_texts,
-    check_no_reference_name,
-    check_no_key_leak,
-    check_catalog_capabilities,
-    check_no_cdn,
-    check_feed_scrolls,
-    check_browser,
-    check_spec_deep_copy,
-    check_eviction,
-    check_batch_limit,
-    check_shared_client,
-    check_no_feed,
-    check_cli,
-]
 
 
 def main_() -> int:
