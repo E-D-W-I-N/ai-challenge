@@ -483,6 +483,12 @@ function renderScenarioBar(sc) {
     <div id="pickers" class="pickers"></div>
     <button class="start" id="start-btn">Старт</button>`;
   bar.querySelector(".scenario-title").textContent = sc.title;
+  // «Старт» заводит колонки заново, а прошлый набор удаляет вместе
+  // с сохранёнными сессиями. Разговор с колонкой до «Старта» — тоже сессия,
+  // и об этом честнее предупредить кнопкой, а не постфактум.
+  $("#start-btn").title =
+    "Заводит колонки заново. Прошлый набор колонок удаляется из базы — " +
+    "включая то, что вы успели написать колонке до «Старта».";
   $("#start-btn").onclick = startRun;
   buildPickers(sc);
 }

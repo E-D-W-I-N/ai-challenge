@@ -1381,8 +1381,16 @@ def check_parallel_writes():
     return "8 сессий писали одновременно, в базе 16 реплик, порядок в каждой свой"
 
 
-@check("ключа OpenRouter в базе нет: ни в конфиге, ни в extra_body, ни в реплике")
+@check("ключа OpenRouter в базе нет ни в одной колонке — включая ещё не придуманные")
 def check_no_key_in_db():
+    """Ключ подставляется во все текстовые пути, а не только в те, где есть redact().
+
+    Прошлая версия проверки клала ключ ровно туда, где редакция была написана
+    руками, — и потому не заметила бы, что `label` и `error` пишутся сырыми.
+    Теперь ключ едет во всё, куда вообще попадает текст, а ищется он не в тех
+    колонках, которые мы вспомнили, а во всех значениях всех строк обеих таблиц
+    и, сверх того, во всех файлах базы побайтно.
+    """
     from app.agent import Agent
 
     key = "sk-or-v1-ТЕСТОВЫЙ-КЛЮЧ-КОТОРЫЙ-НЕ-ДОЛЖЕН-УТЕЧЬ"
@@ -1393,15 +1401,40 @@ def check_no_key_in_db():
     try:
         agent = Agent(
             AgentSpec(
-                label="утечка",
+                # label и note раньше уезжали в базу сырыми: label отдельной
+                # колонкой, note — внутри конфига.
+                label=f"утечка {key}",
                 model="stub/m",
                 messages=[{"role": "system", "content": f"ключ: {key}"}],
                 extra_body={"headers": {"Authorization": f"Bearer {key}"}},
                 system=key,
+                note=key,
             ),
             store=store,
         )
-        agent.remember_exchange(f"вот мой ключ {key}", "не надо мне его слать")
+        agent.overrides["model"] = key
+        agent.save_config()
+        # В error приезжает тело ответа OpenRouter (app/llm.py) — путь не выдуман.
+        agent.remember_exchange(
+            f"вот мой ключ {key}", "не надо мне его слать", error=f"HTTP 401: {key}"
+        )
+
+        # А это — про колонки, которых ещё нет: любая запись идёт через
+        # транзакцию, и параметр чистится независимо от того, вспомнил ли
+        # автор про redact() в этом конкретном методе.
+        with store.tx() as conn:
+            conn.execute("UPDATE sessions SET label = ? WHERE id = ?", (key, agent.id))
+
+        # Ищем не в тех колонках, что вспомнили, а во всех значениях обеих таблиц.
+        leaked = []
+        for table in ("sessions", "messages"):
+            for row in store.conn.execute(f"SELECT * FROM {table}"):
+                for name in row.keys():
+                    value = row[name]
+                    if isinstance(value, str) and key in value:
+                        leaked.append(f"{table}.{name}")
+        assert not leaked, f"ключ лежит в колонках: {sorted(set(leaked))}"
+
         store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         store.close()
 
@@ -1422,7 +1455,154 @@ def check_no_key_in_db():
     # И сам ключ читается только из окружения: в конфиг агента он не попадает.
     source = open(os.path.join(ROOT, "app", "store.py"), encoding="utf-8").read()
     assert "api_key" in source, "хранилище обязано знать про ключ, чтобы его вырезать"
-    return f"ключ не найден ни в одном из файлов базы ({', '.join(files)})"
+    return f"ключ не найден ни в одной колонке и ни в одном файле базы ({', '.join(files)})"
+
+
+# --- 13. два процесса на одной базе -------------------------------------------
+
+
+@check("два процесса на одной базе: id не пересекаются, чужой диалог цел")
+def check_two_processes():
+    result = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "checks", "two_processes.py")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ОК: два процесса" in result.stdout, result.stdout
+    return result.stdout.strip().splitlines()[-3]
+
+
+@check("id выдаёт база: занятый номер не выдаётся второй раз")
+def check_id_claimed_in_store():
+    """То же, что checks/two_processes.py, но без процессов — на одном файле.
+
+    Счётчик id живёт в памяти процесса, поэтому «второй процесс» здесь
+    изображается сдвигом счётчика назад: так же выглядит давно поднятый стенд,
+    мимо которого консоль успела занять следующий номер.
+    """
+    from app.agent import Agent
+    import app.agent as agent_mod
+
+    path = _temp_db("claim")
+    store = Store(path).init()
+
+    stranger = Agent(AgentSpec(label="чужая", model="stub/m", messages=[]), store=store)
+    stranger.remember_exchange("СЕКРЕТ соседа", "ответ соседа")
+    taken = stranger.id
+
+    # Откатываем счётчик ровно на этот номер: так и выглядит давно поднятый
+    # стенд, мимо которого консоль успела занять следующий id.
+    agent_mod._last_id = int(taken.removeprefix("ag_")) - 1
+    assert agent_mod.new_agent_id() == taken, "счётчик должен целиться в занятый номер"
+    agent_mod._last_id = int(taken.removeprefix("ag_")) - 1
+
+    mine = Agent(AgentSpec(label="моя", model="stub/m", messages=[]), store=store)
+    assert mine.id != taken, f"выдан занятый id {taken}"
+    mine.remember_exchange("мой вопрос", "мой ответ")
+
+    survived = [row[2] for row in store.message_rows(taken)]
+    assert survived == ["СЕКРЕТ соседа", "ответ соседа"], survived
+    assert store.load_session(taken)["label"] == "чужая", "чужой конфиг перезаписан"
+    store.close()
+    return f"{taken} остался за соседом, свежий агент получил {mine.id}"
+
+
+@check("выгруженный объект больше не пишет в сессию")
+def check_detached_does_not_clobber():
+    """До Дня 7 такого класса не было: вытеснение удаляло агента совсем.
+
+    Теперь сессия переживает выгрузку, и на неё может смотреть два объекта:
+    поднятый из базы и тот, чью ссылку кто-то придержал. Писать вправе только
+    первый — иначе `persist()` старого затрёт реплики нового.
+    """
+    from app.registry import AgentRegistry
+
+    registry = AgentRegistry(max_agents=1)
+    first = registry.create(AgentSpec(label="долгая", model="stub/m", messages=[]))
+    first.remember_exchange("вопрос 1", "ответ 1")
+
+    registry.create(AgentSpec(label="вытесняющая", model="stub/m", messages=[]))
+    assert registry.get(first.id) is None, "первый должен быть выгружен"
+    assert first.detached is True and first.store is None, "выгруженный обязан отцепиться"
+
+    second = registry.require(first.id)
+    assert second is not first, "поднят тот же объект — проверка ничего не проверяет"
+    second.remember_exchange("вопрос 2", "ответ 2")
+
+    # Старая ссылка продолжает работать в памяти, но в базу не лезет.
+    first.remember_exchange("мусор", "мусор")
+    assert [t.content for t in first.history][-2:] == ["мусор", "мусор"]
+
+    stored = [row[2] for row in registry.store.message_rows(first.id)]
+    assert stored == ["вопрос 1", "ответ 1", "вопрос 2", "ответ 2"], stored
+    return "выгруженный объект пишет только в память, база остаётся за поднятым"
+
+
+@check("колонка занята всю дорожку прогона, включая ожидание depends_on")
+def check_waiting_column_is_busy():
+    """Ждущий субагент не держит lock — и потолок реестра вытеснил бы его
+    прямо из-под идущего прогона, оставив на одной сессии два объекта."""
+    _stub.install(reply="ок", chunks=4, delay=0.02)
+    seen: dict = {}
+
+    async def scenario():
+        stream = main._run_events(0, {}, None)
+        async for event in stream:
+            if event.get("event") == "session_waiting" and "busy" not in seen:
+                waiting = REGISTRY.require(event["agent"])
+                seen["busy"] = waiting.busy
+                seen["evictable"] = REGISTRY._evictable(waiting)
+
+    with _scenarios([LADDER]):
+        asyncio.run(scenario())
+
+    assert seen.get("busy") is True, "ждущая колонка числится свободной"
+    assert seen.get("evictable") is False, "ждущую колонку вытеснение всё ещё трогает"
+    # После прогона бронь снята — иначе колонка навсегда отвечала бы 409.
+    assert all(not a.busy for a in REGISTRY.list()), [a.id for a in REGISTRY.list() if a.busy]
+    return "колонка на ожидании depends_on занята и вытеснению недоступна"
+
+
+@check("context_length переживает выгрузку и перезапуск")
+def check_context_length_restored():
+    path = _temp_db("ctxlen")
+    store = Store(path).init()
+    from app.registry import AgentRegistry
+
+    registry = AgentRegistry(max_agents=10, store=store)
+    agent = registry.create(
+        AgentSpec(label="контекст", model="stub/m", messages=[]), context_length=128_000
+    )
+    registry._unload(agent.id)
+    revived = registry.require(agent.id)
+    assert revived.context_length == 128_000, revived.context_length
+
+    store.close()
+    reopened = Store(path).init()
+    assert reopened.load_session(agent.id)["context_length"] == 128_000
+    reopened.close()
+    return "после выгрузки и после переоткрытия файла context_fill_pct снова считается"
+
+
+@check("ручка сессий показывает действующее окно памяти, а не null")
+def check_sessions_effective_window():
+    from app.agent import DEFAULT_HISTORY_LIMIT
+
+    with TestClient(main.app) as client:
+        default_id = client.post(
+            "/api/agents", json={"agent": {"model": "stub/m", "label": "по умолчанию"}}
+        ).json()["agents"][0]["id"]
+        blank_id = client.post(
+            "/api/agents",
+            json={"agent": {"model": "stub/m", "label": "без памяти", "history_limit": 0}},
+        ).json()["agents"][0]["id"]
+        rows = {s["id"]: s for s in client.get("/api/sessions").json()["sessions"]}
+
+    assert rows[default_id]["history_limit"] == DEFAULT_HISTORY_LIMIT, rows[default_id]
+    assert rows[blank_id]["history_limit"] == 0, rows[blank_id]
+    return f"дефолт показан как {DEFAULT_HISTORY_LIMIT}, а не null; ноль остался нулём"
 
 
 @check(".gitignore ловит базу и её WAL-файлы")
@@ -1614,6 +1794,13 @@ CHECKS = [
     check_sessions_api,
     check_cli_session,
     check_seed_until_started,
+    # --- по итогам ревью ---
+    check_two_processes,
+    check_id_claimed_in_store,
+    check_detached_does_not_clobber,
+    check_waiting_column_is_busy,
+    check_context_length_restored,
+    check_sessions_effective_window,
 ]
 
 

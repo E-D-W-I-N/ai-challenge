@@ -53,6 +53,16 @@ _last_id = 0
 _id_lock = threading.Lock()
 
 
+def effective_history_limit(limit: int | None) -> int:
+    """Окно памяти в сообщениях: None — дефолт агента, отрицательное — ноль.
+
+    Вынесено из свойства `Agent.history_limit`, потому что то же число надо
+    показывать в списке сохранённых сессий: там агента в памяти может не быть
+    вовсе, а окно у сессии всё равно действующее, а не «null».
+    """
+    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+
+
 def new_agent_id() -> str:
     global _last_id
     with _id_lock:
@@ -127,7 +137,15 @@ class Agent:
             response_format=copy.deepcopy(spec.response_format),
             extra_body=copy.deepcopy(spec.extra_body or {}),
         )
-        self.id = agent_id or new_agent_id()
+        # Свежий id занимает база, а не процесс: стенд и CLI ходят в один файл,
+        # и локальный счётчик выдал бы обоим один номер (см. app/store.py).
+        # Без хранилища агент живёт только в памяти — там и счётчика хватает.
+        if agent_id is not None:
+            self.id = agent_id
+        elif store is not None:
+            self.id = store.claim_agent_id()
+        else:
+            self.id = new_agent_id()
         self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at
@@ -148,6 +166,9 @@ class Agent:
         колонки на моделях из day.py, молча отменив выбор пользователя.
         """
 
+        self.detached = False
+        """Агента выгрузили из реестра: писать в сессию он больше не вправе."""
+
         self.seed_used = False
         """Стартовый вопрос уже лёг в историю обычным ходом.
 
@@ -163,7 +184,11 @@ class Agent:
         self._reserved = False
 
         self.store = store
-        """Хранилище сессии. None — агент живёт только в памяти процесса."""
+        """Хранилище сессии. None — агент живёт только в памяти процесса.
+
+        Обнуляется при выгрузке из реестра: с этого момента объект больше
+        не владелец сессии, и писать в неё ему нельзя (см. `detach`).
+        """
 
         if store is not None:
             # Восстановление — здесь, а не отдельным вызовом из UI: забыть
@@ -177,6 +202,11 @@ class Agent:
                 self.seed_messages = [dict(m) for m in saved["seed"]]
                 self.overrides = dict(saved["overrides"])
                 self.seed_used = saved["seed_used"]
+                if saved.get("context_length") is not None and context_length is None:
+                    # Длина контекста нужна метрикам для context_fill_pct.
+                    # Каталог моделей — сетевой запрос, и восстановление сессии
+                    # не должно его ждать: значение лежит рядом с конфигом.
+                    self.context_length = saved["context_length"]
                 self.history = [
                     Turn(role=m["role"], content=m["content"], error=m["error"], at=m["at"])
                     for m in store.load_messages(self.id)
@@ -210,8 +240,7 @@ class Agent:
 
     @property
     def history_limit(self) -> int:
-        limit = self.spec.history_limit
-        return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+        return effective_history_limit(self.spec.history_limit)
 
     def cancel(self) -> None:
         """Просит агента прекратить текущую генерацию.
@@ -326,6 +355,22 @@ class Agent:
             self.remember("user", question, persist=False)
         self.remember("assistant", answer, error=error)
 
+    def detach(self) -> None:
+        """Снимает с объекта право писать в сессию.
+
+        Зовётся при выгрузке из реестра. Сессию в базе владеет тот объект,
+        который сейчас лежит в реестре; выгруженный — уже нет. Иначе чужая
+        ссылка на выгруженного агента пережила бы вытеснение, `require()`
+        поднял бы из базы **второй** объект той же сессии, и `persist()`
+        первого затёр бы реплики второго.
+
+        Терять при этом нечего: история и конфиг пишутся сразу после каждого
+        обмена и после каждой правки, так что на момент выгрузки в базе уже
+        лежит всё. В памяти агент продолжает работать как обычно.
+        """
+        self.store = None
+        self.detached = True
+
     def persist(self) -> None:
         """Пишет историю в хранилище. Без хранилища — тихо ничего не делает."""
         if self.store is not None:
@@ -350,6 +395,7 @@ class Agent:
             overrides=dict(self.overrides),
             seed_used=self.seed_used,
             created_at=self.created_at,
+            context_length=self.context_length,
         )
 
     def _trim(self) -> None:

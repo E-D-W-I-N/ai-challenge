@@ -131,6 +131,8 @@ class AgentRegistry:
         # на вытеснение, а не живёт сверх потолка.
         self._make_room(1)
         spec = _spec_from_config(saved["config"])
+        # context_length конструктор достанет из той же строки: каталог моделей
+        # — сетевой запрос, и восстановление сессии не должно его ждать.
         agent = Agent(
             spec,
             agent_id=saved["id"],
@@ -207,10 +209,23 @@ class AgentRegistry:
             unloaded.extend(self._unload(child.id))
         agent.cancel()
         self._agents.pop(agent_id, None)
+        # Сессией владеет тот объект, что лежит в реестре. Выгруженный больше
+        # не владелец: иначе чужая ссылка на него пережила бы вытеснение,
+        # `require()` поднял бы из базы второй объект той же сессии,
+        # и `persist()` первого затёр бы реплики второго.
+        agent.detach()
         return unloaded
 
     def kill_children(self, parent_id: str) -> list[str]:
-        """Удаляет набор субагентов родителя. «Старт» зовёт это перед новым набором."""
+        """Удаляет набор субагентов родителя. «Старт» зовёт это перед новым набором.
+
+        Именно удаляет, а не выгружает: прошлый набор колонок замещается новым,
+        и без этого база копила бы по набору на каждый «Старт». Плата за это
+        названа прямо — разговор, который успели завести с колонкой **до**
+        «Старта», уходит вместе с набором. Так было и в Дне 6, только там он
+        жил в памяти; теперь это сохранённая сессия, поэтому предупреждение
+        есть и в README, и в подсказке на самой кнопке.
+        """
         killed: list[str] = []
         children = {c.id for c in self.children(parent_id)} | set(self.store.children(parent_id))
         for child_id in sorted(children):
@@ -222,6 +237,7 @@ class AgentRegistry:
         killed = list(self._agents)
         for agent in self._agents.values():
             agent.cancel()
+            agent.detach()
         self._agents.clear()
         if purge:
             self.store.clear()

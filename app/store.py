@@ -22,6 +22,18 @@
 получают дыр после отката несостоявшегося обмена или после кап-а хранимого,
 и в базе никогда не оказывается вопроса без ответа — оборванная транзакция
 откатывается целиком.
+
+**Идентификатор сессии выдаёт база, а не процесс.** Стенд и CLI по умолчанию
+работают с одним файлом, и это штатный сценарий: README предлагает запустить
+консоль рядом с поднятым `uvicorn`. Счётчик в памяти процесса на это не годится
+— два процесса выдали бы один и тот же `ag_00004`, и второй молча стёр бы
+диалог первого (`save_history` начинается с `DELETE`). Поэтому id занимается
+`INSERT`-ом строки сессии: конфликт по первичному ключу — это и есть арбитр,
+а `claim_agent_id` на конфликте догоняет базу и берёт следующий свободный.
+
+Всё, что уезжает в базу, проходит через `redact()`: транзакция отдаёт не голое
+соединение, а обёртку, которая чистит строковые параметры любого запроса.
+Забыть про новую колонку нельзя — она чистится по построению.
 """
 
 from __future__ import annotations
@@ -59,6 +71,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     seed        TEXT NOT NULL DEFAULT '[]',
     overrides   TEXT NOT NULL DEFAULT '{}',
     seed_used   INTEGER NOT NULL DEFAULT 0,
+    context_length INTEGER,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -78,6 +91,14 @@ CREATE INDEX IF NOT EXISTS sessions_by_parent ON sessions(parent_id);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
+
+_CLAIM_ATTEMPTS = 50
+"""Сколько раз пробуем занять id, прежде чем признать, что что-то не так.
+
+Каждая неудача догоняет счётчик за базу, поэтому в норме хватает двух попыток:
+первая ловит конфликт, вторая уже берёт свободный номер. Полсотни — это запас
+на встречный поток из соседнего процесса, а не рабочий режим.
+"""
 
 
 def db_path() -> Path | str:
@@ -122,6 +143,34 @@ def redact(value):
     return value
 
 
+class _Writer:
+    """Соединение, которое чистит строковые параметры любого запроса.
+
+    Единственный способ что-то записать — взять транзакцию, а транзакция
+    отдаёт эту обёртку. Поэтому обещание «ключ не уедет в базу» держится
+    на всех колонках сразу, включая те, которых ещё нет: новую колонку
+    нельзя добавить в обход `redact()`, потому что её значение приедет тем же
+    параметром запроса.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    @staticmethod
+    def _clean(params):
+        if isinstance(params, dict):
+            return {key: redact(value) for key, value in params.items()}
+        return tuple(redact(value) for value in params)
+
+    def execute(self, sql: str, params=()):
+        return self._conn.execute(sql, self._clean(params))
+
+    def executemany(self, sql: str, rows):
+        return self._conn.executemany(sql, (self._clean(row) for row in rows))
+
+
 class Store:
     """Файл базы плюс несколько запросов к нему. Один на процесс.
 
@@ -162,7 +211,20 @@ class Store:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA)
         self._conn = conn
+        self._migrate(conn)
         return self
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Догоняет схему базы, записанной прошлой версией стенда.
+
+        `CREATE TABLE IF NOT EXISTS` новую колонку не добавит, а падать на
+        чужом файле нельзя: в нём лежат сохранённые диалоги. Дописываем
+        недостающее и идём дальше.
+        """
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "context_length" not in have:
+            conn.execute("ALTER TABLE sessions ADD COLUMN context_length INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -182,15 +244,24 @@ class Store:
         """Одна транзакция. Вложенные вызовы коммитятся один раз, самым внешним.
 
         Нужно спавну пачки: сто сессий — это одна транзакция, а не сто.
+
+        Отдаёт не соединение, а `_Writer`: любой строковый параметр запроса
+        проходит через `redact()`. Это и есть то самое «всё, что уезжает
+        в базу, чистится» — по построению, а не по внимательности автора.
         """
         with self._lock:
             conn = self.conn
             outer = self._depth == 0
             if outer:
-                conn.execute("BEGIN")
+                # IMMEDIATE, а не голый BEGIN: писать в базу могут два процесса
+                # сразу, и отложенная транзакция, начавшаяся с чтения, при
+                # попытке записи получила бы SQLITE_BUSY без ретрая по
+                # busy_timeout. Блокировку берём сразу — тогда второй писатель
+                # честно ждёт своей очереди.
+                conn.execute("BEGIN IMMEDIATE")
             self._depth += 1
             try:
-                yield conn
+                yield _Writer(conn)
             except BaseException:
                 self._depth -= 1
                 if outer:
@@ -217,6 +288,7 @@ class Store:
         overrides: dict,
         seed_used: bool,
         created_at: float,
+        context_length: int | None = None,
     ) -> None:
         """Заводит сессию или обновляет её конфиг. `created_at` не перетирается."""
         now = time.time()
@@ -225,8 +297,8 @@ class Store:
                 """
                 INSERT INTO sessions
                     (id, parent_id, label, config, seed, overrides, seed_used,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     context_length, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     parent_id = excluded.parent_id,
                     label     = excluded.label,
@@ -234,6 +306,7 @@ class Store:
                     seed      = excluded.seed,
                     overrides = excluded.overrides,
                     seed_used = excluded.seed_used,
+                    context_length = excluded.context_length,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -244,6 +317,7 @@ class Store:
                     _dumps(redact(seed)),
                     _dumps(redact(overrides)),
                     1 if seed_used else 0,
+                    context_length,
                     created_at,
                     now,
                 ),
@@ -266,6 +340,7 @@ class Store:
             "seed": _loads(row["seed"], []),
             "overrides": _loads(row["overrides"], {}),
             "seed_used": bool(row["seed_used"]),
+            "context_length": row["context_length"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -346,7 +421,7 @@ class Store:
                 seq,
                 turn.role,
                 redact(turn.content),
-                turn.error,
+                redact(turn.error),
                 turn.at,
             )
             for seq, turn in enumerate(turns)
@@ -385,6 +460,41 @@ class Store:
         return [(r["seq"], r["role"], r["content"]) for r in rows]
 
     # --- идентификаторы ------------------------------------------------------
+
+    def claim_agent_id(self) -> str:
+        """Занимает свободный id, вставляя пустую строку сессии.
+
+        Счётчик в памяти процесса тут только подсказка: арбитр — первичный ключ.
+        Если строка с таким id уже есть (её завёл другой процесс — например,
+        CLI рядом с поднятым стендом), `INSERT` падает на конфликте, счётчик
+        догоняет базу, и мы берём следующий свободный. Без этого второй процесс
+        выдал бы занятый id и `save_history` стёр бы чужой диалог: `DELETE`
+        по `session_id` — первая строчка записи истории.
+
+        В SQLite нарушение ограничения откатывает только сам запрос, а не всю
+        транзакцию, поэтому цикл безопасно живёт и внутри `bulk()`.
+        """
+        from .agent import new_agent_id, reserve_ids
+
+        now = time.time()
+        with self.tx() as conn:
+            for _ in range(_CLAIM_ATTEMPTS):
+                candidate = new_agent_id()
+                try:
+                    conn.execute(
+                        "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)",
+                        (candidate, now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    # Догоняем базу разом, а не по одному: между процессами
+                    # разрыв счётчиков бывает и в сотни сессий.
+                    reserve_ids(self.max_agent_seq())
+                    continue
+                return candidate
+        raise RuntimeError(
+            f"не удалось занять свободный id за {_CLAIM_ATTEMPTS} попыток — "
+            f"похоже, база {self.path} занята кем-то ещё"
+        )
 
     def max_agent_seq(self) -> int:
         """Наибольший номер в id вида `ag_00007` среди сохранённых сессий.

@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, commands, llm
-from .agent import Agent, AgentBusyError
+from .agent import Agent, AgentBusyError, effective_history_limit
 from .config import ROOT, has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
@@ -520,7 +520,11 @@ async def list_sessions(limit: int = 500) -> dict:
                 "parent_id": row["parent_id"],
                 "label": row["label"],
                 "model": (row["config"] or {}).get("model", ""),
-                "history_limit": (row["config"] or {}).get("history_limit"),
+                # Действующее окно, а не поле конфига: у сессии с дефолтом там
+                # null, а память у неё при этом есть, и на экране это враньё.
+                "history_limit": effective_history_limit(
+                    (row["config"] or {}).get("history_limit")
+                ),
                 "history_len": row["history_len"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -864,7 +868,14 @@ async def _run_session(
     session = agent.spec
     label = session.label
     outcome = _Outcome()
+    # Колонка занята на всё время своей дорожки, включая ожидание depends_on.
+    # Ждущий субагент не держит lock и формально не занят — а значит, потолок
+    # реестра вправе выгрузить его прямо из-под идущего прогона, и дальше
+    # с той же сессией работали бы два объекта сразу.
+    reserved = False
     try:
+        agent.reserve()
+        reserved = True
         if session.depends_on:
             waiter = ready.get(session.depends_on)
             if waiter is None:
@@ -1065,6 +1076,8 @@ async def _run_session(
             }
         )
     finally:
+        if reserved:
+            agent.release()
         # Исход пишем всегда: зависимая колонка должна узнать и об успехе,
         # и о падении, а не гадать, почему записи нет.
         results[label] = outcome
