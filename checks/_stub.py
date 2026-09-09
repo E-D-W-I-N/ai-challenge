@@ -5,7 +5,8 @@
 (модель и весь промпт целиком) и отдаёт детерминированный ответ чанками.
 
 По записанным вызовам и проверяется главное: что именно агент отправил
-в модель — окно памяти, подстановку depends_on, отсутствие ленты от клиента.
+в модель — окно памяти, отсутствие ленты от клиента и то, что незаданные
+параметры сэмплирования не доезжают до тела запроса.
 """
 
 from __future__ import annotations
@@ -14,7 +15,12 @@ import asyncio
 from typing import Callable
 
 CALLS: list[dict] = []
-"""Все вызовы к «модели» за проверку: {"model", "label", "messages"}."""
+"""Все вызовы к «модели» за проверку: {"model", "label", "messages", "payload"}.
+
+`payload` собирается настоящим `build_payload`, а не пересказывается: проверка
+«незаданный параметр не отправляется» обязана смотреть на то самое тело,
+которое ушло бы в OpenRouter.
+"""
 
 ACTIVE = {"now": 0, "peak": 0, "closed": 0}
 """Сколько стримов открыто прямо сейчас, максимум и сколько закрыто досрочно."""
@@ -36,13 +42,16 @@ def make(
     fail: bool = False,
     chunks: int = 4,
     delay: float = 0.0,
+    reasoning: str = "",
 ):
     """Собирает заглушку `stream_completion`.
 
     reply — текст ответа или функция (messages, номер вызова) → текст.
     fail — вместо ответа отдать событие error, как это делает HTTP 4xx.
     delay — пауза между чанками: нужна проверке обрыва, чтобы успеть оборвать.
+    reasoning — рассуждение, которое модель присылает отдельным полем дельты.
     """
+    from app.llm import build_payload
 
     async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
         messages = list(prompt_override if prompt_override is not None else session.messages)
@@ -52,6 +61,7 @@ def make(
                 "model": session.model,
                 "label": session.label,
                 "messages": [dict(m) for m in messages],
+                "payload": build_payload(session, prompt_override),
             }
         )
 
@@ -90,13 +100,16 @@ def make(
                 finished = True
                 return
 
+            if reasoning:
+                yield {"type": "reasoning", "text": reasoning, "metrics": metrics}
+
             size = max(1, len(text) // max(1, chunks))
             for start in range(0, len(text), size):
                 if delay:
                     await asyncio.sleep(delay)
                 yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
             yield {"type": "metrics", "metrics": metrics}
-            yield {"type": "done", "text": text, "metrics": metrics}
+            yield {"type": "done", "text": text, "reasoning": reasoning, "metrics": metrics}
             finished = True
         finally:
             ACTIVE["now"] -= 1

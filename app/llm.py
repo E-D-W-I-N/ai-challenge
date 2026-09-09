@@ -98,7 +98,7 @@ async def aclose() -> None:
 
 @dataclass
 class Metrics:
-    """Живая статистика одного прогона одной сессии."""
+    """Живая статистика одного вызова к модели."""
 
     ttft_ms: float | None = None
     elapsed_ms: float = 0.0
@@ -159,6 +159,22 @@ class _SpeedTracker:
         return (n1 - n0) / span if span > 0 else 0.0
 
 
+SAMPLING_FIELDS = (
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+)
+"""Параметры сэмплирования, которые уходят в тело запроса как есть.
+
+Порядок только ради читаемости тела: OpenRouter на него не смотрит.
+"""
+
+
 def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None) -> dict:
     """Тело запроса к OpenRouter. require_parameters — на каждом вызове."""
     payload: dict = {
@@ -169,10 +185,15 @@ def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None)
         "usage": {"include": True},
         "provider": {"require_parameters": True},
     }
-    if session.temperature is not None:
-        payload["temperature"] = session.temperature
-    if session.max_tokens is not None:
-        payload["max_tokens"] = session.max_tokens
+    # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль.
+    # Пустое поле в панели справа значит «пусть решает провайдер»; отправить
+    # 0 вместо «не отправлять» — это другой запрос, а с
+    # provider.require_parameters=true ещё и другой список провайдеров.
+    for name in SAMPLING_FIELDS:
+        value = getattr(session, name, None)
+        if value is not None:
+            payload[name] = value
+
     if session.stop:
         payload["stop"] = session.stop
     if session.response_format is not None:
@@ -196,7 +217,7 @@ async def stream_completion(
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
 ) -> AsyncIterator[dict]:
-    """Отдаёт события: {"type": "delta"|"metrics"|"done"|"error", ...}.
+    """Отдаёт события: {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}.
 
     Метрики обновляются по мере генерации, финальный usage приходит последним чанком.
     """
@@ -217,6 +238,7 @@ async def stream_completion(
     speed = _SpeedTracker()
     started = time.monotonic()
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
 
     try:
         # Клиент общий на процесс, а семафор держится на всё время стрима:
@@ -259,6 +281,21 @@ async def stream_completion(
 
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
+
+                        # Рассуждение приходит отдельным полем дельты и в ответ
+                        # не входит: клиент рисует его свёрнутым блоком над
+                        # ответом. В счётчик токенов не идёт — его считает
+                        # usage.completion_tokens_details.reasoning_tokens,
+                        # и удваивать эту цифру своей оценкой нельзя.
+                        thought = delta.get("reasoning") or ""
+                        if thought:
+                            reasoning_parts.append(thought)
+                            yield {
+                                "type": "reasoning",
+                                "text": thought,
+                                "metrics": metrics.as_dict(),
+                            }
+
                         piece = delta.get("content") or ""
                         if piece:
                             if metrics.ttft_ms is None:
@@ -289,7 +326,12 @@ async def stream_completion(
         return
 
     metrics.elapsed_ms = (time.monotonic() - started) * 1000
-    yield {"type": "done", "text": "".join(text_parts), "metrics": metrics.as_dict()}
+    yield {
+        "type": "done",
+        "text": "".join(text_parts),
+        "reasoning": "".join(reasoning_parts),
+        "metrics": metrics.as_dict(),
+    }
 
 
 def _apply_usage(metrics: Metrics, usage: dict) -> None:

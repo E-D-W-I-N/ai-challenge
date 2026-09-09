@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -18,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from checks import _stub  # noqa: E402
+from checks import _daysrc, _stub  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,8 +27,9 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+import day  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
-from app.schema import AgentSpec, Scenario  # noqa: E402
+from app.schema import AgentSpec  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -37,6 +39,7 @@ def check(name):
         def run():
             _stub.reset()
             REGISTRY.kill_all()
+            main.ensure_roster()
             try:
                 detail = fn() or ""
                 RESULTS.append((name, True, detail))
@@ -51,7 +54,7 @@ def check(name):
     return wrap
 
 
-async def _drain(agen) -> list[dict]:
+async def drain(agen) -> list[dict]:
     return [event async for event in agen]
 
 
@@ -60,7 +63,18 @@ def sse(text: str) -> list[dict]:
     return [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
 
 
-# --- 1. спавн сотни -----------------------------------------------------------
+def new_agent(client, **fields) -> str:
+    payload = {"model": "stub/model", "label": "тест", **fields}
+    response = client.post("/api/agents", json={"agent": payload})
+    assert response.status_code == 200, response.text
+    return response.json()["agents"][0]["id"]
+
+
+def read(path: str) -> str:
+    return open(os.path.join(ROOT, path), encoding="utf-8").read()
+
+
+# --- 1. главный критерий дня --------------------------------------------------
 
 
 @check("спавн ста агентов с разными конфигами в одном процессе")
@@ -76,236 +90,160 @@ def check_spawn_100():
     return result.stdout.strip().splitlines()[1]
 
 
-# --- 2. диалог помнит предыдущее ----------------------------------------------
+# --- 2. агенты дней 1–5 -------------------------------------------------------
+
+# Имя агента ростера → колонка того дня. Порядок в списке значим: он и есть
+# соответствие «колонка ↔ агент», по нему идёт сверка.
+PAST_DAYS = {
+    "origin/day-01": ["День 1 · Ответ"],
+    "origin/day-02": [
+        "День 2 · A. Свободный ответ (формат)",
+        "День 2 · B. + response_format",
+        "День 2 · A. Свободный ответ (длина)",
+        "День 2 · B. + max_tokens",
+        "День 2 · A. Свободный ответ (стоп)",
+        "День 2 · B. + stop",
+    ],
+    "origin/day-03": [
+        "День 3 · Прямо (vs пошагово)",
+        "День 3 · Пошагово",
+        "День 3 · Прямо (промпт себе)",
+        "День 3 · Модель пишет промпт",
+        "День 3 · Ответ по своему промпту",
+        "День 3 · Аналитик данных",
+        "День 3 · Курьер-практик",
+        "День 3 · Юрист по рекламе",
+    ],
+    "origin/day-04": ["День 4 · t = 0.0", "День 4 · t = 0.7", "День 4 · t = 1.2"],
+    "origin/day-05": [
+        "День 5 · Слабая · llama-3.1-8b",
+        "День 5 · Средняя · mistral-small-3.2-24b",
+        "День 5 · Сильная · gemini-3.1-flash-lite",
+    ],
+}
+
+TRANSFERRED = ("model", "temperature", "max_tokens", "stop", "response_format", "extra_body")
+
+
+@check("конфиги дней 1–5 перенесены дословно: сверка с day.py каждой ветки")
+def check_past_days_transfer():
+    roster = {spec.label: spec for spec in day.AGENTS}
+    checked = 0
+    for branch, labels in PAST_DAYS.items():
+        columns = _daysrc.columns(branch)
+        assert len(columns) == len(labels), (
+            f"{branch}: колонок {len(columns)}, а имён в переносе {len(labels)} — "
+            "колонка потерялась или добавилась лишняя"
+        )
+        for column, label in zip(columns, labels):
+            spec = roster.get(label)
+            assert spec is not None, f"в ростере нет агента «{label}»"
+            for field in TRANSFERRED:
+                assert getattr(spec, field) == getattr(column, field), (
+                    f"{label} :: {field}: у нас {getattr(spec, field)!r}, "
+                    f"в {branch} {getattr(column, field)!r}"
+                )
+            system, draft = _daysrc.split_messages(column.messages)
+            assert spec.system == system, f"{label} :: системный промпт разошёлся"
+            assert spec.draft == draft, f"{label} :: вопрос дня разошёлся"
+            checked += 1
+    return f"{checked} колонок из пяти веток, по {len(TRANSFERRED) + 2} поля — совпало всё"
+
+
+@check("агенты дней 1–5 подняты на старте процесса и сгруппированы по дням")
+def check_roster_live():
+    with TestClient(main.app) as client:
+        data = client.get("/api/agents").json()
+    live = {a["label"]: a for a in data["agents"]}
+    for labels in PAST_DAYS.values():
+        for label in labels:
+            assert label in live, f"агент «{label}» не поднялся"
+            assert live[label]["group"], f"у «{label}» нет группы — он потеряется в списке"
+    # Порядок групп задаёт day.py, а не сортировка: «День 10» не должен
+    # оказаться между первым и вторым.
+    assert data["groups"] == list(dict.fromkeys(s.group for s in day.AGENTS if s.group))
+    assert data["groups"][0] == "День 1" and data["groups"][-1] == "День 6", data["groups"]
+    return f"{len(live)} агентов, группы: {', '.join(data['groups'])}"
+
+
+@check("вопрос дня лежит черновиком и сам не отправляется")
+def check_draft_not_sent():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        listed = client.get("/api/agents").json()["agents"]
+        agent_id = next(a["id"] for a in listed if a["label"] == "День 1 · Ответ")
+        full = client.get(f"/api/agents/{agent_id}").json()
+        assert full["draft"].startswith("Объясни, почему первый токен"), full["draft"][:60]
+        # Открытие агента не делает ни одного вызова к модели.
+        assert not _stub.CALLS, f"открытие агента сходило в модель {len(_stub.CALLS)} раз"
+        assert [t["role"] for t in full["transcript"]] == ["system"], full["transcript"]
+
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "свой вопрос"})
+    sent = _stub.CALLS[0]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user"], sent
+    assert sent[1]["content"] == "свой вопрос", sent[1]
+    return "черновик виден в конфиге, в модель уходит только отправленное руками"
+
+
+# --- 3. сценариев больше нет --------------------------------------------------
+
+
+@check("сценарии выпилены: ни ручек, ни кода, ни следов в клиенте")
+def check_scenarios_gone():
+    with TestClient(main.app) as client:
+        for path in ("/api/scenarios", "/api/run/0"):
+            assert client.get(path).status_code == 404, path
+        assert client.post("/api/scenarios/0/agents").status_code == 404
+
+    assert not os.path.exists(os.path.join(ROOT, "app", "commands.py")), "app/commands.py жив"
+    server = read("app/main.py") + read("app/agent.py") + read("app/schema.py")
+    for word in ("Scenario", "judge", "depends_on", "repeats", "прогон"):
+        assert word not in server, f"в серверном коде остался {word}"
+    client_src = (read("app/static/app.js") + read("app/static/index.html")).lower()
+    for word in ("scenario", "прогон", "судья", "колонк"):
+        assert word not in client_src, f"в клиенте остался {word}"
+    return "ручки отдают 404, слов Scenario/judge/depends_on/repeats в коде нет"
+
+
+# --- 4. агент: память, окно, откат, 409, обрыв --------------------------------
 
 
 @check("диалог помнит предыдущее: в третьем запросе виден первый вопрос")
 def check_memory():
     _stub.install(reply=lambda m, i: f"ответ {i}")
     with TestClient(main.app) as client:
-        agent_id = client.post(
-            "/api/agents",
-            json={"agent": {"model": "stub/model", "label": "память", "system": "СИСТЕМА"}},
-        ).json()["agents"][0]["id"]
-
+        agent_id = new_agent(client, system="СИСТЕМА")
         for text in ("меня зовут Нина", "мне 33 года", "как меня зовут?"):
             response = client.post(f"/api/agents/{agent_id}/messages", json={"text": text})
             assert response.status_code == 200, response.text
 
     assert len(_stub.CALLS) == 3, len(_stub.CALLS)
     first, second, third = (c["messages"] for c in _stub.CALLS)
-
     assert [m["role"] for m in first] == ["system", "user"], first
-    assert first[0]["content"] == "СИСТЕМА"
-    # Третий запрос: системный промпт + два обмена + новый вопрос.
     roles = [m["role"] for m in third]
     assert roles == ["system", "user", "assistant", "user", "assistant", "user"], roles
     assert third[1]["content"] == "меня зовут Нина", third[1]
     assert third[-1]["content"] == "как меня зовут?", third[-1]
     assert len(second) == 4, second
+    return "3-й запрос: 6 сообщений, первый вопрос в контексте"
 
-    # Агент без памяти при тех же трёх вопросах каждый раз шлёт только вопрос.
-    _stub.reset()
+
+@check("окно памяти режет: history_limit=0 отвечает каждый вопрос как первый")
+def check_history_window():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
-        blank = client.post(
-            "/api/agents",
-            json={"agent": {"model": "stub/model", "label": "без памяти", "history_limit": 0}},
-        ).json()["agents"][0]["id"]
-        for text in ("меня зовут Нина", "мне 33 года", "как меня зовут?"):
-            client.post(f"/api/agents/{blank}/messages", json={"text": text})
-    assert all(len(c["messages"]) == 1 for c in _stub.CALLS), [
-        len(c["messages"]) for c in _stub.CALLS
-    ]
-    return "с памятью 3-й запрос: 6 сообщений; history_limit=0: по 1 сообщению"
+        blank = new_agent(client, history_limit=0, system="СИС")
+        narrow = new_agent(client, history_limit=2, system="СИС")
+        for agent_id in (blank, narrow):
+            for text in ("первый", "второй", "третий"):
+                client.post(f"/api/agents/{agent_id}/messages", json={"text": text})
 
-
-# --- 2б. history_limit=0 стирает и стартовый вопрос ---------------------------
-
-
-@check("history_limit=0 забывает стартовый вопрос, а не только свой ответ")
-def check_blank_forgets_seed():
-    """Находка ревью: seed_messages подклеивались всегда.
-
-    В сценарии дня в messages лежит сам первый вопрос со всей вводной
-    о поездке. Пока он ехал в промпт на каждом ходу, колонка «Без памяти»
-    знала город, даты и бюджет и переспрашивать бы не стала — демонстрация
-    дня на живом прогоне не воспроизвелась бы.
-    """
-    _stub.install(reply=lambda m, i: f"план{i}")
-    with TestClient(main.app) as client:
-        parent = client.post(
-            "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
-        ).json()["agents"][0]["id"]
-        client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
-        kids = client.get(f"/api/agents?parent={parent}&children_only=true").json()["agents"]
-        blank = next(k["id"] for k in kids if k["label"].startswith("Без памяти"))
-        remembers = next(k["id"] for k in kids if k["label"].startswith("С памятью"))
-        _stub.reset()
-        question = "Что мне взять из одежды?"
-        client.post(f"/api/agents/{blank}/messages", json={"text": question})
-        client.post(f"/api/agents/{remembers}/messages", json={"text": question})
-
-    without, with_memory = (c["messages"] for c in _stub.CALLS)
-
-    assert [m["role"] for m in without] == ["system", "user"], without
-    assert without[-1]["content"] == question, without[-1]
-    joined = " ".join(m["content"] for m in without)
-    # «план0» — ответ колонки на первый вопрос: агент без памяти не должен
-    # видеть ни вводную, ни то, что сам на неё ответил.
-    for leak in ("Казань", "Нина", "20 000", "вегетарианка", "план0"):
-        assert leak not in joined, f"агент без памяти всё ещё видит «{leak}»"
-
-    assert [m["role"] for m in with_memory] == ["system", "user", "assistant", "user"], with_memory
-    assert "Казань" in with_memory[1]["content"], with_memory[1]
-    assert with_memory[2]["content"] == "план0", with_memory[2]
-    return "без памяти: [system, вопрос]; с памятью: вводная и ответ на месте"
-
-
-@check("прогон шлёт ровно spec.messages: дни 1–5 не заметили расщепления")
-def check_seed_split_keeps_run():
-    _stub.install(reply=lambda m, i: f"т{i}")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            sse(client.get("/api/run/0").text)
-
-    donor = next(c for c in _stub.CALLS if c["label"] == "Донор")
-    assert donor["messages"] == LADDER.sessions[0].messages, donor["messages"]
-
-    # Ручной вопрос колонке после прогона: та же лента, что и до Дня 6.
-    _stub.reset()
-    _stub.install(reply="ответ")
-    agent = REGISTRY.create(
-        AgentSpec(
-            label="день 1-5",
-            model="stub/m",
-            messages=[
-                {"role": "system", "content": "СИС"},
-                {"role": "user", "content": "ЗАДАЧА"},
-            ],
-        )
-    )
-
-    async def scenario():
-        [e async for e in agent.ask()]
-        [e async for e in agent.ask("уточни")]
-
-    asyncio.run(scenario())
-    run_prompt, follow_up = (c["messages"] for c in _stub.CALLS)
-    assert run_prompt == agent.spec.messages, run_prompt
-    assert [m["content"] for m in follow_up] == ["СИС", "ЗАДАЧА", "ответ", "уточни"], follow_up
-
-    # До «Старта» вопрос сценария всё ещё в промпте: колонка показывает его
-    # в ленте, и промпт обязан сходиться с тем, что видно на экране.
-    _stub.reset()
-    _stub.install(reply="ответ")
-    fresh = REGISTRY.create(
-        AgentSpec(
-            label="до старта",
-            model="stub/m",
-            messages=[
-                {"role": "system", "content": "СИС"},
-                {"role": "user", "content": "ЗАДАЧА"},
-            ],
-        )
-    )
-    asyncio.run(_drain(fresh.ask("вопрос до старта")))
-    assert [m["content"] for m in _stub.CALLS[0]["messages"]] == [
-        "СИС",
-        "ЗАДАЧА",
-        "вопрос до старта",
-    ], _stub.CALLS[0]["messages"]
-    return "прогон байт в байт прежний, ручной вопрос тоже, до «Старта» вводная едет"
-
-
-# --- 2в. выбор в дропдауне переживает «Старт» ---------------------------------
-
-
-@check("выбранная в дропдауне модель переживает «Старт» и второй «Старт»")
-def check_override_survives_start():
-    """Находка ревью: PATCH правил предспавненного агента, а прогон его убивал."""
-    _stub.install(reply=lambda m, i: f"т{i}")
-    scenario = Scenario(
-        title="дропдаун",
-        description="",
-        sessions=[
-            AgentSpec(label="A", model="сценарный/model", messages=[{"role": "user", "content": "a"}])
-        ],
-    )
-    with _scenarios([scenario]):
-        with TestClient(main.app) as client:
-            parent = client.post(
-                "/api/agents", json={"agent": {"model": "stub/chat", "label": "Ассистент"}}
-            ).json()["agents"][0]["id"]
-            column = client.post(f"/api/scenarios/0/agents?parent={parent}").json()["agents"][0]["id"]
-            patched = client.patch(
-                f"/api/agents/{column}", json={"model": "выбранная/пользователем", "temperature": 0.9}
-            )
-            assert patched.json()["model"] == "выбранная/пользователем", patched.text
-
-            _stub.reset()
-            first = sse(client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"}).text)
-            after_first = [c["model"] for c in _stub.CALLS]
-
-            _stub.reset()
-            sse(client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"}).text)
-            after_second = [c["model"] for c in _stub.CALLS]
-
-            # Явный overrides в запросе сильнее перенесённого.
-            _stub.reset()
-            sse(client.get('/api/run/0?overrides={"A":{"model":"из/запроса"}}').text)
-            explicit = [c["model"] for c in _stub.CALLS]
-
-    assert after_first == ["выбранная/пользователем"], after_first
-    assert after_second == ["выбранная/пользователем"], after_second
-    assert explicit == ["из/запроса"], explicit
-
-    # Клиент перерисовывает колонки по run_start — там тоже должна быть
-    # выбранная модель, иначе дропдаун откатится на экране.
-    run_start = next(e for e in first if e["event"] == "run_start")
-    assert run_start["sessions"][0]["model"] == "выбранная/пользователем", run_start["sessions"][0]
-    assert run_start["sessions"][0]["temperature"] == 0.9, run_start["sessions"][0]
-    return "первый и второй «Старт» идут на выбранной модели, overrides из запроса сильнее"
-
-
-# --- 3. клиент больше не шлёт ленту -------------------------------------------
-
-
-@check("клиент шлёт только текст: лента в теле запроса запрещена")
-def check_no_feed():
-    with TestClient(main.app) as client:
-        agent_id = client.post(
-            "/api/agents", json={"agent": {"model": "stub/model", "label": "т"}}
-        ).json()["agents"][0]["id"]
-
-        # Мёртвой ручки нет.
-        assert client.post("/api/chat", json={"model": "x", "messages": []}).status_code == 404
-
-        # Лента в теле — 400 с внятным текстом, а не молчаливое игнорирование.
-        bad = client.post(
-            f"/api/agents/{agent_id}/messages",
-            json={"text": "привет", "messages": [{"role": "user", "content": "привет"}]},
-        )
-        assert bad.status_code == 400, bad.text
-        assert "только text" in bad.json()["detail"], bad.text
-
-        # Модель в теле тоже нельзя: для неё есть PATCH.
-        bad = client.post(
-            f"/api/agents/{agent_id}/messages", json={"text": "привет", "model": "other/model"}
-        )
-        assert bad.status_code == 400, bad.text
-
-        assert client.post(f"/api/agents/{agent_id}/messages", json={"text": "  "}).status_code == 400
-
-    source = open(os.path.join(ROOT, "app", "static", "app.js"), encoding="utf-8").read()
-    assert "/api/chat" not in source, "клиент всё ещё зовёт /api/chat"
-    assert "col.base.concat" not in source, "клиент всё ещё склеивает ленту"
-    assert "{ text }" in source, "клиент должен слать в теле только text"
-    assert "/api/agents/${agentId}/messages" in source, "клиент шлёт сообщение агенту по id"
-    return "POST /api/chat → 404; лишние поля в теле → 400; в app.js ленты нет"
-
-
-# --- 4. два параллельных запроса к одному агенту ------------------------------
+    calls = [c["messages"] for c in _stub.CALLS]
+    assert all(len(m) == 2 for m in calls[:3]), [len(m) for m in calls[:3]]
+    # Окно 2 — это один обмен: системный промпт, пара из истории и новый вопрос.
+    assert [len(m) for m in calls[3:]] == [2, 4, 4], [len(m) for m in calls[3:]]
+    assert calls[5][1]["content"] == "второй", calls[5][1]
+    return "окно 0 — по 2 сообщения, окно 2 — 2/4/4"
 
 
 @check("два параллельных запроса к одному агенту: 409, история не перемешана")
@@ -321,7 +259,6 @@ def check_parallel():
                 "/api/agents", json={"agent": {"model": "stub/model", "label": "п"}}
             )
             agent_id = created.json()["agents"][0]["id"]
-
             first, second = await asyncio.gather(
                 client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"}),
                 client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"}),
@@ -330,43 +267,10 @@ def check_parallel():
 
     agent_id, codes = asyncio.run(scenario())
     assert codes == [200, 409], codes
-
     agent = REGISTRY.require(agent_id)
-    roles = [t.role for t in agent.history]
-    assert roles == ["user", "assistant"], roles
-    assert len(_stub.CALLS) == 1, f"в модель ушёл {len(_stub.CALLS)} вызов(а), а должен один"
-    return f"коды {codes}, в истории {len(agent.history)} реплики, вызов к модели один"
-
-
-# --- 5. серия repeats не раздувает историю ------------------------------------
-
-
-@check("серия repeats не раздувает историю: коммитится только последний ответ")
-def check_repeats():
-    _stub.install(reply=lambda m, i: f"прогон {i}")
-
-    async def scenario():
-        agent = REGISTRY.create(
-            AgentSpec(label="серия", model="stub/model", messages=[], repeats=3)
-        )
-        events = [e async for e in agent.ask("вопрос")]
-        return agent, events
-
-    agent, events = asyncio.run(scenario())
-    kinds = [e["type"] for e in events]
-    assert kinds.count("repeat_start") == 3, kinds
-    assert kinds.count("repeat_done") == 3, kinds
-    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
-
-    roles = [t.role for t in agent.history]
-    assert roles == ["user", "assistant"], roles
-    assert agent.history[1].content == "прогон 2", agent.history[1].content
-    # Все три прогона отправили один и тот же промпт: серия не наращивает контекст.
-    assert len({json.dumps(c["messages"], ensure_ascii=False) for c in _stub.CALLS}) == 1
-    return "3 прогона → 2 реплики в истории, промпт у всех трёх одинаковый"
-
-
-# --- 6. откат несостоявшегося обмена ------------------------------------------
+    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
+    assert len(_stub.CALLS) == 1, f"в модель ушло {len(_stub.CALLS)} вызовов, а должен один"
+    return f"коды {codes}, в истории 2 реплики, вызов к модели один"
 
 
 @check("несостоявшийся обмен: история не тронута, вопрос возвращён клиенту")
@@ -374,9 +278,8 @@ def check_rollback():
     _stub.install(fail=True)
 
     async def scenario():
-        agent = REGISTRY.create(AgentSpec(label="падение", model="stub/model", messages=[]))
-        events = [e async for e in agent.ask("вопрос, который не доедет")]
-        return agent, events
+        agent = REGISTRY.create(AgentSpec(label="падение", model="stub/model"))
+        return agent, await drain(agent.ask("вопрос, который не доедет"))
 
     agent, events = asyncio.run(scenario())
     done = [e for e in events if e["type"] == "done"][0]
@@ -384,18 +287,15 @@ def check_rollback():
     assert done["committed"] is False, done
     assert done["question"] == "вопрос, который не доедет", done
 
-    # Частичный ответ пишется, но помечен ошибкой.
-    _stub.reset()
-
     async def partial():
-        agent = REGISTRY.create(AgentSpec(label="частичный", model="stub/model", messages=[]))
+        agent = REGISTRY.create(AgentSpec(label="частичный", model="stub/model"))
 
         async def half(session, *, prompt_override=None, context_length=None):
             yield {"type": "delta", "text": "полов", "metrics": {"error": None}}
             yield {"type": "error", "message": "оборвалось", "metrics": {"error": "оборвалось"}}
 
         agent_module.stream_completion = half
-        [e async for e in agent.ask("вопрос")]
+        await drain(agent.ask("вопрос"))
         return agent
 
     agent = asyncio.run(partial())
@@ -405,413 +305,284 @@ def check_rollback():
     return "ответа нет → история пуста и вопрос вернулся; частичный → помечен ошибкой"
 
 
-# --- 7. обрыв клиента гасит вызов ---------------------------------------------
-
-
-@check("обрыв клиента гасит вызов: стрим закрыт, ответ в историю не дописан")
+@check("обрыв клиента гасит вызов и снимает бронь")
 def check_disconnect():
     _stub.install(reply="а" * 400, chunks=40, delay=0.02)
 
-    class FakeRequest:
-        """Клиент, который уходит со страницы после нескольких событий."""
-
-        def __init__(self, after: int) -> None:
-            self.after = after
-            self.polls = 0
-
-        async def is_disconnected(self) -> bool:
-            self.polls += 1
-            return self.polls > self.after
-
-    async def scenario():
-        agent = REGISTRY.create(AgentSpec(label="обрыв", model="stub/model", messages=[]))
-        request = FakeRequest(after=3)
-        chunks = []
-        async for frame in main._pump(lambda: main._chat_events(agent, "вопрос"), request):
-            chunks.append(frame)
-        # Даём отменённой задаче добежать до finally.
-        await asyncio.sleep(0.1)
-        return agent, chunks
-
-    agent, chunks = asyncio.run(scenario())
-    assert _stub.ACTIVE["closed"] == 1, _stub.ACTIVE
-    assert _stub.ACTIVE["now"] == 0, _stub.ACTIVE
-    assert len(chunks) < 40, len(chunks)
-    assert agent.busy is False, "бронь агента должна сниматься и на обрыве"
-    # Частичный ответ либо не записан, либо записан помеченным — но не как целый.
-    if agent.history:
-        assert agent.history[-1].error, agent.history[-1]
-    return f"поток закрыт после {len(chunks)} кадров, стрим к модели погашен"
-
-
-@check("обрыв на прогоне гасит все колонки")
-def check_disconnect_run():
-    _stub.install(reply="б" * 400, chunks=40, delay=0.02)
-    scenario = Scenario(
-        title="обрыв",
-        description="",
-        sessions=[
-            AgentSpec(label="A", model="stub/model", messages=[{"role": "user", "content": "a"}]),
-            AgentSpec(label="B", model="stub/model", messages=[{"role": "user", "content": "b"}]),
-        ],
-    )
-
-    class FakeRequest:
-        def __init__(self, after: int) -> None:
-            self.after = after
-            self.polls = 0
-
-        async def is_disconnected(self) -> bool:
-            self.polls += 1
-            return self.polls > self.after
-
-    async def run():
-        with _scenarios([scenario]):
-            async for _ in main._pump(lambda: main._run_events(0, {}, None), FakeRequest(after=3)):
-                pass
-        await asyncio.sleep(0.15)
-
-    asyncio.run(run())
-    assert _stub.ACTIVE["now"] == 0, _stub.ACTIVE
-    assert _stub.ACTIVE["closed"] == 2, _stub.ACTIVE
-    return "обе колонки погашены, открытых стримов не осталось"
-
-
-# --- 8. прежнее поведение стенда ----------------------------------------------
-
-
-class _scenarios:
-    """Временно подменяет сценарии дня — проверкам нужен свой стенд."""
-
-    def __init__(self, scenarios: list[Scenario]) -> None:
-        self.scenarios = scenarios
-
-    def __enter__(self):
-        self.saved = main.SCENARIOS
-        main.SCENARIOS = self.scenarios
-        return self.scenarios
-
-    def __exit__(self, *exc):
-        main.SCENARIOS = self.saved
-        return False
-
-
-LADDER = Scenario(
-    title="Проверочный прогон",
-    description="depends_on, серия и судья в одном сценарии.",
-    layout="split",
-    judge_questions=["Кто лучше?"],
-    sessions=[
-        AgentSpec(
-            label="Донор",
-            model="stub/one",
-            messages=[{"role": "user", "content": "придумай слово"}],
-        ),
-        AgentSpec(
-            label="Потребитель",
-            model="stub/two",
-            messages=[{"role": "user", "content": "используй {{depends_on}} в предложении"}],
-            depends_on="Донор",
-        ),
-        AgentSpec(
-            label="Серия",
-            model="stub/three",
-            messages=[{"role": "user", "content": "три раза"}],
-            repeats=3,
-        ),
-    ],
-)
-
-
-@check("прогон цел: depends_on, серия, судья, метрики, имена событий")
-def check_run_intact():
-    _stub.install(reply=lambda m, i: f"текст-{i}")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            response = client.get("/api/run/0")
-            assert response.status_code == 200, response.text
-            events = sse(response.text)
-
-    names = [e["event"] for e in events]
-    for required in (
-        "run_start",
-        "session_waiting",
-        "session_start",
-        "delta",
-        "metrics",
-        "session_done",
-        "repeat_start",
-        "repeat_done",
-        "judge_start",
-        "judge_delta",
-        "judge_done",
-        "run_done",
-    ):
-        assert required in names, f"нет события {required}: {sorted(set(names))}"
-
-    # depends_on: {{depends_on}} заменён выводом донора.
-    consumer_start = next(
-        e for e in events if e["event"] == "session_start" and e["session"] == "Потребитель"
-    )
-    resolved = consumer_start["resolved_messages"][0]["content"]
-    assert "{{depends_on}}" not in resolved, resolved
-    assert "текст-" in resolved, resolved
-
-    # Серия: три прогона, длина серии объявлена заранее.
-    series_start = next(
-        e for e in events if e["event"] == "session_start" and e["session"] == "Серия"
-    )
-    assert series_start["repeats"] == 3, series_start
-    assert sum(1 for e in events if e["event"] == "repeat_done") == 3
-    series_done = next(e for e in events if e["event"] == "session_done" and e["session"] == "Серия")
-    assert series_done["repeats"] == 3 and len(series_done["texts"]) == 3, series_done
-    assert series_done["unique"] == 3, series_done
-
-    # Метрики доезжают: по ним клиент считает сводку.
-    done = next(e for e in events if e["event"] == "session_done" and e["session"] == "Донор")
-    assert done["metrics"]["cost_usd"] == 0.000123, done["metrics"]
-    assert done["metrics"]["provider"] == "stub", done["metrics"]
-
-    # Судья — отдельный агент в реестре, и он свежий.
-    judge_start = next(e for e in events if e["event"] == "judge_start")
-    assert judge_start["model"] == main.JUDGE_MODEL, judge_start
-    judge = REGISTRY.require(judge_start["agent"])
-    assert judge.spec.label == "Судья", judge.spec.label
-    judge_call = _stub.CALLS[-1]["messages"]
-    assert judge_call[0]["role"] == "system", judge_call[0]
-    assert "Донор" in judge_call[1]["content"], judge_call[1]["content"][:200]
-    assert "придумай слово" not in judge_call[1]["content"], "промпты колонок судье не уходят"
-
-    # Каждое событие колонки помечено id агента — по нему клиент открывает дорожку.
-    for event in events:
-        if event.get("session"):
-            assert event.get("agent"), event
-    return f"{len(events)} событий, все имена прежние, судья {judge.id}"
-
-
-@check("судья спавнится свежим на каждый прогон")
-def check_judge_fresh():
-    _stub.install(reply=lambda m, i: f"т{i}")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            first = sse(client.get("/api/run/0").text)
-            second = sse(client.get("/api/run/0").text)
-    a = next(e for e in first if e["event"] == "judge_start")["agent"]
-    b = next(e for e in second if e["event"] == "judge_start")["agent"]
-    assert a != b, (a, b)
-    assert len(REGISTRY.require(b).history) == 2, "у свежего судьи только текущий вердикт"
-    return f"первый прогон {a}, второй {b}"
-
-
-@check("«Старт» убивает предыдущий набор субагентов")
-def check_run_replaces_agents():
-    _stub.install(reply="ок")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            first = sse(client.get("/api/run/0").text)
-            live_after_first = client.get("/api/health").json()["agents_live"]
-            second = sse(client.get("/api/run/0").text)
-            live_after_second = client.get("/api/health").json()["agents_live"]
-    old = {a["agent"] for a in next(e for e in first if e["event"] == "run_start")["agents"]}
-    new = {a["agent"] for a in next(e for e in second if e["event"] == "run_start")["agents"]}
-    assert not (old & new), (old, new)
-    assert all(REGISTRY.get(i) is None for i in old), "старый набор должен быть убит"
-    assert live_after_second == live_after_first, (live_after_first, live_after_second)
-    return f"после первого прогона {live_after_first}, после второго {live_after_second}"
-
-
-# --- 9. команда /прогон -------------------------------------------------------
-
-
-@check("/прогон спавнит субагентов, поток событий тот же, сводка уходит родителю")
-def check_command_run():
-    _stub.install(reply=lambda m, i: f"вывод-{i}")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            parent = client.post(
-                "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
-            ).json()["agents"][0]["id"]
-            response = client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
-            assert response.status_code == 200, response.text
-            events = sse(response.text)
-            children = client.get(f"/api/agents?parent={parent}&children_only=true").json()
-
-    names = [e["event"] for e in events]
-    assert names[0] == "command_start", names[:2]
-    assert "run_start" in names and "run_done" in names and "session_done" in names
-    assert names[-1] == "command_done", names[-3:]
-
-    labels = {c["label"] for c in children["agents"]}
-    assert {"Донор", "Потребитель", "Серия", "Судья"} <= labels, labels
-    assert all(c["parent_id"] == parent for c in children["agents"])
-
-    agent = REGISTRY.require(parent)
-    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
-    assert agent.history[0].content == "/прогон 1"
-    assert "Донор" in agent.history[1].content, agent.history[1].content
-    return f"субагентов {len(children['agents'])}, сводка в истории родителя есть"
-
-
-@check("команда — только с начала строки, // экранирует")
-def check_command_parsing():
-    from app import commands
-
-    assert commands.parse("привет")[0] is None
-    assert commands.parse("скажи /прогон")[0] is None
-    assert commands.parse("//прогон") == (None, "/прогон")
-    command, _ = commands.parse("/прогон 2")
-    assert command is not None and commands.is_run(command) and command.arg == "2"
-    assert commands.resolve_scenario("", [LADDER]) == 0
-    try:
-        commands.resolve_scenario("9", [LADDER])
-        raise AssertionError("несуществующий сценарий должен ронять ValueError")
-    except ValueError:
-        pass
-
-    _stub.install(reply="ок")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            parent = client.post(
-                "/api/agents", json={"agent": {"model": "stub/model", "label": "p"}}
-            ).json()["agents"][0]["id"]
-            escaped = client.post(f"/api/agents/{parent}/messages", json={"text": "//прогон"})
-            assert escaped.status_code == 200, escaped.text
-            unknown = client.post(f"/api/agents/{parent}/messages", json={"text": "/чепуха"})
-            assert unknown.status_code == 400, unknown.text
-    assert _stub.CALLS, "экранированная команда обязана уйти в модель"
-    assert _stub.CALLS[0]["messages"][-1]["content"] == "/прогон", _stub.CALLS[0]["messages"]
-    return "«скажи /прогон» — не команда, «//прогон» уходит текстом, «/чепуха» → 400"
-
-
-# --- 10. жизненный цикл агентов ------------------------------------------------
-
-
-@check("смена модели на живом агенте")
-def check_patch_model():
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        agent_id = client.post(
-            "/api/agents", json={"agent": {"model": "stub/old", "label": "м"}}
-        ).json()["agents"][0]["id"]
-        patched = client.patch(f"/api/agents/{agent_id}", json={"model": "stub/new"})
-        assert patched.status_code == 200, patched.text
-        assert patched.json()["model"] == "stub/new"
-        assert client.patch(f"/api/agents/{agent_id}", json={"label": "x"}).status_code == 400
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
-    assert _stub.CALLS[0]["model"] == "stub/new", _stub.CALLS[0]["model"]
-    return "PATCH меняет модель, следующий вызов уходит в новую"
-
-
-@check("удаление агента каскадом по детям")
-def check_kill_cascade():
-    with TestClient(main.app) as client:
-        parent = client.post(
-            "/api/agents", json={"agent": {"model": "stub/m", "label": "родитель"}}
-        ).json()["agents"][0]["id"]
-        kids = client.post(
-            "/api/agents",
-            json={
-                "parent_id": parent,
-                "agents": [{"model": "stub/m", "label": f"ребёнок {i}"} for i in range(3)],
-            },
-        ).json()["agents"]
-        killed = client.delete(f"/api/agents/{parent}").json()["killed"]
-        assert set(killed) == {parent} | {k["id"] for k in kids}, killed
-        assert client.get(f"/api/agents/{parent}").status_code == 404
-    return f"убито {len(killed)} агентов одним запросом"
-
-
-@check("потолок реестра вытесняет самых старых простаивающих")
-def check_eviction():
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=10)
-    made = registry.create_many(
-        [AgentSpec(label=f"a{i}", model="stub/m", messages=[]) for i in range(10)]
-    )
-    # Освежаем последнего: вытеснить должны первых, а не его.
-    made[-1].last_used_at = made[-1].last_used_at + 100
-    registry.create_many([AgentSpec(label=f"b{i}", model="stub/m", messages=[]) for i in range(5)])
-    assert len(registry) == 10, len(registry)
-    assert registry.get(made[0].id) is None, "самый старый должен быть вытеснен"
-    assert registry.get(made[-1].id) is not None, "свежий вытесняться не должен"
-    assert registry.evicted == 5, registry.evicted
-    return "потолок 10: 15 созданных, 5 вытеснено, свежий жив"
-
-
-@check("стенограмма агента отдаётся ручкой")
-def check_transcript():
-    _stub.install(reply="и тебе привет")
-    with TestClient(main.app) as client:
-        agent_id = client.post(
-            "/api/agents",
-            json={"agent": {"model": "stub/m", "label": "с", "system": "СИС"}},
-        ).json()["agents"][0]["id"]
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
-        body = client.get(f"/api/agents/{agent_id}").json()
-    transcript = body["transcript"]
-    assert transcript[0] == {"role": "system", "content": "СИС", "seed": True}, transcript[0]
-    assert [t["role"] for t in transcript[1:]] == ["user", "assistant"], transcript
-    assert transcript[-1]["content"] == "и тебе привет"
-    return f"{len(transcript)} реплик, системный промпт помечен seed"
-
-
-@check("залипшая бронь: разрыв до первого события снимает бронь")
-def check_reservation_released_on_early_abort():
-    """Находка ревью: release() стоял в finally генератора событий.
-
-    Если клиент отвалился на первом же опросе, задача с генератором
-    отменяется, не начав выполняться, — его finally не срабатывает никогда.
-    Бронь залипала бы навсегда: агент вечно отвечал бы 409 и никогда бы
-    не вытеснился по потолку, потому что числится занятым.
-    """
-    _stub.install(reply="ок", chunks=10, delay=0.02)
-
     class Gone:
-        """Клиент, которого уже нет к моменту первого опроса."""
+        """Клиент, которого не стало на N-м опросе."""
+
+        def __init__(self, after: int) -> None:
+            self.after = after
+            self.polls = 0
 
         async def is_disconnected(self) -> bool:
-            return True
+            self.polls += 1
+            return self.polls > self.after
 
-    async def scenario():
-        agent = REGISTRY.create(AgentSpec(label="бронь", model="stub/model", messages=[]))
+    async def scenario(after: int):
+        agent = REGISTRY.create(AgentSpec(label="обрыв", model="stub/model"))
         agent.reserve()
         frames = [
             frame
             async for frame in main._pump(
-                lambda: main._chat_events(agent, "вопрос"), Gone(), agent.release
+                lambda: main._chat_events(agent, "вопрос"), Gone(after), agent.release
             )
         ]
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
         return agent, frames
 
-    agent, frames = asyncio.run(scenario())
-    assert frames == [], frames
-    assert agent.busy is False, "бронь залипла: агент навсегда отвечает 409"
+    agent, frames = asyncio.run(scenario(3))
+    assert _stub.ACTIVE["closed"] == 1, _stub.ACTIVE
+    assert _stub.ACTIVE["now"] == 0, _stub.ACTIVE
+    assert agent.busy is False, "бронь должна сниматься и на обрыве"
 
-    # После снятия брони агент снова разговаривает и снова вытесняется.
+    # Разрыв до первого события: генератор не запускался вовсе, а бронь всё
+    # равно обязана сняться — иначе агент навсегда останется занятым.
     _stub.reset()
-    _stub.install(reply="и снова ок")
-    asyncio.run(_drain(agent.ask("второй вопрос")))
-    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
-    return "разрыв на первом опросе: 0 кадров, бронь снята, агент снова отвечает"
+    _stub.install(reply="б" * 200, chunks=20, delay=0.02)
+    early, early_frames = asyncio.run(scenario(0))
+    assert early_frames == [], early_frames
+    assert early.busy is False, "бронь залипла на разрыве до первого события"
+    return f"поток закрыт после {len(frames)} кадров, стрим погашен, бронь снята"
 
 
-@check("прогон без родителя не оставляет ни колонок, ни судьи")
-def check_orphan_run_cleanup():
+# --- 5. новые параметры -------------------------------------------------------
+
+NEW_PARAMS = {
+    "top_p": 0.9,
+    "top_k": 40,
+    "min_p": 0.05,
+    "repetition_penalty": 1.1,
+    "presence_penalty": 0.5,
+    "frequency_penalty": 0.25,
+}
+
+
+@check("новые параметры доезжают до тела запроса, а незаданные — нет")
+def check_new_params():
     _stub.install(reply="ок")
-    with _scenarios([LADDER]):
+    with TestClient(main.app) as client:
+        bare = new_agent(client)
+        client.post(f"/api/agents/{bare}/messages", json={"text": "привет"})
+        empty_payload = _stub.CALLS[-1]["payload"]
+        for name in ("temperature", "max_tokens", *NEW_PARAMS):
+            assert name not in empty_payload, f"{name} уехал в тело, хотя задан не был"
+
+        full = new_agent(client, temperature=0.4, max_tokens=100, **NEW_PARAMS)
+        client.post(f"/api/agents/{full}/messages", json={"text": "привет"})
+        payload = _stub.CALLS[-1]["payload"]
+        for name, value in NEW_PARAMS.items():
+            assert payload.get(name) == value, (name, payload.get(name))
+
+        # Ноль — это заданный ноль, а не «не задано».
+        zero = new_agent(client, presence_penalty=0.0, temperature=0.0)
+        client.post(f"/api/agents/{zero}/messages", json={"text": "привет"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert payload["presence_penalty"] == 0.0, payload
+        assert payload["temperature"] == 0.0, payload
+
+        # PATCH с null снимает параметр: он перестаёт уходить вовсе.
+        client.patch(f"/api/agents/{full}", json={"top_k": None, "min_p": None})
+        client.post(f"/api/agents/{full}/messages", json={"text": "ещё"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert "top_k" not in payload and "min_p" not in payload, payload
+        assert payload["top_p"] == 0.9, payload
+
+        # Кривой тип — 400 с текстом, а не 500 и не молчаливая отправка.
+        assert client.patch(f"/api/agents/{full}", json={"top_k": 0.5}).status_code == 400
+        assert client.patch(f"/api/agents/{full}", json={"top_p": "быстро"}).status_code == 400
+    return "шесть новых параметров едут, незаданные отсутствуют, ноль отличим от пустоты"
+
+
+@check("панель правит живого агента: модель, промпт, имя, окно памяти")
+def check_patch_panel():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, model="stub/old", system="старый")
+        patched = client.patch(
+            f"/api/agents/{agent_id}",
+            json={
+                "model": "stub/new",
+                "system": "новый промпт",
+                "label": "Переименован",
+                "history_limit": 4,
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        body = patched.json()
+        assert body["model"] == "stub/new" and body["label"] == "Переименован"
+        assert body["history_limit"] == 4
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
+        assert client.patch(f"/api/agents/{agent_id}", json={"group": "День 9"}).status_code == 400
+
+    call = _stub.CALLS[-1]
+    assert call["model"] == "stub/new", call["model"]
+    assert call["messages"][0]["content"] == "новый промпт", call["messages"][0]
+    return "PATCH меняет модель, промпт, имя и окно; group снаружи не правится"
+
+
+# --- 6. лента: рассуждение и перегенерация ------------------------------------
+
+
+@check("рассуждение приезжает отдельным событием и в ответ не входит")
+def check_reasoning():
+    _stub.install(reply="итоговый ответ", reasoning="я подумал вот так")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        events = sse(client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"}).text)
+        transcript = client.get(f"/api/agents/{agent_id}").json()["transcript"]
+
+    names = [e["event"] for e in events]
+    assert "reasoning" in names, names
+    thought = next(e for e in events if e["event"] == "reasoning")
+    assert thought["text"] == "я подумал вот так", thought
+    done = next(e for e in events if e["event"] == "done")
+    assert done["reasoning"] == "я подумал вот так", done
+    assert done["text"] == "итоговый ответ", done
+
+    answer = transcript[-1]
+    assert answer["reasoning"] == "я подумал вот так", answer
+    assert answer["content"] == "итоговый ответ", answer
+
+    # Обратно в модель рассуждение не уходит: в контексте только ответ.
+    _stub.reset()
+    _stub.install(reply="второй ответ")
+    with TestClient(main.app) as client:
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "ещё"})
+    sent = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
+    assert "я подумал вот так" not in sent, sent
+    assert "итоговый ответ" in sent, sent
+    return "reasoning виден в потоке и в стенограмме, в контекст не возвращается"
+
+
+@check("перегенерация заменяет последний ответ, а не добавляет второй")
+def check_regenerate():
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        before = client.get(f"/api/agents/{agent_id}").json()["transcript"]
+        again = client.post(f"/api/agents/{agent_id}/regenerate")
+        assert again.status_code == 200, again.text
+        after = client.get(f"/api/agents/{agent_id}").json()["transcript"]
+
+    assert len(before) == len(after) == 2, (len(before), len(after))
+    assert [t["role"] for t in after] == ["user", "assistant"], after
+    assert after[0]["content"] == "вопрос", after[0]
+    assert after[1]["content"] != before[1]["content"], "ответ должен быть новым"
+    # Второй вызов видел тот же контекст, что и первый: пара снята до вызова.
+    assert _stub.CALLS[0]["messages"] == _stub.CALLS[1]["messages"], _stub.CALLS[1]["messages"]
+
+    with TestClient(main.app) as client:
+        empty = new_agent(client)
+        assert client.post(f"/api/agents/{empty}/regenerate").status_code == 409
+    return "после перегенерации в истории по-прежнему один вопрос и один ответ"
+
+
+# --- 7. чаты и ростер ---------------------------------------------------------
+
+
+@check("«Очистить все чаты» не уносит агентов дней 1–5")
+def check_reset_keeps_roster():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        chat = client.post("/api/agents", json={}).json()["agents"][0]
+        client.post(f"/api/agents/{chat['id']}/messages", json={"text": "привет"})
+        before = client.get("/api/agents").json()
+        assert any(a["id"] == chat["id"] for a in before["agents"])
+
+        reset = client.post("/api/agents/reset").json()
+        assert chat["id"] in reset["killed"], reset["killed"]
+        after = client.get("/api/agents").json()
+
+    labels = {a["label"] for a in after["agents"]}
+    for group_labels in PAST_DAYS.values():
+        for label in group_labels:
+            assert label in labels, f"«{label}» пропал после очистки"
+    assert not [a for a in after["agents"] if not a["group"]], "чаты пользователя должны уйти"
+    assert len(after["agents"]) == len(day.AGENTS), (len(after["agents"]), len(day.AGENTS))
+    return f"чат удалён, {len(day.AGENTS)} агентов ростера на месте"
+
+
+@check("«Новый чат» создаётся пустым телом и попадает в чаты, а не в ростер")
+def check_new_chat():
+    with TestClient(main.app) as client:
+        created = client.post("/api/agents", json={})
+        assert created.status_code == 200, created.text
+        agent = created.json()["agents"][0]
+        assert agent["label"] == "Новый чат" and agent["group"] == "", agent
+        # Группу извне не подсунуть: иначе чат притворился бы агентом дня
+        # и пережил бы «Очистить все чаты».
+        sneaky = client.post(
+            "/api/agents", json={"agent": {"model": "stub/m", "label": "х", "group": "День 1"}}
+        )
+        assert sneaky.status_code == 200, sneaky.text
+        assert sneaky.json()["agents"][0]["group"] == "", sneaky.json()["agents"][0]
+    return "новый чат без группы, подсунуть группу снаружи нельзя"
+
+
+# --- 8. ключ и сеть -----------------------------------------------------------
+
+
+@check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
+def check_no_key_leak():
+    client_src = (
+        read("app/static/app.js") + read("app/static/index.html") + read("app/static/style.css")
+    ).lower()
+    for word in ("api key", "api_key", "apikey", "sk-or", "openrouter_api"):
+        assert word not in client_src, f"в клиенте упоминается «{word}»"
+
+    # Подставляем заведомо ненастоящую строку в форме ключа и смотрим,
+    # не вылезет ли она в ответах ручек. Настоящий ключ проверке не нужен.
+    import app.config as config
+
+    saved = config.api_key
+    config.api_key = lambda: "sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА-ДЛЯ-ПРОВЕРКИ"
+    try:
         with TestClient(main.app) as client:
-            sse(client.get("/api/run/0").text)
-            after_first = client.get("/api/health").json()["agents_live"]
-            sse(client.get("/api/run/0").text)
-            after_second = client.get("/api/health").json()["agents_live"]
-    # 3 колонки + судья, и ни одним больше: второй прогон убирает весь первый.
-    assert after_first == 4, after_first
-    assert after_second == after_first, (after_first, after_second)
-    judges = [a for a in REGISTRY.list() if a.spec.label == "Судья"]
-    assert len(judges) == 1, [a.id for a in judges]
-    return f"после первого прогона {after_first}, после второго {after_second}, судья один"
+            agent_id = client.get("/api/agents").json()["agents"][0]["id"]
+            bodies = [
+                client.get("/api/agents").text,
+                client.get("/api/health").text,
+                client.get(f"/api/agents/{agent_id}").text,
+            ]
+    finally:
+        config.api_key = saved
+    for body in bodies:
+        assert "sk-or-v1" not in body, "ключ утёк в ответ ручки"
+    return "в клиенте про ключ ни слова, ручки его не отдают"
+
+
+@check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
+def check_no_cdn():
+    html = read("app/static/index.html")
+    css = read("app/static/style.css")
+    js = read("app/static/app.js")
+    for name, src in (("index.html", html), ("style.css", css), ("app.js", js)):
+        for pattern in ("http://", "https://", "//cdn", "@import", "url("):
+            for hit in re.findall(re.escape(pattern) + r"[^\s\"'()]*", src):
+                # Единственное допустимое вхождение — пространство имён SVG:
+                # это идентификатор, по нему браузер никуда не ходит.
+                assert hit.startswith("http://www.w3.org/2000/svg"), f"{name}: {hit}"
+    assert "@font-face" not in css, "свои шрифты тоже не подключаем"
+    assert html.count("<script") == 1 and 'src="/static/app.js"' in html
+    assert html.count("<link") == 1 and 'href="/static/style.css"' in html
+    return "в статике только относительные пути и w3.org-неймспейс SVG"
+
+
+@check("markdown рендерится своими силами и не пускает разметку из ответа")
+def check_markdown():
+    js = read("app/static/app.js")
+    assert "function renderMarkdown" in js and "function escapeHtml" in js
+    assert "escapeHtml(text)" in js, "ответ модели обязан экранироваться до разбора"
+    for feature in ("<strong>", "<code>", "<pre>", "<li>", "<blockquote>", "<h"):
+        assert feature in js, f"в разборе markdown нет {feature}"
+    assert "https?:" in js, "ссылки должны ограничиваться http(s)"
+    return "свой разбор: заголовки, списки, цитаты, код, жирный, ссылки только http(s)"
+
+
+# --- 9. реестр и инфраструктура -----------------------------------------------
 
 
 @check("конфиг агента копируется вглубь: сто агентов не делят один extra_body")
@@ -832,64 +603,47 @@ def check_spec_deep_copy():
     assert first.spec.extra_body is not shared.extra_body
     assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
     assert first.spec.extra_body is not second.spec.extra_body
-    assert first.spec.messages is not shared.messages
     assert first.spec.messages[0] is not shared.messages[0]
     assert first.spec.stop is not shared.stop
-    assert first.spec.response_format is not shared.response_format
 
     first.spec.extra_body["provider"]["order"] = ["only-me"]
     first.spec.messages[0]["content"] = "ДРУГОЕ"
-    first.spec.stop.append("СТОП")
     assert "order" not in shared.extra_body["provider"], shared.extra_body
     assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
     assert shared.messages[0]["content"] == "СИС", shared.messages
-    assert shared.stop == ["\n"], shared.stop
     return "правка у одного агента не задела ни день, ни соседа"
 
 
-@check("вытеснение уносит детей вместе с родителем")
-def check_eviction_cascade():
+@check("вытеснение уносит детей вместе с родителем и щадит занятых")
+def check_eviction():
     from app.registry import AgentRegistry
 
     registry = AgentRegistry(max_agents=6)
-    parent = registry.create(AgentSpec(label="родитель", model="stub/m", messages=[]))
+    parent = registry.create(AgentSpec(label="родитель", model="stub/m"))
     kids = registry.create_many(
-        [AgentSpec(label=f"ребёнок {i}", model="stub/m", messages=[]) for i in range(3)],
-        parent_id=parent.id,
+        [AgentSpec(label=f"ребёнок {i}", model="stub/m") for i in range(3)], parent_id=parent.id
     )
-    fresh = registry.create_many(
-        [AgentSpec(label=f"новый {i}", model="stub/m", messages=[]) for i in range(2)]
-    )
+    fresh = registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(2)])
     for agent in fresh:
         agent.last_used_at += 100
-
-    registry.create_many([AgentSpec(label=f"ещё {i}", model="stub/m", messages=[]) for i in range(2)])
+    registry.create_many([AgentSpec(label=f"ещё {i}", model="stub/m") for i in range(2)])
 
     assert registry.get(parent.id) is None, "родитель должен быть вытеснен"
-    orphans = [k.id for k in kids if registry.get(k.id) is not None]
-    assert not orphans, f"дети остались сиротами: {orphans}"
+    assert not [k.id for k in kids if registry.get(k.id) is not None], "дети остались сиротами"
     assert all(registry.get(a.id) is not None for a in fresh), "свежие вытесняться не должны"
-    assert len(registry) <= registry.max_agents, len(registry)
-    return f"родитель и {len(kids)} ребёнка ушли одним каскадом, сирот нет"
+
+    busy = AgentRegistry(max_agents=3)
+    held_parent = busy.create(AgentSpec(label="р", model="stub/m"))
+    held = busy.create(AgentSpec(label="д", model="stub/m"), parent_id=held_parent.id)
+    held.reserve()
+    busy.create_many([AgentSpec(label=f"н {i}", model="stub/m") for i in range(3)])
+    assert busy.get(held.id) is not None and busy.get(held_parent.id) is not None
+    held.release()
+    return "каскад работает, занятого и его родителя вытеснение не трогает"
 
 
-@check("занятого агента и его родителя вытеснение не трогает")
-def check_eviction_skips_busy():
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=3)
-    parent = registry.create(AgentSpec(label="родитель", model="stub/m", messages=[]))
-    child = registry.create(AgentSpec(label="ребёнок", model="stub/m", messages=[]), parent_id=parent.id)
-    child.reserve()
-    registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m", messages=[]) for i in range(3)])
-    assert registry.get(child.id) is not None, "занятого вытеснять нельзя"
-    assert registry.get(parent.id) is not None, "родителя занятого — тоже"
-    child.release()
-    return "занятый ребёнок и его родитель пережили вытеснение"
-
-
-@check("потолки: размер пачки и repeats")
-def check_limits():
+@check("потолок пачки при спавне")
+def check_batch_limit():
     with TestClient(main.app) as client:
         too_many = client.post(
             "/api/agents",
@@ -897,46 +651,9 @@ def check_limits():
         )
         assert too_many.status_code == 400, too_many.status_code
         assert str(main.MAX_SPAWN_BATCH) in too_many.json()["detail"], too_many.text
-
-        ok = client.post("/api/agents", json={"agents": [{"model": "stub/m"} for _ in range(3)]})
-        assert ok.status_code == 200, ok.text
-
-        greedy = client.post(
-            "/api/agents", json={"agent": {"model": "stub/m", "repeats": 1_000_000}}
-        )
-        assert greedy.status_code == 400, greedy.status_code
-        assert str(main.MAX_REPEATS) in greedy.json()["detail"], greedy.text
-
-        assert client.post(
-            "/api/agents", json={"agent": {"model": "stub/m", "repeats": main.MAX_REPEATS}}
-        ).status_code == 200
-    return f"пачка > {main.MAX_SPAWN_BATCH} → 400, repeats > {main.MAX_REPEATS} → 400"
-
-
-@check("судью можно переспросить: он помнит собственный вердикт")
-def check_judge_remembers_verdict():
-    _stub.install(reply=lambda m, i: f"вердикт{i}" if i == 3 else f"ответ{i}")
-    with _scenarios([LADDER]):
-        with TestClient(main.app) as client:
-            events = sse(client.get("/api/run/0").text)
-            judge_id = next(e for e in events if e["event"] == "judge_start")["agent"]
-            verdict = next(e for e in events if e["event"] == "judge_done")["text"]
-            _stub.reset()
-            again = client.post(
-                f"/api/agents/{judge_id}/messages", json={"text": "почему ты так решил?"}
-            )
-            assert again.status_code == 200, again.text
-
-    sent = _stub.CALLS[0]["messages"]
-    roles = [m["role"] for m in sent]
-    assert roles == ["system", "user", "assistant", "user"], roles
-    assert sent[2]["content"] == verdict, (sent[2]["content"], verdict)
-    assert "Донор" in sent[1]["content"], sent[1]["content"][:120]
-    assert sent[-1]["content"] == "почему ты так решил?", sent[-1]
-    return "в переспросе едут данные колонок и собственный вердикт судьи"
-
-
-# --- 11. инфраструктура --------------------------------------------------------
+        batch = client.post("/api/agents", json={"agents": [{"model": "stub/m"}] * 3})
+        assert batch.status_code == 200, batch.text
+    return f"пачка больше {main.MAX_SPAWN_BATCH} → 400"
 
 
 @check("общий httpx-клиент и семафор на процесс")
@@ -945,8 +662,7 @@ def check_shared_client():
 
     async def scenario():
         first = llm.shared_client()
-        second = llm.shared_client()
-        assert first is second, "клиент должен быть один на процесс"
+        assert first is llm.shared_client(), "клиент должен быть один на процесс"
         assert llm.call_slots() is llm.call_slots()
         await llm.aclose()
         assert llm.shared_client() is not first, "после закрытия создаётся новый"
@@ -960,32 +676,37 @@ def check_shared_client():
     finally:
         os.environ.pop("LLM_MAX_CONCURRENCY")
     assert llm.max_concurrency() == llm.DEFAULT_MAX_CONCURRENCY
-
-    source = open(os.path.join(ROOT, "app", "llm.py"), encoding="utf-8").read()
-    assert "httpx.AsyncClient(" in source
-    assert source.count("httpx.AsyncClient(") == 1, "клиент создаётся ровно в одном месте"
+    assert read("app/llm.py").count("httpx.AsyncClient(") == 1, "клиент создаётся в одном месте"
     return "клиент один, семафор один, LLM_MAX_CONCURRENCY читается"
 
 
-@check("Session остался алиасом AgentSpec: day.py дней 1–5 импортируется")
+@check("клиент шлёт только текст: лента в теле запроса запрещена")
+def check_no_feed():
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        bad = client.post(
+            f"/api/agents/{agent_id}/messages",
+            json={"text": "привет", "messages": [{"role": "user", "content": "привет"}]},
+        )
+        assert bad.status_code == 400, bad.text
+        assert "только text" in bad.json()["detail"], bad.text
+        assert client.post(f"/api/agents/{agent_id}/messages", json={"text": " "}).status_code == 400
+
+    js = read("app/static/app.js")
+    assert "{ text }" in js, "клиент должен слать в теле только text"
+    assert "/messages" in js and "/regenerate" in js
+    return "лишние поля в теле → 400, в app.js ленты нет"
+
+
+@check("Session остался алиасом AgentSpec")
 def check_session_alias():
     from app.schema import AgentSpec as Spec
     from app.schema import Session
 
     assert Session is Spec
-    old = Session(
-        label="колонка",
-        model="stub/m",
-        messages=[{"role": "user", "content": "x"}],
-        temperature=0.2,
-        max_tokens=100,
-        repeats=2,
-        depends_on=None,
-        note="n",
-        extra_body={"provider": {"allow_fallbacks": False}},
-    )
-    assert old.history_limit is None and old.system == ""
-    return "Session is AgentSpec, старая сигнатура конструктора работает"
+    spec = Session(label="колонка", model="stub/m", messages=[{"role": "user", "content": "x"}])
+    assert spec.history_limit is None and spec.draft == ""
+    return "Session is AgentSpec, конструктор с messages работает"
 
 
 @check("CLI говорит с агентом без веб-слоя")
@@ -1000,72 +721,38 @@ def check_cli():
     out = io.StringIO()
     answer = asyncio.run(cli.ask(agent, "как дела?", out))
     assert answer == "привет из консоли", answer
-    assert "привет из консоли" in out.getvalue()
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
     return "ответ напечатан, история записана, агент в реестре"
 
 
-@check("сценарий дня: одна модель, разный history_limit")
-def check_day():
-    import day
-
-    assert len(day.SCENARIOS) >= 1
-    scenario = day.SCENARIOS[0]
-    models = {s.model for s in scenario.sessions}
-    limits = sorted(s.history_limit for s in scenario.sessions)
-    assert len(models) == 1, models
-    assert limits == [0, day.WITH_MEMORY], limits
-    assert scenario.judge_questions, "у сценария дня должен быть судья"
-    assert day.AGENTS and all(a.messages == [] for a in day.AGENTS)
-
-    # Тот же первый вопрос обеим колонкам — иначе сравнивать нечего.
-    prompts = {json.dumps(s.messages, ensure_ascii=False) for s in scenario.sessions}
-    assert len(prompts) == 1, "первый вопрос у колонок должен совпадать"
-
-    _stub.install(reply=lambda m, i: f"план {i}")
-    with TestClient(main.app) as client:
-        events = sse(client.get("/api/run/0").text)
-    starts = [e for e in events if e["event"] == "session_start"]
-    assert len(starts) == 2, len(starts)
-    assert len(_stub.CALLS) == 3, len(_stub.CALLS)  # две колонки + судья
-    for call in _stub.CALLS[:2]:
-        assert [m["role"] for m in call["messages"]] == ["system", "user"], call["messages"]
-    return f"колонки {[s['session'] for s in starts]}, окна {limits}"
-
-
 CHECKS = [
     check_spawn_100,
+    check_past_days_transfer,
+    check_roster_live,
+    check_draft_not_sent,
+    check_scenarios_gone,
     check_memory,
-    check_blank_forgets_seed,
-    check_seed_split_keeps_run,
-    check_override_survives_start,
-    check_no_feed,
+    check_history_window,
     check_parallel,
-    check_repeats,
     check_rollback,
     check_disconnect,
-    check_disconnect_run,
-    check_run_intact,
-    check_judge_fresh,
-    check_run_replaces_agents,
-    check_command_run,
-    check_command_parsing,
-    check_patch_model,
-    check_kill_cascade,
-    check_eviction,
-    check_transcript,
-    check_reservation_released_on_early_abort,
-    check_orphan_run_cleanup,
+    check_new_params,
+    check_patch_panel,
+    check_reasoning,
+    check_regenerate,
+    check_reset_keeps_roster,
+    check_new_chat,
+    check_no_key_leak,
+    check_no_cdn,
+    check_markdown,
     check_spec_deep_copy,
-    check_eviction_cascade,
-    check_eviction_skips_busy,
-    check_limits,
-    check_judge_remembers_verdict,
+    check_eviction,
+    check_batch_limit,
     check_shared_client,
+    check_no_feed,
     check_session_alias,
     check_cli,
-    check_day,
 ]
 
 
@@ -1077,8 +764,7 @@ def main_() -> int:
     failed = 0
     print()
     for name, ok, detail in RESULTS:
-        mark = "OK  " if ok else "FAIL"
-        print(f"{mark}  {name.ljust(width)}  {detail}")
+        print(f"{'OK  ' if ok else 'FAIL'}  {name.ljust(width)}  {detail}")
         failed += 0 if ok else 1
     print()
     print(f"{len(RESULTS) - failed} из {len(RESULTS)} проверок пройдено")

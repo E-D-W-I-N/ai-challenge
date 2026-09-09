@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,59 +7,148 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <h1>AI Challenge — агенты</h1>
-      <div class="topbar-right">
-        <div id="registry-badge" class="badge" title="Живых агентов в процессе"></div>
-        <div id="key-status" class="badge"></div>
+  <div class="app" id="app">
+
+    <!-- ── слева: список агентов ─────────────────────────────────────── -->
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-head">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">◆</span>
+          <span class="brand-text">
+            <span class="brand-name">AI Challenge</span>
+            <span class="brand-sub">агенты · день 6</span>
+          </span>
+        </div>
+        <button class="icon-btn" id="sidebar-toggle" type="button"
+                title="Свернуть список" aria-label="Свернуть список"></button>
+      </header>
+
+      <button class="new-chat" id="new-chat" type="button">
+        <span class="plus" aria-hidden="true">+</span> Новый чат
+      </button>
+
+      <nav class="list" id="agent-list" aria-label="Агенты"></nav>
+
+      <footer class="sidebar-foot">
+        <button class="foot-btn" id="theme-toggle" type="button"></button>
+        <label class="foot-btn switch-row">
+          <span class="foot-icon" aria-hidden="true">T</span>
+          <span class="foot-label">Автоимя чата</span>
+          <span class="switch"><input type="checkbox" id="autoname" checked><span class="knob"></span></span>
+        </label>
+        <button class="foot-btn danger" id="clear-all" type="button">
+          <span class="foot-icon" aria-hidden="true">⌫</span>
+          <span class="foot-label">Очистить все чаты</span>
+        </button>
+      </footer>
+    </aside>
+
+    <!-- ── по центру: лента ──────────────────────────────────────────── -->
+    <main class="chat">
+      <div class="chat-body">
+        <div class="feed" id="feed"></div>
+        <div class="rail" id="rail" aria-hidden="true"></div>
       </div>
-    </header>
 
-    <main class="layout">
-      <aside id="sidebar" class="sidebar">
-        <div class="sidebar-head">
-          <h2>Сценарии</h2>
-          <button id="sidebar-toggle" class="sidebar-toggle" type="button"
-                  aria-controls="scenario-list" aria-expanded="true"></button>
+      <form class="composer" id="composer">
+        <div class="composer-box">
+          <textarea id="input" class="composer-input" rows="1"
+                    placeholder="Напишите сообщение… (Shift+Enter — новая строка)"></textarea>
+          <button class="send-btn" id="send" type="submit" title="Отправить"
+                  aria-label="Отправить"></button>
         </div>
-        <div id="scenario-list" class="scenario-list"></div>
-        <div class="sidebar-section">
-          <h2>Агенты процесса</h2>
-          <div id="agent-list" class="agent-list"></div>
-        </div>
-      </aside>
-
-      <section class="content">
-        <!-- Главный экран — чат с агентом. Колонки появляются после «/прогон». -->
-        <div class="chat-panel">
-          <header class="chat-head">
-            <label class="roster">
-              <span class="picker-label">Агент</span>
-              <select id="roster-select"></select>
-            </label>
-            <div id="chat-agent-id" class="agent-id"></div>
-            <button id="chat-reset" class="ghost" type="button" title="Создать нового агента с тем же конфигом">Новый агент</button>
-          </header>
-          <div id="chat-feed" class="chat chat-feed"></div>
-          <form id="chat-form" class="composer">
-            <textarea id="chat-input" class="composer-input" rows="1"></textarea>
-            <button id="chat-send" class="send" type="submit">Отправить</button>
-          </form>
-        </div>
-
-        <!-- Кадр прогона: колонки-субагенты. До выбора сценария его нет. -->
-        <div id="stage" class="stage hidden">
-          <div id="scenario-bar" class="scenario-bar"></div>
-          <div id="columns" class="columns"></div>
-        </div>
-
-        <!-- Вердикт и сводка уезжают под кадр: к ним прокручиваются. -->
-        <div id="verdict" class="verdict hidden"></div>
-
-        <div id="summary" class="summary hidden"></div>
-      </section>
+        <div class="composer-hint" id="composer-hint"></div>
+      </form>
     </main>
+
+    <!-- ── справа: настройки агента ──────────────────────────────────── -->
+    <aside class="panel" id="panel">
+      <header class="panel-head">
+        <div class="tabs" role="tablist">
+          <button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab">Модель</button>
+          <button class="tab" id="tab-btn-agent" data-tab="agent" type="button" role="tab">Агент</button>
+        </div>
+        <button class="icon-btn" id="panel-toggle" type="button"
+                title="Свернуть настройки" aria-label="Свернуть настройки"></button>
+      </header>
+
+      <div class="panel-body" id="panel-body">
+        <section class="tab-page" id="tab-model">
+          <label class="field">
+            <span class="field-label">Модель</span>
+            <select id="f-model" class="control"></select>
+          </label>
+          <div class="field-note" id="model-note"></div>
+
+          <div class="grid2">
+            <label class="field">
+              <span class="field-label">Temperature</span>
+              <input id="f-temperature" class="control" type="number" step="0.1" placeholder="по умолчанию">
+            </label>
+            <label class="field">
+              <span class="field-label">Max tokens</span>
+              <input id="f-max_tokens" class="control" type="number" step="1" placeholder="по умолчанию">
+            </label>
+          </div>
+
+          <div class="grid3">
+            <label class="field">
+              <span class="field-label">Top P</span>
+              <input id="f-top_p" class="control" type="number" step="0.05" placeholder="—">
+            </label>
+            <label class="field">
+              <span class="field-label">Top K</span>
+              <input id="f-top_k" class="control" type="number" step="1" placeholder="—">
+            </label>
+            <label class="field">
+              <span class="field-label">Min P</span>
+              <input id="f-min_p" class="control" type="number" step="0.01" placeholder="—">
+            </label>
+          </div>
+
+          <div class="grid3">
+            <label class="field">
+              <span class="field-label">Rep. penalty</span>
+              <input id="f-repetition_penalty" class="control" type="number" step="0.05" placeholder="—">
+            </label>
+            <label class="field">
+              <span class="field-label">Pres. penalty</span>
+              <input id="f-presence_penalty" class="control" type="number" step="0.1" placeholder="—">
+            </label>
+            <label class="field">
+              <span class="field-label">Freq. penalty</span>
+              <input id="f-frequency_penalty" class="control" type="number" step="0.1" placeholder="—">
+            </label>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Окно памяти, сообщений</span>
+            <input id="f-history_limit" class="control" type="number" step="1" min="0" placeholder="по умолчанию">
+          </label>
+          <p class="hint">Пустое поле — параметр не отправляется вовсе. Ноль в окне памяти —
+            агент забывает разговор и каждый вопрос отвечает как первый.</p>
+        </section>
+
+        <section class="tab-page hidden" id="tab-agent">
+          <label class="field">
+            <span class="field-label">Имя агента</span>
+            <input id="f-label" class="control" type="text" placeholder="Новый чат">
+          </label>
+          <label class="field">
+            <span class="field-label">Системный промпт</span>
+            <textarea id="f-system" class="control area" rows="12" placeholder="без системного промпта"></textarea>
+          </label>
+          <div class="field-note" id="agent-note"></div>
+        </section>
+      </div>
+
+      <div class="panel-save">
+        <button class="save-btn" id="save-settings" type="button">Сохранить настройки</button>
+        <div class="save-status" id="save-status"></div>
+      </div>
+
+      <div class="tiles" id="tiles"></div>
+    </aside>
   </div>
 
   <script src="/static/app.js"></script>
