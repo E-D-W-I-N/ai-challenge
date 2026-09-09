@@ -328,14 +328,17 @@ function freshClient(options) {
   const dom = require(path.join(__dirname, "dom.js"));
   // Порядок важен: свои чаты добавляем ПОСЛЕ распаковки options, иначе
   // options.chats затрёт список, а не дополнит его.
-  const env = dom.boot(HTML, {
-    ...options,
-    chats: [
-      { label: "первый чат", system: "СТАРЫЙ ПРОМПТ", model: "первая/модель" },
-      { label: "второй чат", system: "ЧУЖОЙ ПРОМПТ", model: "вторая/модель" },
-      ...((options && options.chats) || []),
-    ],
-  });
+  // Порядок важен: свои чаты добавляем ПОСЛЕ распаковки options, иначе
+  // options.chats затрёт список, а не дополнит его. `bare` — чистый старт:
+  // на сервере нет ни одного чата, как при первом запуске.
+  const seeded = (options && options.bare)
+    ? []
+    : [
+        { label: "первый чат", system: "СТАРЫЙ ПРОМПТ", model: "первая/модель" },
+        { label: "второй чат", system: "ЧУЖОЙ ПРОМПТ", model: "вторая/модель" },
+        ...((options && options.chats) || []),
+      ];
+  const env = dom.boot(HTML, { ...options, chats: seeded });
   const client = require(path.join(__dirname, "..", "app", "static", "app.js"));
   return { ...env, ...dom, client, $: (sel) => env.document.querySelector(sel) };
 }
@@ -443,6 +446,45 @@ async function routeChecks() {
     check("и клиент говорит почему", /не применились/.test($("#composer-hint").textContent),
       $("#composer-hint").textContent);
     check("текст сообщения остался в поле ввода", $("#input").value === "вопрос", $("#input").value);
+  }
+
+  // ── пустой старт: писать надо куда-то сразу ──
+  {
+    const { client, server, $, settle, Evt } = freshClient({ bare: true });
+    check("на чистом старте на сервере нет чатов", server.state.agents.length === 0,
+      String(server.state.agents.length));
+    client.init();
+    await settle(60);
+
+    check("клиент заводит один чат сам", server.state.agents.length === 1,
+      String(server.state.agents.length));
+    check("и сразу его открывает", Boolean(client.state.current), "чат не открыт");
+    check("имя у него по умолчанию", /^Новый чат \d+$/.test(client.state.current.label),
+      client.state.current.label);
+    check("и он пуст: ни переписки, ни черновика",
+      client.state.current.transcript.length === 0 && $("#input").value === "",
+      JSON.stringify([client.state.current.transcript, $("#input").value]));
+    check("в списке ровно одна строка",
+      $("#agent-list").querySelectorAll(".item").length === 1,
+      String($("#agent-list").querySelectorAll(".item").length));
+
+    // Удалили единственный чат — появился свежий, а не пустой экран.
+    const before = client.state.current.id;
+    const row = $("#agent-list").querySelectorAll(".item")[0];
+    row.querySelectorAll(".mini")[1].dispatchEvent(new Evt("click"));
+    const dialog = $(".confirm");
+    check("удаление спрашивает подтверждение", Boolean(dialog), "диалога нет");
+    const buttons = dialog.querySelectorAll(".primary");
+    buttons[0].dispatchEvent(new Evt("click"));
+    await settle(80);
+
+    check("после удаления последнего чата появляется свежий",
+      server.state.agents.length === 1 && client.state.current.id !== before,
+      JSON.stringify({ живых: server.state.agents.length, было: before, стало: client.state.current && client.state.current.id }));
+    check("и он тоже пустой", client.state.current.transcript.length === 0,
+      JSON.stringify(client.state.current.transcript));
+    check("номер имени не переиспользуется", client.state.current.label === "Новый чат 2",
+      client.state.current.label);
   }
 
   // ── где оказывается лента ──

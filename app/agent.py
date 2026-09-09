@@ -137,9 +137,9 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Один и тот же spec из day.py может поднять несколько агентов —
-        # каждому нужна своя копия, иначе правка у одного задела бы всех,
-        # а день ровно про то, что у ста агентов конфиги **разные**.
+        # Один и тот же spec может поднять несколько агентов — каждому нужна
+        # своя копия, иначе правка у одного задела бы всех, а день ровно
+        # про то, что у ста агентов конфиги **разные**.
         self.spec = copy_spec(spec)
         self.id = agent_id or f"ag_{next(_ids):05d}"
         self.created_at = time.time()
@@ -335,7 +335,6 @@ class Agent:
             "response_format": self.spec.response_format,
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
-            "draft": self.spec.draft,
             "history_limit": self.history_limit,
             "history_len": len(self.history),
             "busy": self.busy,

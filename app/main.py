@@ -1,8 +1,7 @@
 """FastAPI-сервер чата: реестр агентов процесса и разговор с любым из них.
 
-Заранее заведённые чаты берутся из day.py в корне ветки. Они ничем не
-особенные: обычные чаты с именем, системным промптом и настройками — их так
-же переименовывают, удаляют и правят, как любой созданный руками.
+Список чатов начинается пустым: заводит их пользователь. Заготовок нет —
+ни имён, ни промптов, ни настроек, придуманных за него.
 
 Сервер держит состояние: агент — объект в реестре процесса, историю диалога
 хранит он, а не браузер. Клиент шлёт только новый текст и id агента. Реестр
@@ -15,7 +14,6 @@ import asyncio
 import contextlib
 import itertools
 import json
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -27,46 +25,24 @@ from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
-from .config import ROOT, has_key
+from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import AgentSpec
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# day.py лежит в корне ветки, рядом с app/. Кладём корень в sys.path сами,
-# чтобы сервер поднимался и не из корня тоже.
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-try:
-    import day as _day
-
-    PRESET_CHATS: list[AgentSpec] = list(_day.CHATS)
-except Exception as exc:  # noqa: BLE001 — без day.py серверу нечего поднимать
-    raise RuntimeError(
-        f"day.py не загрузился ({type(exc).__name__}: {exc}). "
-        "День в ветке один, прятать ошибку не от кого — почините day.py."
-    ) from exc
-
-_wrong = next((a for a in PRESET_CHATS if not isinstance(a, AgentSpec)), None)
-if _wrong is not None:
-    raise RuntimeError(
-        f"day.py: CHATS содержит {type(_wrong).__name__}, а должен — только AgentSpec"
-    )
-_labels = [a.label for a in PRESET_CHATS]
-if len(set(_labels)) != len(_labels):
-    _dupes = sorted({label for label in _labels if _labels.count(label) > 1})
-    raise RuntimeError(
-        f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(_dupes)}"
-    )
-
 NEW_CHAT_SPEC = AgentSpec(
     label="Новый чат",
     model="openai/gpt-4o-mini",
     system="Ты — полезный ассистент. Отвечай по-русски, по делу.",
 )
-"""Заготовка кнопки «Новый чат». Имя ей выдаёт `_next_chat_label`."""
+"""Чистый чат: то, что получает кнопка «Новый чат».
+
+Единственная заготовка в стенде, и она ничего не придумывает за
+пользователя — модель по умолчанию и нейтральный системный промпт.
+Имя ей выдаёт `_next_chat_label`.
+"""
 
 _chat_numbers = itertools.count(1)
 """Счётчик имён по умолчанию: «Новый чат 1», «Новый чат 2» и дальше.
@@ -83,7 +59,6 @@ def _next_chat_label() -> str:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    bootstrap_chats()
     yield
     # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
     # руками: без этого uvicorn на остановке ругается на незакрытый пул.
@@ -97,20 +72,6 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
-
-
-# --- заранее заведённые чаты --------------------------------------------------
-
-
-def bootstrap_chats() -> list[Agent]:
-    """Поднимает чаты из day.py, которых ещё нет. Зовётся на старте процесса.
-
-    Дальше они живут наравне со всеми: их переименовывают, удаляют и правят.
-    Никакой отдельной ветки обработки у них нет — только строчка в day.py
-    вместо кнопки «Новый чат».
-    """
-    live = {a.spec.label for a in REGISTRY.list()}
-    return [REGISTRY.create(spec) for spec in PRESET_CHATS if spec.label not in live]
 
 
 # --- вспомогательное ----------------------------------------------------------
@@ -346,7 +307,6 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
         model=model,
         messages=messages,
         system=system,
-        draft=text("draft"),
         stop=stop or None,
         response_format=response_format,
         extra_body=extra_body,
@@ -374,7 +334,7 @@ def _agent(agent_id: str) -> Agent:
 def _listing() -> dict:
     """Всё, что нужно клиенту для списка слева и статуса ключа.
 
-    Список плоский: ни групп, ни разделения на «свои» и «заготовленные».
+    Список плоский, и на чистом старте он пуст: чаты заводит пользователь.
     Ключа здесь нет и быть не может — наружу уходит только факт его наличия.
     """
     return {
