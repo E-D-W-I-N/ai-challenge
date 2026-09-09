@@ -457,7 +457,6 @@ function buildServer(options) {
     label,
     model: state.models[0].id,
     system: "",
-    draft: "",
     history_limit: null,
     stop: null,
     response_format: null,
@@ -468,9 +467,15 @@ function buildServer(options) {
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
   });
 
-  // Чаты, заведённые заранее, — как их поднимает day.py на старте сервера.
-  ((options && options.chats) || [{ label: "День 1: Ответ" }]).forEach((seed, i) => {
-    state.agents.push(Object.assign(blank("ag_" + (i + 1), seed.label), seed));
+  // Счётчик, как на сервере: только растёт и номера не переиспользует.
+  // Иначе после удаления чата новый получил бы тот же id и то же имя, и
+  // проверка «после удаления появился свежий» прошла бы на подложном равенстве.
+  let issued = 0;
+  const nextId = () => "ag_" + (issued += 1);
+
+  // Чаты, заведённые заранее, — как если бы их создали руками до открытия.
+  ((options && options.chats) || [{ label: "чат" }]).forEach((seed) => {
+    state.agents.push(Object.assign(blank(nextId(), seed.label), seed));
   });
 
   const config = (agent) => {
@@ -536,7 +541,8 @@ function buildServer(options) {
       });
     }
     if (path === "/api/agents" && method === "POST") {
-      const agent = blank("ag_" + (state.agents.length + 1), "Новый чат " + (state.agents.length + 1));
+      const id = nextId();
+      const agent = blank(id, "Новый чат " + id.slice(3));
       state.agents.push(agent);
       return json({ created: 1, agents: [agent] });
     }

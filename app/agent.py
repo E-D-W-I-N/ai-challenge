@@ -206,9 +206,9 @@ class Agent:
         Вынесено из `__init__` только ради уборки: конструктор оборачивает этот
         вызов и на любом исключении освобождает занятую строку сессии.
         """
-        # Один и тот же spec из day.py может поднять несколько агентов —
-        # каждому нужна своя копия, иначе правка у одного задела бы всех,
-        # а день ровно про то, что у ста агентов конфиги **разные**.
+        # Один и тот же spec может поднять несколько агентов — каждому нужна
+        # своя копия, иначе правка у одного задела бы всех, а день ровно
+        # про то, что у ста агентов конфиги **разные**.
         self.spec = copy_spec(spec)
         self.created_at = time.time()
         self.last_used_at = self.created_at
@@ -698,7 +698,6 @@ def spec_as_dict(
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
         "system": spec.system,
-        "draft": spec.draft,
         "history_limit": effective_history_limit(spec.history_limit),
         "history_len": history_len,
         "busy": busy,
