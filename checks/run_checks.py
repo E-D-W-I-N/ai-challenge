@@ -2,14 +2,8 @@
 
     .venv/bin/python checks/run_checks.py
 
-Главные критерии вынесены в отдельные скрипты и запускаются отсюда же:
-`checks/spawn_100.py` — сотня агентов в одном процессе, `checks/restart.py` —
-диалог, переживший перезапуск программы, `checks/two_processes.py` — сервер
-и консоль на одной базе.
-
-База каждой проверке достаётся своя: `_stub.install_offline()` уводит
-AGENT_DB_PATH во временный каталог **до** импорта app.*, а обёртка `check`
-чистит её между проверками.
+Главный критерий дня вынесен в отдельный скрипт (`checks/spawn_100.py`) и
+запускается отсюда же первым пунктом.
 """
 
 from __future__ import annotations
@@ -931,6 +925,21 @@ def check_regenerate_disconnect():
 # --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
+@check("по умолчанию заведены только чаты дней 1–5")
+def check_default_chats():
+    with TestClient(main.app) as client:
+        labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+
+    assert len(labels) == 21, f"{len(labels)} чатов: {labels}"
+    assert "Ассистент" not in labels, "чат текущего дня должен быть удалён"
+    for label in labels:
+        assert label.startswith("День "), f"лишний чат по умолчанию: {label}"
+    days = sorted({label.split(":")[0] for label in labels})
+    assert days == ["День 1", "День 2", "День 3", "День 4", "День 5"], days
+    assert "Ассистент" not in read("day.py"), "в day.py остался чат текущего дня"
+    return f"{len(labels)} чатов, только дни 1–5"
+
+
 @check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
 def check_no_clear_all():
     with TestClient(main.app) as client:
@@ -1010,7 +1019,12 @@ def check_no_leftover_texts():
     assert "group=" not in day_source, "в day.py остались группы"
     for path in ("app/static/app.js", "app/static/index.html"):
         assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
-    return "ни note, ни group — ни в day.py, ни в ответах, ни в разметке"
+
+    # Подписи, объясняющие интерфейс сам себе, — тоже приписки: карандаш
+    # в списке виден и без пояснения под панелью.
+    html = read("app/static/index.html")
+    assert "карандаш" not in html, "приписка про карандаш осталась"
+    return "ни note, ни group, ни подписей к очевидному"
 
 
 @check("имени клиента-референса нет нигде в репозитории")
@@ -1126,18 +1140,13 @@ def check_catalog_capabilities():
 
     js = read("app/static/app.js")
     assert "function paramWarnings" in js, "панель не считает предупреждения"
-    # Закреплённый провайдер — не пояснение, а настройка, ломающая вызов:
-    # шесть чатов дней 4–5 роняют смену модели сырым 404 без подсказки.
-    assert "provider.order" in js, "панель молчит про закреплённого провайдера"
+    # Привязка к поставщику — настройка, которая ломает смену модели.
+    # Панель говорит о ней в момент смены; сам текст проверяется вызовами
+    # в checks/browser_check.js, здесь — что данные для него есть.
     assert "extra_body" in js, "панель не смотрит на extra_body"
+    assert "baseModel" in js, "панель не помнит, с какой модели начинали"
     pinned = [c.label for c in day.CHATS if (c.extra_body or {}).get("provider", {}).get("order")]
-    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым провайдером
-    no_fallback = [
-        c.label
-        for c in day.CHATS
-        if (c.extra_body or {}).get("provider", {}).get("allow_fallbacks") is False
-    ]
-    assert len(no_fallback) == 6, no_fallback  # плюс три чата Дня 5 без фолбэка
+    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым поставщиком
     for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
         assert field in js, f"клиент не смотрит на {field}"
     assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
@@ -1161,13 +1170,15 @@ def check_no_cdn():
     return "в статике только относительные пути и w3.org-неймспейс SVG"
 
 
-@check("поле ввода закреплено внизу и не уезжает вместе с лентой")
-def check_composer_pinned():
-    """Пункт 7: композер уезжал вниз, когда лента становилась длиннее.
+@check("лента прокручивается, а не сжимает карточки; композер закреплён")
+def check_feed_scrolls():
+    """Находка заказчика: карточки сплющивались в полоску вместо прокрутки.
 
-    Держится это на `min-height: 0` у колонки чата: без него автоматический
-    минимум grid- и flex-элемента считается по содержимому, лента распирает
-    колонку выше экрана и утаскивает поле ввода за собой.
+    Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
+    У карточки к тому же `overflow: hidden`, из-за чего её автоматический
+    минимальный размер равен нулю — сжаться она может до полосы. Прошлая
+    правка (`min-height: 0` у колонки чата) закрепила композер, но сжатие
+    шло по другой причине и осталось.
     """
     css = read("app/static/style.css")
     block = css[css.index(".chat {") : css.index(".chat-body")]
@@ -1175,8 +1186,15 @@ def check_composer_pinned():
         assert rule in block, f"у .chat нет правила {rule}"
     assert "min-height: 0" in css[css.index(".chat-body") : css.index(".feed {")]
     assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
-    assert ".feed {" in css and "overflow-y: auto" in css[css.index(".feed {") :]
-    return "колонка чата не растягивается содержимым, прокручивается лента"
+    assert "overflow-y: auto" in css[css.index(".feed {") :], "лента должна прокручиваться"
+
+    # Главное: элементам ленты запрещено сжиматься.
+    assert ".feed > * { flex: 0 0 auto; }" in css, "элементы ленты всё ещё сжимаются"
+    feed = css[css.index(".feed {") : css.index(".feed > *")]
+    assert "scroll-behavior: smooth" not in feed, (
+        "плавная прокрутка ленты дёргает её на каждом куске ответа"
+    )
+    return "элементы ленты не сжимаются, лента прокручивается, композер закреплён"
 
 
 @check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
@@ -1362,6 +1380,7 @@ def check_cli():
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
     return "ответ напечатан, история записана, агент в реестре"
+
 
 
 # --- 12. День 7: память между запусками ---------------------------------------
@@ -2355,6 +2374,59 @@ def check_cli_session():
     return "--session поднимает чат из базы, /сессии его показывает"
 
 
+
+@check("отозванная заготовка удаляется из существующей базы и не возвращается")
+def check_retired_preset_removed():
+    """«Ассистент» ушёл из day.py, но в базе заказчика он уже заведён.
+
+    Просто убрать строку мало: правило «удаление строки живой чат не трогает»
+    оставило бы его сиротой, а просили удалить. Отзыв — это удаление,
+    и ключ при этом остаётся в наборе, поэтому обратно чат не заводится.
+    """
+    path = _temp_db("retired")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    saved_retired = main.RETIRED_PRESETS
+    saved_presets = main.PRESET_CHATS
+    try:
+        # База, заведённая версией, где «Ассистент» ещё был заготовкой.
+        main.RETIRED_PRESETS = ()
+        main.PRESET_CHATS = [
+            *saved_presets,
+            AgentSpec(preset="assistant", label="Ассистент", model="stub/m"),
+        ]
+        registry = _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+        assert "Ассистент" in before, before[-1]
+        # Заказчик успел его переименовать — искать надо не по имени.
+        victim = next(a for a in registry.list() if a.spec.label == "Ассистент")
+        victim.spec.label = "Мой ассистент"
+        victim.save_config()
+
+        # Обновились: строки в day.py больше нет, ключ отозван.
+        main.PRESET_CHATS = saved_presets
+        main.RETIRED_PRESETS = ("assistant",)
+        _restart(store)
+        after = [a["label"] for a in main._listing()["agents"]]
+
+        # И на следующем запуске он не возвращается.
+        _restart(store)
+        again = [a["label"] for a in main._listing()["agents"]]
+        seeded = json.loads(store.get_meta(main.PRESETS_KEY))
+    finally:
+        main.RETIRED_PRESETS = saved_retired
+        main.PRESET_CHATS = saved_presets
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "Мой ассистент" not in after, "переименованный «Ассистент» остался сиротой"
+    assert "Ассистент" not in after, after
+    assert sorted(after) == sorted(spec.label for spec in day.CHATS), after
+    assert again == after, f"на следующем запуске список изменился: {again}"
+    assert "assistant" in seeded, "ключ отозванной заготовки должен остаться отмеченным"
+    return f"{len(before)} чатов было, после отзыва {len(after)}, обратно не заводится"
+
+
 CHECKS = [
     check_spawn_100,
     check_past_days_transfer,
@@ -2378,6 +2450,7 @@ CHECKS = [
     check_regenerate,
     check_regenerate_failure,
     check_regenerate_disconnect,
+    check_default_chats,
     check_no_clear_all,
     check_numbered_names,
     check_list_actions,
@@ -2386,7 +2459,7 @@ CHECKS = [
     check_no_key_leak,
     check_catalog_capabilities,
     check_no_cdn,
-    check_composer_pinned,
+    check_feed_scrolls,
     check_browser,
     check_spec_deep_copy,
     check_eviction,
@@ -2408,11 +2481,12 @@ CHECKS = [
     check_list_survives_restart,
     check_deleted_chat_stays_deleted,
     check_renamed_chat_not_duplicated,
-    check_numbering_survives_restart,
     check_new_preset_appears,
     check_preset_order_changed,
-    check_legacy_bootstrap_migrated,
+    check_retired_preset_removed,
     check_broken_presets_marker,
+    check_legacy_bootstrap_migrated,
+    check_numbering_survives_restart,
     check_list_not_truncated,
     check_list_beyond_cap,
     check_eviction_keeps_session,

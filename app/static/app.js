@@ -18,9 +18,18 @@ const state = {
   tab: "model",
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
+  stick: true,         // лента примотана к низу — доматывать новые ответы
+  baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
+  statusTimer: null,   // таймер, гасящий строку состояния
 };
 
 const $ = (sel) => document.querySelector(sel);
+
+// Сколько пикселей от низа ленты ещё считается «читатель внизу».
+const STICK_SLACK = 80;
+
+// Через сколько гаснет «Применено — со следующего сообщения».
+const STATUS_FADE_MS = 5000;
 
 // ─────────────────────────── иконки ───────────────────────────
 
@@ -378,6 +387,10 @@ async function openAgent(agentId) {
   }
   state.current = agent;
   state.panelDirty = false;
+  // Чат открывают, чтобы увидеть последнее сообщение. Отмотанная лента
+  // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
+  // читатель выключил бы доматывание сразу для всех чатов.
+  state.stick = true;
   state.lastMetrics = lastAnswerMetrics(agent);
   renderList();
   renderFeed(agent);
@@ -406,6 +419,11 @@ function lastAnswerMetrics(agent) {
 
 function renderFeed(agent) {
   const feed = $("#feed");
+  // Подмена содержимого обнуляет прокрутку, поэтому положение после
+  // перерисовки задаётся здесь явно и всегда: либо низ, либо то место,
+  // где читатель остановился. Оставить на усмотрение браузера нельзя —
+  // он оставит ноль, то есть выбросит читателя в начало разговора.
+  const keep = state.stick ? null : feed.scrollTop;
   feed.innerHTML = "";
 
   const turns = agent.transcript.filter((t) => !t.seed);
@@ -419,6 +437,7 @@ function renderFeed(agent) {
     empty.append(h, p);
     feed.appendChild(empty);
     renderRail();
+    feed.scrollTop = 0;
     return;
   }
 
@@ -426,7 +445,7 @@ function renderFeed(agent) {
     feed.appendChild(turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn));
   });
   renderRail();
-  scrollFeed();
+  feed.scrollTop = keep === null ? feed.scrollHeight : keep;
 }
 
 function userBubble(text) {
@@ -547,8 +566,16 @@ function renderRail() {
   });
 }
 
-function scrollFeed() {
+// Лента доматывается вниз, только если читатель и так внизу. Отмотал
+// вверх — новые куски ответа не дёргают её у него под руками.
+function atBottom(feed) {
+  return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= STICK_SLACK;
+}
+
+function scrollFeed(force) {
   const feed = $("#feed");
+  if (force) state.stick = true;
+  if (!state.stick) return;
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -600,22 +627,6 @@ async function send() {
   const text = (input.value || "").trim();
   if (!text || !state.current || !state.hasKey) return;
 
-  // Поле панели могло только что потерять фокус: правка уже полетела на
-  // сервер, и отправлять сообщение вперёд неё нельзя — уедет старый конфиг.
-  if (state.applying) await state.applying;
-  // Правка не доехала — пробуем ещё раз и, если снова мимо, не отправляем:
-  // отправить с настройками, которых у агента нет, значит показать в панели
-  // одно, а в модель послать другое.
-  if (state.panelDirty) {
-    await applySettings();
-    if (state.panelDirty) {
-      hint("Настройки панели не применились — сообщение не отправлено.", true);
-      return;
-    }
-  }
-
-  input.value = "";
-  autoGrow(input);
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
@@ -629,6 +640,26 @@ async function exchange(path, body, questionText) {
   const feed = $("#feed");
   const agent = state.current;
 
+  // Инвариант живёт здесь, а не у вызывающих: через `exchange` проходит
+  // всякая отправка, и третий путь к нему не сможет его обойти. Держать
+  // свойство дисциплиной двух вызывающих — значит ждать, пока появится
+  // третий и молча откроет дыру заново.
+  if (state.applying) await state.applying;
+  if (!(await ensurePanelApplied())) {
+    hint("Настройки панели не применились — сообщение не отправлено.", true);
+    return false;
+  }
+  // Текст забираем из поля только теперь: до этой строки отправка могла
+  // не состояться, и стирать написанное было бы не за что.
+  if (questionText !== null) {
+    const input = $("#input");
+    input.value = "";
+    autoGrow(input);
+  }
+
+  // Обмен затевает сам читатель — и своим сообщением, и повтором ответа:
+  // ленту к низу, чтобы увидеть, что из этого вышло.
+  state.stick = true;
   if (questionText !== null) {
     if (feed.querySelector(".empty")) feed.innerHTML = "";
     feed.appendChild(userBubble(questionText));
@@ -769,6 +800,10 @@ function fillPanel(agent) {
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
   fillResponseFormat(agent.response_format);
+  // Модель ставим сразу, не дожидаясь каталога: пока он едет, поле иначе
+  // пустое, а панель — источник правды, и её пустоту нельзя пролить в агента.
+  setModelOptions([{ id: agent.model }], agent.model);
+  state.baseModel = agent.model;
   fillModels(agent.model).then(renderWarnings);
   saveStatus("");
 }
@@ -797,20 +832,10 @@ function syncResponseFormat() {
   );
 }
 
-async function fillModels(current) {
+function setModelOptions(models, current) {
   const select = $("#f-model");
-  if (!state.models.length) {
-    try {
-      state.models = (await api("/api/models")).models || [];
-    } catch (e) {
-      state.models = [];
-    }
-  }
-  const options = state.models.some((m) => m.id === current)
-    ? state.models
-    : [{ id: current, prompt_price_per_m: 0, completion_price_per_m: 0 }, ...state.models];
   select.innerHTML = "";
-  options.forEach((m) => {
+  models.forEach((m) => {
     const opt = document.createElement("option");
     opt.value = m.id;
     const price = m.prompt_price_per_m
@@ -820,6 +845,20 @@ async function fillModels(current) {
     if (m.id === current) opt.selected = true;
     select.appendChild(opt);
   });
+}
+
+async function fillModels(current) {
+  if (!state.models.length) {
+    try {
+      state.models = (await api("/api/models")).models || [];
+    } catch (e) {
+      state.models = [];
+    }
+  }
+  const options = state.models.some((m) => m.id === current)
+    ? state.models
+    : [{ id: current }, ...state.models];
+  setModelOptions(options, current);
 }
 
 // Пустое поле значит «не отправлять параметр» — сервер получает null и
@@ -884,24 +923,19 @@ const PROVIDER_PARAMS = [
 // provider.require_parameters=true, и параметр, которого модель не заявляет,
 // выкашивает провайдеров. Вместо ответа приходит невнятная ошибка, и по ней
 // не понять, что виноват один переключатель в панели.
-function paramWarnings(model, settings, extraBody) {
+function paramWarnings(model, settings, extraBody, baseModel) {
   const warnings = [];
 
-  // Закреплённый провайдер — не пояснение, а настройка, которая ломает
-  // вызов: у части чатов в extra_body стоит provider.order, и смена модели
-  // на ту, которую этот провайдер не обслуживает, вернёт сырой 404. Панель
-  // это поле не правит, поэтому сказать о нём больше негде.
-  const provider = (extraBody || {}).provider || {};
-  if (Array.isArray(provider.order) && provider.order.length) {
+  // Часть чатов привязана к одному поставщику модели, и другая модель
+  // у него, скорее всего, не обслуживается — ответ не придёт. Говорим об
+  // этом ровно в тот момент, когда модель действительно меняют: постоянная
+  // надпись про настройку, которой не видно, только сбивает с толку.
+  const pinned = ((extraBody || {}).provider || {}).order;
+  if (Array.isArray(pinned) && pinned.length && baseModel && settings.model !== baseModel) {
     warnings.push(
-      `У этого чата провайдер закреплён: ${provider.order.join(", ")}. ` +
-        "Модель, которую он не обслуживает, вернётся ошибкой 404 — " +
-        "смена модели здесь сработает не с любой."
-    );
-  } else if (provider.allow_fallbacks === false) {
-    warnings.push(
-      "У этого чата запрещён фолбэк к другому провайдеру: если основной " +
-        "недоступен, вызов упадёт, а не уйдёт к соседнему."
+      `Этот чат привязан к одному поставщику моделей — ${pinned.join(", ")}. ` +
+        `Если у него нет «${settings.model}», ответа не будет: вернётся ошибка. ` +
+        `Раньше здесь стояла «${baseModel}».`
     );
   }
 
@@ -942,10 +976,20 @@ function paramWarnings(model, settings, extraBody) {
   return warnings;
 }
 
+// Строка состояния под панелью гаснет сама: «Применено» — сообщение
+// о событии, а не постоянная подпись, и висеть всё время ей незачем.
+// Ошибка не гаснет: её надо прочитать и исправить.
 function saveStatus(text, isError) {
   const el = $("#save-status");
   el.className = "save-status" + (isError ? " error" : "");
   el.textContent = text || "";
+  if (state.statusTimer) clearTimeout(state.statusTimer);
+  state.statusTimer = null;
+  if (!text || isError) return;
+  state.statusTimer = setTimeout(() => {
+    if (el.textContent === text) el.textContent = "";
+    state.statusTimer = null;
+  }, STATUS_FADE_MS);
 }
 
 // Настройки применяются сами, как только поле теряет фокус или меняется
@@ -978,7 +1022,8 @@ function renderWarnings() {
     warnings = paramWarnings(
       state.models.find((m) => m.id === settings.model),
       settings,
-      state.current && state.current.extra_body
+      state.current && state.current.extra_body,
+      state.baseModel
     );
   } catch (e) {
     warnings = [];   // поле не разобрать — про это скажет строка состояния
@@ -992,6 +1037,30 @@ function renderWarnings() {
   box.classList.toggle("hidden", !warnings.length);
   // Открыта вкладка «Агент» — про предупреждение всё равно должно быть видно.
   tab.classList.toggle("has-warn", warnings.length > 0);
+}
+
+// Инвариант чата: **сообщение уходит только тогда, когда конфиг агента
+// равен тому, что показывает панель**. Держать его на событии `change`
+// нельзя, и это выяснялось трижды: сначала про кнопку «Сохранить» забывали,
+// потом правку съедал 409, теперь `change` может просто не выстрелить —
+// у него ровно один шанс, а поводов его упустить сколько угодно (значение
+// поставили из кода, поле не потеряло фокус, вкладку спрятали).
+//
+// Поэтому событие оставлено только ради отзывчивости, а истина проверяется
+// в единственном месте, которое обойти нельзя, — прямо перед отправкой.
+// Панель проливается в агента, и если пролить не вышло, сообщение не уходит:
+// показать на экране одно, а послать другое хуже, чем не послать.
+async function ensurePanelApplied() {
+  if (!state.current) return true;
+  try {
+    readPanel();
+  } catch (err) {
+    state.panelDirty = true;
+    saveStatus(String(err.message || err), true);
+    return false;
+  }
+  await applySettings();
+  return !state.panelDirty;
 }
 
 function applySettings() {
@@ -1300,6 +1369,10 @@ function init() {
     };
   });
 
+  $("#feed").addEventListener("scroll", () => {
+    state.stick = atBottom($("#feed"));
+  });
+
   const input = $("#input");
   input.addEventListener("input", () => autoGrow(input));
   input.addEventListener("keydown", (ev) => {
@@ -1322,6 +1395,8 @@ if (typeof module === "undefined") {
   init();
 } else {
   module.exports = {
+    init,
+    state,
     renderMarkdown,
     escapeHtml,
     inlineMarkdown,

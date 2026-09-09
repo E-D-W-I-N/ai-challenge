@@ -198,6 +198,47 @@ def _loads_presets(raw: str) -> set[str] | None:
     return set(parsed)
 
 
+RETIRED_PRESETS = ("assistant",)
+"""Ключи заготовок, которых в `day.py` больше нет и быть не должно.
+
+Просто убрать строку из файла для этого мало. Правило «удаление строки живой
+чат не трогает» — то, ради чего ключи и заводились: заказчик правит `day.py`,
+и заготовка, временно закомментированная там, не должна уносить переписку.
+Но «Ассистент» заказчик попросил именно удалить, а не оставить сиротой,
+и отличить одно от другого может только автор дня — здесь, в этом списке.
+
+Ключ при этом остаётся в наборе заведённых, поэтому обратно чат не заводится:
+отзыв — это удаление, а не забывание. Проход идемпотентный: после первого
+запуска удалять уже нечего.
+"""
+
+
+def retire_presets() -> list[str]:
+    """Удаляет чаты отозванных заготовок — из памяти и из базы.
+
+    Ищет их по `preset` в сохранённом конфиге, а не по имени: чат могли
+    переименовать, и он всё равно тот самый.
+    """
+    if not RETIRED_PRESETS:
+        return []
+    store = REGISTRY.store
+    removed = []
+    for row in store.list_sessions():
+        preset = (row["config"] or {}).get("preset")
+        if preset in RETIRED_PRESETS and REGISTRY.kill(row["id"]):
+            removed.append(row["id"])
+    if removed:
+        # warning, а не info: это единственное место, где сервер удаляет чужие
+        # чаты сам, и в терминале uvicorn это должно быть видно. INFO туда
+        # не доходит — у корневого логгера нет обработчика.
+        LOG.warning(
+            "заготовки %s отозваны — удалено чатов: %d",
+            ", ".join(sorted(RETIRED_PRESETS)),
+            len(removed),
+        )
+    return removed
+
+
 def bootstrap_chats() -> list[Agent]:
     """Заводит заготовки из day.py, которых база ещё не заводила.
 
@@ -215,6 +256,8 @@ def bootstrap_chats() -> list[Agent]:
       в наборе ещё нет.
 
     Если набор не читается, не заводится ничего: см. `_seeded_presets`.
+    Заготовки, отозванные из `day.py` насовсем, убираются здесь же:
+    см. `RETIRED_PRESETS`.
     """
     seeded = _seeded_presets()
     if seeded is None:
@@ -233,6 +276,7 @@ def bootstrap_chats() -> list[Agent]:
         )
         return []
 
+    retire_presets()
     fresh = [spec for spec in PRESET_CHATS if spec.preset not in seeded]
     created = [REGISTRY.create(spec) for spec in fresh]
     # Отмечаем весь сегодняшний day.py, а не только заведённое сейчас: набор
