@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import AsyncIterator
 
-from .llm import MissingKeyError, stream_completion
+from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import AgentSpec
 
 DEFAULT_HISTORY_LIMIT = 20
@@ -61,13 +61,45 @@ class Turn:
     error: str | None = None
     """Заполнен, если ответ оборвался: реплика в истории есть, но она неполная."""
 
+    reasoning: str = ""
+    """Рассуждение модели, если она его прислала. В модель обратно не уходит.
+
+    OpenRouter отдаёт его отдельным полем дельты, и в `content` оно не входит.
+    Клиент рисует его свёрнутым блоком над ответом — как «Thinking» в oMLX.
+    """
+
+    metrics: dict | None = None
+    """Метрики этого ответа: по ним рисуются плитки внизу справа."""
+
     at: float = field(default_factory=time.time)
 
     def as_message(self) -> dict:
+        """Реплика в том виде, в каком она уходит обратно в модель.
+
+        Ни рассуждения, ни метрик здесь нет: в контекст возвращается ответ,
+        а не то, как модель к нему шла.
+        """
         return {"role": self.role, "content": self.content}
 
     def as_dict(self) -> dict:
-        return {"role": self.role, "content": self.content, "error": self.error, "at": self.at}
+        return {
+            "role": self.role,
+            "content": self.content,
+            "error": self.error,
+            "reasoning": self.reasoning,
+            "metrics": self.metrics,
+            "at": self.at,
+        }
+
+
+@dataclass
+class Exchange:
+    """Снятая с истории пара «вопрос — ответ» — то, что можно вернуть назад."""
+
+    question: str
+    turns: list[Turn]
+    depth: int
+    """Длина истории сразу после снятия: по ней видно, занял ли место кто-то другой."""
 
 
 class Agent:
@@ -82,11 +114,10 @@ class Agent:
         spec: AgentSpec,
         *,
         agent_id: str | None = None,
-        parent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: spec может быть колонкой из SCENARIOS,
-        # общей на все прогоны, а `replace` копирует только верхний уровень —
+        # Копия конфига, и вглубь тоже: один и тот же spec из ростера может
+        # поднять несколько агентов, а `replace` копирует только верхний уровень —
         # messages, stop, response_format и extra_body остались бы одним
         # объектом на сотню агентов и на сам день. Правка любого из них
         # у одного агента задела бы всех остальных, а день ровно про то,
@@ -99,7 +130,6 @@ class Agent:
             extra_body=copy.deepcopy(spec.extra_body or {}),
         )
         self.id = agent_id or f"ag_{next(_ids):05d}"
-        self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at
         self.context_length = context_length
@@ -108,16 +138,10 @@ class Agent:
         """Только то, что наговорили в диалоге. Стартовые сообщения — в spec."""
 
         self.seed_messages: list[dict] = [dict(m) for m in (spec.messages or [])]
-        """Стартовый промпт агента. У колонки с depends_on подменяется на старте
-        прогона результатом подстановки — поэтому это поле, а не spec.messages."""
+        """Стартовые сообщения агента: заготовка диалога до первого вопроса.
 
-        self.overrides: dict = {}
-        """Поля, которые пользователь сменил руками через PATCH.
-
-        Нужны, чтобы выбор в дропдауне пережил «Старт»: прогон спавнит свежий
-        набор субагентов вместо предыдущего, и без этого списка он поднял бы
-        колонки на моделях из day.py, молча отменив выбор пользователя.
-        """
+        Отдельное поле, а не `spec.messages`, чтобы правка заготовки у одного
+        агента не задела конфиг, из которого его спавнили."""
 
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
@@ -189,14 +213,14 @@ class Agent:
 
     @property
     def seed_question(self) -> str | None:
-        """Первый вопрос агента: его задаёт прогон, если своего вопроса нет."""
+        """Первый вопрос из `messages`, если он там есть."""
         return self._seed_split()[1]
 
     def starting_prompt(self) -> list[dict]:
         """Стартовый промпт целиком — системная инструкция и `messages`.
 
-        Не зависит от истории: это то, что показывают в колонке до «Старта»,
-        и то, с чего начинается стенограмма.
+        Не зависит от истории: с него начинается стенограмма, и он же виден
+        в ленте до первого вопроса.
         """
         messages: list[dict] = []
         has_system = any(m.get("role") == "system" for m in self.seed_messages)
@@ -208,16 +232,15 @@ class Agent:
     def build_prompt(self, user_text: str | None = None) -> list[dict]:
         """Обстановка + окно истории + вопрос этого хода.
 
-        `user_text=None` — прогон стартового промпта: с пустой историей это
-        ровно `spec.messages`, то есть в точности то, что уходило в модель
-        до появления агентов.
+        `user_text=None` — обмен стартовым промптом: с пустой историей это
+        ровно `spec.messages`.
 
         С заданным `user_text` первый вопрос из `messages` в промпт больше
         не подклеивается: он либо приедет окном истории, либо забыт. Именно
-        здесь `history_limit=0` и становится правдой — колонка «без памяти»
-        на втором вопросе не знает ни вопроса, ни своего ответа. Пока прогона
-        не было и история пуста, вопрос всё же едет: колонка показывает его
-        в ленте, и промпт обязан сходиться с тем, что видно на экране.
+        здесь `history_limit=0` и становится правдой — агент без памяти
+        на втором вопросе не знает ни вопроса, ни своего ответа. Пока история
+        пуста, вопрос всё же едет: он часть заготовки, и промпт обязан
+        сходиться с тем, что показано в стенограмме.
         """
         setting, question = self._seed_split()
         messages: list[dict] = []
@@ -240,8 +263,18 @@ class Agent:
 
     # --- история -------------------------------------------------------------
 
-    def remember(self, role: str, content: str, error: str | None = None) -> None:
-        self.history.append(Turn(role=role, content=content, error=error))
+    def remember(
+        self,
+        role: str,
+        content: str,
+        error: str | None = None,
+        *,
+        reasoning: str = "",
+        metrics: dict | None = None,
+    ) -> None:
+        self.history.append(
+            Turn(role=role, content=content, error=error, reasoning=reasoning, metrics=metrics)
+        )
         self._trim()
 
     def _trim(self) -> None:
@@ -262,25 +295,25 @@ class Agent:
     def as_dict(self, *, with_transcript: bool = False) -> dict:
         data = {
             "id": self.id,
-            "parent_id": self.parent_id,
             "label": self.spec.label,
             "model": self.spec.model,
-            "temperature": self.spec.temperature,
-            "max_tokens": self.spec.max_tokens,
             "stop": self.spec.stop,
             "response_format": self.spec.response_format,
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
+            "draft": self.spec.draft,
+            "group": self.spec.group,
             "note": self.spec.note,
-            "repeats": self.spec.repeats,
-            "depends_on": self.spec.depends_on,
             "history_limit": self.history_limit,
-            "overrides": dict(self.overrides),
             "history_len": len(self.history),
             "busy": self.busy,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
         }
+        # Параметры сэмплирования уходят наружу как есть, включая None:
+        # панель справа отличает «не задано» от нуля, и ей нужно и то и другое.
+        for name in SAMPLING_FIELDS:
+            data[name] = getattr(self.spec, name)
         if with_transcript:
             data["seed_messages"] = self.starting_prompt()
             data["transcript"] = self.transcript()
@@ -288,33 +321,17 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
-    @contextlib.asynccontextmanager
-    async def hold(self):
-        """Занимает агента, не делая вызова: под этим идёт `/прогон`.
-
-        Пока родитель раздаёт работу субагентам, он занят так же, как если бы
-        сам говорил с моделью, — второй `/прогон` в ту же сессию получит 409.
-        """
-        if self._lock.locked():
-            raise AgentBusyError(f"агент {self.id} уже занят: дождитесь текущего ответа")
-        async with self._lock:
-            self.last_used_at = time.time()
-            yield
-
     async def ask(self, user_text: str | None = None, *, commit: bool = True) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
-        События: start, repeat_start, delta, metrics, repeat_error, repeat_done,
-        error, done. Имена намеренно близки к событиям стенда: наверху к ним
-        добавляют label колонки и id агента, но не переводят.
+        События: `start`, `reasoning`, `delta`, `metrics`, `error`, `done`.
 
         История не трогается до конца обмена — откат получается по построению:
 
         * ответа не случилось вовсе → в историю не пишется ничего, вопрос
           возвращается в событии `done` полем `question`;
         * ответ частичный (обрыв, отмена) → пишутся обе реплики, у ответа
-          проставлен `error`;
-        * серия `repeats` коммитит только последний удачный прогон, а не все N.
+          проставлен `error`.
         """
         if self._lock.locked():
             raise AgentBusyError(f"агент {self.id} уже занят: дождитесь текущего ответа")
@@ -325,115 +342,66 @@ class Agent:
             self.last_used_at = time.time()
 
             prompt = self.build_prompt(user_text)
-            # Прогон задаёт стартовый вопрос из конфига — и коммитит его
-            # в историю как обычный ход: агент с памятью обязан помнить,
-            # на что он отвечал, а не только чем ответил.
+            # Вопрос коммитится в историю как обычный ход: агент с памятью
+            # обязан помнить, на что он отвечал, а не только чем ответил.
             question = user_text if user_text is not None else self.seed_question
-            total = max(1, int(self.spec.repeats or 1))
 
-            yield {
-                "type": "start",
-                "resolved_messages": prompt,
-                "repeats": total,
-                "question": question,
-            }
+            yield {"type": "start", "resolved_messages": prompt, "question": question}
 
-            texts: list[str] = []
-            last_metrics: dict | None = None
+            text = ""
+            reasoning = ""
+            final_metrics: dict | None = None
             failure: str | None = None
-            partial = ""
             cancelled = False
 
-            for index in range(total):
-                if cancel.is_set():
-                    cancelled = True
-                    break
-
-                yield {"type": "repeat_start", "repeat": index, "repeats": total}
-
-                text = ""
-                final_metrics: dict | None = None
-                broken = False
-                try:
-                    stream = stream_completion(
-                        self.spec, prompt_override=prompt, context_length=self.context_length
-                    )
-                    async with contextlib.aclosing(stream):
-                        async for chunk in stream:
-                            kind = chunk["type"]
-                            if kind == "delta":
-                                text += chunk["text"]
-                                yield {
-                                    "type": "delta",
-                                    "repeat": index,
-                                    "text": chunk["text"],
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "metrics":
-                                yield {
-                                    "type": "metrics",
-                                    "repeat": index,
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "error":
-                                broken = True
-                                failure = chunk["message"]
-                                # Упавший прогон не отменяет остальные: серия идёт
-                                # дальше, агент жив, если удался хоть один прогон.
-                                yield {
-                                    "type": "repeat_error",
-                                    "repeat": index,
-                                    "message": chunk["message"],
-                                    "metrics": chunk["metrics"],
-                                }
-                            elif kind == "done":
-                                text = chunk["text"]
-                                final_metrics = chunk["metrics"]
-                            if cancel.is_set():
-                                cancelled = True
-                                break
-                except MissingKeyError as exc:
-                    failure = str(exc)
-                    yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit)
-                    return
-                except asyncio.CancelledError:
-                    # Клиент ушёл: частичный ответ всё равно записываем — он уже
-                    # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                    self._commit(question, texts, partial or text, "вызов прерван", commit)
-                    raise
-                except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
-                    failure = f"{type(exc).__name__}: {exc}"
-                    yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit)
-                    return
-
-                if text:
-                    partial = text
-                if cancelled:
-                    break
-                if not broken:
-                    texts.append(text)
-                    last_metrics = final_metrics or last_metrics
-                    yield {
-                        "type": "repeat_done",
-                        "repeat": index,
-                        "text": text,
-                        "metrics": final_metrics,
-                    }
+            try:
+                stream = stream_completion(
+                    self.spec, prompt_override=prompt, context_length=self.context_length
+                )
+                async with contextlib.aclosing(stream):
+                    async for chunk in stream:
+                        kind = chunk["type"]
+                        if kind == "delta":
+                            text += chunk["text"]
+                            yield chunk
+                        elif kind == "reasoning":
+                            reasoning += chunk["text"]
+                            yield chunk
+                        elif kind == "metrics":
+                            yield chunk
+                        elif kind == "error":
+                            failure = chunk["message"]
+                            final_metrics = chunk["metrics"]
+                            yield chunk
+                        elif kind == "done":
+                            text = chunk["text"]
+                            reasoning = chunk.get("reasoning") or reasoning
+                            final_metrics = chunk["metrics"]
+                        if cancel.is_set():
+                            cancelled = True
+                            break
+            except MissingKeyError as exc:
+                failure = str(exc)
+                yield {"type": "error", "message": failure, "metrics": None}
+            except asyncio.CancelledError:
+                # Клиент ушёл: частичный ответ всё равно записываем — он уже
+                # оплачен, а следующий вопрос должен видеть, чем кончилось.
+                self._commit(question, text, "вызов прерван", commit, reasoning, final_metrics)
+                raise
+            except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
+                failure = f"{type(exc).__name__}: {exc}"
+                yield {"type": "error", "message": failure, "metrics": None}
 
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            committed = self._commit(question, texts, partial, failure, commit)
+            committed = self._commit(question, text, failure, commit, reasoning, final_metrics)
 
             done: dict = {
                 "type": "done",
-                "text": texts[-1] if texts else "",
-                "metrics": last_metrics,
-                "repeats": total,
-                "texts": list(texts),
-                "unique": len({t.strip() for t in texts}),
+                "text": text,
+                "reasoning": reasoning,
+                "metrics": final_metrics,
                 "cancelled": cancelled,
                 "error": failure,
                 "committed": committed,
@@ -447,23 +415,57 @@ class Agent:
     def _commit(
         self,
         user_text: str | None,
-        texts: list[str],
-        partial: str,
+        answer: str,
         failure: str | None,
         commit: bool,
+        reasoning: str = "",
+        metrics: dict | None = None,
     ) -> bool:
         """Пишет обмен в историю. Возвращает False, если писать было нечего."""
-        if not commit:
-            return False
-
-        answer = texts[-1] if texts else ""
-        error = None
-        if not answer and partial.strip():
-            answer, error = partial, (failure or "ответ не дописан")
-        if not answer.strip():
+        if not commit or not answer.strip():
             return False
 
         if user_text is not None:
             self.remember("user", user_text)
-        self.remember("assistant", answer, error=error)
+        # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
+        # следующий вопрос должен видеть, что предыдущий ответ неполный.
+        self.remember(
+            "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics
+        )
+        return True
+
+    def take_last_exchange(self) -> Exchange | None:
+        """Снимает с истории последнюю пару «вопрос — ответ» целиком.
+
+        Нужна перегенерации: она должна **заменить** последний ответ, а не
+        дописать второй, поэтому пара уходит из истории до вызова — модель
+        обязана увидеть тот же контекст, что и в первый раз.
+
+        Возвращает снятое целиком, а не только вопрос: если вызов не отдаст
+        ни одного токена, возвращать в чат будет нечего, и пользователь
+        потеряет и свой вопрос, и уже полученный ответ. `restore` кладёт
+        снятое обратно.
+        """
+        if not self.history or self.history[-1].role != "assistant":
+            return None
+        taken = [self.history.pop()]
+        if self.history and self.history[-1].role == "user":
+            taken.insert(0, self.history.pop())
+        question = taken[0].content if taken[0].role == "user" else None
+        if question is None:
+            # Ответ без вопроса переспрашивать нечем — кладём обратно.
+            self.history.extend(taken)
+            return None
+        return Exchange(question=question, turns=taken, depth=len(self.history))
+
+    def restore(self, exchange: Exchange) -> bool:
+        """Кладёт снятую пару обратно, если её место никто не занял.
+
+        Новый обмен успел записаться — значит перегенерация удалась (или
+        оборвалась с частичным ответом, что тоже записано), и возвращать
+        старое поверх нельзя: в ленте оказалось бы два ответа на один вопрос.
+        """
+        if len(self.history) != exchange.depth:
+            return False
+        self.history.extend(exchange.turns)
         return True

@@ -6,7 +6,7 @@
 вызова к модели и поэтому бесплатен и мгновенен.
 
 Потолок на число живых агентов обязателен: процесс стенда живёт часами,
-каждый `/прогон` спавнит новый набор, и без вытеснения реестр течёт.
+новые чаты копятся, и без вытеснения реестр течёт.
 """
 
 from __future__ import annotations
@@ -55,35 +55,21 @@ class AgentRegistry:
 
     # --- создание ------------------------------------------------------------
 
-    def create(
-        self,
-        spec: AgentSpec,
-        *,
-        parent_id: str | None = None,
-        context_length: int | None = None,
-    ) -> Agent:
+    def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
         self._make_room(1)
-        agent = Agent(spec, parent_id=parent_id, context_length=context_length)
+        agent = Agent(spec, context_length=context_length)
         self._agents[agent.id] = agent
         return agent
 
     def create_many(
-        self,
-        specs: Iterable[AgentSpec],
-        *,
-        parent_id: str | None = None,
-        context_lengths: dict[str, int] | None = None,
+        self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
     ) -> list[Agent]:
         """Пачка агентов одним вызовом — сто конфигов, сто объектов, один процесс."""
         specs = list(specs)
         self._make_room(len(specs))
         agents = []
         for spec in specs:
-            agent = Agent(
-                spec,
-                parent_id=parent_id,
-                context_length=(context_lengths or {}).get(spec.model),
-            )
+            agent = Agent(spec, context_length=(context_lengths or {}).get(spec.model))
             self._agents[agent.id] = agent
             agents.append(agent)
         return agents
@@ -99,36 +85,19 @@ class AgentRegistry:
             raise UnknownAgentError(agent_id)
         return agent
 
-    def list(self, *, parent_id: str | None = None, only_children: bool = False) -> list[Agent]:
-        """Все агенты, в порядке создания. only_children — только дети parent_id."""
-        agents = sorted(self._agents.values(), key=lambda a: a.created_at)
-        if only_children:
-            return [a for a in agents if a.parent_id == parent_id]
-        return agents
-
-    def children(self, parent_id: str) -> list[Agent]:
-        return self.list(parent_id=parent_id, only_children=True)
+    def list(self) -> list[Agent]:
+        """Все агенты, в порядке создания."""
+        return sorted(self._agents.values(), key=lambda a: a.created_at)
 
     # --- удаление ------------------------------------------------------------
 
-    def kill(self, agent_id: str) -> list[str]:
-        """Убивает агента и всех его детей. Возвращает id убитых."""
-        agent = self._agents.get(agent_id)
+    def kill(self, agent_id: str) -> bool:
+        """Убирает агента из реестра и гасит его генерацию. False — его уже нет."""
+        agent = self._agents.pop(agent_id, None)
         if agent is None:
-            return []
-        killed = [agent_id]
-        for child in self.children(agent_id):
-            killed.extend(self.kill(child.id))
+            return False
         agent.cancel()
-        self._agents.pop(agent_id, None)
-        return killed
-
-    def kill_children(self, parent_id: str) -> list[str]:
-        """Убивает набор субагентов родителя. «Старт» зовёт это перед новым набором."""
-        killed: list[str] = []
-        for child in self.children(parent_id):
-            killed.extend(self.kill(child.id))
-        return killed
+        return True
 
     def kill_all(self) -> list[str]:
         killed = list(self._agents)
@@ -139,25 +108,11 @@ class AgentRegistry:
 
     # --- вытеснение ----------------------------------------------------------
 
-    def _evictable(self, agent: Agent) -> bool:
-        """Можно ли вытеснить агента вместе со всем его поддеревом.
-
-        Занятый агент не вытесняется никогда: у него идёт обмен, и его ответа
-        кто-то прямо сейчас ждёт. Занятый **потомок** запрещает вытеснять
-        и родителя: вытеснение идёт каскадом, и иначе оно оборвало бы живой
-        прогон, начатый из родительской сессии.
-        """
-        if agent.busy:
-            return False
-        return all(self._evictable(child) for child in self.children(agent.id))
-
     def _make_room(self, need: int) -> None:
         """Освобождает место под `need` новых агентов, вытесняя самых старых простаивающих.
 
-        Вытеснение каскадное, как и `kill`: субагенты прогона уходят вместе
-        с родителем. Иначе после вытеснения родителя дети остались бы в реестре
-        с `parent_id` в никуда — их не найти по родителю и не убить каскадом,
-        то есть потолок от них уже не защищает.
+        Занятый агент не вытесняется никогда: у него идёт обмен, и его ответа
+        кто-то прямо сейчас ждёт.
 
         Если простаивающих не хватило — новые агенты всё равно создаются:
         отказать в спавне хуже, чем на время превысить потолок, а следующий
@@ -166,20 +121,12 @@ class AgentRegistry:
         overflow = len(self._agents) + need - self.max_agents
         if overflow <= 0:
             return
-        # Сначала листья: у поддерева младший потомок и есть самый старый
-        # кандидат, а родителя каскад заберёт вместе с ним.
         idle = sorted(
-            (a for a in self._agents.values() if self._evictable(a)),
-            key=lambda a: a.last_used_at,
+            (a for a in self._agents.values() if not a.busy), key=lambda a: a.last_used_at
         )
-        for agent in idle:
-            if overflow <= 0:
-                break
-            if agent.id not in self._agents:
-                continue  # уже ушёл каскадом вместе с родителем
-            killed = self.kill(agent.id)
-            self.evicted += len(killed)
-            overflow -= len(killed)
+        for agent in idle[:overflow]:
+            if self.kill(agent.id):
+                self.evicted += 1
 
 
 REGISTRY = AgentRegistry()
