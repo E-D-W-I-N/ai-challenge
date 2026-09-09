@@ -113,6 +113,39 @@ def check_flat_list():
     return "на старте пусто, заведённый чат ничем не особенный"
 
 
+@check("у свежего чата нет системного промпта, и в теле его нет вовсе")
+def check_new_chat_is_blank():
+    """Стенд ничего не решает за пользователя — промпт тоже.
+
+    Проверяется не только поле в ответе ручки, но и то, что ушло в модель:
+    пустой `system` обязан пропасть из промпта целиком. Пустая строка в роли
+    `system` — это не «промпта нет», это заданный пустой промпт, и модель
+    получила бы лишнее сообщение ни о чём.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        fresh = client.post("/api/agents", json={}).json()["agents"][0]
+        assert fresh["system"] == "", f"свежий чат несёт промпт: {fresh['system']!r}"
+        full = client.get(f"/api/agents/{fresh['id']}").json()
+        assert full["transcript"] == [], full["transcript"]
+
+        client.post(f"/api/agents/{fresh['id']}/messages", json={"text": "вопрос"})
+        sent = _stub.CALLS[-1]["messages"]
+        assert [m["role"] for m in sent] == ["user"], sent
+        assert not any(m["role"] == "system" for m in sent), sent
+
+        # А заданный руками — доезжает: пустота здесь не запрет, а умолчание.
+        client.patch(f"/api/agents/{fresh['id']}", json={"system": "МОЙ ПРОМПТ"})
+        _stub.reset()
+        client.post(f"/api/agents/{fresh['id']}/messages", json={"text": "ещё"})
+        after = _stub.CALLS[-1]["messages"]
+        assert after[0] == {"role": "system", "content": "МОЙ ПРОМПТ"}, after[0]
+
+    assert "system=" not in read("app/main.py").split("NEW_CHAT_SPEC")[1].split(")")[0], \
+        "в NEW_CHAT_SPEC вернулся системный промпт"
+    return "свежий чат пуст, промпт появляется только заданный руками"
+
+
 @check("заготовок дней 1–5 не осталось нигде")
 def check_no_presets():
     """Заготовки появились ради вопроса «как открыть агентов прошлых дней».
@@ -1270,6 +1303,7 @@ def check_cli():
 CHECKS = [
     check_spawn_100,
     check_flat_list,
+    check_new_chat_is_blank,
     check_no_presets,
     check_scenarios_gone,
     check_memory,

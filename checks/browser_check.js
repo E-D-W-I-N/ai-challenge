@@ -461,6 +461,8 @@ async function routeChecks() {
     check("и сразу его открывает", Boolean(client.state.current), "чат не открыт");
     check("имя у него по умолчанию", /^Новый чат \d+$/.test(client.state.current.label),
       client.state.current.label);
+    check("панель у него тоже пустая: промпт не придуман за пользователя",
+      $("#f-system").value === "", JSON.stringify($("#f-system").value));
     check("и он пуст: ни переписки, ни черновика",
       client.state.current.transcript.length === 0 && $("#input").value === "",
       JSON.stringify([client.state.current.transcript, $("#input").value]));
