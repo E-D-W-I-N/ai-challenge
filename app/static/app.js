@@ -349,8 +349,10 @@ async function selectScenario(index) {
   }
 
   $("#stage").classList.remove("hidden");
-  renderScenarioBar(sc);
+  // Колонки первыми: дропдаун берёт текущую модель из state.columns, и она
+  // должна быть там до того, как соберутся сами дропдауны.
   renderColumns(spawned.agents, sc.layout);
+  renderScenarioBar(sc);
   resetVerdict();
   $("#summary").classList.add("hidden");
   refreshRegistry();
@@ -421,6 +423,8 @@ async function buildPickers(sc) {
       sel.appendChild(opt);
     });
     // Модель меняется прямо на живом агенте: в теле сообщения её больше нет.
+    // Выбор запоминается на агенте и переносится на свежий набор колонок,
+    // который спавнит «Старт», — иначе он молча откатился бы на day.py.
     sel.onchange = async () => {
       const entry = state.columns.get(s.label);
       if (!entry) return;
@@ -1042,8 +1046,10 @@ function handleRunEvent(e) {
       const byLabel = new Map((e.agents || []).map((a) => [a.session, a.agent]));
       const agents = (e.sessions || []).map((s) => ({ ...s, id: byLabel.get(s.label) || "", seed_messages: s.messages }));
       $("#stage").classList.remove("hidden");
-      renderScenarioBar(sc || { title: e.title, sessions: e.sessions || [] });
       renderColumns(agents, e.layout);
+      // Шапка после колонок: в e.sessions уже стоит выбранная пользователем
+      // модель, и дропдаун должен встать на неё, а не откатиться на day.py.
+      renderScenarioBar(sc || { title: e.title, sessions: e.sessions || [] });
       state.columns.forEach((c) => setBusy(c, true));
       runTotals.expected = agents.length;
       state.runBlock.state.textContent = `${agents.length} субагентов`;

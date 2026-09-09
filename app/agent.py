@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import itertools
 import time
 from dataclasses import dataclass, field, replace
@@ -84,9 +85,19 @@ class Agent:
         parent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига: spec может быть колонкой из SCENARIOS, а смена модели
-        # на живом агенте не должна править сценарий дня для всех остальных.
-        self.spec = replace(spec)
+        # Копия конфига, и вглубь тоже: spec может быть колонкой из SCENARIOS,
+        # общей на все прогоны, а `replace` копирует только верхний уровень —
+        # messages, stop, response_format и extra_body остались бы одним
+        # объектом на сотню агентов и на сам день. Правка любого из них
+        # у одного агента задела бы всех остальных, а день ровно про то,
+        # что у ста агентов конфиги **разные**.
+        self.spec = replace(
+            spec,
+            messages=[dict(m) for m in (spec.messages or [])],
+            stop=list(spec.stop) if spec.stop else None,
+            response_format=copy.deepcopy(spec.response_format),
+            extra_body=copy.deepcopy(spec.extra_body or {}),
+        )
         self.id = agent_id or f"ag_{next(_ids):05d}"
         self.parent_id = parent_id
         self.created_at = time.time()
@@ -99,6 +110,14 @@ class Agent:
         self.seed_messages: list[dict] = [dict(m) for m in (spec.messages or [])]
         """Стартовый промпт агента. У колонки с depends_on подменяется на старте
         прогона результатом подстановки — поэтому это поле, а не spec.messages."""
+
+        self.overrides: dict = {}
+        """Поля, которые пользователь сменил руками через PATCH.
+
+        Нужны, чтобы выбор в дропдауне пережил «Старт»: прогон спавнит свежий
+        набор субагентов вместо предыдущего, и без этого списка он поднял бы
+        колонки на моделях из day.py, молча отменив выбор пользователя.
+        """
 
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
@@ -152,21 +171,71 @@ class Agent:
             return []
         return [turn.as_message() for turn in self.history[-limit:]]
 
-    def build_prompt(self, user_text: str | None = None) -> list[dict]:
-        """Системный промпт + стартовые сообщения + окно истории + новый вопрос.
+    def _seed_split(self) -> tuple[list[dict], str | None]:
+        """Делит стартовые сообщения на обстановку и первый вопрос.
 
-        `user_text=None` — прогон стартового промпта: с пустой историей это
-        ровно `spec.messages`, то есть в точности то, что уходило в модель
-        до появления агентов.
+        Обстановка — системная инструкция и всё, что не последняя реплика
+        пользователя. Это конфиг агента, он уезжает в модель всегда.
+
+        Последняя реплика пользователя — не конфиг, а первый **ход** разговора.
+        Агент без памяти забывает его так же, как забыл бы любой другой ход:
+        иначе `history_limit=0` не значил бы ничего, если автор дня положил
+        задачу в `messages`, — а он её туда и кладёт все пять прошлых дней.
+        """
+        seed = self.seed_messages
+        if seed and seed[-1].get("role") == "user":
+            return [dict(m) for m in seed[:-1]], seed[-1].get("content", "")
+        return [dict(m) for m in seed], None
+
+    @property
+    def seed_question(self) -> str | None:
+        """Первый вопрос агента: его задаёт прогон, если своего вопроса нет."""
+        return self._seed_split()[1]
+
+    def starting_prompt(self) -> list[dict]:
+        """Стартовый промпт целиком — системная инструкция и `messages`.
+
+        Не зависит от истории: это то, что показывают в колонке до «Старта»,
+        и то, с чего начинается стенограмма.
         """
         messages: list[dict] = []
         has_system = any(m.get("role") == "system" for m in self.seed_messages)
         if self.spec.system and not has_system:
             messages.append({"role": "system", "content": self.spec.system})
         messages.extend(dict(m) for m in self.seed_messages)
+        return messages
+
+    def build_prompt(self, user_text: str | None = None) -> list[dict]:
+        """Обстановка + окно истории + вопрос этого хода.
+
+        `user_text=None` — прогон стартового промпта: с пустой историей это
+        ровно `spec.messages`, то есть в точности то, что уходило в модель
+        до появления агентов.
+
+        С заданным `user_text` первый вопрос из `messages` в промпт больше
+        не подклеивается: он либо приедет окном истории, либо забыт. Именно
+        здесь `history_limit=0` и становится правдой — колонка «без памяти»
+        на втором вопросе не знает ни вопроса, ни своего ответа. Пока прогона
+        не было и история пуста, вопрос всё же едет: колонка показывает его
+        в ленте, и промпт обязан сходиться с тем, что видно на экране.
+        """
+        setting, question = self._seed_split()
+        messages: list[dict] = []
+        has_system = any(m.get("role") == "system" for m in setting)
+        if self.spec.system and not has_system:
+            messages.append({"role": "system", "content": self.spec.system})
+        messages.extend(setting)
+
+        if user_text is None:
+            messages.extend(self.window())
+            if question is not None:
+                messages.append({"role": "user", "content": question})
+            return messages
+
+        if question is not None and not self.history:
+            messages.append({"role": "user", "content": question})
         messages.extend(self.window())
-        if user_text is not None:
-            messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": user_text})
         return messages
 
     # --- история -------------------------------------------------------------
@@ -184,11 +253,9 @@ class Agent:
 
     def transcript(self) -> list[dict]:
         """Стартовый промпт и всё, что наговорили после него, — одним списком."""
-        prompt = self.build_prompt()
-        seed_size = len(prompt) - len(self.window())
         seed = [
             {"role": m.get("role", "?"), "content": m.get("content", ""), "seed": True}
-            for m in prompt[:seed_size]
+            for m in self.starting_prompt()
         ]
         return seed + [turn.as_dict() for turn in self.history]
 
@@ -208,13 +275,14 @@ class Agent:
             "repeats": self.spec.repeats,
             "depends_on": self.spec.depends_on,
             "history_limit": self.history_limit,
+            "overrides": dict(self.overrides),
             "history_len": len(self.history),
             "busy": self.busy,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
         }
         if with_transcript:
-            data["seed_messages"] = [dict(m) for m in self.seed_messages]
+            data["seed_messages"] = self.starting_prompt()
             data["transcript"] = self.transcript()
         return data
 
@@ -257,13 +325,17 @@ class Agent:
             self.last_used_at = time.time()
 
             prompt = self.build_prompt(user_text)
+            # Прогон задаёт стартовый вопрос из конфига — и коммитит его
+            # в историю как обычный ход: агент с памятью обязан помнить,
+            # на что он отвечал, а не только чем ответил.
+            question = user_text if user_text is not None else self.seed_question
             total = max(1, int(self.spec.repeats or 1))
 
             yield {
                 "type": "start",
                 "resolved_messages": prompt,
                 "repeats": total,
-                "question": user_text,
+                "question": question,
             }
 
             texts: list[str] = []
@@ -323,17 +395,17 @@ class Agent:
                 except MissingKeyError as exc:
                     failure = str(exc)
                     yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(user_text, texts, partial or text, failure, commit)
+                    self._commit(question, texts, partial or text, failure, commit)
                     return
                 except asyncio.CancelledError:
                     # Клиент ушёл: частичный ответ всё равно записываем — он уже
                     # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                    self._commit(user_text, texts, partial or text, "вызов прерван", commit)
+                    self._commit(question, texts, partial or text, "вызов прерван", commit)
                     raise
                 except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                     failure = f"{type(exc).__name__}: {exc}"
                     yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(user_text, texts, partial or text, failure, commit)
+                    self._commit(question, texts, partial or text, failure, commit)
                     return
 
                 if text:
@@ -353,7 +425,7 @@ class Agent:
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            committed = self._commit(user_text, texts, partial, failure, commit)
+            committed = self._commit(question, texts, partial, failure, commit)
 
             done: dict = {
                 "type": "done",
@@ -366,10 +438,10 @@ class Agent:
                 "error": failure,
                 "committed": committed,
             }
-            if not committed and user_text is not None:
+            if not committed and question is not None:
                 # Обмена не было: вопрос нельзя оставлять в ленте клиента —
                 # он вернётся в поле ввода и его можно будет повторить.
-                done["question"] = user_text
+                done["question"] = question
             yield done
 
     def _commit(

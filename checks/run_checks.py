@@ -51,6 +51,10 @@ def check(name):
     return wrap
 
 
+async def _drain(agen) -> list[dict]:
+    return [event async for event in agen]
+
+
 def sse(text: str) -> list[dict]:
     """Разбирает тело SSE-ответа в список событий."""
     return [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ")]
@@ -114,6 +118,154 @@ def check_memory():
         len(c["messages"]) for c in _stub.CALLS
     ]
     return "с памятью 3-й запрос: 6 сообщений; history_limit=0: по 1 сообщению"
+
+
+# --- 2б. history_limit=0 стирает и стартовый вопрос ---------------------------
+
+
+@check("history_limit=0 забывает стартовый вопрос, а не только свой ответ")
+def check_blank_forgets_seed():
+    """Находка ревью: seed_messages подклеивались всегда.
+
+    В сценарии дня в messages лежит сам первый вопрос со всей вводной
+    о поездке. Пока он ехал в промпт на каждом ходу, колонка «Без памяти»
+    знала город, даты и бюджет и переспрашивать бы не стала — демонстрация
+    дня на живом прогоне не воспроизвелась бы.
+    """
+    _stub.install(reply=lambda m, i: f"план{i}")
+    with TestClient(main.app) as client:
+        parent = client.post(
+            "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
+        ).json()["agents"][0]["id"]
+        client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
+        kids = client.get(f"/api/agents?parent={parent}&children_only=true").json()["agents"]
+        blank = next(k["id"] for k in kids if k["label"].startswith("Без памяти"))
+        remembers = next(k["id"] for k in kids if k["label"].startswith("С памятью"))
+        _stub.reset()
+        question = "Что мне взять из одежды?"
+        client.post(f"/api/agents/{blank}/messages", json={"text": question})
+        client.post(f"/api/agents/{remembers}/messages", json={"text": question})
+
+    without, with_memory = (c["messages"] for c in _stub.CALLS)
+
+    assert [m["role"] for m in without] == ["system", "user"], without
+    assert without[-1]["content"] == question, without[-1]
+    joined = " ".join(m["content"] for m in without)
+    # «план0» — ответ колонки на первый вопрос: агент без памяти не должен
+    # видеть ни вводную, ни то, что сам на неё ответил.
+    for leak in ("Казань", "Нина", "20 000", "вегетарианка", "план0"):
+        assert leak not in joined, f"агент без памяти всё ещё видит «{leak}»"
+
+    assert [m["role"] for m in with_memory] == ["system", "user", "assistant", "user"], with_memory
+    assert "Казань" in with_memory[1]["content"], with_memory[1]
+    assert with_memory[2]["content"] == "план0", with_memory[2]
+    return "без памяти: [system, вопрос]; с памятью: вводная и ответ на месте"
+
+
+@check("прогон шлёт ровно spec.messages: дни 1–5 не заметили расщепления")
+def check_seed_split_keeps_run():
+    _stub.install(reply=lambda m, i: f"т{i}")
+    with _scenarios([LADDER]):
+        with TestClient(main.app) as client:
+            sse(client.get("/api/run/0").text)
+
+    donor = next(c for c in _stub.CALLS if c["label"] == "Донор")
+    assert donor["messages"] == LADDER.sessions[0].messages, donor["messages"]
+
+    # Ручной вопрос колонке после прогона: та же лента, что и до Дня 6.
+    _stub.reset()
+    _stub.install(reply="ответ")
+    agent = REGISTRY.create(
+        AgentSpec(
+            label="день 1-5",
+            model="stub/m",
+            messages=[
+                {"role": "system", "content": "СИС"},
+                {"role": "user", "content": "ЗАДАЧА"},
+            ],
+        )
+    )
+
+    async def scenario():
+        [e async for e in agent.ask()]
+        [e async for e in agent.ask("уточни")]
+
+    asyncio.run(scenario())
+    run_prompt, follow_up = (c["messages"] for c in _stub.CALLS)
+    assert run_prompt == agent.spec.messages, run_prompt
+    assert [m["content"] for m in follow_up] == ["СИС", "ЗАДАЧА", "ответ", "уточни"], follow_up
+
+    # До «Старта» вопрос сценария всё ещё в промпте: колонка показывает его
+    # в ленте, и промпт обязан сходиться с тем, что видно на экране.
+    _stub.reset()
+    _stub.install(reply="ответ")
+    fresh = REGISTRY.create(
+        AgentSpec(
+            label="до старта",
+            model="stub/m",
+            messages=[
+                {"role": "system", "content": "СИС"},
+                {"role": "user", "content": "ЗАДАЧА"},
+            ],
+        )
+    )
+    asyncio.run(_drain(fresh.ask("вопрос до старта")))
+    assert [m["content"] for m in _stub.CALLS[0]["messages"]] == [
+        "СИС",
+        "ЗАДАЧА",
+        "вопрос до старта",
+    ], _stub.CALLS[0]["messages"]
+    return "прогон байт в байт прежний, ручной вопрос тоже, до «Старта» вводная едет"
+
+
+# --- 2в. выбор в дропдауне переживает «Старт» ---------------------------------
+
+
+@check("выбранная в дропдауне модель переживает «Старт» и второй «Старт»")
+def check_override_survives_start():
+    """Находка ревью: PATCH правил предспавненного агента, а прогон его убивал."""
+    _stub.install(reply=lambda m, i: f"т{i}")
+    scenario = Scenario(
+        title="дропдаун",
+        description="",
+        sessions=[
+            AgentSpec(label="A", model="сценарный/model", messages=[{"role": "user", "content": "a"}])
+        ],
+    )
+    with _scenarios([scenario]):
+        with TestClient(main.app) as client:
+            parent = client.post(
+                "/api/agents", json={"agent": {"model": "stub/chat", "label": "Ассистент"}}
+            ).json()["agents"][0]["id"]
+            column = client.post(f"/api/scenarios/0/agents?parent={parent}").json()["agents"][0]["id"]
+            patched = client.patch(
+                f"/api/agents/{column}", json={"model": "выбранная/пользователем", "temperature": 0.9}
+            )
+            assert patched.json()["model"] == "выбранная/пользователем", patched.text
+
+            _stub.reset()
+            first = sse(client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"}).text)
+            after_first = [c["model"] for c in _stub.CALLS]
+
+            _stub.reset()
+            sse(client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"}).text)
+            after_second = [c["model"] for c in _stub.CALLS]
+
+            # Явный overrides в запросе сильнее перенесённого.
+            _stub.reset()
+            sse(client.get('/api/run/0?overrides={"A":{"model":"из/запроса"}}').text)
+            explicit = [c["model"] for c in _stub.CALLS]
+
+    assert after_first == ["выбранная/пользователем"], after_first
+    assert after_second == ["выбранная/пользователем"], after_second
+    assert explicit == ["из/запроса"], explicit
+
+    # Клиент перерисовывает колонки по run_start — там тоже должна быть
+    # выбранная модель, иначе дропдаун откатится на экране.
+    run_start = next(e for e in first if e["event"] == "run_start")
+    assert run_start["sessions"][0]["model"] == "выбранная/пользователем", run_start["sessions"][0]
+    assert run_start["sessions"][0]["temperature"] == 0.9, run_start["sessions"][0]
+    return "первый и второй «Старт» идут на выбранной модели, overrides из запроса сильнее"
 
 
 # --- 3. клиент больше не шлёт ленту -------------------------------------------
@@ -464,7 +616,7 @@ def check_run_replaces_agents():
     new = {a["agent"] for a in next(e for e in second if e["event"] == "run_start")["agents"]}
     assert not (old & new), (old, new)
     assert all(REGISTRY.get(i) is None for i in old), "старый набор должен быть убит"
-    assert live_after_second <= live_after_first + 1, (live_after_first, live_after_second)
+    assert live_after_second == live_after_first, (live_after_first, live_after_second)
     return f"после первого прогона {live_after_first}, после второго {live_after_second}"
 
 
@@ -604,6 +756,186 @@ def check_transcript():
     return f"{len(transcript)} реплик, системный промпт помечен seed"
 
 
+@check("залипшая бронь: разрыв до первого события снимает бронь")
+def check_reservation_released_on_early_abort():
+    """Находка ревью: release() стоял в finally генератора событий.
+
+    Если клиент отвалился на первом же опросе, задача с генератором
+    отменяется, не начав выполняться, — его finally не срабатывает никогда.
+    Бронь залипала бы навсегда: агент вечно отвечал бы 409 и никогда бы
+    не вытеснился по потолку, потому что числится занятым.
+    """
+    _stub.install(reply="ок", chunks=10, delay=0.02)
+
+    class Gone:
+        """Клиент, которого уже нет к моменту первого опроса."""
+
+        async def is_disconnected(self) -> bool:
+            return True
+
+    async def scenario():
+        agent = REGISTRY.create(AgentSpec(label="бронь", model="stub/model", messages=[]))
+        agent.reserve()
+        frames = [
+            frame
+            async for frame in main._pump(
+                lambda: main._chat_events(agent, "вопрос"), Gone(), agent.release
+            )
+        ]
+        await asyncio.sleep(0.05)
+        return agent, frames
+
+    agent, frames = asyncio.run(scenario())
+    assert frames == [], frames
+    assert agent.busy is False, "бронь залипла: агент навсегда отвечает 409"
+
+    # После снятия брони агент снова разговаривает и снова вытесняется.
+    _stub.reset()
+    _stub.install(reply="и снова ок")
+    asyncio.run(_drain(agent.ask("второй вопрос")))
+    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
+    return "разрыв на первом опросе: 0 кадров, бронь снята, агент снова отвечает"
+
+
+@check("прогон без родителя не оставляет ни колонок, ни судьи")
+def check_orphan_run_cleanup():
+    _stub.install(reply="ок")
+    with _scenarios([LADDER]):
+        with TestClient(main.app) as client:
+            sse(client.get("/api/run/0").text)
+            after_first = client.get("/api/health").json()["agents_live"]
+            sse(client.get("/api/run/0").text)
+            after_second = client.get("/api/health").json()["agents_live"]
+    # 3 колонки + судья, и ни одним больше: второй прогон убирает весь первый.
+    assert after_first == 4, after_first
+    assert after_second == after_first, (after_first, after_second)
+    judges = [a for a in REGISTRY.list() if a.spec.label == "Судья"]
+    assert len(judges) == 1, [a.id for a in judges]
+    return f"после первого прогона {after_first}, после второго {after_second}, судья один"
+
+
+@check("конфиг агента копируется вглубь: сто агентов не делят один extra_body")
+def check_spec_deep_copy():
+    from app.registry import AgentRegistry
+
+    shared = AgentSpec(
+        label="общий",
+        model="stub/model",
+        messages=[{"role": "system", "content": "СИС"}],
+        stop=["\n"],
+        response_format={"type": "json_object"},
+        extra_body={"provider": {"allow_fallbacks": False}},
+    )
+    registry = AgentRegistry(max_agents=100)
+    first, second = registry.create_many([shared, shared])
+
+    assert first.spec.extra_body is not shared.extra_body
+    assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
+    assert first.spec.extra_body is not second.spec.extra_body
+    assert first.spec.messages is not shared.messages
+    assert first.spec.messages[0] is not shared.messages[0]
+    assert first.spec.stop is not shared.stop
+    assert first.spec.response_format is not shared.response_format
+
+    first.spec.extra_body["provider"]["order"] = ["only-me"]
+    first.spec.messages[0]["content"] = "ДРУГОЕ"
+    first.spec.stop.append("СТОП")
+    assert "order" not in shared.extra_body["provider"], shared.extra_body
+    assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
+    assert shared.messages[0]["content"] == "СИС", shared.messages
+    assert shared.stop == ["\n"], shared.stop
+    return "правка у одного агента не задела ни день, ни соседа"
+
+
+@check("вытеснение уносит детей вместе с родителем")
+def check_eviction_cascade():
+    from app.registry import AgentRegistry
+
+    registry = AgentRegistry(max_agents=6)
+    parent = registry.create(AgentSpec(label="родитель", model="stub/m", messages=[]))
+    kids = registry.create_many(
+        [AgentSpec(label=f"ребёнок {i}", model="stub/m", messages=[]) for i in range(3)],
+        parent_id=parent.id,
+    )
+    fresh = registry.create_many(
+        [AgentSpec(label=f"новый {i}", model="stub/m", messages=[]) for i in range(2)]
+    )
+    for agent in fresh:
+        agent.last_used_at += 100
+
+    registry.create_many([AgentSpec(label=f"ещё {i}", model="stub/m", messages=[]) for i in range(2)])
+
+    assert registry.get(parent.id) is None, "родитель должен быть вытеснен"
+    orphans = [k.id for k in kids if registry.get(k.id) is not None]
+    assert not orphans, f"дети остались сиротами: {orphans}"
+    assert all(registry.get(a.id) is not None for a in fresh), "свежие вытесняться не должны"
+    assert len(registry) <= registry.max_agents, len(registry)
+    return f"родитель и {len(kids)} ребёнка ушли одним каскадом, сирот нет"
+
+
+@check("занятого агента и его родителя вытеснение не трогает")
+def check_eviction_skips_busy():
+    from app.registry import AgentRegistry
+
+    registry = AgentRegistry(max_agents=3)
+    parent = registry.create(AgentSpec(label="родитель", model="stub/m", messages=[]))
+    child = registry.create(AgentSpec(label="ребёнок", model="stub/m", messages=[]), parent_id=parent.id)
+    child.reserve()
+    registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m", messages=[]) for i in range(3)])
+    assert registry.get(child.id) is not None, "занятого вытеснять нельзя"
+    assert registry.get(parent.id) is not None, "родителя занятого — тоже"
+    child.release()
+    return "занятый ребёнок и его родитель пережили вытеснение"
+
+
+@check("потолки: размер пачки и repeats")
+def check_limits():
+    with TestClient(main.app) as client:
+        too_many = client.post(
+            "/api/agents",
+            json={"agents": [{"model": "stub/m"} for _ in range(main.MAX_SPAWN_BATCH + 1)]},
+        )
+        assert too_many.status_code == 400, too_many.status_code
+        assert str(main.MAX_SPAWN_BATCH) in too_many.json()["detail"], too_many.text
+
+        ok = client.post("/api/agents", json={"agents": [{"model": "stub/m"} for _ in range(3)]})
+        assert ok.status_code == 200, ok.text
+
+        greedy = client.post(
+            "/api/agents", json={"agent": {"model": "stub/m", "repeats": 1_000_000}}
+        )
+        assert greedy.status_code == 400, greedy.status_code
+        assert str(main.MAX_REPEATS) in greedy.json()["detail"], greedy.text
+
+        assert client.post(
+            "/api/agents", json={"agent": {"model": "stub/m", "repeats": main.MAX_REPEATS}}
+        ).status_code == 200
+    return f"пачка > {main.MAX_SPAWN_BATCH} → 400, repeats > {main.MAX_REPEATS} → 400"
+
+
+@check("судью можно переспросить: он помнит собственный вердикт")
+def check_judge_remembers_verdict():
+    _stub.install(reply=lambda m, i: f"вердикт{i}" if i == 3 else f"ответ{i}")
+    with _scenarios([LADDER]):
+        with TestClient(main.app) as client:
+            events = sse(client.get("/api/run/0").text)
+            judge_id = next(e for e in events if e["event"] == "judge_start")["agent"]
+            verdict = next(e for e in events if e["event"] == "judge_done")["text"]
+            _stub.reset()
+            again = client.post(
+                f"/api/agents/{judge_id}/messages", json={"text": "почему ты так решил?"}
+            )
+            assert again.status_code == 200, again.text
+
+    sent = _stub.CALLS[0]["messages"]
+    roles = [m["role"] for m in sent]
+    assert roles == ["system", "user", "assistant", "user"], roles
+    assert sent[2]["content"] == verdict, (sent[2]["content"], verdict)
+    assert "Донор" in sent[1]["content"], sent[1]["content"][:120]
+    assert sent[-1]["content"] == "почему ты так решил?", sent[-1]
+    return "в переспросе едут данные колонок и собственный вердикт судьи"
+
+
 # --- 11. инфраструктура --------------------------------------------------------
 
 
@@ -705,6 +1037,9 @@ def check_day():
 CHECKS = [
     check_spawn_100,
     check_memory,
+    check_blank_forgets_seed,
+    check_seed_split_keeps_run,
+    check_override_survives_start,
     check_no_feed,
     check_parallel,
     check_repeats,
@@ -720,6 +1055,13 @@ CHECKS = [
     check_kill_cascade,
     check_eviction,
     check_transcript,
+    check_reservation_released_on_early_abort,
+    check_orphan_run_cleanup,
+    check_spec_deep_copy,
+    check_eviction_cascade,
+    check_eviction_skips_busy,
+    check_limits,
+    check_judge_remembers_verdict,
     check_shared_client,
     check_session_alias,
     check_cli,

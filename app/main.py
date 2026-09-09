@@ -151,13 +151,23 @@ async def _context_lengths() -> dict[str, int]:
 
 
 async def _pump(
-    make_events: Callable[[], AsyncIterator[dict]], request: Request | None
+    make_events: Callable[[], AsyncIterator[dict]],
+    request: Request | None,
+    on_close: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     """Гоняет поток событий в SSE и гасит его, когда клиент ушёл.
 
     Обрыв клиента обязан гасить вызов и на POST-потоке тоже: брошенная вкладка
     иначе жжёт токены, а агент ещё и допишет недосмотренный ответ в историю.
     Генератор событий отменяется, его `finally` доводит отмену до субагентов.
+
+    `on_close` снимает бронь агента, и делает это именно здесь. Если клиент
+    отвалился до первого события, задача с генератором отменяется, не начав
+    выполняться: `make_events()` не запускается, и его собственный `finally`
+    не сработает никогда. Бронь залипла бы навсегда — агент вечно отвечал бы
+    409 и никогда не вытеснился бы по потолку, потому что числится занятым.
+    Единственное место, которое выполнится при любом исходе, — это finally
+    здесь: генератор `_pump` starlette всегда либо дочитывает, либо закрывает.
     """
     queue: asyncio.Queue = asyncio.Queue()
     done = object()
@@ -189,11 +199,17 @@ async def _pump(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        if on_close is not None:
+            on_close()
 
 
-def _stream(make_events: Callable[[], AsyncIterator[dict]], request: Request | None):
+def _stream(
+    make_events: Callable[[], AsyncIterator[dict]],
+    request: Request | None,
+    on_close: Callable[[], None] | None = None,
+):
     return StreamingResponse(
-        _pump(make_events, request),
+        _pump(make_events, request, on_close),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -202,6 +218,22 @@ def _stream(make_events: Callable[[], AsyncIterator[dict]], request: Request | N
 # --- разбор пользовательского ввода: и конфиг агента, и overrides у /api/run ---
 
 _ROLES = ("system", "user", "assistant")
+
+MAX_SPAWN_BATCH = 250
+"""Сколько агентов можно создать одним запросом.
+
+Спавн бесплатен, но список из тела запроса ничем не ограничен, а реестр —
+живая память процесса. Двести пятьдесят с запасом покрывают демонстрацию
+сотни и не дают одним запросом раздуть процесс.
+"""
+
+MAX_REPEATS = 20
+"""Потолок серии у агента, созданного через API.
+
+`repeats` умножает число вызовов к платному API один в один: без потолка
+один запрос мог бы попросить стенд сходить в модель миллион раз. Колонки
+из day.py под этот потолок не попадают — там серию задаёт автор дня.
+"""
 
 # Что клиент вправе переопределить у колонки сценария. Всё остальное —
 # messages, label, depends_on, extra_body — принадлежит автору дня: подмена
@@ -351,8 +383,14 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     note = _optional_field(payload, "note", (str,), "строка или null", where) or ""
 
     repeats = _optional_field(payload, "repeats", (int,), "целое число или null", where)
-    if repeats is not None and repeats < 1:
-        raise HTTPException(status_code=400, detail=f"{where}repeats: целое число от 1")
+    if repeats is not None and not 1 <= repeats <= MAX_REPEATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{where}repeats: целое число от 1 до {MAX_REPEATS} — "
+                "серия множит вызовы к платному API один в один"
+            ),
+        )
 
     history_limit = _optional_field(
         payload, "history_limit", (int,), "целое число от нуля или null", where
@@ -421,6 +459,14 @@ async def create_agents(payload: dict = Body(...)) -> dict:
         raw = [single]
     if not isinstance(raw, list) or not raw:
         raise HTTPException(status_code=400, detail="agents: непустой список конфигов")
+    if len(raw) > MAX_SPAWN_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"agents: за один запрос можно создать не больше {MAX_SPAWN_BATCH} агентов, "
+                f"а прислано {len(raw)}"
+            ),
+        )
 
     started = time.perf_counter()
     specs = [_parse_spec(item, f"agents[{i}].") for i, item in enumerate(raw)]
@@ -483,9 +529,11 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     if "model" in payload:
         agent.spec.model = _model_field(payload)
         agent.context_length = (await _context_lengths()).get(agent.spec.model)
+        agent.overrides["model"] = agent.spec.model
     for name in ("temperature", "max_tokens"):
         if name in payload:
             setattr(agent.spec, name, sampling[name])
+            agent.overrides[name] = sampling[name]
     return agent.as_dict()
 
 
@@ -525,10 +573,37 @@ async def spawn_scenario_agents(index: int, parent: str = "", overrides: str = "
     }
 
 
+def _previous_columns(parent: Agent | None) -> list[Agent]:
+    """Набор субагентов прошлого прогона — тот, который сейчас заменят."""
+    if parent is not None:
+        return REGISTRY.children(parent.id)
+    return [a for a in (REGISTRY.get(i) for i in _ORPHAN_RUN) if a is not None]
+
+
+def _carried_overrides(scenario: Scenario, previous: list[Agent]) -> dict[str, dict]:
+    """Что пользователь сменил руками у прошлого набора колонок.
+
+    «Старт» спавнит свежий набор вместо предыдущего — иначе реестр течёт за
+    пару минут записи. Но выбор в дропдауне живёт именно на предспавненном
+    агенте: он правится через PATCH, а в теле сообщения модели больше нет.
+    Без переноса «Старт» молча откатывал бы колонку на модель из day.py,
+    и смена модели работала бы ровно до нажатия кнопки.
+    """
+    labels = {session.label for session in scenario.sessions}
+    return {
+        agent.spec.label: dict(agent.overrides)
+        for agent in previous
+        if agent.overrides and agent.spec.label in labels
+    }
+
+
 async def _spawn_columns(
     scenario: Scenario, patch: dict[str, dict], parent: Agent | None
 ) -> list[Agent]:
     """Свежий набор субагентов по колонкам сценария вместо предыдущего."""
+    previous = _previous_columns(parent)
+    carried = _carried_overrides(scenario, previous)
+
     if parent is not None:
         REGISTRY.kill_children(parent.id)
     else:
@@ -538,20 +613,36 @@ async def _spawn_columns(
             REGISTRY.kill(agent_id)
         _ORPHAN_RUN.clear()
 
-    specs = [replace(s, **patch.get(s.label, {})) for s in scenario.sessions]
+    # Явный overrides из запроса сильнее перенесённого: клиент, который
+    # прислал модель в query, знает про неё больше, чем прошлый набор.
+    merged = {
+        label: {**carried.get(label, {}), **patch.get(label, {})}
+        for label in set(carried) | set(patch)
+    }
+
+    specs = [replace(s, **merged.get(s.label, {})) for s in scenario.sessions]
     context_lengths = await _context_lengths()
     agents = REGISTRY.create_many(
         specs,
         parent_id=parent.id if parent is not None else None,
         context_lengths=context_lengths,
     )
+    for agent in agents:
+        # Свежий набор помнит выбор пользователя так же, как помнил прошлый:
+        # иначе он потерялся бы на втором «Старте».
+        agent.overrides = dict(merged.get(agent.spec.label, {}))
     if parent is None:
         _ORPHAN_RUN.extend(a.id for a in agents)
     return agents
 
 
 _ORPHAN_RUN: list[str] = []
-"""Набор субагентов последнего прогона без родителя. Нужен только чтобы его убить."""
+"""Агенты последнего прогона без родителя: колонки и судья.
+
+Нужен только чтобы их убить. У прогона с родителем эту роль играет
+`parent_id`, а безродительскому `GET /api/run/{index}` привязаться не к чему,
+и без этого списка каждый такой прогон оставлял бы в реестре и колонки,
+и судью."""
 
 
 # --- чат с агентом ------------------------------------------------------------
@@ -601,7 +692,7 @@ async def send_message(agent_id: str, request: Request, payload: dict = Body(...
         agent.release()
         raise
     if command is not None:
-        return _stream(lambda: _command_run(agent, index, command.raw), request)
+        return _stream(lambda: _command_run(agent, index, command.raw), request, agent.release)
 
     if not has_key():
         agent.release()
@@ -610,7 +701,7 @@ async def send_message(agent_id: str, request: Request, payload: dict = Body(...
             detail="OPENROUTER_API_KEY не найден: скопируйте .env.example в .env и впишите ключ",
         )
 
-    return _stream(lambda: _chat_events(agent, prompt_text), request)
+    return _stream(lambda: _chat_events(agent, prompt_text), request, agent.release)
 
 
 def _reject_unknown_command(command) -> None:
@@ -654,8 +745,6 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
             "message": f"{type(exc).__name__}: {exc}",
             "metrics": None,
         }
-    finally:
-        agent.release()
 
 
 _CHAT_EVENT_NAMES = {
@@ -972,10 +1061,12 @@ JUDGE_SPEC = AgentSpec(
     system=_JUDGE_SYSTEM,
     temperature=JUDGE_TEMPERATURE,
     max_tokens=JUDGE_MAX_TOKENS,
-    # Судья спавнится свежим на каждый прогон, но лимит истории всё равно
-    # нулевой: если его переспросят «почему ты так решил», прошлый вердикт
-    # должен приехать в вопросе явно, а не подмешаться сам.
-    history_limit=0,
+    # Свежесть судьи обеспечивает спавн на каждый прогон, а не нулевая память:
+    # прошлые вердикты ему не достаются просто потому, что это другой агент.
+    # Свой собственный вердикт он помнить обязан — иначе на вопрос «почему ты
+    # так решил» он отвечал бы, не видя ни данных колонок, ни того, что сам
+    # написал. Шесть сообщений — вердикт и пара уточняющих обменов.
+    history_limit=6,
     note="Судит другая модель: один вызов после всех колонок.",
 )
 
@@ -1099,6 +1190,10 @@ async def _run_judge(
         parent_id=parent.id if parent is not None else None,
         context_length=context_lengths.get(model),
     )
+    if parent is None:
+        # Привязаться не к чему: без этого каждый безродительский прогон
+        # оставлял бы в реестре по судье навсегда.
+        _ORPHAN_RUN.append(judge.id)
     yield {
         "event": "judge_start",
         "model": model,
@@ -1310,8 +1405,6 @@ async def _command_run(parent: Agent, index: int, raw: str) -> AsyncIterator[dic
             yield {"event": "command_done", "agent": parent.id, "summary": summary}
     except AgentBusyError as exc:
         yield {"event": "error", "agent": parent.id, "message": str(exc), "metrics": None}
-    finally:
-        parent.release()
 
 
 # --- служебное ----------------------------------------------------------------
