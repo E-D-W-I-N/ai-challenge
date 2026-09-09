@@ -257,6 +257,14 @@ async function loadAgents(selectId) {
   const data = await api("/api/agents");
   state.agents = data.agents;
   state.hasKey = data.has_key;
+  // Пустой список — это пустой экран, в который нечего написать. Заводим
+  // чистый чат сами: список начинается пустым, и удалить последний чат
+  // тоже можно, а писать пользователю надо куда-то сразу.
+  if (!state.agents.length) {
+    const created = await api("/api/agents", json("POST", {}));
+    state.agents = created.agents;
+    return openAgent(created.agents[0].id);
+  }
   renderList();
   const wanted = selectId || (state.current && state.current.id);
   const exists = state.agents.some((a) => a.id === wanted);
@@ -397,11 +405,8 @@ async function openAgent(agentId) {
   fillPanel(agent);
   renderTiles();
 
-  // Черновик вопроса дня: показываем в поле ввода, но не отправляем —
-  // отправка всегда решение пользователя.
   const input = $("#input");
-  const spoken = agent.transcript.some((t) => t.role === "user" && !t.seed);
-  input.value = agent.draft && !spoken ? agent.draft : "";
+  input.value = "";
   autoGrow(input);
   setBusy(false);
   hint("");

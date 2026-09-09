@@ -1,8 +1,7 @@
 """FastAPI-сервер чата: реестр агентов процесса и разговор с любым из них.
 
-Заранее заведённые чаты берутся из day.py в корне ветки. Они ничем не
-особенные: обычные чаты с именем, системным промптом и настройками — их так
-же переименовывают, удаляют и правят, как любой созданный руками.
+Список чатов начинается пустым: заводит их пользователь. Заготовок нет —
+ни имён, ни промптов, ни настроек, придуманных за него.
 
 Сервер держит состояние: агент — объект в реестре процесса, историю диалога
 хранит он, а не браузер. Клиент шлёт только новый текст и id агента.
@@ -20,7 +19,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -32,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
-from .config import ROOT, has_key
+from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import AgentSpec
@@ -43,89 +41,15 @@ LOG = logging.getLogger("app.main")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# day.py лежит в корне ветки, рядом с app/. Кладём корень в sys.path сами,
-# чтобы сервер поднимался и не из корня тоже.
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model="openai/gpt-4o-mini")
+"""Чистый чат: то, что получает кнопка «Новый чат».
 
-try:
-    import day as _day
-
-    PRESET_CHATS: list[AgentSpec] = list(_day.CHATS)
-except Exception as exc:  # noqa: BLE001 — без day.py серверу нечего поднимать
-    raise RuntimeError(
-        f"day.py не загрузился ({type(exc).__name__}: {exc}). "
-        "День в ветке один, прятать ошибку не от кого — почините day.py."
-    ) from exc
-
-RETIRED_PRESETS = ("assistant",)
-"""Ключи заготовок, которых в `day.py` больше нет и быть не должно.
-
-Просто убрать строку из файла для этого мало. Правило «удаление строки живой
-чат не трогает» — то, ради чего ключи и заводились: заказчик правит `day.py`,
-и заготовка, временно закомментированная там, не должна уносить переписку.
-Но «Ассистент» заказчик попросил именно удалить, а не оставить сиротой,
-и отличить одно от другого может только автор дня — здесь, в этом списке.
-
-Ключ при этом остаётся в наборе заведённых, поэтому обратно чат не заводится:
-отзыв — это удаление, а не забывание. Проход идемпотентный: после первого
-запуска удалять уже нечего.
+Пусто всё, кроме модели: без неё запрос некуда отправить. Системного
+промпта нет намеренно — его задаёт пользователь в панели, когда он ему
+нужен, ровно как модель и остальные настройки. Пустой `system` в тело
+запроса не попадает вовсе: ни ключа, ни пустой строки в роли `system`.
+Имя чату выдаёт `_next_chat_label`.
 """
-
-
-def validate_presets(chats: list, retired: tuple[str, ...]) -> None:
-    """Проверяет, что заготовки и отзывы не противоречат друг другу.
-
-    Отдельной функцией, а не пятью `if` на уровне модуля: так это можно
-    позвать с любыми входами и увидеть, что каждая поломка действительно
-    ловится, а не поверить, что ловится.
-    """
-    wrong = next((a for a in chats if not isinstance(a, AgentSpec)), None)
-    if wrong is not None:
-        raise RuntimeError(
-            f"day.py: CHATS содержит {type(wrong).__name__}, а должен — только AgentSpec"
-        )
-
-    labels = [a.label for a in chats]
-    if len(set(labels)) != len(labels):
-        dupes = sorted({label for label in labels if labels.count(label) > 1})
-        raise RuntimeError(
-            f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(dupes)}"
-        )
-
-    nameless = [a.label for a in chats if not a.preset]
-    if nameless:
-        raise RuntimeError(
-            "day.py: у каждой заготовки должен быть preset — устойчивый ключ, по которому "
-            f"сервер помнит, что она заведена. Нет у: {', '.join(nameless)}"
-        )
-
-    keys = [a.preset for a in chats]
-    if len(set(keys)) != len(keys):
-        dupes = sorted({key for key in keys if keys.count(key) > 1})
-        raise RuntimeError(
-            f"day.py: ключи заготовок должны быть уникальны, а повторяются: {', '.join(dupes)}. "
-            "Заготовка с чужим ключом молча не появится: сервер сочтёт её уже заведённой"
-        )
-
-    contradictory = sorted(set(keys) & set(retired))
-    if contradictory:
-        raise RuntimeError(
-            f"ключи {', '.join(contradictory)} и отозваны, и есть в day.py. Такой чат "
-            "удалялся бы на каждом старте и молча не заводился обратно: отзыв сильнее "
-            "строки в файле. Уберите ключ из RETIRED_PRESETS, если заготовка нужна, "
-            "или строку из day.py, если нет"
-        )
-
-
-validate_presets(PRESET_CHATS, RETIRED_PRESETS)
-
-NEW_CHAT_SPEC = AgentSpec(
-    label="Новый чат",
-    model="openai/gpt-4o-mini",
-    system="Ты — полезный ассистент. Отвечай по-русски, по делу.",
-)
-"""Заготовка кнопки «Новый чат». Имя ей выдаёт `_next_chat_label`."""
 
 CHAT_NUMBER_KEY = "chat_number"
 """Ключ счётчика имён по умолчанию в таблице `meta`.
@@ -146,7 +70,6 @@ def _next_chat_label() -> str:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    bootstrap_chats()
     yield
     # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
     # руками: без этого uvicorn на остановке ругается на незакрытый пул.
@@ -171,143 +94,6 @@ async def _store_busy(_request: Request, exc: StoreBusyError) -> JSONResponse:
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
-
-
-# --- заранее заведённые чаты --------------------------------------------------
-
-
-PRESETS_KEY = "preset_chats_seeded"
-"""Ключи заготовок, которые база уже заводила. JSON-список строк.
-
-Не «всё заведено», а **что именно заведено**. Одна отметка на всю базу
-выполняла бы два требования из трёх: удалённый чат не возвращался бы,
-переименованный не задваивался бы — но дописать в `day.py` новую заготовку
-и увидеть её в существующей базе стало бы нельзя навсегда. А это тот самый
-файл, который заказчик открывает, чтобы дописать заготовку.
-"""
-
-LEGACY_BOOTSTRAP_KEY = "preset_chats_done"
-"""Отметка прошлой версии: «заготовки заведены», без уточнения каких.
-
-Базу с ней надо перевести на ключи, а не заводить всё заново: у заказчика
-в ней лежит переписка, и двадцать два дубликата он увидит первым делом.
-"""
-
-
-def _seeded_presets() -> set[str] | None:
-    """Какие заготовки база уже заводила. None — запись не читается.
-
-    База, записанная прошлой версией, знает только «заводила вообще». Считаем,
-    что заводила она сегодняшний `day.py`: заготовок в ней ровно столько,
-    сколько было на момент той записи, и отметить их все — единственный способ
-    не насыпать дубликатов. Заготовка, дописанная в `day.py` после этого,
-    в такой базе не появится ровно один раз, при переходе; дальше — как у всех.
-
-    Нечитаемая запись — это не «пусто». Пустой набор значит «не заводили
-    ничего», и на нём сервер завёл бы все заготовки заново: удалённые чаты
-    вернулись бы, а живые задвоились. Отличить одно от другого нельзя,
-    поэтому здесь честное «не знаю», а решение принимает `bootstrap_chats`.
-    """
-    store = REGISTRY.store
-    raw = store.get_meta(PRESETS_KEY)
-    if raw is not None:
-        return _loads_presets(raw)
-    if store.get_meta(LEGACY_BOOTSTRAP_KEY):
-        return {spec.preset for spec in PRESET_CHATS}
-    return set()
-
-
-def _loads_presets(raw: str) -> set[str] | None:
-    """Набор ключей из записи `meta`. None — запись испорчена.
-
-    Строгий разбор: не список, не строка внутри — значит, читать нечего.
-    Выкинуть непонятный элемент и продолжить было бы тем же угадыванием,
-    только тише: пропавший ключ вернул бы удалённый чат.
-    """
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(parsed, list):
-        return None
-    if not all(isinstance(item, str) for item in parsed):
-        return None
-    return set(parsed)
-
-
-def retire_presets() -> list[str]:
-    """Удаляет чаты отозванных заготовок — из памяти и из базы.
-
-    Ищет их по `preset` в сохранённом конфиге, а не по имени: чат могли
-    переименовать, и он всё равно тот самый.
-    """
-    if not RETIRED_PRESETS:
-        return []
-    store = REGISTRY.store
-    removed = []
-    for row in store.list_sessions():
-        preset = (row["config"] or {}).get("preset")
-        if preset in RETIRED_PRESETS and REGISTRY.kill(row["id"]):
-            removed.append(row["id"])
-    if removed:
-        # warning, а не info: это единственное место, где сервер удаляет чужие
-        # чаты сам, и в терминале uvicorn это должно быть видно. INFO туда
-        # не доходит — у корневого логгера нет обработчика.
-        LOG.warning(
-            "заготовки %s отозваны — удалено чатов: %d",
-            ", ".join(sorted(RETIRED_PRESETS)),
-            len(removed),
-        )
-    return removed
-
-
-def bootstrap_chats() -> list[Agent]:
-    """Заводит заготовки из day.py, которых база ещё не заводила.
-
-    Дальше они живут наравне со всеми: их переименовывают, удаляют и правят.
-    Никакой отдельной ветки обработки у них нет — только строчка в day.py
-    вместо кнопки «Новый чат».
-
-    Узнаёт их сервер по `preset` — ключу, который не делает больше ничего
-    и потому не меняется. Ни имя, ни настройки, ни порядок строк в `day.py`
-    для этого не годятся: их правят. Отсюда три обещания сразу:
-
-    * удалённый чат не возвращается — его ключ остался отмеченным;
-    * переименованный не задваивается — сверка не про имя;
-    * дописанная заготовка появляется и в существующей базе — её ключа
-      в наборе ещё нет.
-
-    Если набор не читается, не заводится ничего: см. `_seeded_presets`.
-    Заготовки, отозванные из `day.py` насовсем, убираются здесь же:
-    см. `RETIRED_PRESETS`.
-    """
-    seeded = _seeded_presets()
-    if seeded is None:
-        # Запись о заведённых заготовках не читается. Завести их «на всякий
-        # случай» — это вернуть удалённые чаты и задвоить живые, то есть ровно
-        # та поломка, от которой набор ключей и защищает. Ничего не заводим
-        # и ничего не перезаписываем: испорченное значение остаётся на месте,
-        # его можно посмотреть и починить. Всё, что уже есть в базе, работает
-        # как обычно — набор управляет только заведением заготовок.
-        LOG.error(
-            "%s в базе не читается (%r) — заготовки из day.py не заведены. "
-            "Все существующие чаты на месте и работают. Почините или удалите "
-            "эту запись в таблице meta, чтобы заготовки снова заводились.",
-            PRESETS_KEY,
-            REGISTRY.store.get_meta(PRESETS_KEY),
-        )
-        return []
-
-    retire_presets()
-    fresh = [spec for spec in PRESET_CHATS if spec.preset not in seeded]
-    created = [REGISTRY.create(spec) for spec in fresh]
-    # Отмечаем весь сегодняшний day.py, а не только заведённое сейчас: набор
-    # должен пережить и удаление строки из файла — иначе вернувшаяся строка
-    # завела бы второй чат рядом с живым.
-    REGISTRY.store.set_meta(
-        PRESETS_KEY, json.dumps(sorted(seeded | {spec.preset for spec in PRESET_CHATS}))
-    )
-    return created
 
 
 # --- вспомогательное ----------------------------------------------------------
@@ -543,10 +329,6 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
         model=model,
         messages=messages,
         system=system,
-        draft=text("draft"),
-        # Ключ заготовки снаружи не задаётся: чат, назвавшийся чужим ключом,
-        # отменил бы появление настоящей заготовки.
-        preset="",
         stop=stop or None,
         response_format=response_format,
         extra_body=extra_body,
@@ -575,7 +357,7 @@ def _agent(agent_id: str) -> Agent:
 def _listing() -> dict:
     """Всё, что нужно клиенту для списка слева и статуса ключа.
 
-    Список плоский: ни групп, ни разделения на «свои» и «заготовленные».
+    Список плоский, и на чистом старте он пуст: чаты заводит пользователь.
     Ключа здесь нет и быть не может — наружу уходит только факт его наличия.
     """
     agents = REGISTRY.catalogue()
@@ -712,7 +494,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         if name in payload:
             setattr(agent.spec, name, sampling[name])
     # Правка из панели — часть чата: без записи она не пережила бы рестарт,
-    # и чат поднялся бы на конфиге из day.py, молча отменив выбор.
+    # и следующий запрос ушёл бы со старым конфигом.
     agent.save_config()
     return agent.as_dict()
 
