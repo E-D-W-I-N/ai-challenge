@@ -328,11 +328,24 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     def text(name: str) -> str:
         return _optional_field(payload, name, (str,), "строка или null", where) or ""
 
+    messages = _parse_messages(payload.get("messages") or [], where)
+    system = text("system")
+    if system and any(m["role"] == "system" for m in messages):
+        # У системного промпта одно место — поле `system`. Если он задан
+        # и там, и сообщением, одно из двух пришлось бы выбросить молча.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{where}system задан и полем, и сообщением в messages: "
+                "у системного промпта одно место — выберите его"
+            ),
+        )
+
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
         model=model,
-        messages=_parse_messages(payload.get("messages") or [], where),
-        system=text("system"),
+        messages=messages,
+        system=system,
         draft=text("draft"),
         stop=stop or None,
         response_format=response_format,
@@ -435,9 +448,10 @@ async def get_agent(agent_id: str) -> dict:
 async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     """Панель справа: имя, системный промпт, модель, память, сэмплирование.
 
-    Изменения применяются к живому агенту и действуют со следующего сообщения.
-    Присланный `null` снимает параметр — он перестаёт уходить в OpenRouter
-    вовсе; пропущенный ключ не трогает ничего.
+    Изменения применяются к живому агенту и действуют со следующего сообщения —
+    в том числе если прямо сейчас идёт генерация. Присланный `null` снимает
+    параметр: он перестаёт уходить в OpenRouter вовсе; пропущенный ключ
+    не трогает ничего.
     """
     agent = _agent(agent_id)
     if not isinstance(payload, dict) or not payload:
@@ -448,11 +462,13 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
             status_code=400,
             detail=f"менять можно только {', '.join(PATCHABLE)}, а не {', '.join(sorted(unknown))}",
         )
-    if agent.busy:
-        raise HTTPException(
-            status_code=409,
-            detail=f"агент {agent_id} занят: правка конфига посреди ответа исказила бы метрики",
-        )
+    # Правка во время генерации разрешена намеренно. Она не может исказить
+    # текущий ответ: `stream_completion` собирает тело запроса и метрики
+    # синхронно, до первого await, — дальше конфиг уже не читается. Зато
+    # запрет стоил дорого: 409 приходил ровно тогда, когда правку и хочется
+    # внести — пока читаешь длинный ответ, — и терялся навсегда, потому что
+    # повторять его было нечем. Правка действует со следующего сообщения,
+    # ровно как и обещает строка состояния под панелью.
 
     sampling = _sampling_fields(payload)
     if "model" in payload:

@@ -17,6 +17,7 @@ const state = {
   lastMetrics: null,   // метрики последнего ответа — из них плитки
   tab: "model",
   applying: null,      // незавершённое применение настроек панели
+  panelDirty: false,   // правка панели не доехала до агента
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -376,6 +377,7 @@ async function openAgent(agentId) {
     return loadAgents();
   }
   state.current = agent;
+  state.panelDirty = false;
   state.lastMetrics = lastAnswerMetrics(agent);
   renderList();
   renderFeed(agent);
@@ -598,11 +600,22 @@ async function send() {
   const text = (input.value || "").trim();
   if (!text || !state.current || !state.hasKey) return;
 
-  input.value = "";
-  autoGrow(input);
   // Поле панели могло только что потерять фокус: правка уже полетела на
   // сервер, и отправлять сообщение вперёд неё нельзя — уедет старый конфиг.
   if (state.applying) await state.applying;
+  // Правка не доехала — пробуем ещё раз и, если снова мимо, не отправляем:
+  // отправить с настройками, которых у агента нет, значит показать в панели
+  // одно, а в модель послать другое.
+  if (state.panelDirty) {
+    await applySettings();
+    if (state.panelDirty) {
+      hint("Настройки панели не применились — сообщение не отправлено.", true);
+      return;
+    }
+  }
+
+  input.value = "";
+  autoGrow(input);
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
@@ -871,10 +884,30 @@ const PROVIDER_PARAMS = [
 // provider.require_parameters=true, и параметр, которого модель не заявляет,
 // выкашивает провайдеров. Вместо ответа приходит невнятная ошибка, и по ней
 // не понять, что виноват один переключатель в панели.
-function paramWarnings(model, settings) {
+function paramWarnings(model, settings, extraBody) {
   const warnings = [];
-  // Каталог не загрузился или модель в нём не нашлась — молчим: пугать
-  // предупреждением, которого не на чем основать, хуже, чем не предупредить.
+
+  // Закреплённый провайдер — не пояснение, а настройка, которая ломает
+  // вызов: у части чатов в extra_body стоит provider.order, и смена модели
+  // на ту, которую этот провайдер не обслуживает, вернёт сырой 404. Панель
+  // это поле не правит, поэтому сказать о нём больше негде.
+  const provider = (extraBody || {}).provider || {};
+  if (Array.isArray(provider.order) && provider.order.length) {
+    warnings.push(
+      `У этого чата провайдер закреплён: ${provider.order.join(", ")}. ` +
+        "Модель, которую он не обслуживает, вернётся ошибкой 404 — " +
+        "смена модели здесь сработает не с любой."
+    );
+  } else if (provider.allow_fallbacks === false) {
+    warnings.push(
+      "У этого чата запрещён фолбэк к другому провайдеру: если основной " +
+        "недоступен, вызов упадёт, а не уйдёт к соседнему."
+    );
+  }
+
+  // Каталог не загрузился или модель в нём не нашлась — про параметры молчим:
+  // пугать предупреждением, которого не на чем основать, хуже, чем не
+  // предупредить.
   if (!model) return warnings;
 
   const declared = model.supported_parameters || [];
@@ -944,7 +977,8 @@ function renderWarnings() {
     const settings = readPanel();
     warnings = paramWarnings(
       state.models.find((m) => m.id === settings.model),
-      settings
+      settings,
+      state.current && state.current.extra_body
     );
   } catch (e) {
     warnings = [];   // поле не разобрать — про это скажет строка состояния
@@ -966,6 +1000,8 @@ function applySettings() {
   try {
     patch = readPanel();
   } catch (err) {
+    // Поле не разобрать — правка не доехала, и сообщение с ней уйти не должно.
+    state.panelDirty = true;
     saveStatus(String(err.message || err), true);
     renderWarnings();
     return Promise.resolve();
@@ -981,8 +1017,12 @@ function applySettings() {
       }
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
+      state.panelDirty = false;
       saveStatus("Применено — со следующего сообщения.");
     } catch (err) {
+      // Правка не доехала. Забыть про неё нельзя: в панели у пользователя
+      // одно, у агента другое, а `change` уже отработал и сам не повторится.
+      state.panelDirty = true;
       saveStatus(String(err.message || err), true);
     }
   })();

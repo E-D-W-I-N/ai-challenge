@@ -144,7 +144,14 @@ class Agent:
         # создания агента.
         seed = [dict(m) for m in (spec.messages or [])]
         carried = [m.get("content", "") for m in seed if m.get("role") == "system"]
-        if carried and not self.spec.system:
+        if carried and self.spec.system:
+            # Выбросить одно из двух молча нельзя: у промпта ровно один дом,
+            # и какой из двух текстов лишний — знает только автор конфига.
+            raise ValueError(
+                f"агент «{spec.label}»: системный промпт задан и полем system, "
+                "и сообщением в messages — оставьте что-то одно"
+            )
+        if carried:
             self.spec.system = "\n\n".join(carried)
 
         self.seed_messages: list[dict] = [m for m in seed if m.get("role") != "system"]

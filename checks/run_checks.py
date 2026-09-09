@@ -179,6 +179,8 @@ def check_flat_list():
     js = read("app/static/app.js")
     for gone in ("list-group", "state.groups", "agent.note"):
         assert gone not in js, f"в клиенте осталась группировка: {gone}"
+    # Стиль без селектора — тот же мёртвый код, только в другом файле.
+    assert "list-group" not in read("app/static/style.css"), "в стилях остался .list-group"
     return f"{len(live)} чатов одним списком, переименование и удаление работают"
 
 
@@ -477,6 +479,70 @@ def check_panel_applies_next_message():
     return "промпт, модель, окно и все параметры уехали новыми"
 
 
+@check("правка панели во время генерации не теряется")
+def check_patch_during_generation():
+    """Находка ревью: PATCH на занятом агенте отдавал 409 и правка пропадала.
+
+    Повторить её было нечем — единственный триггер применения уже отработал,
+    и следующее сообщение уезжало со старым промптом при новом тексте
+    в панели. Ровно та жалоба, с которой начинался девятый пункт.
+
+    Запрет был не нужен: `stream_completion` собирает тело запроса и метрики
+    синхронно, до первого await, поэтому правка конфига текущий ответ
+    и не могла бы исказить.
+    """
+
+    async def scenario():
+        from httpx import ASGITransport, AsyncClient
+
+        _stub.install(reply="д" * 400, chunks=40, delay=0.02)
+        transport = ASGITransport(app=main.app)
+        async with AsyncClient(transport=transport, base_url="http://bench") as client:
+            created = await client.post(
+                "/api/agents",
+                json={"agent": {"model": "stub/model", "label": "п", "system": "СТАРЫЙ ПРОМПТ"}},
+            )
+            agent_id = created.json()["agents"][0]["id"]
+
+            generating = asyncio.create_task(
+                client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+            )
+            await asyncio.sleep(0.15)
+            patched = await client.patch(
+                f"/api/agents/{agent_id}",
+                json={"system": "НОВЫЙ ПРОМПТ", "temperature": 0.9},
+            )
+            await generating
+            current = list(_stub.CALLS)
+
+            _stub.reset()
+            _stub.install(reply="ок")
+            await client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+            return patched, current, list(_stub.CALLS)
+
+    patched, current, following = asyncio.run(scenario())
+
+    assert patched.status_code == 200, f"правку во время генерации отвергли: {patched.text}"
+
+    # Текущий ответ правка не задела: тело запроса снято слепком на старте.
+    assert [m["content"] for m in current[0]["messages"] if m["role"] == "system"] == [
+        "СТАРЫЙ ПРОМПТ"
+    ], current[0]["messages"]
+    assert "temperature" not in current[0]["payload"], current[0]["payload"]
+
+    # А следующее сообщение ушло уже новым.
+    assert [m["content"] for m in following[0]["messages"] if m["role"] == "system"] == [
+        "НОВЫЙ ПРОМПТ"
+    ], following[0]["messages"]
+    assert following[0]["payload"]["temperature"] == 0.9, following[0]["payload"]
+
+    # Клиент, кроме того, не отправит сообщение, пока правка не доехала.
+    js = read("app/static/app.js")
+    assert "panelDirty" in js, "клиент не помнит о недоехавшей правке"
+    assert "сообщение не отправлено" in js, "клиент отправляет при непринятой правке"
+    return "PATCH во время генерации принят, текущий ответ цел, следующий — новый"
+
+
 @check("системный промпт живёт в одном месте и не фиксируется при создании")
 def check_system_prompt_single_home():
     """Корень той же жалобы: промпт мог приехать внутри `messages`.
@@ -504,7 +570,36 @@ def check_system_prompt_single_home():
     systems = [m["content"] for m in sent if m["role"] == "system"]
     assert systems == ["ПРАВЛЕНЫЙ"], systems
     assert "ИЗ ЗАГОТОВКИ" not in " ".join(m["content"] for m in sent), sent
-    return "промпт из messages переехал в конфиг и правится оттуда"
+
+    # Два дома сразу — ошибка, а не молчаливая потеря одного из промптов.
+    with TestClient(main.app) as client:
+        both = client.post(
+            "/api/agents",
+            json={
+                "agent": {
+                    "model": "stub/m",
+                    "system": "полем",
+                    "messages": [{"role": "system", "content": "сообщением"}],
+                }
+            },
+        )
+        assert both.status_code == 400, both.text
+        assert "одно место" in both.json()["detail"], both.text
+
+    # Тот же запрет и в конструкторе: ошибку в day.py видно на старте.
+    try:
+        REGISTRY.create(
+            AgentSpec(
+                label="двойной",
+                model="stub/m",
+                system="полем",
+                messages=[{"role": "system", "content": "сообщением"}],
+            )
+        )
+        raise AssertionError("конструктор проглотил два системных промпта")
+    except ValueError as exc:
+        assert "одно" in str(exc), exc
+    return "промпт из messages переехал в конфиг; два дома сразу — 400 и ValueError"
 
 
 @check("stop и response_format правятся из панели и доезжают до тела запроса")
@@ -957,6 +1052,18 @@ def check_catalog_capabilities():
 
     js = read("app/static/app.js")
     assert "function paramWarnings" in js, "панель не считает предупреждения"
+    # Закреплённый провайдер — не пояснение, а настройка, ломающая вызов:
+    # шесть чатов дней 4–5 роняют смену модели сырым 404 без подсказки.
+    assert "provider.order" in js, "панель молчит про закреплённого провайдера"
+    assert "extra_body" in js, "панель не смотрит на extra_body"
+    pinned = [c.label for c in day.CHATS if (c.extra_body or {}).get("provider", {}).get("order")]
+    assert len(pinned) == 3, pinned  # три чата Дня 4 с закреплённым провайдером
+    no_fallback = [
+        c.label
+        for c in day.CHATS
+        if (c.extra_body or {}).get("provider", {}).get("allow_fallbacks") is False
+    ]
+    assert len(no_fallback) == 6, no_fallback  # плюс три чата Дня 5 без фолбэка
     for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
         assert field in js, f"клиент не смотрит на {field}"
     assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
@@ -1196,6 +1303,7 @@ CHECKS = [
     check_disconnect,
     check_new_params,
     check_panel_applies_next_message,
+    check_patch_during_generation,
     check_system_prompt_single_home,
     check_stop_and_format,
     check_patch_panel,

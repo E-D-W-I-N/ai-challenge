@@ -200,6 +200,31 @@ check(
     paramWarnings(plain, { history_limit: 0 }).length === 0);
 }
 
+// ── закреплённый провайдер: настройка, которую панель не правит ──
+
+{
+  const model = { id: "openai/gpt-4o-mini", supported_parameters: ["temperature"], temperature_capped: false };
+  const pinned = paramWarnings(model, {}, { provider: { order: ["openai"], allow_fallbacks: false } });
+  check("закреплённый провайдер предупреждает", pinned.length === 1, JSON.stringify(pinned));
+  check("в предупреждении назван провайдер", /openai/.test(pinned[0] || ""), pinned[0]);
+  check("сказано, чем кончится смена модели", /404/.test(pinned[0] || ""), pinned[0]);
+
+  const noFallback = paramWarnings(model, {}, { provider: { allow_fallbacks: false } });
+  check("запрет фолбэка предупреждает отдельно", noFallback.length === 1, JSON.stringify(noFallback));
+  check("и говорит именно про фолбэк", /фолбэк/.test(noFallback[0] || ""), noFallback[0]);
+
+  check("без extra_body про провайдера молчим", paramWarnings(model, {}, {}).length === 0);
+  check("без extra_body вовсе — тоже молчим", paramWarnings(model, {}).length === 0);
+  check(
+    "про провайдера говорим, даже если модели нет в каталоге",
+    paramWarnings(null, {}, { provider: { order: ["openai"] } }).length === 1
+  );
+  check(
+    "закреплённый провайдер и незаявленный параметр — два повода",
+    paramWarnings(model, { top_k: 40 }, { provider: { order: ["openai"] } }).length === 2
+  );
+}
+
 // ── что закрывает Escape ──
 
 check(
