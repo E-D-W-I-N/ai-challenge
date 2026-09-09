@@ -327,8 +327,6 @@ function freshClient(options) {
   Object.keys(require.cache).forEach((key) => delete require.cache[key]);
   const dom = require(path.join(__dirname, "dom.js"));
   // Порядок важен: свои чаты добавляем ПОСЛЕ распаковки options, иначе
-  // options.chats затрёт список, а не дополнит его.
-  // Порядок важен: свои чаты добавляем ПОСЛЕ распаковки options, иначе
   // options.chats затрёт список, а не дополнит его. `bare` — чистый старт:
   // на сервере нет ни одного чата, как при первом запуске.
   const seeded = (options && options.bare)
@@ -599,6 +597,154 @@ async function routeChecks() {
     }
   }
 
+  // ── «Применено» — о событии, а не о каждой отправке ──
+  //
+  // Жалоба заказчика: строка появлялась на каждое сообщение. Причина
+  // в правке двумя кругами раньше: пролив панели переехал внутрь `exchange`
+  // и стал случаться перед каждой отправкой, а сообщение показывалось
+  // по факту пролива. Инвариант тут ни при чём — проливать надо всегда,
+  // сообщать не о чем. Утверждения ниже — про то, что видно на экране.
+  {
+    const { client, $, settle, Evt } = freshClient();
+    const shown = () => $("#save-status").textContent;
+    client.init();
+    await settle(20);
+
+    // 1. Отправка без единой правки: панель проливается, экран молчит.
+    $("#input").value = "первый";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("отправка без правок ничего не сообщает", shown() === "", shown());
+
+    $("#input").value = "второй";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("и вторая отправка тоже", shown() === "", shown());
+
+    // 2. Правка есть — сообщение появляется.
+    $("#f-system").value = "ПРАВКА";
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("после настоящей правки сообщение есть", /Применено/.test(shown()), shown());
+
+    // 3. Правка, а сразу за ней отправка: сообщение остаётся тем же самым,
+    //    а не появляется вторым — таймер у него один, назначенный правкой.
+    const timer = client.state.statusTimer;
+    $("#input").value = "третий";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("отправка сразу после правки не показывает второе сообщение",
+      /Применено/.test(shown()) && client.state.statusTimer === timer,
+      `${shown()} | таймер ${client.state.statusTimer === timer ? "тот же" : "новый"}`);
+
+    // 4. Следующая отправка уже без правок — снова тишина.
+    await settle(0);
+    $("#save-status").textContent = "";
+    $("#input").value = "четвёртый";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("после применённой правки следующая отправка молчит", shown() === "", shown());
+  }
+
+  // ── пролив теми же значениями изменением не является ──
+  {
+    const { client, $, settle, Evt } = freshClient();
+    const shown = () => $("#save-status").textContent;
+    client.init();
+    await settle(20);
+
+    // Ставим в поля ровно то, что там уже стоит: панель «изменилась»
+    // по событию, но конфиг агента — нет.
+    $("#f-system").value = $("#f-system").value;
+    $("#f-temperature").value = $("#f-temperature").value;
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("правка теми же значениями ничего не сообщает", shown() === "", shown());
+
+    // Пустое поле не равно нулю: заданный ноль — это правка.
+    $("#f-top_p").value = "0";
+    $("#f-top_p").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("ноль в пустом поле — настоящая правка", /Применено/.test(shown()), shown());
+
+    // ...а стереть ноль обратно в пустоту — тоже правка, в другую сторону.
+    $("#save-status").textContent = "";
+    $("#f-top_p").value = "";
+    $("#f-top_p").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("и стереть его обратно — тоже", /Применено/.test(shown()), shown());
+
+    // Стоп-строки: лишний перевод строки списком не становится.
+    $("#save-status").textContent = "";
+    $("#f-stop").value = "\n\n";
+    $("#f-stop").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("пустые строки в стоп-списке правкой не считаются", shown() === "", shown());
+
+    $("#f-stop").value = "КОНЕЦ";
+    $("#f-stop").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("а настоящая стоп-строка — считается", /Применено/.test(shown()), shown());
+  }
+
+  // ── две правки подряд: таймер не залипает ──
+  {
+    const { client, $, settle, Evt } = freshClient();
+    const shown = () => $("#save-status").textContent;
+    client.init();
+    await settle(20);
+
+    $("#f-system").value = "раз";
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(40);
+    const first = client.state.statusTimer;
+    $("#f-system").value = "два";
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("вторая правка перевешивает таймер, а не копит второй",
+      /Применено/.test(shown()) && Boolean(client.state.statusTimer) &&
+        client.state.statusTimer !== first,
+      `${shown()} | ${first === client.state.statusTimer ? "тот же таймер" : "новый таймер"}`);
+
+    await new Promise((r) => setTimeout(r, 5100));
+    check("и через пять секунд после последней правки строка пуста",
+      shown() === "", shown());
+  }
+
+  // ── неудачная правка: своя красная строка, а не «Применено» ──
+  {
+    const { client, $, settle, Evt } = freshClient();
+    const shown = () => $("#save-status").textContent;
+    client.init();
+    await settle(20);
+
+    // Пустая модель — сервер отвечает 400.
+    $("#f-model").value = "";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await settle(60);
+    check("провалившийся PATCH не сообщает о применении", !/Применено/.test(shown()), shown());
+    check("а говорит, что не так", shown().length > 0, "строка пуста");
+    check("и делает это красным",
+      /error/.test($("#save-status").className), $("#save-status").className);
+  }
+
+  // ── перегенерация без правок ──
+  {
+    const { client, $, settle, Evt } = freshClient();
+    const shown = () => $("#save-status").textContent;
+    client.init();
+    await settle(20);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(120);
+    $("#save-status").textContent = "";
+
+    const card = $("#feed").querySelector(".card");
+    card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+    await settle(140);
+    check("перегенерация без правок ничего не сообщает", shown() === "", shown());
+  }
+
   // ── строка состояния гаснет ──
   {
     const { client, $, settle, Evt } = freshClient();
@@ -792,6 +938,33 @@ function stubChecks() {
     third.onclick = () => replaced.push("второй");
     third.dispatchEvent(new dom.Evt("click"));
     check("инлайновый один: переприсвоение заменяет", replaced.join() === "второй", replaced.join());
+  }
+
+  // 9. <select> с чужим значением теряет выбор, а не держит старое.
+  {
+    const { make } = fresh();
+    const box = make("select");
+    ["первая/модель", "вторая/модель"].forEach((id) => {
+      const opt = make("option");
+      opt.value = id;
+      box.appendChild(opt);
+    });
+    check("без выбора показывает первую опцию", box.value === "первая/модель", box.value);
+    box.value = "вторая/модель";
+    check("существующая опция выбирается", box.value === "вторая/модель", box.value);
+    box.value = "нет/такой/модели";
+    check("значения, которого нет в списке, не остаётся — выбор снят",
+      box.value === "", JSON.stringify(box.value));
+    check("и selectedIndex это подтверждает", box.selectedIndex === -1, String(box.selectedIndex));
+    box.value = "первая/модель";
+    check("после снятия выбор снова назначается", box.value === "первая/модель", box.value);
+    box.value = "";
+    box.innerHTML = "";
+    const opt = make("option");
+    opt.value = "третья/модель";
+    box.appendChild(opt);
+    check("пересобранный список снова начинается с первой опции",
+      box.value === "третья/модель", box.value);
   }
 
   // 8. Подмена содержимого обнуляет прокрутку — то, ради чего всё затевалось.
