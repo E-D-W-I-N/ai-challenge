@@ -5,8 +5,12 @@
 
 С Дня 6 сервер держит состояние: агент — объект в реестре процесса, историю
 диалога хранит он, а не браузер. Клиент шлёт только новый текст и id агента.
-Реестр живёт в памяти: перезапуск процесса стирает его — это постановка Дня 7,
-а не недоделка.
+
+С Дня 7 это состояние переживает перезапуск: реестр стал реестром сессий
+поверх SQLite (`app/store.py`). Ручки не изменились — изменилось то, что
+`/api/agents/{id}` теперь находит и ту сессию, которой в памяти уже нет:
+её поднимают из базы вместе с историей. Добавилась одна ручка, `/api/sessions`:
+список сохранённых диалогов, из которого клиент их и переключает.
 """
 
 from __future__ import annotations
@@ -21,15 +25,16 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, commands, llm
-from .agent import Agent, AgentBusyError
+from .agent import Agent, AgentBusyError, effective_history_limit
 from .config import ROOT, has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import AgentSpec, Scenario
+from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -89,6 +94,17 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="AI Challenge Bench", version="1.0.0", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(StoreBusyError)
+async def _store_busy(_request: Request, exc: StoreBusyError) -> JSONResponse:
+    """Занятая база — это 503 с объяснением, а не голый 500.
+
+    Два процесса на одной базе — режим штатный, и упереться в блокировку тут
+    не поломка, а очередь. Пользователю нужен текст «занято, повторите», а не
+    строка из драйвера sqlite.
+    """
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.get("/")
@@ -426,8 +442,9 @@ def _agent(agent_id: str) -> Agent:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"агента {agent_id} нет в реестре: он мог быть вытеснен по лимиту "
-                "или стёрт перезапуском стенда — создайте нового"
+                f"сессии {agent_id} нет ни в памяти, ни в базе: её удалили — "
+                "создайте новую. Вытеснение по лимиту и перезапуск стенда "
+                "сессию не стирают, такую ручка поднимает из базы сама"
             ),
         ) from exc
 
@@ -495,6 +512,41 @@ async def list_agents(parent: str = "", children_only: bool = False) -> dict:
     }
 
 
+@app.get("/api/sessions")
+async def list_sessions(limit: int = 500) -> dict:
+    """Сохранённые сессии — не только живые в процессе.
+
+    Это и есть ответ дня на экране: список диалогов, который переживает
+    перезапуск. Живые помечены `live`, у остальных в памяти сейчас никого,
+    но открыть их можно — обращение к `/api/agents/{id}` поднимет сессию.
+    """
+    sessions = REGISTRY.sessions(limit=max(1, min(int(limit), 1000)))
+    return {
+        "live": len(REGISTRY),
+        "max_agents": REGISTRY.max_agents,
+        "evicted": REGISTRY.evicted,
+        "stored": len(sessions),
+        "sessions": [
+            {
+                "id": row["id"],
+                "parent_id": row["parent_id"],
+                "label": row["label"],
+                "model": (row["config"] or {}).get("model", ""),
+                # Действующее окно, а не поле конфига: у сессии с дефолтом там
+                # null, а память у неё при этом есть, и на экране это враньё.
+                "history_limit": effective_history_limit(
+                    (row["config"] or {}).get("history_limit")
+                ),
+                "history_len": row["history_len"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "live": row["live"],
+            }
+            for row in sessions
+        ],
+    }
+
+
 @app.get("/api/agents/{agent_id}")
 async def get_agent(agent_id: str) -> dict:
     """Конфиг агента со стенограммой: стартовый промпт и весь диалог."""
@@ -534,6 +586,9 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         if name in payload:
             setattr(agent.spec, name, sampling[name])
             agent.overrides[name] = sampling[name]
+    # Выбор пользователя — часть сессии: без записи он не пережил бы рестарт,
+    # и колонка поднялась бы на модели из day.py.
+    agent.save_config()
     return agent.as_dict()
 
 
@@ -631,6 +686,8 @@ async def _spawn_columns(
         # Свежий набор помнит выбор пользователя так же, как помнил прошлый:
         # иначе он потерялся бы на втором «Старте».
         agent.overrides = dict(merged.get(agent.spec.label, {}))
+        if agent.overrides:
+            agent.save_config()
     if parent is None:
         _ORPHAN_RUN.extend(a.id for a in agents)
     return agents
@@ -734,7 +791,8 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
                 yield _agent_event(event, agent)
     except AgentBusyError as exc:
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}
-    except MissingKeyError as exc:
+    except (MissingKeyError, StoreBusyError) as exc:
+        # У обеих текст уже человеческий — имя класса перед ним только мешает.
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}
     except asyncio.CancelledError:
         raise
@@ -823,7 +881,14 @@ async def _run_session(
     session = agent.spec
     label = session.label
     outcome = _Outcome()
+    # Колонка занята на всё время своей дорожки, включая ожидание depends_on.
+    # Ждущий субагент не держит lock и формально не занят — а значит, потолок
+    # реестра вправе выгрузить его прямо из-под идущего прогона, и дальше
+    # с той же сессией работали бы два объекта сразу.
+    reserved = False
     try:
+        agent.reserve()
+        reserved = True
         if session.depends_on:
             waiter = ready.get(session.depends_on)
             if waiter is None:
@@ -867,8 +932,10 @@ async def _run_session(
                 return
             # Подстановка правит стартовый промпт самого агента: дальше с этой
             # колонкой можно переписываться, и она будет помнить итоговый промпт,
-            # а не шаблон с {{depends_on}}.
+            # а не шаблон с {{depends_on}} — в том числе после перезапуска,
+            # поэтому итог сразу уезжает в базу.
             agent.seed_messages = _substitute(agent.seed_messages, donor.text)
+            agent.save_config()
 
         total = max(1, session.repeats)
         # При repeats=1 поток остаётся ровно таким, каким был до появления
@@ -1003,7 +1070,7 @@ async def _run_session(
             done_event["texts"] = list(texts)
             done_event["unique"] = len({t.strip() for t in texts})
         await queue.put(done_event)
-    except MissingKeyError as exc:
+    except (MissingKeyError, StoreBusyError) as exc:
         outcome = _Outcome(error=str(exc))
         await queue.put(
             {"event": "session_error", "session": label, "agent": agent.id, "message": str(exc)}
@@ -1022,6 +1089,8 @@ async def _run_session(
             }
         )
     finally:
+        if reserved:
+            agent.release()
         # Исход пишем всегда: зависимая колонка должна узнать и об успехе,
         # и о падении, а не гадать, почему записи нет.
         results[label] = outcome
@@ -1400,8 +1469,7 @@ async def _command_run(parent: Agent, index: int, raw: str) -> AsyncIterator[dic
                 results[label] = _Outcome(text=text, texts=[text], ok=bool(text.strip()))
 
             summary = _run_summary(scenario, results)
-            parent.remember("user", raw)
-            parent.remember("assistant", summary)
+            parent.remember_exchange(raw, summary)
             yield {"event": "command_done", "agent": parent.id, "summary": summary}
     except AgentBusyError as exc:
         yield {"event": "error", "agent": parent.id, "message": str(exc), "metrics": None}
@@ -1418,5 +1486,6 @@ async def health() -> dict:
         "agents_live": len(REGISTRY),
         "agents_max": REGISTRY.max_agents,
         "agents_evicted": REGISTRY.evicted,
+        "sessions_stored": REGISTRY.store.count_sessions(),
         "llm_max_concurrency": llm.max_concurrency(),
     }

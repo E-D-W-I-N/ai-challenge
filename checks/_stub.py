@@ -118,13 +118,39 @@ def install(module_names=("app.agent",), **kwargs) -> None:
         module.stream_completion = fake
 
 
-def install_offline() -> None:
+def use_temp_db(path: str | None = None) -> str:
+    """Уводит базу агентов во временный файл — до импорта app.*.
+
+    Без этого проверки писали бы в рабочую базу стенда: реестр открывает
+    хранилище на импорте, а путь берёт из AGENT_DB_PATH один раз.
+
+    Без аргумента каждый процесс получает **свежий** каталог, даже если
+    AGENT_DB_PATH унаследован от родителя: иначе `spawn_100.py`, запущенный
+    подпроцессом, писал бы сотню сессий в базу проверок, и следующий агент
+    родителя поднял бы чужую историю по совпавшему id. Явный путь нужен
+    проверке перезапуска — там два процесса обязаны видеть один файл.
+    """
+    import os
+    import tempfile
+
+    if path is None:
+        path = os.path.join(tempfile.mkdtemp(prefix="checks-db-"), "agents.db")
+    os.environ["AGENT_DB_PATH"] = path
+    return path
+
+
+def install_offline(db_path: str | None = None) -> None:
     """Убирает из проверок всё, что ходит в сеть, кроме самого стрима.
 
     Каталог моделей — живой HTTP-запрос к OpenRouter; ключа он не требует,
     но проверки обязаны работать без сети вовсе. Ключ подменяем на «есть»,
     иначе ручка сообщения отдаст 503 раньше, чем дойдёт до агента.
+
+    Заодно уводит базу во временный файл: импорт app.main поднимает реестр,
+    а тот открывает хранилище.
     """
+    use_temp_db(db_path)
+
     import app.catalog as catalog
     import app.main as main
 
