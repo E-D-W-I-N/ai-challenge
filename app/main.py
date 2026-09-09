@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sys
 import time
 from dataclasses import replace
@@ -36,6 +37,9 @@ from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import AgentSpec
 from .store import StoreBusyError
+
+LOG = logging.getLogger("app.main")
+"""Логгер сервера. Пишет туда же, куда uvicorn, — в терминал, где его запустили."""
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -153,34 +157,45 @@ LEGACY_BOOTSTRAP_KEY = "preset_chats_done"
 """
 
 
-def _seeded_presets() -> set[str]:
-    """Какие заготовки база уже заводила.
+def _seeded_presets() -> set[str] | None:
+    """Какие заготовки база уже заводила. None — запись не читается.
 
     База, записанная прошлой версией, знает только «заводила вообще». Считаем,
     что заводила она сегодняшний `day.py`: заготовок в ней ровно столько,
     сколько было на момент той записи, и отметить их все — единственный способ
     не насыпать дубликатов. Заготовка, дописанная в `day.py` после этого,
     в такой базе не появится ровно один раз, при переходе; дальше — как у всех.
+
+    Нечитаемая запись — это не «пусто». Пустой набор значит «не заводили
+    ничего», и на нём сервер завёл бы все заготовки заново: удалённые чаты
+    вернулись бы, а живые задвоились. Отличить одно от другого нельзя,
+    поэтому здесь честное «не знаю», а решение принимает `bootstrap_chats`.
     """
     store = REGISTRY.store
     raw = store.get_meta(PRESETS_KEY)
     if raw is not None:
-        seeded = _loads_presets(raw)
-        if seeded is not None:
-            return seeded
+        return _loads_presets(raw)
     if store.get_meta(LEGACY_BOOTSTRAP_KEY):
         return {spec.preset for spec in PRESET_CHATS}
     return set()
 
 
 def _loads_presets(raw: str) -> set[str] | None:
+    """Набор ключей из записи `meta`. None — запись испорчена.
+
+    Строгий разбор: не список, не строка внутри — значит, читать нечего.
+    Выкинуть непонятный элемент и продолжить было бы тем же угадыванием,
+    только тише: пропавший ключ вернул бы удалённый чат.
+    """
     try:
         parsed = json.loads(raw)
     except ValueError:
         return None
     if not isinstance(parsed, list):
         return None
-    return {item for item in parsed if isinstance(item, str)}
+    if not all(isinstance(item, str) for item in parsed):
+        return None
+    return set(parsed)
 
 
 def bootstrap_chats() -> list[Agent]:
@@ -198,8 +213,26 @@ def bootstrap_chats() -> list[Agent]:
     * переименованный не задваивается — сверка не про имя;
     * дописанная заготовка появляется и в существующей базе — её ключа
       в наборе ещё нет.
+
+    Если набор не читается, не заводится ничего: см. `_seeded_presets`.
     """
     seeded = _seeded_presets()
+    if seeded is None:
+        # Запись о заведённых заготовках не читается. Завести их «на всякий
+        # случай» — это вернуть удалённые чаты и задвоить живые, то есть ровно
+        # та поломка, от которой набор ключей и защищает. Ничего не заводим
+        # и ничего не перезаписываем: испорченное значение остаётся на месте,
+        # его можно посмотреть и починить. Всё, что уже есть в базе, работает
+        # как обычно — набор управляет только заведением заготовок.
+        LOG.error(
+            "%s в базе не читается (%r) — заготовки из day.py не заведены. "
+            "Все существующие чаты на месте и работают. Почините или удалите "
+            "эту запись в таблице meta, чтобы заготовки снова заводились.",
+            PRESETS_KEY,
+            REGISTRY.store.get_meta(PRESETS_KEY),
+        )
+        return []
+
     fresh = [spec for spec in PRESET_CHATS if spec.preset not in seeded]
     created = [REGISTRY.create(spec) for spec in fresh]
     # Отмечаем весь сегодняшний day.py, а не только заведённое сейчас: набор

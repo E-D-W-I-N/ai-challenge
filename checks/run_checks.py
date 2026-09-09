@@ -1806,6 +1806,74 @@ def check_preset_order_changed():
     return f"{len(before)} чатов до перестановки и столько же после, дубликатов нет"
 
 
+@check("нечитаемая отметка о заготовках не заводит их заново")
+def check_broken_presets_marker():
+    """«Не читается» — это не «пусто».
+
+    Пустой набор значит «не заводили ничего», и на нём сервер завёл бы все
+    заготовки заново: удалённые чаты вернулись бы, живые задвоились — ровно
+    та поломка, от которой набор ключей и защищает. Отличить испорченную
+    запись от пустой базы нельзя, поэтому сервер не заводит ничего, ничего
+    не перезаписывает и говорит об этом в лог.
+    """
+    import logging
+
+    path = _temp_db("broken-marker")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        before = [a["label"] for a in main._listing()["agents"]]
+        victim = next(a for a in main.REGISTRY.list() if a.spec.label == "День 1: Ответ")
+        main.REGISTRY.kill(victim.id)
+        before = [label for label in before if label != "День 1: Ответ"]
+
+        for broken in ('{"не": "список"}', "[1, 2, 3]", "не json вовсе", '["ключ", 7]'):
+            store.set_meta(main.PRESETS_KEY, broken)
+            records = []
+
+            class _Catch(logging.Handler):
+                def emit(self, record):
+                    records.append(record.getMessage())
+
+            handler = _Catch()
+            main.LOG.addHandler(handler)
+            try:
+                # `_restart` заводит заготовки сам — этот вызов и проверяем.
+                registry = _restart(store)
+            finally:
+                main.LOG.removeHandler(handler)
+
+            after = [a["label"] for a in main._listing()["agents"]]
+            assert len(registry) == 0, f"на {broken!r} заведено {len(registry)} заготовок"
+            assert after == before, (
+                f"на {broken!r} список изменился: "
+                f"лишние {sorted(set(after) - set(before))}"
+            )
+            assert "День 1: Ответ" not in after, f"на {broken!r} удалённый чат вернулся"
+            # Испорченное значение не перезаписано: его можно посмотреть и починить.
+            assert store.get_meta(main.PRESETS_KEY) == broken, store.get_meta(main.PRESETS_KEY)
+            # И это не молчание: в логе есть что показать.
+            assert any(main.PRESETS_KEY in text for text in records), records
+
+        # Починили запись — заготовки снова заводятся как обычно.
+        store.set_meta(main.PRESETS_KEY, json.dumps(sorted(before_keys())))
+        _restart(store)
+        healed = [a["label"] for a in main._listing()["agents"]]
+    finally:
+        main.REGISTRY = saved_registry
+        store.close()
+
+    assert "День 1: Ответ" not in healed, "починенная запись вернула удалённый чат"
+    assert sorted(healed) == sorted(before), (len(healed), len(before))
+    return "битая отметка: ничего не заведено, ничего не перезаписано, в логе сказано"
+
+
+def before_keys() -> set[str]:
+    """Ключи всех сегодняшних заготовок — то, что пишет здоровый сервер."""
+    return {spec.preset for spec in day.CHATS}
+
+
 @check("база прошлой версии не насыпает дубликатов при переходе на ключи")
 def check_legacy_bootstrap_migrated():
     """До этой правки в базе стояла одна отметка «заготовки заведены».
@@ -2344,6 +2412,7 @@ CHECKS = [
     check_new_preset_appears,
     check_preset_order_changed,
     check_legacy_bootstrap_migrated,
+    check_broken_presets_marker,
     check_list_not_truncated,
     check_list_beyond_cap,
     check_eviction_keeps_session,
