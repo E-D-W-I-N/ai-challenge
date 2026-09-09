@@ -16,7 +16,7 @@ const path = require("path");
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
 
 const app = require(path.join(__dirname, "..", "app", "static", "app.js"));
-const { renderMarkdown, layoutFor, chatTitle } = app;
+const { renderMarkdown, layoutFor, escapeAction, chatTitle } = app;
 
 const failures = [];
 let passed = 0;
@@ -130,6 +130,26 @@ check(
   JSON.stringify(layoutFor(false, { sidebar: "0", panel: "0" })) ===
     JSON.stringify({ sidebar: false, panel: false })
 );
+
+// ── что закрывает Escape ──
+
+check(
+  "Escape закрывает диалог подтверждения всегда",
+  escapeAction(true, false, 0) === "dialog",
+  escapeAction(true, false, 0)
+);
+check(
+  "открытый диалог важнее ящиков",
+  escapeAction(true, true, 2) === "dialog",
+  escapeAction(true, true, 2)
+);
+check(
+  "без диалога Escape закрывает ящики узкого окна",
+  escapeAction(false, true, 1) === "drawers",
+  escapeAction(false, true, 1)
+);
+check("на широком окне Escape не трогает борта", escapeAction(false, false, 2) === null);
+check("закрывать нечего — Escape ничего не делает", escapeAction(false, true, 0) === null);
 
 // ── автоимя чата ──
 

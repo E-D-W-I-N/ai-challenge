@@ -970,6 +970,15 @@ function applyWidth() {
 
 // ─────────────────── очистка и новый чат ──────────────────────
 
+// Что должен закрыть Escape. Диалог подтверждения всегда важнее ящиков:
+// он поверх всего, и пока он открыт, Escape относится к нему.
+// Отдельной функцией без DOM — решение проверяется без браузера.
+function escapeAction(hasDialog, narrow, openDrawerCount) {
+  if (hasDialog) return "dialog";
+  if (narrow && openDrawerCount > 0) return "drawers";
+  return null;
+}
+
 function confirmBox(title, text, onYes) {
   const wrap = document.createElement("div");
   wrap.className = "confirm";
@@ -981,19 +990,32 @@ function confirmBox(title, text, onYes) {
   p.textContent = text;
   const row = document.createElement("div");
   row.className = "confirm-row";
+
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    wrap.remove();
+  };
+  // Escape закрывает диалог всегда, а не только на узком окне: это
+  // подтверждение необратимого действия, и выйти из него надо уметь
+  // не глядя. Обработчик снимается вместе с диалогом.
+  const onKey = (ev) => {
+    if (ev.key === "Escape") close();
+  };
+  document.addEventListener("keydown", onKey);
+
   const no = document.createElement("button");
   no.type = "button";
   no.textContent = "Отмена";
-  no.onclick = () => wrap.remove();
+  no.onclick = close;
   const yes = document.createElement("button");
   yes.type = "button";
   yes.className = "primary";
   yes.textContent = "Очистить";
-  yes.onclick = () => { wrap.remove(); onYes(); };
+  yes.onclick = () => { close(); onYes(); };
   row.append(no, yes);
   box.append(h, p, row);
   wrap.appendChild(box);
-  wrap.onclick = (ev) => { if (ev.target === wrap) wrap.remove(); };
+  wrap.onclick = (ev) => { if (ev.target === wrap) close(); };
   document.body.appendChild(wrap);
 }
 
@@ -1036,7 +1058,14 @@ function init() {
   applyWidth();
   NARROW.addEventListener("change", applyWidth);
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && NARROW.matches && openDrawers().length) closeDrawers();
+    if (ev.key !== "Escape") return;
+    const what = escapeAction(
+      Boolean(document.querySelector(".confirm")),
+      NARROW.matches,
+      openDrawers().length
+    );
+    // Диалог закрывает себя сам — свой обработчик он вешает поверх этого.
+    if (what === "drawers") closeDrawers();
   });
 
   $("#autoname").checked = read(KEYS.autoname, "1") === "1";
@@ -1076,5 +1105,12 @@ function init() {
 if (typeof module === "undefined") {
   init();
 } else {
-  module.exports = { renderMarkdown, escapeHtml, inlineMarkdown, layoutFor, chatTitle };
+  module.exports = {
+    renderMarkdown,
+    escapeHtml,
+    inlineMarkdown,
+    layoutFor,
+    escapeAction,
+    chatTitle,
+  };
 }

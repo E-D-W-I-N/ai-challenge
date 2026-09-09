@@ -595,7 +595,29 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
         raise HTTPException(
             status_code=409, detail="перегенерировать нечего: последнего ответа в истории нет"
         )
-    return _stream(lambda: _regenerate_events(agent, taken), request, agent.release)
+    return _stream(
+        lambda: _regenerate_events(agent, taken), request, _restore_and_release(agent, taken)
+    )
+
+
+def _restore_and_release(agent: Agent, taken) -> Callable[[], None]:
+    """Что сделать, когда поток перегенерации закрылся, чем бы он ни кончился.
+
+    Клиент мог отвалиться **до первого события**: тогда задача с генератором
+    отменяется, не начав выполняться, `_regenerate_events` не запускается,
+    и его `finally` не сработает никогда — снятая пара пропала бы вместе
+    с вопросом. То же место, что и у брони: единственное, что выполнится
+    при любом исходе, — это `finally` в `_pump`, и зовёт он вот это.
+
+    `restore` сам проверяет, не занял ли место новый обмен, поэтому позвать
+    его и отсюда, и из генератора безопасно.
+    """
+
+    def close() -> None:
+        agent.restore(taken)
+        agent.release()
+
+    return close
 
 
 async def _regenerate_events(agent: Agent, taken) -> AsyncIterator[dict]:
@@ -616,6 +638,9 @@ async def _regenerate_events(agent: Agent, taken) -> AsyncIterator[dict]:
         # `restore` сам проверит, не занял ли место новый обмен.
         if not restored:
             agent.restore(taken)
+        # Случай «клиент отвалился, не увидев ни одного события», сюда
+        # не доходит вовсе: генератор не запускается. Его закрывает
+        # `_restore_and_release` из `finally` в `_pump`.
 
 
 async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:

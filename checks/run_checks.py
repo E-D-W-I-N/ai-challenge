@@ -575,6 +575,52 @@ def check_regenerate_failure():
     return "провал вернул пару на место, частичный ответ её заменил"
 
 
+@check("обрыв до первого события не теряет снятую перегенерацией пару")
+def check_regenerate_disconnect():
+    """Дыра того же класса, что залипшая бронь, и закрыта тем же приёмом.
+
+    `take_last_exchange` вызывается в обработчике, до `_stream`, а возврат
+    жил только внутри генератора событий. Если клиент отвалился до первого
+    опроса, генератор отменяется, не начав выполняться, и его `finally`
+    не срабатывает никогда — пара уходила вместе с вопросом.
+    """
+    _stub.install(reply="новый ответ", chunks=10, delay=0.02)
+
+    class Gone:
+        """Клиента уже нет к моменту первого опроса."""
+
+        async def is_disconnected(self) -> bool:
+            return True
+
+    async def scenario():
+        agent = REGISTRY.create(AgentSpec(label="обрыв", model="stub/model"))
+        agent.remember("user", "мой вопрос")
+        agent.remember("assistant", "живой ответ")
+        agent.reserve()
+        taken = agent.take_last_exchange()
+        assert taken is not None
+        assert agent.history == [], "пара обязана сняться до вызова"
+        frames = [
+            frame
+            async for frame in main._pump(
+                lambda: main._regenerate_events(agent, taken),
+                Gone(),
+                # Ровно то, что вешает на поток сама ручка перегенерации.
+                main._restore_and_release(agent, taken),
+            )
+        ]
+        await asyncio.sleep(0.05)
+        return agent, frames
+
+    agent, frames = asyncio.run(scenario())
+    assert frames == [], frames
+    pairs = [(t.role, t.content) for t in agent.history]
+    assert pairs == [("user", "мой вопрос"), ("assistant", "живой ответ")], pairs
+    assert agent.busy is False, "бронь должна сниматься и здесь"
+    assert not _stub.CALLS, "до модели дело дойти не должно было"
+    return "0 кадров, пара на месте, бронь снята"
+
+
 # --- 7. чаты и ростер ---------------------------------------------------------
 
 
@@ -868,6 +914,7 @@ CHECKS = [
     check_first_token,
     check_regenerate,
     check_regenerate_failure,
+    check_regenerate_disconnect,
     check_reset_keeps_roster,
     check_new_chat,
     check_no_key_leak,
