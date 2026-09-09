@@ -1,14 +1,20 @@
 "use strict";
 
+// День 6: ленту диалога хранит агент на сервере. Клиент держит только id
+// агента и шлёт новое сообщение текстом — ни истории, ни модели в теле
+// запроса больше нет.
+
 const state = {
   scenarios: [],
-  current: null,
+  roster: [],
   hasKey: false,
-  overrides: {},      // { sessionLabel: { model } }
-  columns: new Map(), // label -> DOM refs + лента диалога
-  source: null,
+  current: null,        // выбранный сценарий
+  chat: null,           // { id, spec, feed, входное поле, busy } — агент главного экрана
+  columns: new Map(),   // label -> DOM-ссылки колонки-субагента
+  runBlock: null,       // вложенный блок прогона в ленте чата
   running: false,
-  judge: null,        // блок «Вердикт» текущего прогона
+  abort: null,          // AbortController активного потока прогона
+  judge: null,          // блок «Вердикт» текущего прогона
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -25,10 +31,77 @@ function fmtNum(v) {
   return v === null || v === undefined ? "—" : String(v);
 }
 
-async function loadScenarios() {
-  const res = await fetch("/api/scenarios");
-  const data = await res.json();
+// --- сеть ---------------------------------------------------------------
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body && body.detail) {
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      }
+    } catch (e) { /* тело не JSON — остаётся код статуса */ }
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// SSE поверх fetch: и чат, и прогон идут одним и тем же POST-потоком.
+// AbortController нужен не для красоты — оборванный fetch закрывает соединение,
+// сервер это видит и гасит вызов к модели.
+async function streamEvents(path, body, onEvent, signal) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const parsed = await res.json();
+      if (parsed && parsed.detail) {
+        detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
+      }
+    } catch (e) { /* тело не JSON */ }
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      frame.split("\n").forEach((line) => {
+        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
+      });
+    }
+  }
+}
+
+// Тело сообщения — только текст. Всё остальное у агента уже есть.
+function sendTo(agentId, text, onEvent, signal) {
+  return streamEvents(`/api/agents/${agentId}/messages`, { text }, onEvent, signal);
+}
+
+// --- загрузка дня --------------------------------------------------------
+
+async function loadDay() {
+  const data = await api("/api/scenarios");
   state.scenarios = data.scenarios;
+  state.roster = data.roster;
   state.hasKey = !!data.has_key;
 
   const badge = $("#key-status");
@@ -36,12 +109,11 @@ async function loadScenarios() {
   badge.className = "badge " + (data.has_key ? "ok" : "bad");
 
   renderSidebar();
-
-  // Сценарий в дне часто один — выбирать не из чего, показываем сразу.
-  if (state.scenarios.length === 1) selectScenario(0);
+  renderRoster();
+  await newChatAgent(0);
+  refreshRegistry();
 }
 
-// Сценарии дня простым списком, в порядке из SCENARIOS.
 function renderSidebar() {
   const list = $("#scenario-list");
   list.innerHTML = "";
@@ -49,7 +121,6 @@ function renderSidebar() {
     list.innerHTML = '<p class="empty-hint">Сценариев нет — day.py не отдал ни одного</p>';
     return;
   }
-
   const ul = document.createElement("ul");
   ul.className = "scenarios";
   state.scenarios.forEach((sc) => {
@@ -62,22 +133,229 @@ function renderSidebar() {
   list.appendChild(ul);
 }
 
-function selectScenario(index) {
+// Реестр процесса виден в сайдбаре: сто агентов — это сто строк здесь,
+// а не сто вкладок и не сто процессов.
+async function refreshRegistry() {
+  let data;
+  try {
+    data = await api("/api/agents");
+  } catch (e) {
+    return;
+  }
+  $("#registry-badge").textContent = `агентов: ${data.live} из ${data.max_agents}`;
+  const box = $("#agent-list");
+  box.innerHTML = "";
+  data.agents.forEach((a) => {
+    const row = document.createElement("div");
+    row.className = "agent-row" + (state.chat && a.id === state.chat.id ? " active" : "");
+    row.innerHTML = `<span class="agent-row-label"></span><span class="agent-row-id"></span>`;
+    row.querySelector(".agent-row-label").textContent =
+      (a.parent_id ? "↳ " : "") + a.label + (a.history_len ? ` · ${a.history_len}` : "");
+    row.querySelector(".agent-row-id").textContent = a.id;
+    row.title = `${a.model}\nокно памяти ${a.history_limit}, реплик ${a.history_len}`;
+    box.appendChild(row);
+  });
+}
+
+// --- чат с агентом главного экрана ---------------------------------------
+
+function renderRoster() {
+  const sel = $("#roster-select");
+  sel.innerHTML = "";
+  state.roster.forEach((spec, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = spec.label;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => newChatAgent(Number(sel.value));
+}
+
+async function newChatAgent(rosterIndex) {
+  const spec = state.roster[rosterIndex] || state.roster[0];
+  if (!spec) return;
+  // Прошлый собеседник уходит вместе со своими субагентами: реестр не должен
+  // копить брошенные диалоги.
+  if (state.chat) {
+    try { await api(`/api/agents/${state.chat.id}`, { method: "DELETE" }); } catch (e) { /* уже нет */ }
+  }
+  const created = await api("/api/agents", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agent: agentPayload(spec) }),
+  });
+  const agent = created.agents[0];
+  state.chat = { id: agent.id, spec, busy: false, rosterIndex };
+  $("#chat-agent-id").textContent = `${agent.id} · ${agent.model} · окно памяти ${agent.history_limit}`;
+  $("#chat-feed").innerHTML = "";
+  hideStage();
+  appendChat("system-note", chatHint(spec));
+  setChatBusy(false);
+  refreshRegistry();
+}
+
+// Конфиг для ручки создания: ровно те поля, которые она принимает.
+function agentPayload(spec) {
+  return {
+    label: spec.label,
+    model: spec.model,
+    messages: spec.messages || [],
+    temperature: spec.temperature ?? null,
+    max_tokens: spec.max_tokens ?? null,
+    stop: spec.stop ?? null,
+    response_format: spec.response_format ?? null,
+    extra_body: spec.extra_body || {},
+    system: spec.system || "",
+    note: spec.note || "",
+    repeats: spec.repeats ?? 1,
+    history_limit: spec.history_limit ?? null,
+  };
+}
+
+function chatHint(spec) {
+  const lines = [spec.note || "Агент готов."];
+  if (state.scenarios.length) {
+    lines.push("Команда /прогон <номер> запускает сценарий субагентами:");
+    state.scenarios.forEach((sc) => lines.push(`  /прогон ${sc.index + 1} — ${sc.title}`));
+  }
+  if (!state.hasKey) lines.push("Нужен .env с OPENROUTER_API_KEY — без него вызова не будет.");
+  return lines.join("\n");
+}
+
+function appendChat(kind, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + kind;
+  if (kind !== "system-note") {
+    const head = document.createElement("div");
+    head.className = "role";
+    head.textContent = kind === "user" ? "вы" : kind;
+    el.appendChild(head);
+  }
+  const body = document.createElement("div");
+  body.className = "body";
+  body.textContent = text || "";
+  el.appendChild(body);
+  const feed = $("#chat-feed");
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight;
+  return body;
+}
+
+function setChatBusy(busy) {
+  if (state.chat) state.chat.busy = busy;
+  const locked = busy || !state.hasKey;
+  $("#chat-input").disabled = locked;
+  $("#chat-send").disabled = locked;
+  $("#chat-input").placeholder = state.hasKey
+    ? "Спросить агента или /прогон 1…"
+    : "Нужен .env с OPENROUTER_API_KEY";
+  $("#chat-form").classList.toggle("locked", !state.hasKey);
+}
+
+function autoGrow(input) {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+}
+
+async function sendChat() {
+  const input = $("#chat-input");
+  const text = (input.value || "").trim();
+  if (!text || !state.chat || state.chat.busy) return;
+  const isCommand = text.startsWith("/") && !text.startsWith("//");
+  if (!isCommand && !state.hasKey) return;
+
+  input.value = "";
+  autoGrow(input);
+  const questionBox = appendChat("user", text).parentElement;
+  setChatBusy(true);
+
+  const controller = new AbortController();
+  state.abort = controller;
+  let body = null;
+  let answer = "";
+  let failed = null;
+
+  try {
+    await sendTo(state.chat.id, text, (e) => {
+      if (isCommand) {
+        handleRunEvent(e);
+        return;
+      }
+      switch (e.event) {
+        case "delta":
+          if (!body) body = appendChat("assistant", "");
+          answer += e.text;
+          body.textContent = answer;
+          $("#chat-feed").scrollTop = $("#chat-feed").scrollHeight;
+          break;
+        case "done":
+          if (e.text) {
+            if (!body) body = appendChat("assistant", "");
+            answer = e.text;
+            body.textContent = answer;
+          }
+          break;
+        case "error":
+          failed = e.message;
+          break;
+      }
+    }, controller.signal);
+  } catch (err) {
+    if (err.name !== "AbortError") failed = String(err.message || err);
+  }
+
+  if (failed) {
+    // Обмена не было: агент вопрос не запомнил, и в ленте его оставлять нельзя —
+    // текст возвращается в поле ввода, чтобы можно было повторить.
+    if (!answer) {
+      questionBox.remove();
+      if (!input.value) { input.value = text; autoGrow(input); }
+    }
+    appendChat("failed", failed);
+  }
+  state.abort = null;
+  setChatBusy(false);
+  refreshRegistry();
+}
+
+// --- сценарий и колонки-субагенты ----------------------------------------
+
+function hideStage() {
+  $("#stage").classList.add("hidden");
+  $("#verdict").classList.add("hidden");
+  $("#summary").classList.add("hidden");
+  state.columns.clear();
+  state.current = null;
+  document.querySelectorAll("#scenario-list li").forEach((li) => li.classList.remove("active"));
+}
+
+async function selectScenario(index) {
   const sc = state.scenarios[index];
-  if (!sc) return;
-  // Переключение сценария обрывает текущий прогон. Иначе старый EventSource
-  // остаётся открытым и продолжает слать события, а колонки он ищет по label —
-  // совпавший label нового сценария принял бы чужой текст.
+  if (!sc || !state.chat) return;
   stopRun();
   state.current = sc;
-  state.overrides = {};
   document.querySelectorAll("#scenario-list li").forEach((li) => {
     li.classList.toggle("active", Number(li.dataset.index) === index);
   });
+
+  // Агенты колонок создаются заранее: с колонкой можно переписываться
+  // до «Старта» — она уже настоящая сессия, а не заготовка.
+  let spawned;
+  try {
+    spawned = await api(`/api/scenarios/${index}/agents?parent=${state.chat.id}`, { method: "POST" });
+  } catch (err) {
+    appendChat("failed", `не удалось создать субагентов: ${err.message}`);
+    return;
+  }
+
+  $("#stage").classList.remove("hidden");
+  // Колонки первыми: дропдаун берёт текущую модель из state.columns, и она
+  // должна быть там до того, как соберутся сами дропдауны.
+  renderColumns(spawned.agents, sc.layout);
   renderScenarioBar(sc);
-  renderColumns(sc.sessions, sc.layout);
   resetVerdict();
   $("#summary").classList.add("hidden");
+  refreshRegistry();
 }
 
 // Шапка сценария — одна компактная строка: название, модели, «Старт».
@@ -86,10 +364,10 @@ function selectScenario(index) {
 function renderScenarioBar(sc) {
   const bar = $("#scenario-bar");
   bar.innerHTML = `
-    <h2 class="scenario-title">${sc.title}</h2>
+    <h2 class="scenario-title"></h2>
     <div id="pickers" class="pickers"></div>
     <button class="start" id="start-btn">Старт</button>`;
-
+  bar.querySelector(".scenario-title").textContent = sc.title;
   $("#start-btn").onclick = startRun;
   buildPickers(sc);
 }
@@ -106,16 +384,13 @@ async function buildPickers(sc) {
   if (sc.sessions.some((s) => s.stop && s.stop.length)) requires.push("stop");
   if (sc.sessions.some((s) => s.response_format)) requires.push("response_format");
   if (requires.length) params.set("requires", requires.join(","));
-  // День 5 сравнивает стоимость: :free и :batch уже отброшены на бэке, но
-  // бесплатные варианты убираем и здесь.
   params.set("exclude_free", "true");
   // День 4: anthropic/* обрезает температуру на 1.0 и вернёт 400 на 1.2.
   if (hotTemperature) params.set("exclude_temperature_capped", "true");
 
   let models = [];
   try {
-    const res = await fetch("/api/models?" + params.toString());
-    models = (await res.json()).models || [];
+    models = (await api("/api/models?" + params.toString())).models || [];
   } catch (e) {
     box.innerHTML = '<span class="hint">каталог моделей недоступен — берём модели из сценария</span>';
     return;
@@ -123,6 +398,7 @@ async function buildPickers(sc) {
 
   box.innerHTML = "";
   sc.sessions.forEach((s) => {
+    const col = state.columns.get(s.label);
     const wrap = document.createElement("label");
     wrap.className = "model-picker";
     if (sc.sessions.length > 1) {
@@ -132,9 +408,10 @@ async function buildPickers(sc) {
       wrap.appendChild(name);
     }
     const sel = document.createElement("select");
-    const options = models.some((m) => m.id === s.model)
+    const current = col ? col.model : s.model;
+    const options = models.some((m) => m.id === current)
       ? models
-      : [{ id: s.model, name: s.model + " (из сценария)", prompt_price_per_m: 0, completion_price_per_m: 0 }, ...models];
+      : [{ id: current, name: current + " (из сценария)", prompt_price_per_m: 0, completion_price_per_m: 0 }, ...models];
     options.forEach((m) => {
       const opt = document.createElement("option");
       opt.value = m.id;
@@ -142,13 +419,27 @@ async function buildPickers(sc) {
         ? `  ·  $${m.prompt_price_per_m}/$${m.completion_price_per_m} за 1M`
         : "";
       opt.textContent = m.id + price;
-      if (m.id === s.model) opt.selected = true;
+      if (m.id === current) opt.selected = true;
       sel.appendChild(opt);
     });
-    sel.onchange = () => {
-      state.overrides[s.label] = { ...(state.overrides[s.label] || {}), model: sel.value };
-      const col = state.columns.get(s.label);
-      if (col) col.modelId.textContent = sel.value;
+    // Модель меняется прямо на живом агенте: в теле сообщения её больше нет.
+    // Выбор запоминается на агенте и переносится на свежий набор колонок,
+    // который спавнит «Старт», — иначе он молча откатился бы на day.py.
+    sel.onchange = async () => {
+      const entry = state.columns.get(s.label);
+      if (!entry) return;
+      try {
+        const patched = await api(`/api/agents/${entry.agentId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: sel.value }),
+        });
+        entry.model = patched.model;
+        entry.modelId.textContent = patched.model;
+      } catch (err) {
+        setStatus(entry, "error", `модель не сменилась: ${err.message}`);
+        sel.value = entry.model;
+      }
     };
     wrap.appendChild(sel);
     box.appendChild(wrap);
@@ -253,11 +544,6 @@ function appendMessage(col, role, text, caption) {
   return body;
 }
 
-function autoGrow(input) {
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 160) + "px";
-}
-
 function setStatus(col, kind, text) {
   col.status.className = "status" + (kind ? " " + kind : "");
   col.status.textContent = text;
@@ -285,7 +571,7 @@ function buildComposer(col) {
 
   input.title = "Enter — отправить, Shift+Enter — перенос строки";
   if (state.hasKey) {
-    input.placeholder = "Спросить модель…";
+    input.placeholder = "Спросить эту колонку…";
   } else {
     // Без ключа поле недоступно, но видно, чего не хватает.
     input.placeholder = "Нужен .env с OPENROUTER_API_KEY";
@@ -312,20 +598,26 @@ function buildComposer(col) {
   return form;
 }
 
-function renderColumns(sessions, layout) {
+// agents — то, что вернула ручка спавна или run_start: у каждой колонки есть
+// живой агент, и колонка адресуется его id.
+function renderColumns(agents, layout) {
   const box = $("#columns");
   box.className = "columns" + (layout === "single" ? " single" : "");
   box.innerHTML = "";
   state.columns.clear();
 
-  sessions.forEach((s) => {
+  agents.forEach((a) => {
     const col = document.createElement("div");
     col.className = "column";
 
     const head = document.createElement("header");
-    head.innerHTML = `<h3>${s.label}</h3>
-      <div class="modelid">${s.model}</div>
-      ${s.note ? `<div class="note">${s.note}</div>` : ""}`;
+    head.innerHTML = `<h3></h3><div class="modelid"></div><div class="agent-id"></div>
+      <div class="note"></div>`;
+    head.querySelector("h3").textContent = a.label;
+    head.querySelector(".modelid").textContent = a.model;
+    head.querySelector(".agent-id").textContent = a.id;
+    const note = head.querySelector(".note");
+    if (a.note) note.textContent = a.note; else note.remove();
 
     // Лента: промпт сверху (виден до «Старта»), ответы и ручные вопросы — под ним.
     const chat = document.createElement("div");
@@ -340,7 +632,8 @@ function renderColumns(sessions, layout) {
     STAT_FIELDS.forEach(([key, title]) => {
       const row = document.createElement("div");
       row.className = "stat";
-      row.innerHTML = `<span class="k">${title}</span><span class="v">—</span>`;
+      row.innerHTML = `<span class="k"></span><span class="v">—</span>`;
+      row.querySelector(".k").textContent = title;
       values[key] = row.querySelector(".v");
       stats.appendChild(row);
     });
@@ -356,11 +649,12 @@ function renderColumns(sessions, layout) {
 
     const status = document.createElement("div");
     status.className = "status";
-    status.textContent = "ожидание";
+    status.textContent = "готова к разговору";
 
     const entry = {
-      label: s.label,
-      session: s,
+      label: a.label,
+      agentId: a.id,
+      model: a.model,
       root: col,
       modelId: head.querySelector(".modelid"),
       values,
@@ -369,9 +663,8 @@ function renderColumns(sessions, layout) {
       statsNote,
       uniq,
       status,
-      dependsOn: s.depends_on || null,
-      base: (s.messages || []).map((m) => ({ role: m.role, content: m.content })),
-      turns: [],          // всё, что добавилось после промпта сценария
+      dependsOn: a.depends_on || null,
+      base: (a.seed_messages || []).map((m) => ({ role: m.role, content: m.content })),
       answer: null,       // тело ответа сценария, в него стримятся delta
       repeatsTotal: 1,    // длина серии: приходит в session_start
       repeats: new Map(), // индекс прогона -> тело его блока
@@ -385,7 +678,19 @@ function renderColumns(sessions, layout) {
     box.appendChild(col);
 
     renderPrompt(entry, entry.base, false);
-    state.columns.set(s.label, entry);
+    state.columns.set(a.label, entry);
+  });
+
+  // Стартовый промпт колонки приезжает отдельным запросом: ручка спавна
+  // отдаёт конфиг без стенограммы, а показать промпт надо до «Старта».
+  agents.forEach(async (a) => {
+    const entry = state.columns.get(a.label);
+    if (!entry || entry.base.length) return;
+    try {
+      const full = await api(`/api/agents/${a.id}`);
+      entry.base = (full.seed_messages || []).map((m) => ({ role: m.role, content: m.content }));
+      renderPrompt(entry, entry.base, false);
+    } catch (e) { /* промпт не показали — колонка всё равно работает */ }
   });
 }
 
@@ -444,61 +749,7 @@ function applyMetrics(col, metrics) {
   });
 }
 
-// --- ручной ввод: диалог продолжается всей накопленной лентой колонки ---
-
-function columnModel(col) {
-  return (state.overrides[col.label] || {}).model || col.session.model;
-}
-
-function columnPayload(col) {
-  const s = col.session;
-  return {
-    label: col.label,
-    model: columnModel(col),
-    messages: col.base.concat(col.turns),
-    temperature: s.temperature ?? null,
-    max_tokens: s.max_tokens ?? null,
-    stop: s.stop ?? null,
-    response_format: s.response_format ?? null,
-    extra_body: s.extra_body || {},
-  };
-}
-
-// SSE поверх POST: тело запроса — вся лента колонки, в GET-строку она не влезет.
-async function streamChat(payload, onEvent) {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body && body.detail) {
-        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
-      }
-    } catch (e) { /* тело не JSON — остаётся код статуса */ }
-    throw new Error(detail);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buffer.indexOf("\n\n")) >= 0) {
-      const frame = buffer.slice(0, cut);
-      buffer = buffer.slice(cut + 2);
-      frame.split("\n").forEach((line) => {
-        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
-      });
-    }
-  }
-}
+// --- ручной вопрос колонке: тело запроса — только текст -------------------
 
 async function sendManual(col) {
   const text = (col.input.value || "").trim();
@@ -506,21 +757,15 @@ async function sendManual(col) {
 
   col.input.value = "";
   autoGrow(col.input);
-  // Вопрос уходит в модель вместе со всей лентой: диалог продолжается.
-  const question = { role: "user", content: text };
-  col.turns.push(question);
   const questionBox = appendMessage(col, "user", text).parentElement;
-
   const body = appendMessage(col, "assistant", "");
   setBusy(col, true);
   setStatus(col, "", "генерация…");
 
-  // Обмен не состоялся: вопрос нельзя оставлять ни в ленте, ни в col.turns —
-  // иначе он уйдёт в модель ещё раз, вторым user-сообщением подряд, а в кадре
-  // этого не видно. Текст возвращается в поле ввода, чтобы можно было повторить.
+  // Обмен не состоялся: агент вопрос не запомнил, значит и в ленте его быть
+  // не должно — иначе кадр врёт про то, что видит модель. Текст возвращается
+  // в поле ввода, чтобы можно было повторить.
   const rollback = () => {
-    const i = col.turns.lastIndexOf(question);
-    if (i >= 0) col.turns.splice(i, 1);
     questionBox.remove();
     body.parentElement.remove();
     if (!col.input.value) {
@@ -532,7 +777,7 @@ async function sendManual(col) {
   let answer = "";
   let failed = false;
   try {
-    await streamChat(columnPayload(col), (e) => {
+    await sendTo(col.agentId, text, (e) => {
       switch (e.event) {
         case "delta":
           answer += e.text;
@@ -561,8 +806,6 @@ async function sendManual(col) {
   }
 
   if (answer) {
-    // Ответ есть — он часть диалога, даже если поток оборвался на середине.
-    col.turns.push({ role: "assistant", content: answer });
     if (!col.status.classList.contains("error")) setStatus(col, "", "готово");
   } else if (failed) {
     rollback();
@@ -570,12 +813,11 @@ async function sendManual(col) {
 
   setBusy(col, false);
   scrollChat(col);
+  refreshRegistry();
 }
 
-// --- блок «Вердикт»: ответ модели-судьи на вопросы задания дня ---
+// --- блок «Вердикт»: ответ модели-судьи -----------------------------------
 
-// Судья вызывается только у сценариев с judge_questions, поэтому блока
-// может не быть вовсе — тогда его просто не показываем.
 function resetVerdict() {
   state.judge = null;
   const box = $("#verdict");
@@ -608,7 +850,7 @@ function verdictStatus(kind, text) {
 }
 
 function startVerdict(e) {
-  const judge = verdictBox("судит " + e.model);
+  const judge = verdictBox("судит " + e.model + (e.agent ? " · " + e.agent : ""));
   // Пока судья молчит, в кадре должно быть видно, что он работает,
   // а не пустой блок.
   judge.root.classList.add("busy");
@@ -654,9 +896,88 @@ function skipVerdict(message) {
   verdictStatus("", message);
 }
 
-// --- прогон сценария ---
+// --- вложенный блок прогона в ленте чата ----------------------------------
 
-// Кнопка «Старт» снова рабочая, колонки больше не «генерируют».
+// Прогон живёт в ленте чата отдельным блоком с дорожками по субагентам.
+// Дорожка — это витрина: полная сессия колонки открывается кнопкой.
+function runBlock(title) {
+  const el = document.createElement("div");
+  el.className = "run-block";
+  el.innerHTML = `<div class="run-head"><span class="run-title"></span><span class="run-state"></span></div>
+    <div class="lanes"></div><div class="run-foot"></div>`;
+  el.querySelector(".run-title").textContent = title;
+  const feed = $("#chat-feed");
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight;
+  return {
+    root: el,
+    lanes: el.querySelector(".lanes"),
+    state: el.querySelector(".run-state"),
+    foot: el.querySelector(".run-foot"),
+    byLabel: new Map(),
+  };
+}
+
+function addLane(block, label, agentId) {
+  const lane = document.createElement("div");
+  lane.className = "lane";
+  lane.innerHTML = `<div class="lane-head"><span class="lane-label"></span>
+      <span class="lane-agent"></span>
+      <button class="ghost lane-open" type="button">Открыть сессию</button></div>
+    <div class="lane-body"></div><div class="lane-foot"></div>`;
+  lane.querySelector(".lane-label").textContent = label;
+  lane.querySelector(".lane-agent").textContent = agentId || "";
+  lane.querySelector(".lane-open").onclick = () => openLane(label);
+  block.lanes.appendChild(lane);
+  const entry = {
+    root: lane,
+    body: lane.querySelector(".lane-body"),
+    foot: lane.querySelector(".lane-foot"),
+    text: "",
+  };
+  block.byLabel.set(label, entry);
+  return entry;
+}
+
+function lane(label) {
+  if (!state.runBlock) return null;
+  return state.runBlock.byLabel.get(label) || addLane(state.runBlock, label, "");
+}
+
+// «Открыть сессию» — это переход к колонке: она и есть отдельная сессия
+// с собственным полем ввода и собственной историей на сервере.
+function openLane(label) {
+  const col = state.columns.get(label);
+  if (!col) return;
+  $("#stage").classList.remove("hidden");
+  col.root.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  col.root.classList.add("highlight");
+  setTimeout(() => col.root.classList.remove("highlight"), 1200);
+  if (col.input && !col.input.disabled) col.input.focus();
+}
+
+function laneTail(entry) {
+  // В дорожке видно, что модель пишет; целиком ответ читают в колонке.
+  const text = entry.text;
+  entry.body.textContent = text.length > 400 ? "…" + text.slice(-400) : text;
+  const feed = $("#chat-feed");
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function laneFoot(entry, metrics, extra) {
+  const parts = [];
+  if (metrics) {
+    if (metrics.ttft_ms !== null && metrics.ttft_ms !== undefined) parts.push("TTFT " + fmtMs(metrics.ttft_ms));
+    if (metrics.completion_tokens || metrics.tokens_out) parts.push((metrics.completion_tokens || metrics.tokens_out) + " токенов");
+    if (metrics.cost_usd !== null && metrics.cost_usd !== undefined) parts.push(fmtCost(metrics.cost_usd));
+    if (metrics.finish_reason) parts.push(metrics.finish_reason);
+  }
+  if (extra) parts.unshift(extra);
+  entry.foot.textContent = parts.join("  ·  ");
+}
+
+// --- прогон сценария ------------------------------------------------------
+
 function resetRunUi() {
   state.running = false;
   const btn = $("#start-btn");
@@ -665,213 +986,230 @@ function resetRunUi() {
     btn.textContent = "Старт";
   }
   state.columns.forEach((col) => setBusy(col, false));
+  setChatBusy(false);
 }
 
-// Обрывает активный прогон и забывает поток: всё, что придёт по нему после
-// этого, уже не относится к тому, что на экране.
+// Обрывает активный прогон. Оборванный fetch закрывает соединение — сервер
+// видит обрыв и гасит вызовы к модели, а не дожёвывает их за наш счёт.
 function stopRun() {
-  if (state.source) {
-    state.source.close();
-    state.source = null;
+  if (state.abort) {
+    state.abort.abort();
+    state.abort = null;
   }
   resetRunUi();
 }
 
+// «Старт» — это та же команда /прогон, что и в чате: один путь, один поток
+// событий. Сервер сам убивает предыдущий набор субагентов и спавнит свежий.
 function startRun() {
-  if (!state.current || state.running) return;
-  const btn = $("#start-btn");
-  btn.disabled = true;
-  btn.textContent = "идёт прогон…";
-  state.running = true;
+  if (!state.current || state.running || !state.chat) return;
+  $("#chat-input").value = `/прогон ${state.current.index + 1}`;
+  sendChat();
+}
 
-  const sessions = state.current.sessions.map((s) => ({
-    ...s,
-    ...(state.overrides[s.label] || {}),
-  }));
-  renderColumns(sessions, state.current.layout);
-  resetVerdict();
-  $("#summary").classList.add("hidden");
-  state.columns.forEach((col) => setBusy(col, true));
+const runTotals = { cost: 0, tokens: 0, done: 0, expected: 0, startedAt: 0 };
+const runStarted = new Set();
+const runSettled = new Set();
 
-  const totals = { cost: 0, tokens: 0, done: 0, expected: sessions.length };
-  // Ход прогона по колонкам: нужен, чтобы при обрыве объяснить происходящее
-  // именно тем колонкам, которые всё ещё чего-то ждут.
-  const started = new Set();   // пришёл session_start
-  const settled = new Set();   // пришёл session_done или session_error
-  const startedAt = performance.now();
-  let gotEvent = false;
+function handleRunEvent(e) {
+  const col = e.session ? state.columns.get(e.session) : null;
+  const track = e.session ? lane(e.session) : null;
 
-  const finish = () => {
-    state.source = null;
-    resetRunUi();
-  };
+  switch (e.event) {
+    case "command_start":
+      state.running = true;
+      runTotals.cost = 0;
+      runTotals.tokens = 0;
+      runTotals.done = 0;
+      runTotals.startedAt = performance.now();
+      runStarted.clear();
+      runSettled.clear();
+      state.runBlock = runBlock("Прогон: " + e.title);
+      state.runBlock.state.textContent = "спавним субагентов…";
+      resetVerdict();
+      $("#summary").classList.add("hidden");
+      if ($("#start-btn")) {
+        $("#start-btn").disabled = true;
+        $("#start-btn").textContent = "идёт прогон…";
+      }
+      break;
 
-  const qs = Object.keys(state.overrides).length
-    ? "?overrides=" + encodeURIComponent(JSON.stringify(state.overrides))
-    : "";
-  const source = new EventSource(`/api/run/${state.current.index}${qs}`);
-  state.source = source;
-
-  // Поток принадлежит тому сценарию, на котором его запустили. Если он больше
-  // не текущий — его успели оборвать, и всё пришедшее по нему отбрасываем.
-  const isCurrent = () => state.source === source;
-
-  // Обрыв потока EventSource сообщает без причины и без текста. Молчать здесь
-  // нельзя: колонка так и осталась бы в «генерация…», а на записи это
-  // неотличимо от медленной модели. Объясняем обрыв каждой колонке, которая
-  // его не дождалась, и подводим итог по тому, что успело досчитаться.
-  const abort = () => {
-    const reason = gotEvent
-      ? "соединение со стендом оборвано"
-      : "стенд недоступен";
-    state.columns.forEach((col, label) => {
-      if (settled.has(label)) return;
-      setStatus(col, "error", started.has(label)
-        ? `${reason} — ответ не дописан`
-        : `${reason} — колонка не запускалась`);
-    });
-    finish();
-    if (totals.done) renderSummary(totals, performance.now() - startedAt, true);
-  };
-
-  source.onmessage = (ev) => {
-    if (!isCurrent()) {
-      source.close();
-      return;
+    case "run_start": {
+      // Набор свежий: колонки перерисовываем по нему, старые id больше не живут.
+      const sc = state.scenarios[e.scenario];
+      if (sc) {
+        state.current = sc;
+        document.querySelectorAll("#scenario-list li").forEach((li) => {
+          li.classList.toggle("active", Number(li.dataset.index) === e.scenario);
+        });
+      }
+      const byLabel = new Map((e.agents || []).map((a) => [a.session, a.agent]));
+      const agents = (e.sessions || []).map((s) => ({ ...s, id: byLabel.get(s.label) || "", seed_messages: s.messages }));
+      $("#stage").classList.remove("hidden");
+      renderColumns(agents, e.layout);
+      // Шапка после колонок: в e.sessions уже стоит выбранная пользователем
+      // модель, и дропдаун должен встать на неё, а не откатиться на day.py.
+      renderScenarioBar(sc || { title: e.title, sessions: e.sessions || [] });
+      state.columns.forEach((c) => setBusy(c, true));
+      runTotals.expected = agents.length;
+      state.runBlock.state.textContent = `${agents.length} субагентов`;
+      agents.forEach((a) => addLane(state.runBlock, a.label, a.id));
+      break;
     }
-    const e = JSON.parse(ev.data);
-    gotEvent = true;
-    const col = e.session ? state.columns.get(e.session) : null;
 
-    switch (e.event) {
-      case "session_waiting":
-        if (col) setStatus(col, "waiting", `ждёт вывод колонки «${e.on}»`);
-        break;
-      case "session_start":
-        started.add(e.session);
-        if (col) {
-          col.repeatsTotal = e.repeats || 1;
-          setStatus(col, "", col.repeatsTotal > 1
-            ? `генерация… прогон 1 из ${col.repeatsTotal}`
-            : "генерация…");
-          // Для колонки с depends_on это первый момент, когда известен
-          // итоговый промпт: заменяем предварительный текст на него.
-          if (e.resolved_messages) {
-            col.base = e.resolved_messages.map((m) => ({ role: m.role, content: m.content }));
-            renderPrompt(col, col.base, true);
-          }
-        }
-        break;
-      case "repeat_start":
-        if (col) {
-          col.repeatsTotal = e.repeats || col.repeatsTotal;
-          answerBlock(col, e.repeat);
-          setStatus(col, "", `генерация… прогон ${e.repeat + 1} из ${col.repeatsTotal}`);
-          // Панель метрик подписана прогоном: видно, к чему относятся цифры.
-          col.statsNote.classList.remove("hidden");
-          col.statsNote.textContent = `метрики прогона ${e.repeat + 1} из ${col.repeatsTotal}`;
-        }
-        break;
-      case "delta":
-        if (col) {
-          answerBlock(col, e.repeat).textContent += e.text;
-          applyMetrics(col, e.metrics);
-          scrollChat(col);
-        }
-        break;
-      case "metrics":
-        if (col) applyMetrics(col, e.metrics);
-        break;
-      case "repeat_done":
-        if (col) {
-          applyMetrics(col, e.metrics);
-          repeatMetricsLine(answerBlock(col, e.repeat), e.metrics);
-          col.texts.push(e.text || "");
-          updateUniq(col);
-          // Сумма по прогону складывается здесь: session_done у серии несёт
-          // метрики последнего прогона и второй раз их считать нельзя.
-          if (e.metrics) {
-            if (e.metrics.cost_usd) totals.cost += e.metrics.cost_usd;
-            if (e.metrics.total_tokens) totals.tokens += e.metrics.total_tokens;
-          }
-          scrollChat(col);
-        }
-        break;
-      case "repeat_error":
-        // Падение одного прогона не хоронит колонку: серия идёт дальше.
-        if (col) {
-          const body = answerBlock(col, e.repeat);
-          body.classList.add("failed");
-          body.textContent = e.message;
-          applyMetrics(col, e.metrics);
-          scrollChat(col);
-        }
-        break;
-      case "session_error":
-        settled.add(e.session);
-        if (col) {
-          setStatus(col, "error", e.message);
-          applyMetrics(col, e.metrics);
-        }
-        break;
-      case "session_done":
-        settled.add(e.session);
-        if (col) {
-          applyMetrics(col, e.metrics);
-          // У серии суммы уже сложены по repeat_done — иначе последний
-          // прогон посчитался бы дважды.
-          if (e.metrics && !(e.repeats > 1)) {
-            if (e.metrics.cost_usd) totals.cost += e.metrics.cost_usd;
-            if (e.metrics.total_tokens) totals.tokens += e.metrics.total_tokens;
-          }
-          if (e.repeats > 1) {
-            // Серия, из которой не выжил ни один прогон, — это провал колонки,
-            // а не «готово»: ответов ноль, и строка состояния обязана это
-            // сказать, иначе она противоречит красным блокам в ленте.
-            if (!(e.texts || []).length) {
-              setStatus(col, "error", `ни один прогон не удался — 0 из ${e.repeats}`);
-              col.statsNote.textContent = "метрик удачных прогонов нет";
-            } else {
-              col.statsNote.textContent = `метрики последнего прогона из ${e.repeats}`;
-              updateUniq(col);
-            }
-          }
-          if (!col.status.classList.contains("error")) setStatus(col, "", "готово");
-          // Ответ сценария становится частью диалога: следующий ручной
-          // вопрос уйдёт в модель вместе с ним.
-          const answer = (e.text || "").trim();
-          if (answer) col.turns.push({ role: "assistant", content: answer });
-          setBusy(col, false);
-        }
-        totals.done += 1;
-        break;
-      case "judge_start":
-        startVerdict(e);
-        break;
-      case "judge_delta":
-        appendVerdict(e.text);
-        break;
-      case "judge_done":
-        finishVerdict(e);
-        break;
-      case "judge_error":
-        failVerdict(e.message);
-        break;
-      case "judge_skipped":
-        skipVerdict(e.message);
-        break;
-      case "run_done":
-        source.close();
-        finish();
-        renderSummary(totals, e.wall_clock_ms);
-        break;
-    }
-  };
+    case "session_waiting":
+      if (col) setStatus(col, "waiting", `ждёт вывод колонки «${e.on}»`);
+      if (track) laneFoot(track, null, `ждёт «${e.on}»`);
+      break;
 
-  source.onerror = () => {
-    source.close();
-    if (isCurrent()) abort();
-  };
+    case "session_start":
+      runStarted.add(e.session);
+      if (col) {
+        col.repeatsTotal = e.repeats || 1;
+        setStatus(col, "", col.repeatsTotal > 1
+          ? `генерация… прогон 1 из ${col.repeatsTotal}`
+          : "генерация…");
+        // Для колонки с depends_on это первый момент, когда известен
+        // итоговый промпт: заменяем предварительный текст на него.
+        if (e.resolved_messages) {
+          col.base = e.resolved_messages.map((m) => ({ role: m.role, content: m.content }));
+          renderPrompt(col, col.base, true);
+        }
+      }
+      if (track) laneFoot(track, null, "генерация…");
+      break;
+
+    case "repeat_start":
+      if (col) {
+        col.repeatsTotal = e.repeats || col.repeatsTotal;
+        answerBlock(col, e.repeat);
+        setStatus(col, "", `генерация… прогон ${e.repeat + 1} из ${col.repeatsTotal}`);
+        // Панель метрик подписана прогоном: видно, к чему относятся цифры.
+        col.statsNote.classList.remove("hidden");
+        col.statsNote.textContent = `метрики прогона ${e.repeat + 1} из ${col.repeatsTotal}`;
+      }
+      if (track) {
+        track.text = "";
+        laneFoot(track, null, `прогон ${e.repeat + 1} из ${e.repeats}`);
+      }
+      break;
+
+    case "delta":
+      if (col) {
+        answerBlock(col, e.repeat).textContent += e.text;
+        applyMetrics(col, e.metrics);
+        scrollChat(col);
+      }
+      if (track) {
+        track.text += e.text;
+        laneTail(track);
+      }
+      break;
+
+    case "metrics":
+      if (col) applyMetrics(col, e.metrics);
+      break;
+
+    case "repeat_done":
+      if (col) {
+        applyMetrics(col, e.metrics);
+        repeatMetricsLine(answerBlock(col, e.repeat), e.metrics);
+        col.texts.push(e.text || "");
+        updateUniq(col);
+        // Сумма по прогону складывается здесь: session_done у серии несёт
+        // метрики последнего прогона и второй раз их считать нельзя.
+        if (e.metrics) {
+          if (e.metrics.cost_usd) runTotals.cost += e.metrics.cost_usd;
+          if (e.metrics.total_tokens) runTotals.tokens += e.metrics.total_tokens;
+        }
+        scrollChat(col);
+      }
+      if (track) laneFoot(track, e.metrics, `прогон ${e.repeat + 1} готов`);
+      break;
+
+    case "repeat_error":
+      // Падение одного прогона не хоронит колонку: серия идёт дальше.
+      if (col) {
+        const body = answerBlock(col, e.repeat);
+        body.classList.add("failed");
+        body.textContent = e.message;
+        applyMetrics(col, e.metrics);
+        scrollChat(col);
+      }
+      if (track) laneFoot(track, e.metrics, "прогон упал");
+      break;
+
+    case "session_error":
+      runSettled.add(e.session);
+      if (col) {
+        setStatus(col, "error", e.message);
+        applyMetrics(col, e.metrics);
+        setBusy(col, false);
+      }
+      if (track) {
+        track.root.classList.add("failed");
+        laneFoot(track, e.metrics, e.message);
+      }
+      break;
+
+    case "session_done":
+      runSettled.add(e.session);
+      if (col) {
+        applyMetrics(col, e.metrics);
+        // У серии суммы уже сложены по repeat_done — иначе последний
+        // прогон посчитался бы дважды.
+        if (e.metrics && !(e.repeats > 1)) {
+          if (e.metrics.cost_usd) runTotals.cost += e.metrics.cost_usd;
+          if (e.metrics.total_tokens) runTotals.tokens += e.metrics.total_tokens;
+        }
+        if (e.repeats > 1) {
+          // Серия, из которой не выжил ни один прогон, — это провал колонки,
+          // а не «готово»: ответов ноль, и строка состояния обязана это
+          // сказать, иначе она противоречит красным блокам в ленте.
+          if (!(e.texts || []).length) {
+            setStatus(col, "error", `ни один прогон не удался — 0 из ${e.repeats}`);
+            col.statsNote.textContent = "метрик удачных прогонов нет";
+          } else {
+            col.statsNote.textContent = `метрики последнего прогона из ${e.repeats}`;
+            updateUniq(col);
+          }
+        }
+        if (!col.status.classList.contains("error")) setStatus(col, "", "готово · можно спрашивать дальше");
+        setBusy(col, false);
+      }
+      if (track) {
+        track.text = e.text || track.text;
+        laneTail(track);
+        laneFoot(track, e.metrics, "готово");
+      }
+      runTotals.done += 1;
+      break;
+
+    case "judge_start": startVerdict(e); break;
+    case "judge_delta": appendVerdict(e.text); break;
+    case "judge_done": finishVerdict(e); break;
+    case "judge_error": failVerdict(e.message); break;
+    case "judge_skipped": skipVerdict(e.message); break;
+
+    case "run_done":
+      renderSummary(runTotals, e.wall_clock_ms);
+      if (state.runBlock) state.runBlock.state.textContent = "прогон закончен";
+      break;
+
+    case "command_done":
+      if (state.runBlock) {
+        state.runBlock.foot.textContent = "сводка прогона дописана в память агента — следующий вопрос её увидит";
+      }
+      resetRunUi();
+      refreshRegistry();
+      break;
+
+    case "error":
+      appendChat("failed", e.message);
+      if (state.runBlock) state.runBlock.state.textContent = "прогон не состоялся";
+      resetRunUi();
+      break;
+  }
 }
 
 // Сравнение колонок имеет смысл только когда колонок больше одной: «самая
@@ -909,12 +1247,17 @@ function renderSummary(totals, wallClockMs, interrupted) {
 
   const box = $("#summary");
   box.classList.remove("hidden");
-  box.innerHTML = rows
-    .map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${v}</div></div>`)
-    .join("");
+  box.innerHTML = "";
+  rows.forEach(([k, v]) => {
+    const cell = document.createElement("div");
+    cell.innerHTML = '<div class="k"></div><div class="v"></div>';
+    cell.querySelector(".k").textContent = k;
+    cell.querySelector(".v").textContent = v;
+    box.appendChild(cell);
+  });
 }
 
-// --- сворачивание сайдбара ---
+// --- сворачивание сайдбара ------------------------------------------------
 
 // Во время записи список сценариев нужен только в момент выбора: дальше это
 // ширина, которой не хватает колонкам. Состояние переживает перезагрузку —
@@ -951,5 +1294,24 @@ function initSidebar() {
   };
 }
 
+function initChat() {
+  const input = $("#chat-input");
+  input.title = "Enter — отправить, Shift+Enter — перенос строки";
+  input.addEventListener("input", () => autoGrow(input));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      $("#chat-form").requestSubmit();
+    }
+  });
+  $("#chat-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    sendChat();
+  });
+  $("#chat-reset").onclick = () => newChatAgent(state.chat ? state.chat.rosterIndex : 0);
+  setChatBusy(false);
+}
+
 initSidebar();
-loadScenarios();
+initChat();
+loadDay();
