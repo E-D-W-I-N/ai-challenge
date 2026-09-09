@@ -125,7 +125,7 @@ def db_path() -> Path | str:
 
 
 def _dumps(value) -> str:
-    # default=str: в extra_body может приехать что угодно из day.py, и падение
+    # default=str: в extra_body приезжает что угодно из панели, и падение
     # сериализации не должно ронять обмен, который уже оплачен.
     return json.dumps(value, ensure_ascii=False, default=str)
 

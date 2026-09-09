@@ -2025,6 +2025,55 @@ def check_clean_start_survives_restart():
     return "пустой старт, один чат, после переоткрытия файла переписка и панель на месте"
 
 
+@check("переименованный чат остаётся переименованным после перезапуска")
+def check_rename_survives_restart():
+    """Переименование — то, чем пользуются постоянно, и оно обязано пережить рестарт.
+
+    Проверяется настоящим переоткрытием файла, а не тем же объектом в памяти:
+    имя лежит и отдельной колонкой, и внутри конфига, и разойтись они не должны.
+    Номер, из которого имя собиралось, при этом не переиспользуется — иначе
+    следующий чат получил бы имя, только что освобождённое переименованием.
+    """
+    _stub.install(reply="ответ")
+    path = _temp_db("rename")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        with TestClient(main.app) as client:
+            created = client.post("/api/agents", json={}).json()["agents"][0]
+            assert created["label"] == "Новый чат 1", created["label"]
+            client.post(f"/api/agents/{created['id']}/messages", json={"text": "привет"})
+            renamed = client.patch(
+                f"/api/agents/{created['id']}", json={"label": "Про Казань"}
+            )
+            assert renamed.status_code == 200 and renamed.json()["label"] == "Про Казань"
+
+        # Закрываем базу и открываем файл заново — это и есть перезапуск.
+        store.close()
+        again = Store(path).init()
+        second = _restart(again)
+        listing = main._listing()["agents"]
+        with TestClient(main.app) as client:
+            after = client.post("/api/agents", json={}).json()["agents"][0]["label"]
+    finally:
+        main.REGISTRY = saved_registry
+
+    assert [a["label"] for a in listing] == ["Про Казань"], listing
+    revived = second.require(created["id"])
+    assert revived.spec.label == "Про Казань", revived.spec.label
+    # Имя лежит и колонкой, и в конфиге: разойтись они не должны.
+    row = again.load_session(created["id"])
+    assert row["label"] == "Про Казань", row["label"]
+    assert row["config"]["label"] == "Про Казань", row["config"]["label"]
+    # Переписка при переименовании не пострадала.
+    assert [t.content for t in revived.history] == ["привет", "ответ"], revived.history
+    # И освободившийся номер не переиспользован.
+    assert after == "Новый чат 2", after
+    again.close()
+    return f"«{created['label']}» → «Про Казань» пережило переоткрытие файла, следующий — {after}"
+
+
 @check("удалили последний чат — список пуст, а номер следующего не повторяется")
 def check_last_chat_deleted():
     """Клиент на пустом списке заводит чат сам, и номер ему нужен свежий."""
@@ -2149,6 +2198,7 @@ CHECKS = [
     check_gitignore_db,
     check_cli_session,
     check_clean_start_survives_restart,
+    check_rename_survives_restart,
     check_last_chat_deleted,
     check_list_not_truncated,
 ]
