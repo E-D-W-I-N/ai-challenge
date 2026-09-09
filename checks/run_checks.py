@@ -1,9 +1,14 @@
-"""Все проверки Дня 6 — без сети, без ключа, без живых вызовов к LLM.
+"""Все проверки Дней 6 и 7 — без сети, без ключа, без живых вызовов к LLM.
 
     .venv/bin/python checks/run_checks.py
 
-Главный критерий дня вынесен в отдельный скрипт (`checks/spawn_100.py`) и
-запускается отсюда же первым пунктом.
+Главные критерии вынесены в отдельные скрипты и запускаются отсюда же первыми
+пунктами: `checks/spawn_100.py` — сотня агентов в одном процессе (День 6),
+`checks/restart.py` — диалог, переживший перезапуск программы (День 7).
+
+База каждой проверке достаётся своя: `_stub.install_offline()` уводит
+AGENT_DB_PATH во временный каталог **до** импорта app.*, а обёртка `check`
+чистит её между проверками.
 """
 
 from __future__ import annotations
@@ -26,8 +31,10 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+import app.store as store_module  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec, Scenario  # noqa: E402
+from app.store import Store  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -125,35 +132,56 @@ def check_memory():
 
 @check("history_limit=0 забывает стартовый вопрос, а не только свой ответ")
 def check_blank_forgets_seed():
-    """Находка ревью: seed_messages подклеивались всегда.
+    """Находка ревью Дня 6: seed_messages подклеивались всегда.
 
-    В сценарии дня в messages лежит сам первый вопрос со всей вводной
-    о поездке. Пока он ехал в промпт на каждом ходу, колонка «Без памяти»
-    знала город, даты и бюджет и переспрашивать бы не стала — демонстрация
-    дня на живом прогоне не воспроизвелась бы.
+    В `messages` колонки лежит сам первый вопрос со всей вводной. Пока он ехал
+    в промпт на каждом ходу, колонка «без памяти» знала город, даты и бюджет
+    и переспрашивать бы не стала — демонстрация на живом прогоне не
+    воспроизвелась бы.
+
+    Сценарий здесь свой, а не из day.py: проверяется семантика окна, а она
+    не должна зависеть от того, про что день. Свой сценарий Дня 7 проверяет
+    check_day.
     """
     _stub.install(reply=lambda m, i: f"план{i}")
-    with TestClient(main.app) as client:
-        parent = client.post(
-            "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
-        ).json()["agents"][0]["id"]
-        client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
-        kids = client.get(f"/api/agents?parent={parent}&children_only=true").json()["agents"]
-        blank = next(k["id"] for k in kids if k["label"].startswith("Без памяти"))
-        remembers = next(k["id"] for k in kids if k["label"].startswith("С памятью"))
-        _stub.reset()
-        question = "Что мне взять из одежды?"
-        client.post(f"/api/agents/{blank}/messages", json={"text": question})
-        client.post(f"/api/agents/{remembers}/messages", json={"text": question})
+    pair = Scenario(
+        title="окно памяти",
+        description="",
+        sessions=[
+            AgentSpec(
+                label=name,
+                model="stub/model",
+                messages=[
+                    {"role": "system", "content": "СИС"},
+                    {"role": "user", "content": "Меня зовут Нина, еду в Казань, вегетарианка."},
+                ],
+                history_limit=limit,
+            )
+            for name, limit in (("С памятью", 20), ("Без памяти", 0))
+        ],
+    )
+    with _scenarios([pair]):
+        with TestClient(main.app) as client:
+            parent = client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
+            ).json()["agents"][0]["id"]
+            client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
+            kids = client.get(f"/api/agents?parent={parent}&children_only=true").json()["agents"]
+            blank = next(k["id"] for k in kids if k["label"] == "Без памяти")
+            remembers = next(k["id"] for k in kids if k["label"] == "С памятью")
+            _stub.reset()
+            question = "Что мне взять из одежды?"
+            client.post(f"/api/agents/{blank}/messages", json={"text": question})
+            client.post(f"/api/agents/{remembers}/messages", json={"text": question})
 
     without, with_memory = (c["messages"] for c in _stub.CALLS)
 
     assert [m["role"] for m in without] == ["system", "user"], without
     assert without[-1]["content"] == question, without[-1]
     joined = " ".join(m["content"] for m in without)
-    # «план0» — ответ колонки на первый вопрос: агент без памяти не должен
+    # «план1» — ответ колонки на первый вопрос: агент без памяти не должен
     # видеть ни вводную, ни то, что сам на неё ответил.
-    for leak in ("Казань", "Нина", "20 000", "вегетарианка", "план0"):
+    for leak in ("Казань", "Нина", "вегетарианка", "план1"):
         assert leak not in joined, f"агент без памяти всё ещё видит «{leak}»"
 
     assert [m["role"] for m in with_memory] == ["system", "user", "assistant", "user"], with_memory
@@ -1006,32 +1034,537 @@ def check_cli():
     return "ответ напечатан, история записана, агент в реестре"
 
 
-@check("сценарий дня: одна модель, разный history_limit")
+@check("сценарии дня: перезапуск в одной колонке, изоляция сессий в двух")
 def check_day():
+    """День 7 сменил постановку, и сценарии сменились вместе с ней.
+
+    Первый сценарий — сама постановка: одна колонка, один агент, разговор,
+    который надо продолжить после рестарта; судьи там нет и быть не должно.
+    Второй — то, на чём спотыкаются: две сессии, и правая не знает того, что
+    сказали левой.
+    """
     import day
 
-    assert len(day.SCENARIOS) >= 1
-    scenario = day.SCENARIOS[0]
-    models = {s.model for s in scenario.sessions}
-    limits = sorted(s.history_limit for s in scenario.sessions)
-    assert len(models) == 1, models
-    assert limits == [0, day.WITH_MEMORY], limits
-    assert scenario.judge_questions, "у сценария дня должен быть судья"
-    assert day.AGENTS and all(a.messages == [] for a in day.AGENTS)
+    assert len(day.SCENARIOS) == 2, len(day.SCENARIOS)
+    restart, isolation = day.SCENARIOS
 
-    # Тот же первый вопрос обеим колонкам — иначе сравнивать нечего.
-    prompts = {json.dumps(s.messages, ensure_ascii=False) for s in scenario.sessions}
-    assert len(prompts) == 1, "первый вопрос у колонок должен совпадать"
+    assert restart.layout == "single", restart.layout
+    assert len(restart.sessions) == 1, restart.sessions
+    assert restart.sessions[0].history_limit == day.MEMORY_WINDOW
+    assert not restart.judge_questions, "судить сразу после первого хода нечего"
+    # Постановка дня должна быть видна в описании: перезапуск, а не просто память.
+    for word in ("перезапуск", "SQLite"):
+        assert word.casefold() in restart.description.casefold(), word
+
+    assert isolation.layout == "split" and len(isolation.sessions) == 2
+    assert len({s.model for s in isolation.sessions}) == 1, "разница должна быть в сессиях"
+    assert isolation.judge_questions, "у сценария про изоляцию должен быть судья"
+    left, right = isolation.sessions
+    assert "Нина" in json.dumps(left.messages, ensure_ascii=False)
+    assert "Нина" not in json.dumps(right.messages, ensure_ascii=False), (
+        "правая колонка не должна знать имени — она про чужой разговор"
+    )
+    assert day.AGENTS and all(a.messages == [] for a in day.AGENTS)
 
     _stub.install(reply=lambda m, i: f"план {i}")
     with TestClient(main.app) as client:
-        events = sse(client.get("/api/run/0").text)
-    starts = [e for e in events if e["event"] == "session_start"]
+        first = sse(client.get("/api/run/0").text)
+        _stub.reset()
+        second = sse(client.get("/api/run/1").text)
+
+    assert len([e for e in first if e["event"] == "session_start"]) == 1
+    assert not [e for e in first if e["event"] == "judge_start"], "судьи в первом сценарии нет"
+
+    starts = [e for e in second if e["event"] == "session_start"]
     assert len(starts) == 2, len(starts)
     assert len(_stub.CALLS) == 3, len(_stub.CALLS)  # две колонки + судья
-    for call in _stub.CALLS[:2]:
+    column_prompts = _stub.CALLS[:2]
+    for call in column_prompts:
         assert [m["role"] for m in call["messages"]] == ["system", "user"], call["messages"]
-    return f"колонки {[s['session'] for s in starts]}, окна {limits}"
+    right_prompt = " ".join(m["content"] for m in column_prompts[1]["messages"])
+    assert "Нина" not in right_prompt and "Казань" not in right_prompt, right_prompt
+    return f"сценарий 1 — одна колонка без судьи; сценарий 2 — {[s['session'] for s in starts]}"
+
+
+# --- 12. День 7: память между запусками ---------------------------------------
+
+
+def _temp_db(name: str) -> str:
+    """Свежий файл базы под одну проверку. Каталога заранее нет — его создаёт Store."""
+    import tempfile
+
+    return os.path.join(tempfile.mkdtemp(prefix=f"check-{name}-"), "nested", "agents.db")
+
+
+class _Turn:
+    """Минимальная реплика: хранилищу от неё нужны пять полей, и только они."""
+
+    def __init__(self, role, content, error=None, at=1.0):
+        self.role, self.content, self.error, self.at = role, content, error, at
+
+
+@check("настоящий перезапуск: файл базы закрыт и открыт заново")
+def check_store_reopen():
+    path = _temp_db("reopen")
+    assert not os.path.isdir(os.path.dirname(path)), "каталога быть не должно — его создаёт init()"
+
+    first = Store(path).init()
+    first.save_session(
+        "ag_00042",
+        parent_id=None,
+        label="Нина",
+        config={"model": "stub/m", "history_limit": 7},
+        seed=[{"role": "system", "content": "СИС"}],
+        overrides={"model": "выбранная/пользователем"},
+        seed_used=True,
+        created_at=100.0,
+    )
+    first.save_history(
+        "ag_00042",
+        [_Turn("user", "меня зовут Нина"), _Turn("assistant", "привет, Нина")],
+    )
+    first.close()
+
+    # Новый объект на том же файле — это и есть перезапуск, а не «тот же
+    # объект в памяти»: соединение закрыто, кеш sqlite ушёл вместе с ним.
+    second = Store(path).init()
+    saved = second.load_session("ag_00042")
+    assert saved is not None, "сессия не пережила закрытие файла"
+    assert saved["config"]["history_limit"] == 7, saved["config"]
+    assert saved["overrides"] == {"model": "выбранная/пользователем"}, saved["overrides"]
+    assert saved["seed_used"] is True and saved["created_at"] == 100.0
+    assert saved["seed"] == [{"role": "system", "content": "СИС"}], saved["seed"]
+    rows = second.message_rows("ag_00042")
+    assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
+    assert second.max_agent_seq() == 42, second.max_agent_seq()
+    second.close()
+    return f"каталог создан init(), после переоткрытия {len(rows)} реплики и конфиг на месте"
+
+
+@check("диалог продолжается в новом процессе программы")
+def check_restart_process():
+    result = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "checks", "restart.py")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ОК: диалог продолжился" in result.stdout, result.stdout
+    return result.stdout.strip().splitlines()[2]
+
+
+@check("восстановление истории — в конструкторе агента, а не отдельным вызовом")
+def check_restore_in_constructor():
+    from app.agent import Agent
+
+    path = _temp_db("ctor")
+    store = Store(path).init()
+    spec = AgentSpec(label="ctor", model="stub/m", messages=[], system="СИС")
+
+    born = Agent(spec, store=store)
+    born.remember_exchange("меня зовут Нина", "привет, Нина")
+    born.remember_exchange("мне 33", "запомнил")
+    store.close()
+
+    # Тот же id, новый объект, новое открытие файла — история обязана приехать
+    # сама, без единого вызова restore().
+    again = Store(path).init()
+    revived = Agent(spec, agent_id=born.id, store=again)
+    assert [t.content for t in revived.history] == [
+        "меня зовут Нина",
+        "привет, Нина",
+        "мне 33",
+        "запомнил",
+    ], revived.history
+    assert not hasattr(Agent, "restore"), "отдельного restore() быть не должно — его забудут"
+
+    _stub.install(reply="ок")
+    asyncio.run(_drain(revived.ask("как меня зовут?")))
+    sent = [m["content"] for m in _stub.CALLS[0]["messages"]]
+    assert sent == ["СИС", "меня зовут Нина", "привет, Нина", "мне 33", "запомнил", "как меня зовут?"], sent
+    again.close()
+    return "агент поднят конструктором: 4 реплики из базы уехали в следующий запрос"
+
+
+@check("изоляция сессий: у сообщений есть session_id, ленты не сливаются")
+def check_session_isolation():
+    _stub.install(reply=lambda m, i: f"ответ{i}")
+    with TestClient(main.app) as client:
+        first, second = (
+            client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", "label": f"чат {n}"}}
+            ).json()["agents"][0]["id"]
+            for n in (1, 2)
+        )
+        client.post(f"/api/agents/{first}/messages", json={"text": "меня зовут Нина"})
+        _stub.reset()
+        client.post(f"/api/agents/{second}/messages", json={"text": "как меня зовут?"})
+
+    asked = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
+    assert "Нина" not in asked, f"вторая сессия видит чужую историю: {asked}"
+
+    store = REGISTRY.store
+    assert [r[2] for r in store.message_rows(first)] == ["меня зовут Нина", "ответ0"]
+    assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"]
+
+    # Схема не даёт записать реплику без сессии: ключ составной, и это
+    # единственная защита от «все чаты в одной ленте» после перезапуска.
+    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(messages)")}
+    assert "session_id" in columns, columns
+    keys = [row[1] for row in store.conn.execute("PRAGMA table_info(messages)") if row[5]]
+    assert keys == ["session_id", "seq"], keys
+    indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(messages)")}
+    assert "messages_by_session" in indexes, indexes
+    return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
+
+
+@check("порядковые номера без дыр: откат и кап окна пересчитывают seq от нуля")
+def check_seq_renumbered():
+    from app.agent import MAX_STORED_MESSAGES, Agent
+
+    path = _temp_db("seq")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="seq", model="stub/m", messages=[]), store=store)
+
+    # 1) Несостоявшийся обмен: в базе не должно появиться вопроса без ответа.
+    _stub.install(fail=True)
+    asyncio.run(_drain(agent.ask("вопрос, на который не ответили")))
+    assert store.message_rows(agent.id) == [], store.message_rows(agent.id)
+
+    # 2) Обычные обмены и кап хранимого.
+    _stub.reset()
+    _stub.install(reply="ок")
+    for i in range(3):
+        asyncio.run(_drain(agent.ask(f"вопрос {i}")))
+    seqs = [row[0] for row in store.message_rows(agent.id)]
+    assert seqs == list(range(6)), seqs
+
+    agent.history = agent.history[-2:]  # так выглядит история после кап-а окна
+    agent.persist()
+    seqs = [row[0] for row in store.message_rows(agent.id)]
+    assert seqs == [0, 1], f"после укорачивания номера должны идти от нуля: {seqs}"
+
+    # 3) Жёсткий потолок хранимого держится и в базе.
+    agent.history = [_Turn("user", f"т{i}") for i in range(MAX_STORED_MESSAGES + 10)]
+    agent._trim()
+    agent.persist()
+    rows = store.message_rows(agent.id)
+    assert len(rows) == MAX_STORED_MESSAGES, len(rows)
+    assert [r[0] for r in rows] == list(range(MAX_STORED_MESSAGES))
+    store.close()
+    return f"нет ответа — нет записи; после укорачивания seq = 0..N, потолок {MAX_STORED_MESSAGES}"
+
+
+@check("частичный ответ пишется в базу с пометкой ошибки, парой с вопросом")
+def check_partial_persisted():
+    from app.agent import Agent
+
+    path = _temp_db("partial")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="partial", model="stub/m", messages=[]), store=store)
+
+    async def broken(session, *, prompt_override=None, context_length=None):
+        yield {"type": "delta", "text": "начал отвеч", "metrics": None}
+        raise RuntimeError("провод оборвался")
+
+    agent_module.stream_completion = broken
+    asyncio.run(_drain(agent.ask("вопрос")))
+    store.close()
+
+    reopened = Store(path).init()
+    rows = reopened.message_rows(agent.id)
+    assert [(r[0], r[1]) for r in rows] == [(0, "user"), (1, "assistant")], rows
+    errors = [
+        row["error"]
+        for row in reopened.conn.execute(
+            "SELECT error FROM messages WHERE session_id = ? ORDER BY seq", (agent.id,)
+        )
+    ]
+    assert errors[0] is None and errors[1], errors
+    reopened.close()
+    return "после обрыва в базе пара реплик, у ответа проставлена ошибка"
+
+
+@check("вытеснение — выгрузка, а не удаление: сессия остаётся в базе")
+def check_eviction_keeps_session():
+    from app.registry import AgentRegistry
+
+    registry = AgentRegistry(max_agents=2)
+    old = registry.create(AgentSpec(label="старый", model="stub/m", messages=[]))
+    old.remember_exchange("меня зовут Нина", "привет")
+    old.spec.temperature = 0.9
+    old.overrides["temperature"] = 0.9
+    old.save_config()
+    old_id = old.id
+
+    registry.create_many(
+        [AgentSpec(label=f"новый {i}", model="stub/m", messages=[]) for i in range(3)]
+    )
+    assert registry.get(old_id) is None, "старый должен быть выгружен из памяти"
+    assert registry.evicted >= 1, registry.evicted
+    assert registry.store.load_session(old_id) is not None, "выгрузка не должна удалять сессию"
+
+    revived = registry.require(old_id)
+    assert revived is not old, "поднят новый объект, а не тот же самый"
+    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет"], revived.history
+    assert revived.spec.temperature == 0.9, revived.spec.temperature
+    assert revived.overrides == {"temperature": 0.9}, revived.overrides
+    assert len(registry) <= registry.max_agents, len(registry)
+
+    # А удаление удаляет — и из памяти, и из базы.
+    registry.kill(revived.id)
+    assert registry.store.load_session(old_id) is None, "kill обязан стереть и строку в базе"
+    return "выгруженная сессия поднялась с историей и конфигом; kill стёр её из базы"
+
+
+@check("прогон пишет все сессии разом, parent_id переживает перезапуск")
+def check_run_sessions_persist():
+    _stub.install(reply=lambda m, i: f"вывод-{i}")
+    with _scenarios([LADDER]):
+        with TestClient(main.app) as client:
+            parent = client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", "label": "Ассистент"}}
+            ).json()["agents"][0]["id"]
+            client.post(f"/api/agents/{parent}/messages", json={"text": "/прогон 1"})
+
+    path = str(REGISTRY.store.path)
+    # Новое открытие того же файла: так стенд увидит базу после рестарта.
+    after = Store(path).init()
+    rows = {row["id"]: row for row in after.list_sessions()}
+    children = [row for row in rows.values() if row["parent_id"] == parent]
+    labels = {row["label"] for row in children}
+    assert {"Донор", "Потребитель", "Серия", "Судья"} <= labels, labels
+    assert all(row["history_len"] >= 2 for row in children), [
+        (r["label"], r["history_len"]) for r in children
+    ]
+    # Сводка родителя тоже в базе — иначе после рестарта прогона как не было.
+    assert rows[parent]["history_len"] == 2, rows[parent]["history_len"]
+
+    # Подстановка depends_on сохранена: после рестарта колонка помнит итоговый
+    # промпт, а не шаблон.
+    consumer = next(row for row in children if row["label"] == "Потребитель")
+    seed = json.dumps(consumer["seed"], ensure_ascii=False)
+    assert "{{depends_on}}" not in seed, seed
+    after.close()
+    return f"{len(children)} субсессии с parent_id, сводка родителя и подстановка в базе"
+
+
+@check("параллельная запись: восемь сессий пишут одновременно, ничего не теряется")
+def check_parallel_writes():
+    from app.agent import Agent
+
+    path = _temp_db("parallel")
+    store = Store(path).init()
+    _stub.install(reply=lambda m, i: f"ответ-{i}", chunks=6, delay=0.002)
+
+    agents = [
+        Agent(AgentSpec(label=f"колонка {i}", model="stub/m", messages=[]), store=store)
+        for i in range(8)
+    ]
+
+    async def all_at_once():
+        await asyncio.gather(*(_drain(a.ask(f"вопрос {i}")) for i, a in enumerate(agents)))
+
+    asyncio.run(all_at_once())
+    store.close()
+
+    reopened = Store(path).init()
+    for i, agent in enumerate(agents):
+        rows = reopened.message_rows(agent.id)
+        assert [r[0] for r in rows] == [0, 1], (agent.id, rows)
+        assert rows[0][2] == f"вопрос {i}", rows
+        assert rows[1][1] == "assistant", rows
+    total = reopened.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert total == 16, total
+    reopened.close()
+    return "8 сессий писали одновременно, в базе 16 реплик, порядок в каждой свой"
+
+
+@check("ключа OpenRouter в базе нет: ни в конфиге, ни в extra_body, ни в реплике")
+def check_no_key_in_db():
+    from app.agent import Agent
+
+    key = "sk-or-v1-ТЕСТОВЫЙ-КЛЮЧ-КОТОРЫЙ-НЕ-ДОЛЖЕН-УТЕЧЬ"
+    saved_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = key
+    path = _temp_db("secret")
+    store = Store(path).init()
+    try:
+        agent = Agent(
+            AgentSpec(
+                label="утечка",
+                model="stub/m",
+                messages=[{"role": "system", "content": f"ключ: {key}"}],
+                extra_body={"headers": {"Authorization": f"Bearer {key}"}},
+                system=key,
+            ),
+            store=store,
+        )
+        agent.remember_exchange(f"вот мой ключ {key}", "не надо мне его слать")
+        store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        store.close()
+
+        folder = os.path.dirname(path)
+        files = sorted(os.listdir(folder))
+        blob = b""
+        for name in files:
+            with open(os.path.join(folder, name), "rb") as handle:
+                blob += handle.read()
+        assert key.encode() not in blob, f"ключ утёк в файлы базы: {files}"
+        assert "***".encode() in blob, "ключ должен быть заменён, а не потерян молча"
+    finally:
+        if saved_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+
+    # И сам ключ читается только из окружения: в конфиг агента он не попадает.
+    source = open(os.path.join(ROOT, "app", "store.py"), encoding="utf-8").read()
+    assert "api_key" in source, "хранилище обязано знать про ключ, чтобы его вырезать"
+    return f"ключ не найден ни в одном из файлов базы ({', '.join(files)})"
+
+
+@check(".gitignore ловит базу и её WAL-файлы")
+def check_gitignore_db():
+    patterns = [
+        line.strip()
+        for line in open(os.path.join(ROOT, ".gitignore"), encoding="utf-8")
+        if line.strip() and not line.startswith("#")
+    ]
+    for needed in ("*.db", "*.db-wal", "*.db-shm"):
+        assert needed in patterns, f"{needed} не в .gitignore: база уедет в публичный репозиторий"
+
+    # И проверяем не только текст, но и сам git: он единственный судья.
+    probe = ["data/agents.db", "data/agents.db-wal", "data/agents.db-shm", "agents.db"]
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", *probe],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    ignored = set(result.stdout.split())
+    assert set(probe) <= ignored, f"git не игнорирует: {sorted(set(probe) - ignored)}"
+    return "git игнорирует *.db, *.db-wal, *.db-shm и каталог data/"
+
+
+@check("ручка сессий: список, открытие вытесненной, удаление из базы")
+def check_sessions_api():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = client.post(
+            "/api/agents", json={"agent": {"model": "stub/m", "label": "сессия"}}
+        ).json()["agents"][0]["id"]
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
+
+        listing = client.get("/api/sessions").json()
+        row = next(s for s in listing["sessions"] if s["id"] == agent_id)
+        assert row["live"] is True and row["history_len"] == 2, row
+        assert listing["stored"] >= 1 and "evicted" in listing
+
+        # Выгружаем сессию из памяти — ручка обязана поднять её из базы.
+        REGISTRY._unload(agent_id)
+        assert REGISTRY.get(agent_id) is None
+        stored = next(
+            s for s in client.get("/api/sessions").json()["sessions"] if s["id"] == agent_id
+        )
+        assert stored["live"] is False, stored
+
+        body = client.get(f"/api/agents/{agent_id}").json()
+        assert [t["content"] for t in body["transcript"] if not t.get("seed")] == ["привет", "ок"]
+        assert client.get("/api/health").json()["sessions_stored"] >= 1
+
+        # Удаление — из обоих слоёв разом.
+        client.delete(f"/api/agents/{agent_id}")
+        assert client.get(f"/api/agents/{agent_id}").status_code == 404
+        assert all(
+            s["id"] != agent_id for s in client.get("/api/sessions").json()["sessions"]
+        )
+    return "список сессий отдаётся, выгруженная поднимается из базы, DELETE стирает её"
+
+
+@check("CLI продолжает сохранённую сессию: --session и /сессии")
+def check_cli_session():
+    import io
+
+    from app import cli
+
+    _stub.install(reply="запомнил")
+    first = cli.build_agent(cli._parse_args(["--model", "stub/m", "--label", "консоль"]))
+    asyncio.run(cli.ask(first, "меня зовут Нина", io.StringIO()))
+
+    # Выгружаем из памяти: для CLI второго запуска в памяти нет вообще ничего.
+    REGISTRY._unload(first.id)
+    assert REGISTRY.get(first.id) is None
+
+    second = cli.build_agent(cli._parse_args(["--session", first.id]))
+    assert second.id == first.id and [t.content for t in second.history] == [
+        "меня зовут Нина",
+        "запомнил",
+    ], second.history
+
+    # repl читает вопрос со stdin — подменяем его пустым, иначе проверка
+    # повисла бы на вводе. Нужна только шапка: она и есть то, что видит
+    # человек во втором запуске.
+    out = io.StringIO()
+    saved_stdin = sys.stdin
+    sys.stdin = io.StringIO("")
+    try:
+        asyncio.run(cli.repl(second, once=True, out=out))
+    finally:
+        sys.stdin = saved_stdin
+    assert "[продолжаем]" in out.getvalue(), out.getvalue()
+
+    listing = io.StringIO()
+    cli._print_sessions(listing)
+    assert first.id in listing.getvalue(), listing.getvalue()
+
+    missing = cli._parse_args(["--session", "ag_99999"])
+    try:
+        cli.build_agent(missing)
+        raise AssertionError("несуществующая сессия должна честно падать")
+    except SystemExit:
+        pass
+    return "--session поднимает сессию из базы, /сессии её показывает"
+
+
+@check("вводная колонки едет в промпт до «Старта», а после — только историей")
+def check_seed_until_started():
+    """Хвост Дня 6: вводная исчезала из промпта после первого ручного обмена.
+
+    Колонка продолжала показывать стартовый вопрос в ленте, а в модель он
+    больше не уезжал — промпт расходился с экраном. Признак теперь не «история
+    пуста», а «стартовый вопрос уже стал ходом».
+    """
+    _stub.install(reply=lambda m, i: f"о{i}")
+    column = AgentSpec(
+        label="колонка",
+        model="stub/m",
+        messages=[
+            {"role": "system", "content": "СИС"},
+            {"role": "user", "content": "ЗАДАЧА"},
+        ],
+    )
+    agent = REGISTRY.create(column)
+    # Два ручных обмена до «Старта»: вводная обязана ехать в обоих.
+    asyncio.run(_drain(agent.ask("первый вопрос")))
+    asyncio.run(_drain(agent.ask("второй вопрос")))
+    before = [[m["content"] for m in c["messages"]] for c in _stub.CALLS]
+    assert before[0] == ["СИС", "ЗАДАЧА", "первый вопрос"], before[0]
+    assert before[1] == ["СИС", "ЗАДАЧА", "первый вопрос", "о0", "второй вопрос"], before[1]
+    assert agent.seed_used is False
+
+    # «Старт»: вопрос коммитится в историю обычным ходом.
+    _stub.reset()
+    asyncio.run(_drain(agent.ask()))
+    assert agent.seed_used is True
+    assert REGISTRY.store.load_session(agent.id)["seed_used"] is True, "флаг обязан пережить рестарт"
+
+    _stub.reset()
+    asyncio.run(_drain(agent.ask("после старта")))
+    after = [m["content"] for m in _stub.CALLS[0]["messages"]]
+    assert after.count("ЗАДАЧА") == 1, f"вводная задвоилась: {after}"
+    return "до «Старта» вводная в каждом промпте, после — ровно один раз, историей"
 
 
 CHECKS = [
@@ -1066,6 +1599,21 @@ CHECKS = [
     check_session_alias,
     check_cli,
     check_day,
+    # --- День 7 ---
+    check_store_reopen,
+    check_restart_process,
+    check_restore_in_constructor,
+    check_session_isolation,
+    check_seq_renumbered,
+    check_partial_persisted,
+    check_eviction_keeps_session,
+    check_run_sessions_persist,
+    check_parallel_writes,
+    check_no_key_in_db,
+    check_gitignore_db,
+    check_sessions_api,
+    check_cli_session,
+    check_seed_until_started,
 ]
 
 

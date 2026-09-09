@@ -3,6 +3,11 @@
 // День 6: ленту диалога хранит агент на сервере. Клиент держит только id
 // агента и шлёт новое сообщение текстом — ни истории, ни модели в теле
 // запроса больше нет.
+//
+// День 7: и сам агент теперь не в памяти процесса, а в базе. Клиент помнит
+// в localStorage только id открытой сессии — этого хватает, чтобы после
+// перезапуска стенда и обновления страницы открыть тот же диалог с того же
+// места. Ленту он не хранит и здесь: её отдаёт стенограмма сессии.
 
 const state = {
   scenarios: [],
@@ -110,7 +115,14 @@ async function loadDay() {
 
   renderSidebar();
   renderRoster();
-  await newChatAgent(0);
+  // Главный экран дня: открытый диалог продолжается после перезапуска стенда.
+  // Клиент помнит только id, всё остальное приезжает из базы.
+  const previous = readSession();
+  if (previous) {
+    await openSession(previous);
+  } else {
+    await newChatAgent(0);
+  }
   refreshRegistry();
 }
 
@@ -133,28 +145,66 @@ function renderSidebar() {
   list.appendChild(ul);
 }
 
-// Реестр процесса виден в сайдбаре: сто агентов — это сто строк здесь,
-// а не сто вкладок и не сто процессов.
+// Сохранённые сессии видны в сайдбаре: это и есть ответ дня на экране —
+// список диалогов, который переживает перезапуск. Живые в процессе помечены,
+// остальные лежат в базе и поднимутся при первом же открытии.
 async function refreshRegistry() {
   let data;
   try {
-    data = await api("/api/agents");
+    data = await api("/api/sessions");
   } catch (e) {
     return;
   }
-  $("#registry-badge").textContent = `агентов: ${data.live} из ${data.max_agents}`;
+  $("#registry-badge").textContent =
+    `сессий: ${data.stored} · в памяти ${data.live} из ${data.max_agents}`;
+  $("#registry-badge").title =
+    `В базе ${data.stored} сохранённых сессий.\n` +
+    `В памяти процесса ${data.live} (потолок ${data.max_agents}, выгружено ${data.evicted}).\n` +
+    "Выгрузка по потолку сессию не удаляет: она поднимется из базы при открытии.";
+
   const box = $("#agent-list");
   box.innerHTML = "";
-  data.agents.forEach((a) => {
+  if (!data.sessions.length) {
+    box.innerHTML = '<p class="empty-hint">Сохранённых сессий пока нет</p>';
+    return;
+  }
+  data.sessions.forEach((s) => {
     const row = document.createElement("div");
-    row.className = "agent-row" + (state.chat && a.id === state.chat.id ? " active" : "");
-    row.innerHTML = `<span class="agent-row-label"></span><span class="agent-row-id"></span>`;
+    const current = state.chat && s.id === state.chat.id;
+    row.className =
+      "agent-row" + (current ? " active" : "") + (s.live ? "" : " stored");
+    row.innerHTML =
+      '<span class="agent-row-label"></span><span class="agent-row-id"></span>' +
+      '<button class="agent-row-drop" type="button" title="Удалить сессию из базы">✕</button>';
     row.querySelector(".agent-row-label").textContent =
-      (a.parent_id ? "↳ " : "") + a.label + (a.history_len ? ` · ${a.history_len}` : "");
-    row.querySelector(".agent-row-id").textContent = a.id;
-    row.title = `${a.model}\nокно памяти ${a.history_limit}, реплик ${a.history_len}`;
+      (s.parent_id ? "↳ " : "") + s.label + (s.history_len ? ` · ${s.history_len}` : "");
+    row.querySelector(".agent-row-id").textContent = s.id;
+    row.title =
+      `${s.model}\nреплик ${s.history_len}, окно памяти ${s.history_limit}\n` +
+      (s.live ? "живая в процессе" : "в базе — откроется из неё") +
+      "\nКлик — открыть эту сессию";
+    row.onclick = (ev) => {
+      if (ev.target.classList.contains("agent-row-drop")) return;
+      openSession(s.id);
+    };
+    row.querySelector(".agent-row-drop").onclick = () => dropSession(s.id);
     box.appendChild(row);
   });
+}
+
+// Удаление — это удаление: и из памяти, и из базы, каскадом по субагентам.
+async function dropSession(id) {
+  try {
+    await api(`/api/agents/${id}`, { method: "DELETE" });
+  } catch (e) {
+    /* уже нет — список всё равно перерисуем */
+  }
+  if (state.chat && state.chat.id === id) {
+    rememberSession(null);
+    await newChatAgent(0);
+    return;
+  }
+  refreshRegistry();
 }
 
 // --- чат с агентом главного экрана ---------------------------------------
@@ -171,14 +221,33 @@ function renderRoster() {
   sel.onchange = () => newChatAgent(Number(sel.value));
 }
 
+// id открытой сессии — единственное, что клиент хранит у себя. Ленту он
+// не помнит: после перезапуска стенда она приедет из базы вместе с сессией.
+const SESSION_KEY = "ui.chat.session";
+
+function rememberSession(id) {
+  try {
+    if (id) localStorage.setItem(SESSION_KEY, id);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch (e) {
+    /* приватный режим — просто откроется новая сессия */
+  }
+}
+
+function readSession() {
+  try {
+    return localStorage.getItem(SESSION_KEY) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function newChatAgent(rosterIndex) {
   const spec = state.roster[rosterIndex] || state.roster[0];
   if (!spec) return;
-  // Прошлый собеседник уходит вместе со своими субагентами: реестр не должен
-  // копить брошенные диалоги.
-  if (state.chat) {
-    try { await api(`/api/agents/${state.chat.id}`, { method: "DELETE" }); } catch (e) { /* уже нет */ }
-  }
+  // Прошлый собеседник больше не удаляется: его сессия лежит в базе, и в неё
+  // можно вернуться из списка слева. Память процесса бережёт не удаление,
+  // а потолок реестра — он выгружает старые сессии, не стирая их.
   const created = await api("/api/agents", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -186,12 +255,58 @@ async function newChatAgent(rosterIndex) {
   });
   const agent = created.agents[0];
   state.chat = { id: agent.id, spec, busy: false, rosterIndex };
+  rememberSession(agent.id);
   $("#chat-agent-id").textContent = `${agent.id} · ${agent.model} · окно памяти ${agent.history_limit}`;
   $("#chat-feed").innerHTML = "";
   hideStage();
   appendChat("system-note", chatHint(spec));
   setChatBusy(false);
   refreshRegistry();
+}
+
+// Открыть сохранённую сессию: стенд поднимет её из базы, если в памяти её нет.
+async function openSession(id) {
+  let agent;
+  try {
+    agent = await api(`/api/agents/${id}`);
+  } catch (e) {
+    // Сессию удалили из другой вкладки — начинаем новую, а не показываем ошибку.
+    rememberSession(null);
+    await newChatAgent(state.chat ? state.chat.rosterIndex : 0);
+    return;
+  }
+  // Субагент колонки в ростере не значится — дропдаун тогда не трогаем,
+  // иначе он показал бы не того, кто открыт.
+  const found = state.roster.findIndex((r) => r.label === agent.label);
+  state.chat = { id: agent.id, spec: agent, busy: false, rosterIndex: Math.max(found, 0) };
+  rememberSession(agent.id);
+  const sel = $("#roster-select");
+  if (sel && found >= 0) sel.value = String(found);
+  $("#chat-agent-id").textContent =
+    `${agent.id} · ${agent.model} · окно памяти ${agent.history_limit}`;
+  $("#chat-feed").innerHTML = "";
+  hideStage();
+  appendChat("system-note", chatHint(agent));
+  renderTranscript(agent);
+  setChatBusy(false);
+  refreshRegistry();
+}
+
+// Лента сессии из её стенограммы. Стартовый промпт (seed) не показываем:
+// это конфиг агента, а не то, что наговорили в диалоге.
+function renderTranscript(agent) {
+  const turns = (agent.transcript || []).filter((t) => !t.seed);
+  if (!turns.length) return;
+  turns.forEach((t) => {
+    appendChat(t.role === "user" ? "user" : "assistant", t.content);
+    // Оборванный ответ помечаем той же меткой, что и живой сбой в ленте.
+    if (t.error) appendChat("failed", t.error);
+  });
+  appendChat(
+    "system-note",
+    `Выше — ${turns.length} реплик из базы: этот разговор продолжается, ` +
+      "а не начинается заново."
+  );
 }
 
 // Конфиг для ручки создания: ровно те поля, которые она принимает.

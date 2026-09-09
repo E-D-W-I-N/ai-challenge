@@ -1,14 +1,19 @@
 """Разговор с агентом из консоли — без браузера и без запущенного сервера.
 
-Это самое короткое доказательство главного требования дня: агент самостоятелен,
-веб-слой ему не нужен. Тот же класс `Agent`, тот же `stream_completion`, та же
-история — просто вывод идёт в терминал.
+Это самое короткое доказательство главных требований дня: агент самостоятелен,
+веб-слой ему не нужен, и его память переживает перезапуск. Тот же класс `Agent`,
+тот же `stream_completion`, та же история — просто вывод идёт в терминал.
 
     .venv/bin/python -m app.cli
     .venv/bin/python -m app.cli --model openai/gpt-4o-mini --history-limit 0
     echo "привет" | .venv/bin/python -m app.cli --once
 
-Команды внутри диалога: /выход, /история, /забыть, /агенты.
+Демонстрация памяти между запусками — два запуска подряд, разные процессы:
+
+    .venv/bin/python -m app.cli                       # представьтесь, запомните id
+    .venv/bin/python -m app.cli --session ag_00001    # спросите, как вас зовут
+
+Команды внутри диалога: /выход, /история, /забыть, /агенты, /сессии.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import argparse
 import asyncio
 import sys
 
-from . import llm
+from . import llm, store
 from .agent import Agent, AgentBusyError
 from .config import has_key
 from .registry import REGISTRY
@@ -44,6 +49,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="сколько сообщений истории уходит в модель; 0 — агент без памяти",
     )
     parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help="продолжить сохранённую сессию по её id вместо создания новой",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="прочитать один вопрос со stdin, ответить и выйти",
@@ -52,7 +63,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_agent(args: argparse.Namespace) -> Agent:
-    """Агент по аргументам командной строки. Он же кладётся в реестр процесса."""
+    """Агент по аргументам командной строки. Он же кладётся в реестр процесса.
+
+    С `--session` агент не создаётся, а поднимается из базы: конфиг и история
+    приезжают оттуда, аргументы командной строки к нему уже не применяются —
+    иначе продолжение разговора молча сменило бы модель на дефолтную.
+    """
+    if args.session:
+        agent = REGISTRY.load(args.session)
+        if agent is None:
+            raise SystemExit(
+                f"сессии {args.session} нет в базе ({store.db_path()}). "
+                "Посмотреть сохранённые: python -m app.cli, затем /сессии"
+            )
+        return agent
+
     spec = AgentSpec(
         label=args.label,
         model=args.model,
@@ -95,6 +120,22 @@ def _print_history(agent: Agent, out=sys.stdout) -> None:
         out.write(f"{turn.role}{mark}: {turn.content}\n")
 
 
+def _print_sessions(out=sys.stdout) -> None:
+    """Сохранённые сессии — те, что переживут перезапуск."""
+    sessions = REGISTRY.sessions(limit=30)
+    if not sessions:
+        out.write("[сохранённых сессий нет]\n")
+        return
+    out.write(f"сохранённых сессий: {len(sessions)} · база {store.db_path()}\n")
+    for row in sessions:
+        mark = "живая" if row["live"] else "в базе"
+        out.write(
+            f"  {row['id']}  {row['label']}  {row['config'].get('model', '')}  "
+            f"реплик {row['history_len']}  ({mark})\n"
+        )
+    out.write("Продолжить: python -m app.cli --session <id>\n")
+
+
 def _print_agents(out=sys.stdout) -> None:
     out.write(f"живых агентов: {len(REGISTRY)} (потолок {REGISTRY.max_agents})\n")
     for agent in REGISTRY.list():
@@ -104,10 +145,18 @@ def _print_agents(out=sys.stdout) -> None:
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
     """Цикл «вопрос — ответ». Возвращает код возврата процесса."""
     out.write(f"агент {agent.id} · {agent.spec.model} · окно памяти {agent.history_limit}\n")
+    if agent.history:
+        # Ради этой строки день и делался: процесс новый, разговор старый.
+        out.write(
+            f"[продолжаем] в базе {len(agent.history)} реплик — "
+            "агент помнит этот разговор с прошлого запуска\n"
+        )
+    else:
+        out.write(f"[новая сессия] продолжить её потом: --session {agent.id}\n")
     if not has_key():
         out.write("[нет ключа] OPENROUTER_API_KEY не найден — вызова не будет.\n")
     if not once:
-        out.write("Команды: /выход, /история, /забыть, /агенты\n")
+        out.write("Команды: /выход, /история, /забыть, /агенты, /сессии\n")
 
     while True:
         if not once:
@@ -133,6 +182,9 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
             continue
         if text in ("/агенты", "/agents"):
             _print_agents(out)
+            continue
+        if text in ("/сессии", "/sessions"):
+            _print_sessions(out)
             continue
 
         try:

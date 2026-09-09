@@ -9,6 +9,13 @@
 `stream_completion` и дописывает ответ себе в историю. Наружу отдаёт поток
 событий — из него и SSE стенда, и вывод CLI.
 
+С Дня 7 у агента есть хранилище (`app/store.py`). Восстановление истории
+сделано **в конструкторе**: агенту, которому дали `store` и чужой `agent_id`,
+история приезжает сама. Отдельного `restore()`, который можно забыть позвать,
+нет и не должно быть. Запись идёт после каждого завершённого обмена — тем же
+правилом, что уже действует в памяти: несостоявшийся обмен не пишется вовсе,
+частичный ответ пишется с пометкой ошибки.
+
 Агент ничего не знает ни про FastAPI, ни про SSE, ни про реестр: сто агентов —
 это сто объектов в одном процессе, а не сто процессов.
 """
@@ -18,13 +25,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
-import itertools
+import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import AsyncIterator
 
 from .llm import MissingKeyError, stream_completion
 from .schema import AgentSpec
+from .store import Store
 
 DEFAULT_HISTORY_LIMIT = 20
 """Сколько последних сообщений уходит в окно, если spec.history_limit не задан.
@@ -41,7 +49,27 @@ MAX_STORED_MESSAGES = 400
 уходит хвост, а список растёт вечно.
 """
 
-_ids = itertools.count(1)
+_last_id = 0
+_id_lock = threading.Lock()
+
+
+def new_agent_id() -> str:
+    global _last_id
+    with _id_lock:
+        _last_id += 1
+        return f"ag_{_last_id:05d}"
+
+
+def reserve_ids(upto: int) -> None:
+    """Сдвигает счётчик так, чтобы новые агенты не заняли id из базы.
+
+    Счётчик живёт в процессе и после перезапуска начинается с нуля. Без этой
+    поправки второй запуск выдал бы `ag_00001` заново, а конструктор поднял бы
+    под этим id чужую историю: свежий агент молча унаследовал бы прошлый диалог.
+    """
+    global _last_id
+    with _id_lock:
+        _last_id = max(_last_id, int(upto))
 
 
 class AgentBusyError(RuntimeError):
@@ -84,6 +112,7 @@ class Agent:
         agent_id: str | None = None,
         parent_id: str | None = None,
         context_length: int | None = None,
+        store: Store | None = None,
     ) -> None:
         # Копия конфига, и вглубь тоже: spec может быть колонкой из SCENARIOS,
         # общей на все прогоны, а `replace` копирует только верхний уровень —
@@ -98,7 +127,7 @@ class Agent:
             response_format=copy.deepcopy(spec.response_format),
             extra_body=copy.deepcopy(spec.extra_body or {}),
         )
-        self.id = agent_id or f"ag_{next(_ids):05d}"
+        self.id = agent_id or new_agent_id()
         self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at
@@ -119,9 +148,40 @@ class Agent:
         колонки на моделях из day.py, молча отменив выбор пользователя.
         """
 
+        self.seed_used = False
+        """Стартовый вопрос уже лёг в историю обычным ходом.
+
+        До этого момента он подклеивается к промпту: колонка показывает его
+        в ленте ещё до «Старта», и промпт обязан сходиться с тем, что видно
+        на экране. После «Старта» вопрос приезжает окном истории, и второй раз
+        его подклеивать нельзя — иначе `history_limit=0` перестал бы значить
+        хоть что-нибудь.
+        """
+
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
         self._reserved = False
+
+        self.store = store
+        """Хранилище сессии. None — агент живёт только в памяти процесса."""
+
+        if store is not None:
+            # Восстановление — здесь, а не отдельным вызовом из UI: забыть
+            # позвать restore() должно быть невозможно. У свежего id в базе
+            # ничего нет, и агент просто заводит себе строку.
+            saved = store.load_session(self.id) if agent_id else None
+            if saved is not None:
+                self.parent_id = saved["parent_id"]
+                self.created_at = saved["created_at"]
+                self.last_used_at = saved["updated_at"]
+                self.seed_messages = [dict(m) for m in saved["seed"]]
+                self.overrides = dict(saved["overrides"])
+                self.seed_used = saved["seed_used"]
+                self.history = [
+                    Turn(role=m["role"], content=m["content"], error=m["error"], at=m["at"])
+                    for m in store.load_messages(self.id)
+                ]
+            self.save_config()
 
     # --- состояние -----------------------------------------------------------
 
@@ -213,11 +273,16 @@ class Agent:
         до появления агентов.
 
         С заданным `user_text` первый вопрос из `messages` в промпт больше
-        не подклеивается: он либо приедет окном истории, либо забыт. Именно
-        здесь `history_limit=0` и становится правдой — колонка «без памяти»
-        на втором вопросе не знает ни вопроса, ни своего ответа. Пока прогона
-        не было и история пуста, вопрос всё же едет: колонка показывает его
-        в ленте, и промпт обязан сходиться с тем, что видно на экране.
+        не подклеивается — но только после того, как он **сам стал ходом**,
+        то есть после «Старта». Именно здесь `history_limit=0` и становится
+        правдой: колонка «без памяти» на втором вопросе не знает ни вопроса,
+        ни своего ответа.
+
+        Пока «Старта» не было, вопрос едет в каждом ходу: колонка показывает
+        его в ленте как стартовый, и промпт обязан сходиться с тем, что видно
+        на экране. Признак — `seed_used`, а не пустая история: разговор с
+        колонкой можно завести и до прогона, и после первого же ручного обмена
+        вводная иначе молча исчезала бы из промпта, оставаясь на экране.
         """
         setting, question = self._seed_split()
         messages: list[dict] = []
@@ -232,7 +297,7 @@ class Agent:
                 messages.append({"role": "user", "content": question})
             return messages
 
-        if question is not None and not self.history:
+        if question is not None and not self.seed_used:
             messages.append({"role": "user", "content": question})
         messages.extend(self.window())
         messages.append({"role": "user", "content": user_text})
@@ -240,9 +305,52 @@ class Agent:
 
     # --- история -------------------------------------------------------------
 
-    def remember(self, role: str, content: str, error: str | None = None) -> None:
+    def remember(
+        self, role: str, content: str, error: str | None = None, *, persist: bool = True
+    ) -> None:
         self.history.append(Turn(role=role, content=content, error=error))
         self._trim()
+        if persist:
+            self.persist()
+
+    def remember_exchange(
+        self, question: str | None, answer: str, error: str | None = None
+    ) -> None:
+        """Вопрос и ответ ложатся в историю парой и пишутся одной транзакцией.
+
+        Отдельная запись вопроса оставила бы в базе вопрос без ответа, если
+        процесс умрёт между двумя `remember`. В памяти такого не бывает —
+        в базе тоже не должно.
+        """
+        if question is not None:
+            self.remember("user", question, persist=False)
+        self.remember("assistant", answer, error=error)
+
+    def persist(self) -> None:
+        """Пишет историю в хранилище. Без хранилища — тихо ничего не делает."""
+        if self.store is not None:
+            self.store.save_history(self.id, self.history)
+
+    def save_config(self) -> None:
+        """Пишет конфиг сессии: модель, семплирование, стартовые сообщения, overrides.
+
+        Зовётся при создании и после каждой правки конфига — смены модели
+        через PATCH, подстановки depends_on, переноса overrides на «Старте».
+        Иначе после перезапуска сессия поднялась бы на модели из day.py,
+        молча отменив выбор пользователя.
+        """
+        if self.store is None:
+            return
+        self.store.save_session(
+            self.id,
+            parent_id=self.parent_id,
+            label=self.spec.label,
+            config=asdict(self.spec),
+            seed=[dict(m) for m in self.seed_messages],
+            overrides=dict(self.overrides),
+            seed_used=self.seed_used,
+            created_at=self.created_at,
+        )
 
     def _trim(self) -> None:
         if len(self.history) > MAX_STORED_MESSAGES:
@@ -250,6 +358,7 @@ class Agent:
 
     def forget(self) -> None:
         self.history.clear()
+        self.persist()
 
     def transcript(self) -> list[dict]:
         """Стартовый промпт и всё, что наговорили после него, — одним списком."""
@@ -329,6 +438,7 @@ class Agent:
             # в историю как обычный ход: агент с памятью обязан помнить,
             # на что он отвечал, а не только чем ответил.
             question = user_text if user_text is not None else self.seed_question
+            is_seed = user_text is None
             total = max(1, int(self.spec.repeats or 1))
 
             yield {
@@ -395,17 +505,17 @@ class Agent:
                 except MissingKeyError as exc:
                     failure = str(exc)
                     yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit)
+                    self._commit(question, texts, partial or text, failure, commit, seed=is_seed)
                     return
                 except asyncio.CancelledError:
                     # Клиент ушёл: частичный ответ всё равно записываем — он уже
                     # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                    self._commit(question, texts, partial or text, "вызов прерван", commit)
+                    self._commit(question, texts, partial or text, "вызов прерван", commit, seed=is_seed)
                     raise
                 except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                     failure = f"{type(exc).__name__}: {exc}"
                     yield {"type": "error", "message": failure, "metrics": None}
-                    self._commit(question, texts, partial or text, failure, commit)
+                    self._commit(question, texts, partial or text, failure, commit, seed=is_seed)
                     return
 
                 if text:
@@ -425,7 +535,7 @@ class Agent:
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            committed = self._commit(question, texts, partial, failure, commit)
+            committed = self._commit(question, texts, partial, failure, commit, seed=is_seed)
 
             done: dict = {
                 "type": "done",
@@ -451,8 +561,14 @@ class Agent:
         partial: str,
         failure: str | None,
         commit: bool,
+        *,
+        seed: bool = False,
     ) -> bool:
-        """Пишет обмен в историю. Возвращает False, если писать было нечего."""
+        """Пишет обмен в историю и в базу. Возвращает False, если писать было нечего.
+
+        `seed=True` — обмен был стартовым вопросом из конфига: с этого момента
+        он живёт в истории обычным ходом и в промпт отдельно не подклеивается.
+        """
         if not commit:
             return False
 
@@ -463,7 +579,14 @@ class Agent:
         if not answer.strip():
             return False
 
-        if user_text is not None:
-            self.remember("user", user_text)
-        self.remember("assistant", answer, error=error)
+        # Флаг и обмен пишутся одной транзакцией: иначе процесс, умерший между
+        # ними, оставил бы колонку с поднятым seed_used и без записанного хода —
+        # и стартовый вопрос исчез бы из промпта, ни разу не прозвучав.
+        with self.store.tx() if self.store is not None else contextlib.nullcontext():
+            if seed and not self.seed_used:
+                # Флаг — часть конфига сессии: после перезапуска колонка
+                # не должна заново считать стартовый вопрос незаданным.
+                self.seed_used = True
+                self.save_config()
+            self.remember_exchange(user_text, answer, error=error)
         return True

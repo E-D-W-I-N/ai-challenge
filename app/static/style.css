@@ -634,3 +634,37 @@ button.ghost:hover { color: var(--text); border-color: var(--accent); }
 @media (max-width: 860px) {
   .chat-panel { max-height: none; min-height: 220px; }
 }
+
+/* --- Сессии в сайдбаре: список того, что лежит в базе ---------------------- */
+
+.sidebar-hint {
+  margin: -2px 0 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+/* Строка стала кликабельной: клик открывает сессию, крестик её удаляет. */
+.agent-row { align-items: center; cursor: pointer; }
+.agent-row:hover { background: var(--panel-2); }
+.agent-row-label { flex: 1 1 auto; min-width: 0; }
+
+/* Сессии, которой сейчас нет в памяти процесса: откроется — поднимется из базы. */
+.agent-row.stored .agent-row-id { opacity: 0.55; }
+
+.agent-row-drop {
+  flex: 0 0 auto;
+  border: 0;
+  background: none;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+
+.agent-row:hover .agent-row-drop,
+.agent-row-drop:focus-visible { opacity: 0.7; }
+
+.agent-row-drop:hover { opacity: 1; }
