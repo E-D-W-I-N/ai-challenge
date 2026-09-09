@@ -16,7 +16,7 @@ const path = require("path");
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
 
 const app = require(path.join(__dirname, "..", "app", "static", "app.js"));
-const { renderMarkdown, layoutFor, escapeAction, chatTitle } = app;
+const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFormat, paramWarnings } = app;
 
 const failures = [];
 let passed = 0;
@@ -131,6 +131,100 @@ check(
     JSON.stringify({ sidebar: false, panel: false })
 );
 
+// ── предупреждение о параметрах, которых модель не потянет ──
+
+{
+  const plain = {
+    id: "openai/gpt-4o-mini",
+    supported_parameters: ["temperature", "max_tokens", "stop", "response_format"],
+    temperature_capped: false,
+    temperature_cap: null,
+  };
+  const capped = {
+    id: "anthropic/claude-sonnet",
+    supported_parameters: ["temperature", "max_tokens", "top_p"],
+    temperature_capped: true,
+    temperature_cap: 1.0,
+  };
+
+  const unsupported = paramWarnings(plain, { temperature: 0.5, top_k: 40, min_p: 0.05 });
+  check("незаявленный параметр даёт предупреждение", unsupported.length === 1, JSON.stringify(unsupported));
+  check("в предупреждении названы все незаявленные", /top_k, min_p/.test(unsupported[0] || ""), unsupported[0]);
+  check("в предупреждении названа модель", /gpt-4o-mini/.test(unsupported[0] || ""), unsupported[0]);
+  check(
+    "предупреждение объясняет, чем это кончится",
+    /require_parameters/.test(unsupported[0] || ""),
+    unsupported[0]
+  );
+
+  check(
+    "заявленные параметры молчат",
+    paramWarnings(plain, { temperature: 0.5, max_tokens: 100, stop: ["СТОП"] }).length === 0
+  );
+  check(
+    "незаданные параметры не считаются незаявленными",
+    paramWarnings(plain, { temperature: null, top_k: null, min_p: undefined }).length === 0
+  );
+  check(
+    "response_format проверяется наравне с числами",
+    paramWarnings(
+      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
+      { response_format: { type: "json_object" } }
+    ).length === 1
+  );
+  check(
+    "stop проверяется наравне с числами",
+    paramWarnings(
+      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
+      { stop: ["КОНЕЦ"] }
+    ).length === 1
+  );
+
+  // Главная ловушка: модель заявляет temperature и всё равно вернёт 400.
+  const hot = paramWarnings(capped, { temperature: 1.2 });
+  check("обрезанная температура предупреждает, хотя параметр заявлен", hot.length === 1, JSON.stringify(hot));
+  check("в предупреждении назван потолок", /1\.0/.test(hot[0] || ""), hot[0]);
+  check("температура под потолком молчит", paramWarnings(capped, { temperature: 0.9 }).length === 0);
+  check("ровно потолок молчит", paramWarnings(capped, { temperature: 1.0 }).length === 0);
+  check(
+    "оба повода дают два предупреждения",
+    paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }).length === 2,
+    JSON.stringify(paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }))
+  );
+
+  // Не на чем основать — не пугаем.
+  check("модель не найдена в каталоге — молчим", paramWarnings(null, { top_k: 40 }).length === 0);
+  check("модель не отдала supported_parameters — молчим",
+    paramWarnings({ id: "m", supported_parameters: [] }, { top_k: 40 }).length === 0);
+  check("окно памяти в запрос не уходит и не проверяется",
+    paramWarnings(plain, { history_limit: 0 }).length === 0);
+}
+
+// ── закреплённый провайдер: настройка, которую панель не правит ──
+
+{
+  const model = { id: "openai/gpt-4o-mini", supported_parameters: ["temperature"], temperature_capped: false };
+  const pinned = paramWarnings(model, {}, { provider: { order: ["openai"], allow_fallbacks: false } });
+  check("закреплённый провайдер предупреждает", pinned.length === 1, JSON.stringify(pinned));
+  check("в предупреждении назван провайдер", /openai/.test(pinned[0] || ""), pinned[0]);
+  check("сказано, чем кончится смена модели", /404/.test(pinned[0] || ""), pinned[0]);
+
+  const noFallback = paramWarnings(model, {}, { provider: { allow_fallbacks: false } });
+  check("запрет фолбэка предупреждает отдельно", noFallback.length === 1, JSON.stringify(noFallback));
+  check("и говорит именно про фолбэк", /фолбэк/.test(noFallback[0] || ""), noFallback[0]);
+
+  check("без extra_body про провайдера молчим", paramWarnings(model, {}, {}).length === 0);
+  check("без extra_body вовсе — тоже молчим", paramWarnings(model, {}).length === 0);
+  check(
+    "про провайдера говорим, даже если модели нет в каталоге",
+    paramWarnings(null, {}, { provider: { order: ["openai"] } }).length === 1
+  );
+  check(
+    "закреплённый провайдер и незаявленный параметр — два повода",
+    paramWarnings(model, { top_k: 40 }, { provider: { order: ["openai"] } }).length === 2
+  );
+}
+
 // ── что закрывает Escape ──
 
 check(
@@ -151,11 +245,39 @@ check(
 check("на широком окне Escape не трогает борта", escapeAction(false, false, 2) === null);
 check("закрывать нечего — Escape ничего не делает", escapeAction(false, true, 0) === null);
 
-// ── автоимя чата ──
+// ── стоп-строки и формат ответа из панели ──
 
-check("автоимя режет по словам", chatTitle("расскажи про кэширование промптов в OpenRouter").length <= 40);
-check("автоимя не рвёт слово", !chatTitle("расскажи про кэширование промптов в OpenRouter").endsWith("-"));
-check("пустой ввод даёт имя по умолчанию", chatTitle("   ") === "Новый чат", chatTitle("   "));
+check(
+  "стоп-строки читаются по одной в строке",
+  JSON.stringify(readStopLines("КОНЕЦ\nСТОП")) === JSON.stringify(["КОНЕЦ", "СТОП"]),
+  JSON.stringify(readStopLines("КОНЕЦ\nСТОП"))
+);
+check("пробелы по краям срезаются", JSON.stringify(readStopLines("  КОНЕЦ  ")) === JSON.stringify(["КОНЕЦ"]));
+check("пустые строки не считаются", JSON.stringify(readStopLines("a\n\n\n b ")) === JSON.stringify(["a", "b"]));
+check("пустое поле — параметр не отправляется", readStopLines("   ") === null);
+check("совсем пустое поле — тоже null", readStopLines("") === null);
+
+check("формат по умолчанию не задан", parseResponseFormat("", "") === null);
+check(
+  "готовый вариант не требует писать JSON",
+  JSON.stringify(parseResponseFormat("json_object", "")) === JSON.stringify({ type: "json_object" })
+);
+check(
+  "свой JSON разбирается",
+  JSON.stringify(parseResponseFormat("custom", '{"type":"json_schema"}')) ===
+    JSON.stringify({ type: "json_schema" })
+);
+check("свой JSON пустым не отправляется", parseResponseFormat("custom", "   ") === null);
+{
+  let broke = false;
+  try { parseResponseFormat("custom", "{не json"); } catch (e) { broke = /не JSON/.test(e.message); }
+  check("кривой JSON даёт понятную ошибку, а не уезжает провайдеру", broke);
+}
+{
+  let broke = false;
+  try { parseResponseFormat("custom", "[1,2]"); } catch (e) { broke = /объект/.test(e.message); }
+  check("массив вместо объекта тоже ошибка", broke);
+}
 
 // ── итог ──
 

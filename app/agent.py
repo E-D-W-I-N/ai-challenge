@@ -7,7 +7,7 @@
 `Agent` принимает **текст пользователя**, а не готовую ленту: сам склеивает
 системный промпт, стартовые сообщения, хвост истории и новый вопрос, зовёт
 `stream_completion` и дописывает ответ себе в историю. Наружу отдаёт поток
-событий — из него и SSE стенда, и вывод CLI.
+событий — из него и SSE веб-клиента, и вывод CLI.
 
 Агент ничего не знает ни про FastAPI, ни про SSE, ни про реестр: сто агентов —
 это сто объектов в одном процессе, а не сто процессов.
@@ -44,6 +44,27 @@ MAX_STORED_MESSAGES = 400
 _ids = itertools.count(1)
 
 
+def copy_spec(spec: AgentSpec) -> AgentSpec:
+    """Копия конфига, и вглубь тоже.
+
+    `replace` копирует только верхний уровень: `messages`, `stop`,
+    `response_format` и `extra_body` остались бы одним объектом на всех, кого
+    подняли из этого конфига, — правка у одного задела бы остальных.
+    """
+    return replace(
+        spec,
+        messages=[dict(m) for m in (spec.messages or [])],
+        stop=list(spec.stop) if spec.stop else None,
+        response_format=copy.deepcopy(spec.response_format),
+        extra_body=copy.deepcopy(spec.extra_body or {}),
+    )
+
+
+def _history_limit(spec: AgentSpec) -> int:
+    limit = spec.history_limit
+    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+
+
 class AgentBusyError(RuntimeError):
     """У агента уже идёт обмен. Второй параллельный запрос — ошибка, а не очередь.
 
@@ -65,7 +86,7 @@ class Turn:
     """Рассуждение модели, если она его прислала. В модель обратно не уходит.
 
     OpenRouter отдаёт его отдельным полем дельты, и в `content` оно не входит.
-    Клиент рисует его свёрнутым блоком над ответом — как «Thinking» в oMLX.
+    Клиент рисует его свёрнутым блоком «Рассуждение» над ответом.
     """
 
     metrics: dict | None = None
@@ -116,19 +137,10 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: один и тот же spec из ростера может
-        # поднять несколько агентов, а `replace` копирует только верхний уровень —
-        # messages, stop, response_format и extra_body остались бы одним
-        # объектом на сотню агентов и на сам день. Правка любого из них
-        # у одного агента задела бы всех остальных, а день ровно про то,
-        # что у ста агентов конфиги **разные**.
-        self.spec = replace(
-            spec,
-            messages=[dict(m) for m in (spec.messages or [])],
-            stop=list(spec.stop) if spec.stop else None,
-            response_format=copy.deepcopy(spec.response_format),
-            extra_body=copy.deepcopy(spec.extra_body or {}),
-        )
+        # Один и тот же spec из day.py может поднять несколько агентов —
+        # каждому нужна своя копия, иначе правка у одного задела бы всех,
+        # а день ровно про то, что у ста агентов конфиги **разные**.
+        self.spec = copy_spec(spec)
         self.id = agent_id or f"ag_{next(_ids):05d}"
         self.created_at = time.time()
         self.last_used_at = self.created_at
@@ -137,11 +149,28 @@ class Agent:
         self.history: list[Turn] = []
         """Только то, что наговорили в диалоге. Стартовые сообщения — в spec."""
 
-        self.seed_messages: list[dict] = [dict(m) for m in (spec.messages or [])]
-        """Стартовые сообщения агента: заготовка диалога до первого вопроса.
+        # Системный промпт живёт ровно в одном месте — `spec.system`, и читается
+        # оттуда на каждом обращении. Если он приехал внутри `messages`, его
+        # переносят сюда прямо здесь: иначе панель правила бы `spec.system`,
+        # а в модель уезжала бы копия из заготовки, зафиксированная в момент
+        # создания агента.
+        seed = [dict(m) for m in (spec.messages or [])]
+        carried = [m.get("content", "") for m in seed if m.get("role") == "system"]
+        if carried and self.spec.system:
+            # Выбросить одно из двух молча нельзя: у промпта ровно один дом,
+            # и какой из двух текстов лишний — знает только автор конфига.
+            raise ValueError(
+                f"агент «{spec.label}»: системный промпт задан и полем system, "
+                "и сообщением в messages — оставьте что-то одно"
+            )
+        if carried:
+            self.spec.system = "\n\n".join(carried)
+
+        self.seed_messages: list[dict] = [m for m in seed if m.get("role") != "system"]
+        """Заготовка диалога до первого вопроса — без системных сообщений.
 
         Отдельное поле, а не `spec.messages`, чтобы правка заготовки у одного
-        агента не задела конфиг, из которого его спавнили."""
+        агента не задела конфиг, из которого его подняли."""
 
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
@@ -174,8 +203,7 @@ class Agent:
 
     @property
     def history_limit(self) -> int:
-        limit = self.spec.history_limit
-        return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
+        return _history_limit(self.spec)
 
     def cancel(self) -> None:
         """Просит агента прекратить текущую генерацию.
@@ -188,9 +216,9 @@ class Agent:
 
     # --- сборка промпта ------------------------------------------------------
 
-    def window(self) -> list[dict]:
+    def window(self, spec: AgentSpec | None = None) -> list[dict]:
         """Хвост истории, который уезжает в модель. При history_limit=0 — пусто."""
-        limit = self.history_limit
+        limit = _history_limit(spec if spec is not None else self.spec)
         if not limit:
             return []
         return [turn.as_message() for turn in self.history[-limit:]]
@@ -198,8 +226,9 @@ class Agent:
     def _seed_split(self) -> tuple[list[dict], str | None]:
         """Делит стартовые сообщения на обстановку и первый вопрос.
 
-        Обстановка — системная инструкция и всё, что не последняя реплика
-        пользователя. Это конфиг агента, он уезжает в модель всегда.
+        Обстановка — всё, что не последняя реплика пользователя: она уезжает
+        в модель всегда. Системных сообщений здесь уже нет — они переехали
+        в `spec.system` при создании агента.
 
         Последняя реплика пользователя — не конфиг, а первый **ход** разговора.
         Агент без памяти забывает его так же, как забыл бы любой другой ход:
@@ -217,19 +246,21 @@ class Agent:
         return self._seed_split()[1]
 
     def starting_prompt(self) -> list[dict]:
-        """Стартовый промпт целиком — системная инструкция и `messages`.
+        """Стартовый промпт целиком — системная инструкция и заготовка.
 
         Не зависит от истории: с него начинается стенограмма, и он же виден
-        в ленте до первого вопроса.
+        в ленте до первого вопроса. Системный промпт берётся из конфига
+        каждый раз, поэтому правка в панели видна сразу.
         """
         messages: list[dict] = []
-        has_system = any(m.get("role") == "system" for m in self.seed_messages)
-        if self.spec.system and not has_system:
+        if self.spec.system:
             messages.append({"role": "system", "content": self.spec.system})
         messages.extend(dict(m) for m in self.seed_messages)
         return messages
 
-    def build_prompt(self, user_text: str | None = None) -> list[dict]:
+    def build_prompt(
+        self, user_text: str | None = None, *, spec: AgentSpec | None = None
+    ) -> list[dict]:
         """Обстановка + окно истории + вопрос этого хода.
 
         `user_text=None` — обмен стартовым промптом: с пустой историей это
@@ -242,22 +273,25 @@ class Agent:
         пуста, вопрос всё же едет: он часть заготовки, и промпт обязан
         сходиться с тем, что показано в стенограмме.
         """
+        # `spec` передаёт обмен: он собирает промпт и тело запроса из одного
+        # слепка, чтобы правка панели не могла попасть между ними.
+        spec = spec if spec is not None else self.spec
+
         setting, question = self._seed_split()
         messages: list[dict] = []
-        has_system = any(m.get("role") == "system" for m in setting)
-        if self.spec.system and not has_system:
-            messages.append({"role": "system", "content": self.spec.system})
+        if spec.system:
+            messages.append({"role": "system", "content": spec.system})
         messages.extend(setting)
 
         if user_text is None:
-            messages.extend(self.window())
+            messages.extend(self.window(spec))
             if question is not None:
                 messages.append({"role": "user", "content": question})
             return messages
 
         if question is not None and not self.history:
             messages.append({"role": "user", "content": question})
-        messages.extend(self.window())
+        messages.extend(self.window(spec))
         messages.append({"role": "user", "content": user_text})
         return messages
 
@@ -302,8 +336,6 @@ class Agent:
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
             "draft": self.spec.draft,
-            "group": self.spec.group,
-            "note": self.spec.note,
             "history_limit": self.history_limit,
             "history_len": len(self.history),
             "busy": self.busy,
@@ -341,7 +373,19 @@ class Agent:
             cancel = self._cancel
             self.last_used_at = time.time()
 
-            prompt = self.build_prompt(user_text)
+            # Слепок конфига на весь обмен. Промпт и тело запроса собираются
+            # в двух разных точках, и между ними стоит `yield` события `start`:
+            # правка панели, попавшая туда, дала бы смешанный запрос — новую
+            # модель со старым системным промптом. Сейчас через этот `yield`
+            # никто не приостанавливается, но держится это на устройстве
+            # доставки событий, а не на самом обмене: ограничат очередь или
+            # добавят один `await` — и окно откроется молча. Со слепком
+            # «текущий вызов идёт целиком на одном конфиге» верно
+            # по построению, а не по совпадению.
+            spec = copy_spec(self.spec)
+            context_length = self.context_length
+
+            prompt = self.build_prompt(user_text, spec=spec)
             # Вопрос коммитится в историю как обычный ход: агент с памятью
             # обязан помнить, на что он отвечал, а не только чем ответил.
             question = user_text if user_text is not None else self.seed_question
@@ -356,7 +400,7 @@ class Agent:
 
             try:
                 stream = stream_completion(
-                    self.spec, prompt_override=prompt, context_length=self.context_length
+                    spec, prompt_override=prompt, context_length=context_length
                 )
                 async with contextlib.aclosing(stream):
                     async for chunk in stream:
