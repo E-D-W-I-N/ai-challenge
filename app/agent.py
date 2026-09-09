@@ -7,7 +7,7 @@
 `Agent` принимает **текст пользователя**, а не готовую ленту: сам склеивает
 системный промпт, стартовые сообщения, хвост истории и новый вопрос, зовёт
 `stream_completion` и дописывает ответ себе в историю. Наружу отдаёт поток
-событий — из него и SSE стенда, и вывод CLI.
+событий — из него и SSE веб-клиента, и вывод CLI.
 
 Агент ничего не знает ни про FastAPI, ни про SSE, ни про реестр: сто агентов —
 это сто объектов в одном процессе, а не сто процессов.
@@ -65,7 +65,7 @@ class Turn:
     """Рассуждение модели, если она его прислала. В модель обратно не уходит.
 
     OpenRouter отдаёт его отдельным полем дельты, и в `content` оно не входит.
-    Клиент рисует его свёрнутым блоком над ответом — как «Thinking» в oMLX.
+    Клиент рисует его свёрнутым блоком «Рассуждение» над ответом.
     """
 
     metrics: dict | None = None
@@ -116,7 +116,7 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: один и тот же spec из ростера может
+        # Копия конфига, и вглубь тоже: один и тот же spec из day.py может
         # поднять несколько агентов, а `replace` копирует только верхний уровень —
         # messages, stop, response_format и extra_body остались бы одним
         # объектом на сотню агентов и на сам день. Правка любого из них
@@ -137,11 +137,21 @@ class Agent:
         self.history: list[Turn] = []
         """Только то, что наговорили в диалоге. Стартовые сообщения — в spec."""
 
-        self.seed_messages: list[dict] = [dict(m) for m in (spec.messages or [])]
-        """Стартовые сообщения агента: заготовка диалога до первого вопроса.
+        # Системный промпт живёт ровно в одном месте — `spec.system`, и читается
+        # оттуда на каждом обращении. Если он приехал внутри `messages`, его
+        # переносят сюда прямо здесь: иначе панель правила бы `spec.system`,
+        # а в модель уезжала бы копия из заготовки, зафиксированная в момент
+        # создания агента.
+        seed = [dict(m) for m in (spec.messages or [])]
+        carried = [m.get("content", "") for m in seed if m.get("role") == "system"]
+        if carried and not self.spec.system:
+            self.spec.system = "\n\n".join(carried)
+
+        self.seed_messages: list[dict] = [m for m in seed if m.get("role") != "system"]
+        """Заготовка диалога до первого вопроса — без системных сообщений.
 
         Отдельное поле, а не `spec.messages`, чтобы правка заготовки у одного
-        агента не задела конфиг, из которого его спавнили."""
+        агента не задела конфиг, из которого его подняли."""
 
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
@@ -198,8 +208,9 @@ class Agent:
     def _seed_split(self) -> tuple[list[dict], str | None]:
         """Делит стартовые сообщения на обстановку и первый вопрос.
 
-        Обстановка — системная инструкция и всё, что не последняя реплика
-        пользователя. Это конфиг агента, он уезжает в модель всегда.
+        Обстановка — всё, что не последняя реплика пользователя: она уезжает
+        в модель всегда. Системных сообщений здесь уже нет — они переехали
+        в `spec.system` при создании агента.
 
         Последняя реплика пользователя — не конфиг, а первый **ход** разговора.
         Агент без памяти забывает его так же, как забыл бы любой другой ход:
@@ -217,14 +228,14 @@ class Agent:
         return self._seed_split()[1]
 
     def starting_prompt(self) -> list[dict]:
-        """Стартовый промпт целиком — системная инструкция и `messages`.
+        """Стартовый промпт целиком — системная инструкция и заготовка.
 
         Не зависит от истории: с него начинается стенограмма, и он же виден
-        в ленте до первого вопроса.
+        в ленте до первого вопроса. Системный промпт берётся из конфига
+        каждый раз, поэтому правка в панели видна сразу.
         """
         messages: list[dict] = []
-        has_system = any(m.get("role") == "system" for m in self.seed_messages)
-        if self.spec.system and not has_system:
+        if self.spec.system:
             messages.append({"role": "system", "content": self.spec.system})
         messages.extend(dict(m) for m in self.seed_messages)
         return messages
@@ -244,8 +255,7 @@ class Agent:
         """
         setting, question = self._seed_split()
         messages: list[dict] = []
-        has_system = any(m.get("role") == "system" for m in setting)
-        if self.spec.system and not has_system:
+        if self.spec.system:
             messages.append({"role": "system", "content": self.spec.system})
         messages.extend(setting)
 
@@ -302,8 +312,6 @@ class Agent:
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
             "draft": self.spec.draft,
-            "group": self.spec.group,
-            "note": self.spec.note,
             "history_limit": self.history_limit,
             "history_len": len(self.history),
             "busy": self.busy,

@@ -1,8 +1,8 @@
-"""FastAPI-стенд: реестр агентов процесса и чат с любым из них.
+"""FastAPI-сервер чата: реестр агентов процесса и разговор с любым из них.
 
-Ростер берётся из day.py в корне ветки: ветка — это один день, и стенд в ней
-ровно один. В ростере и агенты самого Дня 6, и агенты заданий дней 1–5 — их
-конфиги перенесены сюда из веток тех дней, чтобы с ними можно было поговорить.
+Заранее заведённые чаты берутся из day.py в корне ветки. Они ничем не
+особенные: обычные чаты с именем, системным промптом и настройками — их так
+же переименовывают, удаляют и правят, как любой созданный руками.
 
 Сервер держит состояние: агент — объект в реестре процесса, историю диалога
 хранит он, а не браузер. Клиент шлёт только новый текст и id агента. Реестр
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import sys
 import time
@@ -20,7 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -34,46 +35,55 @@ from .schema import AgentSpec
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # day.py лежит в корне ветки, рядом с app/. Кладём корень в sys.path сами,
-# чтобы стенд поднимался и не из корня тоже.
+# чтобы сервер поднимался и не из корня тоже.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
     import day as _day
 
-    ROSTER: list[AgentSpec] = list(_day.AGENTS)
-except Exception as exc:  # noqa: BLE001 — без дня стенду нечего показывать
+    PRESET_CHATS: list[AgentSpec] = list(_day.CHATS)
+except Exception as exc:  # noqa: BLE001 — без day.py серверу нечего поднимать
     raise RuntimeError(
         f"day.py не загрузился ({type(exc).__name__}: {exc}). "
         "День в ветке один, прятать ошибку не от кого — почините day.py."
     ) from exc
 
-if not ROSTER:
-    raise RuntimeError("day.py: AGENTS должен быть непустым списком AgentSpec")
-_wrong = next((a for a in ROSTER if not isinstance(a, AgentSpec)), None)
+_wrong = next((a for a in PRESET_CHATS if not isinstance(a, AgentSpec)), None)
 if _wrong is not None:
     raise RuntimeError(
-        f"day.py: AGENTS содержит {type(_wrong).__name__}, а должен — только AgentSpec"
+        f"day.py: CHATS содержит {type(_wrong).__name__}, а должен — только AgentSpec"
     )
-_labels = [a.label for a in ROSTER]
+_labels = [a.label for a in PRESET_CHATS]
 if len(set(_labels)) != len(_labels):
     _dupes = sorted({label for label in _labels if _labels.count(label) > 1})
     raise RuntimeError(
-        f"day.py: имена агентов должны быть уникальны, а повторяются: {', '.join(_dupes)}"
+        f"day.py: имена чатов должны быть уникальны, а повторяются: {', '.join(_dupes)}"
     )
 
 NEW_CHAT_SPEC = AgentSpec(
     label="Новый чат",
     model="openai/gpt-4o-mini",
     system="Ты — полезный ассистент. Отвечай по-русски, по делу.",
-    note="Чистый чат: конфиг настраивается в панели справа.",
 )
-"""Конфиг кнопки «Новый чат». Группы у него нет — это чат пользователя."""
+"""Заготовка кнопки «Новый чат». Имя ей выдаёт `_next_chat_label`."""
+
+_chat_numbers = itertools.count(1)
+"""Счётчик имён по умолчанию: «Новый чат 1», «Новый чат 2» и дальше.
+
+Счётчик только растёт и номера не переиспользует. Иначе после удаления
+третьего чата следующий стал бы вторым «Новым чатом 3» — а двух одинаковых
+имён по умолчанию быть не должно.
+"""
+
+
+def _next_chat_label() -> str:
+    return f"Новый чат {next(_chat_numbers)}"
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    ensure_roster()
+    bootstrap_chats()
     yield
     # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
     # руками: без этого uvicorn на остановке ругается на незакрытый пул.
@@ -89,22 +99,18 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
-# --- ростер -------------------------------------------------------------------
+# --- заранее заведённые чаты --------------------------------------------------
 
 
-def ensure_roster() -> list[Agent]:
-    """Поднимает недостающих агентов ростера. Идемпотентна.
+def bootstrap_chats() -> list[Agent]:
+    """Поднимает чаты из day.py, которых ещё нет. Зовётся на старте процесса.
 
-    Зовётся на старте процесса и после «Очистить все чаты»: агенты дней 1–5 —
-    часть стенда, а не пользовательские чаты, и пропасть они не должны.
+    Дальше они живут наравне со всеми: их переименовывают, удаляют и правят.
+    Никакой отдельной ветки обработки у них нет — только строчка в day.py
+    вместо кнопки «Новый чат».
     """
-    live = {a.spec.label for a in REGISTRY.list() if a.spec.group}
-    return [REGISTRY.create(spec) for spec in ROSTER if spec.label not in live]
-
-
-def _chat_agents() -> list[Agent]:
-    """Чаты пользователя: у них нет группы. Ростер — всё остальное."""
-    return [a for a in REGISTRY.list() if not a.spec.group]
+    live = {a.spec.label for a in REGISTRY.list()}
+    return [REGISTRY.create(spec) for spec in PRESET_CHATS if spec.label not in live]
 
 
 # --- вспомогательное ----------------------------------------------------------
@@ -205,12 +211,19 @@ MAX_SPAWN_BATCH = 250
 _INT_FIELDS = ("max_tokens", "top_k")
 _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 
-PATCHABLE = ("label", "system", "model", "history_limit", *SAMPLING_FIELDS)
-"""Что панель справа вправе менять у живого агента.
+PATCHABLE = (
+    "label",
+    "system",
+    "model",
+    "history_limit",
+    "stop",
+    "response_format",
+    *SAMPLING_FIELDS,
+)
+"""Что панель справа вправе менять у живого чата.
 
-Всё сразу: панель и есть редактор конфига, а не набор заплаток поверх него.
-Снаружи не меняются только `group` (по ней «Очистить все чаты» отличает
-ростер от чатов) и стартовые `messages`.
+Всё, что видно в панели, и ничего сверх: стартовая заготовка `messages`
+снаружи не правится, а имя меняют из списка слева тем же полем `label`.
 """
 
 
@@ -316,15 +329,11 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
         return _optional_field(payload, name, (str,), "строка или null", where) or ""
 
     return AgentSpec(
-        label=str(payload.get("label") or "Новый чат"),
+        label=str(payload.get("label") or _next_chat_label()),
         model=model,
         messages=_parse_messages(payload.get("messages") or [], where),
         system=text("system"),
         draft=text("draft"),
-        # Группу извне задать нельзя: она отличает агентов ростера от чатов
-        # пользователя, и «Очистить все чаты» ходит именно по ней.
-        group="",
-        note=text("note"),
         stop=stop or None,
         response_format=response_format,
         extra_body=extra_body,
@@ -344,7 +353,7 @@ def _agent(agent_id: str) -> Agent:
             status_code=404,
             detail=(
                 f"агента {agent_id} нет в реестре: он мог быть вытеснен по лимиту "
-                "или стёрт перезапуском стенда — создайте нового"
+                "или стёрт перезапуском сервера — создайте новый"
             ),
         ) from exc
 
@@ -352,16 +361,14 @@ def _agent(agent_id: str) -> Agent:
 def _listing() -> dict:
     """Всё, что нужно клиенту для списка слева и статуса ключа.
 
-    Ключа здесь нет и быть не может: наружу уходит только факт его наличия.
+    Список плоский: ни групп, ни разделения на «свои» и «заготовленные».
+    Ключа здесь нет и быть не может — наружу уходит только факт его наличия.
     """
     return {
         "has_key": has_key(),
         "live": len(REGISTRY),
         "max_agents": REGISTRY.max_agents,
         "evicted": REGISTRY.evicted,
-        # Порядок групп задаёт day.py, а не сортировка: «День 10» не должен
-        # оказаться между первым и вторым.
-        "groups": list(dict.fromkeys(spec.group for spec in ROSTER if spec.group)),
         "agents": [a.as_dict() for a in REGISTRY.list()],
     }
 
@@ -403,7 +410,9 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
 
     started = time.perf_counter()
     specs = [
-        replace(NEW_CHAT_SPEC) if item is None else _parse_spec(item, f"agents[{i}].")
+        replace(NEW_CHAT_SPEC, label=_next_chat_label())
+        if item is None
+        else _parse_spec(item, f"agents[{i}].")
         for i, item in enumerate(raw)
     ]
     context_lengths = await _context_lengths()
@@ -414,18 +423,6 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
         "live": len(REGISTRY),
         "agents": [a.as_dict() for a in agents],
     }
-
-
-@app.post("/api/agents/reset")
-async def reset_chats() -> dict:
-    """«Очистить все чаты»: сносит чаты пользователя, ростер не трогает.
-
-    Агенты дней 1–5 — часть стенда, а не переписка: они переживают очистку
-    и восстанавливаются, если чего-то не хватает.
-    """
-    killed = [agent.id for agent in _chat_agents() if REGISTRY.kill(agent.id)]
-    ensure_roster()
-    return {"killed": killed, **_listing()}
 
 
 @app.get("/api/agents/{agent_id}")
@@ -478,6 +475,17 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
                 status_code=400, detail="history_limit: целое число от нуля или null"
             )
         agent.spec.history_limit = limit
+    if "stop" in payload:
+        stop = _optional_field(payload, "stop", (list,), "список строк или null")
+        if stop is not None and not all(isinstance(x, str) for x in stop):
+            raise HTTPException(status_code=400, detail="stop: список строк или null")
+        # Пустая строка стоп-строкой не является: поле в панели построчное,
+        # и лишний перевод строки не должен превращаться в параметр.
+        agent.spec.stop = [x.strip() for x in (stop or []) if x.strip()] or None
+    if "response_format" in payload:
+        agent.spec.response_format = _optional_field(
+            payload, "response_format", (dict,), "объект или null"
+        )
     for name in SAMPLING_FIELDS:
         if name in payload:
             setattr(agent.spec, name, sampling[name])
@@ -502,23 +510,13 @@ async def cancel_agent(agent_id: str) -> dict:
 
 
 @app.get("/api/models")
-async def list_models(
-    requires: str = Query("", description="csv: temperature,stop,response_format"),
-    exclude_free: bool = False,
-    exclude_temperature_capped: bool = False,
-) -> dict:
+async def list_models() -> dict:
+    """Каталог моделей для дропдауна — целиком, без отбора."""
     try:
         models = await catalog.fetch_models()
     except Exception as exc:  # каталог недоступен — UI не должен падать
         raise HTTPException(status_code=502, detail=f"каталог моделей недоступен: {exc}") from exc
-    needed = tuple(p.strip() for p in requires.split(",") if p.strip())
-    filtered = catalog.filter_models(
-        models,
-        requires=needed,
-        exclude_free=exclude_free,
-        exclude_temperature_capped=exclude_temperature_capped,
-    )
-    return {"total": len(models), "count": len(filtered), "models": filtered}
+    return {"total": len(models), "models": models}
 
 
 # --- разговор -----------------------------------------------------------------
@@ -657,7 +655,7 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}
     except asyncio.CancelledError:
         raise
-    except Exception as exc:  # noqa: BLE001 — падает обмен, стенд живёт
+    except Exception as exc:  # noqa: BLE001 — падает обмен, сервер живёт
         yield {
             "event": "error",
             "agent": agent.id,

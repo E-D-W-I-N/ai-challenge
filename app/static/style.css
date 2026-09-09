@@ -1,5 +1,5 @@
-/* Клиент по образцу oMLX Chat: список агентов слева, лента по центру,
-   настройки и метрики справа.
+/* Чат-клиент: список чатов слева, лента по центру, настройки и метрики
+   справа.
 
    Ничего из сети: ни шрифтов, ни иконок, ни библиотек. Шрифт — системный,
    иконки — inline SVG из app.js, разметка markdown разбирается своими силами.
@@ -164,22 +164,31 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .list-empty { padding: 8px; font-size: 12px; color: var(--faint); }
 
 .item {
-  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 0;
+  margin-bottom: 2px;
+  border-radius: 9px;
+  transition: background .12s ease;
+}
+.item:hover { background: var(--bg-soft); }
+.item.active { background: var(--bubble); }
+
+.item-open {
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 8px 10px;
-  margin-bottom: 2px;
+  padding: 8px 4px 8px 10px;
   border: 0;
   border-radius: 9px;
   background: transparent;
   color: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background .12s ease;
 }
-.item:hover { background: var(--bg-soft); }
-.item.active { background: var(--bubble); }
 .item-icon { flex: 0 0 auto; color: var(--faint); display: grid; place-items: center; }
 .item-icon svg { width: 15px; height: 15px; }
 .item.active .item-icon { color: var(--accent); }
@@ -191,7 +200,39 @@ button, input, select, textarea { font: inherit; color: inherit; }
   white-space: nowrap;
   font-size: 13.5px;
 }
-.item-count { flex: 0 0 auto; font-size: 10px; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+/* Карандаш и корзина: проявляются на наведении и у открытого чата, чтобы
+   список не рябил кнопками. На узком окне видны всегда — наводить нечем. */
+.item-actions { flex: 0 0 auto; display: flex; gap: 1px; opacity: 0; transition: opacity .12s ease; }
+.item:hover .item-actions, .item.active .item-actions, .item:focus-within .item-actions { opacity: 1; }
+.mini {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.mini svg { width: 14px; height: 14px; }
+.mini:hover { background: var(--bg); color: var(--text); }
+.mini.danger:hover { color: var(--danger); }
+
+.item-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 4px 0 4px 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--bg);
+  font-size: 13.5px;
+  outline: none;
+}
+.item.renaming .item-actions { opacity: 0; pointer-events: none; }
 
 .sidebar-foot {
   flex: 0 0 auto;
@@ -244,14 +285,21 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ──────────────────────────── лента ──────────────────────────── */
 
+/* Композер закреплён у нижнего края: прокручивается лента, а не поле
+   ввода. Держится это на min-height: 0 — без него автоматический минимум
+   grid- и flex-элемента считается по содержимому, лента распирает столбец
+   выше экрана, и поле ввода уезжает вниз вместе с ней. */
 .chat {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   position: relative;
 }
-.chat-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.chat-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
 
 .feed {
   flex: 1 1 auto;
@@ -264,7 +312,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   scroll-behavior: smooth;
 }
 
-/* Рельс справа от ленты: точка на сообщение, как в oMLX. */
+/* Рельс справа от ленты: точка на сообщение, клик прокручивает к нему. */
 .rail {
   flex: 0 0 22px;
   padding: 30px 0 10px;
@@ -359,7 +407,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 [data-theme="dark"] .card-error { background: #2a1d1f; }
 
-/* «Рассуждение» — свёрнутый блок над ответом, как Thinking в oMLX */
+/* «Рассуждение» — свёрнутый блок над ответом */
 .think {
   margin: 12px 16px 0;
   border: 1px solid var(--line);
@@ -553,7 +601,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .control:focus { border-color: var(--accent); }
 .control::placeholder { color: var(--faint); }
-.control.area { resize: vertical; line-height: 1.5; font-size: 12.5px; min-height: 120px; }
+.control.area { resize: vertical; line-height: 1.5; font-size: 12.5px; min-height: 76px; }
+.control.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 select.control { appearance: none; cursor: pointer; padding-right: 26px;
   background-image: linear-gradient(45deg, transparent 50%, var(--faint) 50%),
                     linear-gradient(135deg, var(--faint) 50%, transparent 50%);
@@ -569,26 +618,13 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 
 .panel-save {
   flex: 0 0 auto;
-  padding: 10px 14px;
+  min-height: 34px;
+  padding: 8px 14px;
   border-top: 1px solid var(--line-soft);
   display: flex;
   align-items: center;
-  gap: 10px;
 }
-.save-btn {
-  flex: 0 0 auto;
-  padding: 8px 16px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--bg-soft);
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 550;
-  cursor: pointer;
-  transition: background .12s ease, border-color .12s ease;
-}
-.save-btn:hover { background: var(--bubble); border-color: var(--faint); }
-.save-status { flex: 1 1 auto; font-size: 11.5px; color: var(--ok); min-width: 0; }
+.save-status { flex: 1 1 auto; font-size: 11.5px; color: var(--ok); min-width: 0; line-height: 1.4; }
 .save-status.error { color: var(--danger); }
 
 /* ── плитки метрик ── */
@@ -684,6 +720,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
    и по Escape. */
 @media (max-width: 940px) {
   .app { grid-template-columns: minmax(0, 1fr); }
+  .item-actions { opacity: 1; }
   .sidebar, .panel {
     position: fixed;
     top: 0;

@@ -16,7 +16,7 @@ const path = require("path");
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
 
 const app = require(path.join(__dirname, "..", "app", "static", "app.js"));
-const { renderMarkdown, layoutFor, escapeAction, chatTitle } = app;
+const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFormat } = app;
 
 const failures = [];
 let passed = 0;
@@ -151,11 +151,39 @@ check(
 check("на широком окне Escape не трогает борта", escapeAction(false, false, 2) === null);
 check("закрывать нечего — Escape ничего не делает", escapeAction(false, true, 0) === null);
 
-// ── автоимя чата ──
+// ── стоп-строки и формат ответа из панели ──
 
-check("автоимя режет по словам", chatTitle("расскажи про кэширование промптов в OpenRouter").length <= 40);
-check("автоимя не рвёт слово", !chatTitle("расскажи про кэширование промптов в OpenRouter").endsWith("-"));
-check("пустой ввод даёт имя по умолчанию", chatTitle("   ") === "Новый чат", chatTitle("   "));
+check(
+  "стоп-строки читаются по одной в строке",
+  JSON.stringify(readStopLines("КОНЕЦ\nСТОП")) === JSON.stringify(["КОНЕЦ", "СТОП"]),
+  JSON.stringify(readStopLines("КОНЕЦ\nСТОП"))
+);
+check("пробелы по краям срезаются", JSON.stringify(readStopLines("  КОНЕЦ  ")) === JSON.stringify(["КОНЕЦ"]));
+check("пустые строки не считаются", JSON.stringify(readStopLines("a\n\n\n b ")) === JSON.stringify(["a", "b"]));
+check("пустое поле — параметр не отправляется", readStopLines("   ") === null);
+check("совсем пустое поле — тоже null", readStopLines("") === null);
+
+check("формат по умолчанию не задан", parseResponseFormat("", "") === null);
+check(
+  "готовый вариант не требует писать JSON",
+  JSON.stringify(parseResponseFormat("json_object", "")) === JSON.stringify({ type: "json_object" })
+);
+check(
+  "свой JSON разбирается",
+  JSON.stringify(parseResponseFormat("custom", '{"type":"json_schema"}')) ===
+    JSON.stringify({ type: "json_schema" })
+);
+check("свой JSON пустым не отправляется", parseResponseFormat("custom", "   ") === null);
+{
+  let broke = false;
+  try { parseResponseFormat("custom", "{не json"); } catch (e) { broke = /не JSON/.test(e.message); }
+  check("кривой JSON даёт понятную ошибку, а не уезжает провайдеру", broke);
+}
+{
+  let broke = false;
+  try { parseResponseFormat("custom", "[1,2]"); } catch (e) { broke = /объект/.test(e.message); }
+  check("массив вместо объекта тоже ошибка", broke);
+}
 
 // ── итог ──
 

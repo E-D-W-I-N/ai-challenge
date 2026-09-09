@@ -1,7 +1,7 @@
 "use strict";
 
-// Клиент по образцу oMLX Chat. Историю диалога хранит агент на сервере:
-// клиент держит только id агента и шлёт новый текст.
+// Чат-клиент. Историю диалога хранит агент на сервере: клиент держит
+// только id открытого чата и шлёт новый текст.
 //
 // Из сети не тянется ничего — ни шрифтов, ни библиотек, ни иконок: репозиторий
 // публичный и обязан работать без интернета. Иконки — inline SVG ниже,
@@ -9,7 +9,6 @@
 
 const state = {
   agents: [],          // всё, что вернул GET /api/agents
-  groups: [],          // порядок групп в списке слева, из day.py
   hasKey: false,
   current: null,       // открытый агент (полный ответ GET /api/agents/{id})
   models: [],          // каталог моделей для дропдауна
@@ -17,6 +16,7 @@ const state = {
   abort: null,         // AbortController активного потока
   lastMetrics: null,   // метрики последнего ответа — из них плитки
   tab: "model",
+  applying: null,      // незавершённое применение настроек панели
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -39,6 +39,8 @@ const ICONS = {
   sun: "M12 5V3M12 21v-2M5 12H3M21 12h-2M6.5 6.5L5 5M19 19l-1.5-1.5M6.5 17.5L5 19M19 5l-1.5 1.5M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z",
   moon: "M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z",
   clock: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+  pencil: "M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z",
+  trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
 };
 
 function icon(name) {
@@ -244,7 +246,6 @@ async function streamPost(path, body, onEvent, signal) {
 async function loadAgents(selectId) {
   const data = await api("/api/agents");
   state.agents = data.agents;
-  state.groups = data.groups;
   state.hasKey = data.has_key;
   renderList();
   const wanted = selectId || (state.current && state.current.id);
@@ -255,57 +256,111 @@ async function loadAgents(selectId) {
 function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
-
-  const chats = state.agents.filter((a) => !a.group);
-  const section = (title, agents, kind) => {
-    if (!agents.length) return;
-    const head = document.createElement("div");
-    head.className = "list-group";
-    head.textContent = title;
-    box.appendChild(head);
-    agents.forEach((a) => box.appendChild(listItem(a, kind)));
-  };
-
-  // Сначала чаты пользователя, ниже — агенты дней в порядке из day.py.
-  if (chats.length) {
-    section("Чаты", chats, "chat");
-  } else {
-    const head = document.createElement("div");
-    head.className = "list-group";
-    head.textContent = "Чаты";
+  if (!state.agents.length) {
     const empty = document.createElement("div");
     empty.className = "list-empty";
-    empty.textContent = "пока пусто — начните с «Новый чат»";
-    box.append(head, empty);
+    empty.textContent = "чатов пока нет — начните с «Новый чат»";
+    box.appendChild(empty);
+    return;
   }
-  state.groups.forEach((group) => {
-    section(group, state.agents.filter((a) => a.group === group), "bot");
-  });
+  // Список плоский: все чаты равны, никаких групп и разделов.
+  state.agents.forEach((agent) => box.appendChild(listItem(agent)));
 }
 
-function listItem(agent, kind) {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "item" + (state.current && agent.id === state.current.id ? " active" : "");
+function listItem(agent) {
+  const row = document.createElement("div");
+  const active = state.current && agent.id === state.current.id;
+  row.className = "item" + (active ? " active" : "");
 
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "item-open";
   const ico = document.createElement("span");
   ico.className = "item-icon";
-  ico.appendChild(icon(kind === "chat" ? "chat" : "bot"));
-
+  ico.appendChild(icon("chat"));
   const title = document.createElement("span");
   title.className = "item-title";
   title.textContent = agent.label;
+  open.append(ico, title);
+  open.title = agent.label + "\n" + agent.model;
+  open.onclick = () => openAgent(agent.id);
+  row.appendChild(open);
 
-  btn.append(ico, title);
-  if (agent.history_len) {
-    const count = document.createElement("span");
-    count.className = "item-count";
-    count.textContent = agent.history_len;
-    btn.appendChild(count);
-  }
-  btn.title = agent.label + "\n" + agent.model + (agent.note ? "\n\n" + agent.note : "");
-  btn.onclick = () => openAgent(agent.id);
+  const actions = document.createElement("div");
+  actions.className = "item-actions";
+  actions.append(
+    miniButton("pencil", "Переименовать", (ev) => { ev.stopPropagation(); startRename(row, agent); }),
+    miniButton("trash", "Удалить чат", (ev) => { ev.stopPropagation(); askDelete(agent); }, true)
+  );
+  row.appendChild(actions);
+  return row;
+}
+
+function miniButton(name, title, onClick, danger) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "mini" + (danger ? " danger" : "");
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+  btn.appendChild(icon(name));
+  btn.onclick = onClick;
   return btn;
+}
+
+// Переименование прямо в списке: Enter сохраняет, Escape отменяет,
+// потеря фокуса — тоже сохраняет, чтобы имя не терялось молча.
+function startRename(row, agent) {
+  const open = row.querySelector(".item-open");
+  const input = document.createElement("input");
+  input.className = "item-rename";
+  input.value = agent.label;
+  row.replaceChild(input, open);
+  row.classList.add("renaming");
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = async (save) => {
+    if (settled) return;
+    settled = true;
+    const name = (input.value || "").trim();
+    if (save && name && name !== agent.label) {
+      try {
+        const updated = await api("/api/agents/" + agent.id, json("PATCH", { label: name }));
+        Object.assign(agent, updated);
+        if (state.current && state.current.id === agent.id) state.current.label = updated.label;
+      } catch (err) {
+        hint(String(err.message || err), true);
+      }
+    }
+    renderList();
+    if (state.current) renderFeed(state.current);
+  };
+
+  input.onkeydown = (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(false); }
+  };
+  input.onblur = () => finish(true);
+}
+
+// Удаление — с подтверждением: переписку нельзя терять одним промахом мыши.
+function askDelete(agent) {
+  confirmBox(
+    "Удалить чат?",
+    `«${agent.label}» удалится вместе со всей перепиской. Восстановить её будет неоткуда.`,
+    "Удалить",
+    async () => {
+      try {
+        await api("/api/agents/" + agent.id, { method: "DELETE" });
+      } catch (err) {
+        hint(String(err.message || err), true);
+        return;
+      }
+      if (state.current && state.current.id === agent.id) state.current = null;
+      await loadAgents();
+    }
+  );
 }
 
 // ─────────────────────── открытие агента ──────────────────────
@@ -334,7 +389,7 @@ async function openAgent(agentId) {
   input.value = agent.draft && !spoken ? agent.draft : "";
   autoGrow(input);
   setBusy(false);
-  hint(agent.note || "");
+  hint("");
 }
 
 function lastAnswerMetrics(agent) {
@@ -358,8 +413,7 @@ function renderFeed(agent) {
     const h = document.createElement("h2");
     h.textContent = agent.label;
     const p = document.createElement("p");
-    p.textContent =
-      agent.note || "Напишите сообщение — историю разговора хранит сам агент, на сервере.";
+    p.textContent = "Напишите сообщение — историю разговора хранит сервер, а не браузер.";
     empty.append(h, p);
     feed.appendChild(empty);
     renderRail();
@@ -519,7 +573,7 @@ function setBusy(busy) {
   send.disabled = !busy && !state.hasKey;
   $("#input").disabled = busy;
   // Про ключ в интерфейсе не говорим и менять его отсюда нельзя: репозиторий
-  // публичный, ключ живёт в .env и остаётся делом того, кто поднял стенд.
+  // публичный, ключ живёт в .env и остаётся делом того, кто поднял сервер.
   if (!state.hasKey) hint("Стенд не настроен: нет .env — вызова к модели не будет.", true);
 }
 
@@ -546,6 +600,9 @@ async function send() {
 
   input.value = "";
   autoGrow(input);
+  // Поле панели могло только что потерять фокус: правка уже полетела на
+  // сервер, и отправлять сообщение вперёд неё нельзя — уедет старый конфиг.
+  if (state.applying) await state.applying;
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
@@ -664,7 +721,6 @@ async function exchange(path, body, questionText) {
     }
   }
 
-  if (questionText !== null) await maybeAutoName(questionText);
   // Лента и список слева перерисовываются по серверу: на экране должно быть
   // ровно то, что у агента в истории, а не то, что мы дорисовали по дороге.
   await refreshCurrent();
@@ -679,30 +735,9 @@ async function refreshCurrent() {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
-    fillPanel(fresh);
-  } catch (e) { /* агент исчез — список обновится при следующем открытии */ }
-}
-
-// Автоимя: чат называется по первому сообщению, без отдельного вызова
-// к модели — просто первые слова, обрезанные по границе слова.
-function chatTitle(text) {
-  const words = text.replace(/\s+/g, " ").trim().split(" ");
-  let title = "";
-  for (const word of words) {
-    if (title && (title + " " + word).length > 34) break;
-    title = title ? title + " " + word : word;
-  }
-  return title.slice(0, 40) || "Новый чат";
-}
-
-async function maybeAutoName(text) {
-  const agent = state.current;
-  if (!agent || agent.group) return;                 // агентов дней не переименовываем
-  if (!$("#autoname").checked) return;
-  if (agent.label !== "Новый чат") return;           // имя уже задано
-  try {
-    await api("/api/agents/" + agent.id, json("PATCH", { label: chatTitle(text) }));
-  } catch (e) { /* имя не критично: чат работает и без него */ }
+    // Панель намеренно не перерисовываем: пользователь мог печатать в ней
+    // прямо сейчас, и затирать его текст ответом сервера нельзя.
+  } catch (e) { /* чат исчез — список обновится при следующем открытии */ }
 }
 
 // ─────────────────────── панель настроек ──────────────────────
@@ -717,24 +752,36 @@ function fillPanel(agent) {
     const el = $("#f-" + name);
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
-  $("#f-label").value = agent.label;
   $("#f-system").value = agent.system || "";
-  $("#agent-note").textContent = agent.note || "";
-  $("#model-note").textContent = describeExtras(agent);
+  // Стоп-строки — по одной в строке: список строк, а не JSON руками.
+  $("#f-stop").value = (agent.stop || []).join("\n");
+  fillResponseFormat(agent.response_format);
   fillModels(agent.model);
-  $("#save-status").textContent = "";
+  saveStatus("");
 }
 
-// Провайдер, стоп-строки и формат ответа панелью не правятся, но молчать
-// о них нельзя: это они делают агента дня тем, чем он был.
-function describeExtras(agent) {
-  const parts = [];
-  const provider = (agent.extra_body || {}).provider || {};
-  if (provider.order) parts.push("провайдер закреплён: " + provider.order.join(", "));
-  if (provider.allow_fallbacks === false) parts.push("без фолбэков");
-  if (agent.stop && agent.stop.length) parts.push("stop: " + agent.stop.join(" | "));
-  if (agent.response_format) parts.push("response_format: " + JSON.stringify(agent.response_format));
-  return parts.join(" · ");
+// Формат ответа: частый случай выбирается из списка, редкий пишется JSON.
+function fillResponseFormat(value) {
+  const kind = $("#f-response_format_kind");
+  const custom = $("#f-response_format");
+  if (!value) {
+    kind.value = "";
+    custom.value = "";
+  } else if (JSON.stringify(value) === JSON.stringify({ type: "json_object" })) {
+    kind.value = "json_object";
+    custom.value = "";
+  } else {
+    kind.value = "custom";
+    custom.value = JSON.stringify(value, null, 2);
+  }
+  syncResponseFormat();
+}
+
+function syncResponseFormat() {
+  $("#response-format-custom").classList.toggle(
+    "hidden",
+    $("#f-response_format_kind").value !== "custom"
+  );
 }
 
 async function fillModels(current) {
@@ -772,34 +819,80 @@ function readNumber(name) {
   return value;
 }
 
-async function saveSettings() {
-  if (!state.current) return;
-  const status = $("#save-status");
-  const patch = {
-    label: ($("#f-label").value || "").trim() || state.current.label,
-    system: $("#f-system").value,
-    model: $("#f-model").value,
-  };
+// Стоп-строки: по одной в строке. Пустые строки и пробелы по краям
+// выбрасываются, пустое поле значит «не отправлять параметр».
+// Отдельной функцией без DOM — разбор проверяется без браузера.
+function readStopLines(text) {
+  const lines = String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length ? lines : null;
+}
+
+// Формат ответа: частый случай выбирается из списка, редкий пишется JSON.
+// Кривой JSON — понятная ошибка, а не молчаливая отправка мусора провайдеру.
+function parseResponseFormat(kind, raw) {
+  if (!kind) return null;
+  if (kind === "json_object") return { type: "json_object" };
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  let parsed;
   try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error("формат ответа: это не JSON — " + e.message);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("формат ответа: нужен объект JSON");
+  }
+  return parsed;
+}
+
+function saveStatus(text, isError) {
+  const el = $("#save-status");
+  el.className = "save-status" + (isError ? " error" : "");
+  el.textContent = text || "";
+}
+
+// Настройки применяются сами, как только поле теряет фокус или меняется
+// выбор в списке. Отдельной кнопки «Сохранить» нет намеренно: про неё легко
+// забыть, и тогда правка системного промпта молча не доезжает до модели —
+// ровно на это и жаловались.
+function applySettings() {
+  if (!state.current) return Promise.resolve();
+  let patch;
+  try {
+    patch = {
+      system: $("#f-system").value,
+      model: $("#f-model").value,
+      stop: readStopLines($("#f-stop").value),
+      response_format: parseResponseFormat(
+        $("#f-response_format_kind").value,
+        $("#f-response_format").value
+      ),
+    };
     NUMBER_FIELDS.forEach((name) => { patch[name] = readNumber(name); });
   } catch (err) {
-    status.className = "save-status error";
-    status.textContent = String(err.message || err);
-    return;
+    saveStatus(String(err.message || err), true);
+    return Promise.resolve();
   }
-  try {
-    const updated = await api("/api/agents/" + state.current.id, json("PATCH", patch));
-    state.current = { ...state.current, ...updated };
-    const listed = state.agents.find((a) => a.id === updated.id);
-    if (listed) Object.assign(listed, updated);
-    renderList();
-    fillPanel(state.current);
-    status.className = "save-status";
-    status.textContent = "Принято — со следующего сообщения.";
-  } catch (err) {
-    status.className = "save-status error";
-    status.textContent = String(err.message || err);
-  }
+
+  const id = state.current.id;
+  state.applying = (async () => {
+    try {
+      const updated = await api("/api/agents/" + id, json("PATCH", patch));
+      if (state.current && state.current.id === id) {
+        state.current = { ...state.current, ...updated };
+      }
+      const listed = state.agents.find((a) => a.id === id);
+      if (listed) Object.assign(listed, updated);
+      saveStatus("Применено — со следующего сообщения.");
+    } catch (err) {
+      saveStatus(String(err.message || err), true);
+    }
+  })();
+  return state.applying;
 }
 
 // ─────────────────────────── плитки ───────────────────────────
@@ -859,7 +952,7 @@ function renderTiles() {
 
 // ─────────────────── сворачивание и тема ──────────────────────
 
-const KEYS = { sidebar: "ui.sidebar", panel: "ui.panel", theme: "ui.theme", autoname: "ui.autoname" };
+const KEYS = { sidebar: "ui.sidebar", panel: "ui.panel", theme: "ui.theme" };
 
 function store(key, value) {
   try { localStorage.setItem(key, value); } catch (e) { /* приватный режим — не беда */ }
@@ -968,7 +1061,7 @@ function applyWidth() {
   applyCollapsed("panel", want.panel);
 }
 
-// ─────────────────── очистка и новый чат ──────────────────────
+// ─────────────────── новый чат и подтверждения ────────────────
 
 // Что должен закрыть Escape. Диалог подтверждения всегда важнее ящиков:
 // он поверх всего, и пока он открыт, Escape относится к нему.
@@ -979,7 +1072,7 @@ function escapeAction(hasDialog, narrow, openDrawerCount) {
   return null;
 }
 
-function confirmBox(title, text, onYes) {
+function confirmBox(title, text, confirmLabel, onYes) {
   const wrap = document.createElement("div");
   wrap.className = "confirm";
   const box = document.createElement("div");
@@ -1010,7 +1103,7 @@ function confirmBox(title, text, onYes) {
   const yes = document.createElement("button");
   yes.type = "button";
   yes.className = "primary";
-  yes.textContent = "Очистить";
+  yes.textContent = confirmLabel;
   yes.onclick = () => { close(); onYes(); };
   row.append(no, yes);
   box.append(h, p, row);
@@ -1025,19 +1118,6 @@ async function newChat() {
   state.current = null;
   await loadAgents(created.agents[0].id);
   $("#input").focus();
-}
-
-function clearAll() {
-  confirmBox(
-    "Очистить все чаты?",
-    "Удалятся только ваши чаты вместе с их историей. Агенты дней 1–5 останутся на месте — они часть стенда, а не переписка.",
-    async () => {
-      stopStream();
-      await api("/api/agents/reset", { method: "POST" });
-      state.current = null;
-      await loadAgents();
-    }
-  );
 }
 
 // ─────────────────────────── старт ────────────────────────────
@@ -1068,12 +1148,14 @@ function init() {
     if (what === "drawers") closeDrawers();
   });
 
-  $("#autoname").checked = read(KEYS.autoname, "1") === "1";
-  $("#autoname").onchange = (ev) => store(KEYS.autoname, ev.target.checked ? "1" : "0");
-
   $("#new-chat").onclick = () => newChat();
-  $("#clear-all").onclick = clearAll;
-  $("#save-settings").onclick = saveSettings;
+
+  // Настройки применяются по change: у полей ввода это потеря фокуса,
+  // у списков — выбор. Отдельной кнопки сохранения нет.
+  $("#panel-body").addEventListener("change", (ev) => {
+    if (ev.target.id === "f-response_format_kind") syncResponseFormat();
+    applySettings();
+  });
 
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.onclick = () => {
@@ -1111,6 +1193,7 @@ if (typeof module === "undefined") {
     inlineMarkdown,
     layoutFor,
     escapeAction,
-    chatTitle,
+    readStopLines,
+    parseResponseFormat,
   };
 }

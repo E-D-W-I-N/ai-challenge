@@ -40,7 +40,7 @@ def check(name):
         def run():
             _stub.reset()
             REGISTRY.kill_all()
-            main.ensure_roster()
+            main.bootstrap_chats()
             try:
                 detail = fn() or ""
                 RESULTS.append((name, True, detail))
@@ -93,33 +93,33 @@ def check_spawn_100():
 
 # --- 2. агенты дней 1–5 -------------------------------------------------------
 
-# Имя агента ростера → колонка того дня. Порядок в списке значим: он и есть
+# Имя заготовленного чата → колонка того дня. Порядок в списке значим: он и есть
 # соответствие «колонка ↔ агент», по нему идёт сверка.
 PAST_DAYS = {
-    "origin/day-01": ["День 1 · Ответ"],
+    "origin/day-01": ["День 1: Ответ"],
     "origin/day-02": [
-        "День 2 · A. Свободный ответ (формат)",
-        "День 2 · B. + response_format",
-        "День 2 · A. Свободный ответ (длина)",
-        "День 2 · B. + max_tokens",
-        "День 2 · A. Свободный ответ (стоп)",
-        "День 2 · B. + stop",
+        "День 2: A. Свободный ответ (формат)",
+        "День 2: B. + response_format",
+        "День 2: A. Свободный ответ (длина)",
+        "День 2: B. + max_tokens",
+        "День 2: A. Свободный ответ (стоп)",
+        "День 2: B. + stop",
     ],
     "origin/day-03": [
-        "День 3 · Прямо (vs пошагово)",
-        "День 3 · Пошагово",
-        "День 3 · Прямо (промпт себе)",
-        "День 3 · Модель пишет промпт",
-        "День 3 · Ответ по своему промпту",
-        "День 3 · Аналитик данных",
-        "День 3 · Курьер-практик",
-        "День 3 · Юрист по рекламе",
+        "День 3: Прямо (vs пошагово)",
+        "День 3: Пошагово",
+        "День 3: Прямо (промпт себе)",
+        "День 3: Модель пишет промпт",
+        "День 3: Ответ по своему промпту",
+        "День 3: Аналитик данных",
+        "День 3: Курьер-практик",
+        "День 3: Юрист по рекламе",
     ],
-    "origin/day-04": ["День 4 · t = 0.0", "День 4 · t = 0.7", "День 4 · t = 1.2"],
+    "origin/day-04": ["День 4: t = 0.0", "День 4: t = 0.7", "День 4: t = 1.2"],
     "origin/day-05": [
-        "День 5 · Слабая · llama-3.1-8b",
-        "День 5 · Средняя · mistral-small-3.2-24b",
-        "День 5 · Сильная · gemini-3.1-flash-lite",
+        "День 5: Слабая · llama-3.1-8b",
+        "День 5: Средняя · mistral-small-3.2-24b",
+        "День 5: Сильная · gemini-3.1-flash-lite",
     ],
 }
 
@@ -128,7 +128,7 @@ TRANSFERRED = ("model", "temperature", "max_tokens", "stop", "response_format", 
 
 @check("конфиги дней 1–5 перенесены дословно: сверка с day.py каждой ветки")
 def check_past_days_transfer():
-    roster = {spec.label: spec for spec in day.AGENTS}
+    preset = {spec.label: spec for spec in day.CHATS}
     checked = 0
     for branch, labels in PAST_DAYS.items():
         columns = _daysrc.columns(branch)
@@ -137,8 +137,8 @@ def check_past_days_transfer():
             "колонка потерялась или добавилась лишняя"
         )
         for column, label in zip(columns, labels):
-            spec = roster.get(label)
-            assert spec is not None, f"в ростере нет агента «{label}»"
+            spec = preset.get(label)
+            assert spec is not None, f"в day.py нет чата «{label}»"
             for field in TRANSFERRED:
                 assert getattr(spec, field) == getattr(column, field), (
                     f"{label} :: {field}: у нас {getattr(spec, field)!r}, "
@@ -151,20 +151,35 @@ def check_past_days_transfer():
     return f"{checked} колонок из пяти веток, по {len(TRANSFERRED) + 2} поля — совпало всё"
 
 
-@check("агенты дней 1–5 подняты на старте процесса и сгруппированы по дням")
-def check_roster_live():
+@check("список плоский: чаты дней 1–5 подняты и ничем не отличаются от прочих")
+def check_flat_list():
     with TestClient(main.app) as client:
         data = client.get("/api/agents").json()
-    live = {a["label"]: a for a in data["agents"]}
-    for labels in PAST_DAYS.values():
-        for label in labels:
-            assert label in live, f"агент «{label}» не поднялся"
-            assert live[label]["group"], f"у «{label}» нет группы — он потеряется в списке"
-    # Порядок групп задаёт day.py, а не сортировка: «День 10» не должен
-    # оказаться между первым и вторым.
-    assert data["groups"] == list(dict.fromkeys(s.group for s in day.AGENTS if s.group))
-    assert data["groups"][0] == "День 1" and data["groups"][-1] == "День 6", data["groups"]
-    return f"{len(live)} агентов, группы: {', '.join(data['groups'])}"
+        assert "groups" not in data, "групп в ответе быть не должно"
+        live = {a["label"]: a for a in data["agents"]}
+        for labels in PAST_DAYS.values():
+            for label in labels:
+                assert label in live, f"чат «{label}» не поднялся"
+
+        # Ни признака особости, ни пояснений: в списке все чаты равны.
+        for agent in data["agents"]:
+            for gone in ("group", "note", "origin"):
+                assert gone not in agent, f"наружу торчит поле {gone}"
+
+        # Заготовленный чат правится и удаляется как любой другой.
+        first = data["agents"][0]
+        renamed = client.patch(f"/api/agents/{first['id']}", json={"label": "Просто чат"})
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["label"] == "Просто чат"
+        assert client.delete(f"/api/agents/{first['id']}").status_code == 200
+        assert client.get(f"/api/agents/{first['id']}").status_code == 404
+        after = client.get("/api/agents").json()["agents"]
+        assert len(after) == len(data["agents"]) - 1, len(after)
+
+    js = read("app/static/app.js")
+    for gone in ("list-group", "state.groups", "agent.note"):
+        assert gone not in js, f"в клиенте осталась группировка: {gone}"
+    return f"{len(live)} чатов одним списком, переименование и удаление работают"
 
 
 @check("вопрос дня лежит черновиком и сам не отправляется")
@@ -172,7 +187,7 @@ def check_draft_not_sent():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         listed = client.get("/api/agents").json()["agents"]
-        agent_id = next(a["id"] for a in listed if a["label"] == "День 1 · Ответ")
+        agent_id = next(a["id"] for a in listed if a["label"] == "День 1: Ответ")
         full = client.get(f"/api/agents/{agent_id}").json()
         assert full["draft"].startswith("Объясни, почему первый токен"), full["draft"][:60]
         # Открытие агента не делает ни одного вызова к модели.
@@ -409,7 +424,130 @@ def check_new_params():
     return "шесть новых параметров едут, незаданные отсутствуют, ноль отличим от пустоты"
 
 
-@check("панель правит живого агента: модель, промпт, имя, окно памяти")
+# Каждое поле панели вместе с тем, во что оно должно превратиться в теле
+# запроса. `system` проверяется отдельно: он едет не в теле, а сообщением.
+PANEL_FIELDS = {
+    "model": "новая/модель",
+    "temperature": 0.9,
+    "max_tokens": 555,
+    "top_p": 0.11,
+    "top_k": 7,
+    "min_p": 0.02,
+    "repetition_penalty": 1.3,
+    "presence_penalty": 0.4,
+    "frequency_penalty": 0.6,
+    "stop": ["СТОП"],
+    "response_format": {"type": "json_object"},
+}
+
+
+@check("правка в панели применяется к следующему сообщению, а не к следующему чату")
+def check_panel_applies_next_message():
+    """Жалоба заказчика: сменил системный промпт — уезжает старый.
+
+    Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
+    и каждое поле панели, и окно памяти.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, model="старая/модель", system="СТАРЫЙ ПРОМПТ")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+        assert _stub.CALLS[-1]["messages"][0]["content"] == "СТАРЫЙ ПРОМПТ"
+
+        patched = client.patch(
+            f"/api/agents/{agent_id}",
+            json={"system": "НОВЫЙ ПРОМПТ", "history_limit": 0, **PANEL_FIELDS},
+        )
+        assert patched.status_code == 200, patched.text
+
+        _stub.reset()
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+
+    call = _stub.CALLS[-1]
+    sent, payload = call["messages"], call["payload"]
+    assert sent[0]["role"] == "system", sent
+    assert sent[0]["content"] == "НОВЫЙ ПРОМПТ", sent[0]["content"]
+    assert call["model"] == "новая/модель", call["model"]
+    for name, value in PANEL_FIELDS.items():
+        if name == "model":
+            continue
+        assert payload.get(name) == value, (name, payload.get(name), value)
+    # history_limit=0 — окно тоже применилось: в промпте только промпт и вопрос.
+    assert [m["role"] for m in sent] == ["system", "user"], sent
+    return "промпт, модель, окно и все параметры уехали новыми"
+
+
+@check("системный промпт живёт в одном месте и не фиксируется при создании")
+def check_system_prompt_single_home():
+    """Корень той же жалобы: промпт мог приехать внутри `messages`.
+
+    Тогда панель правила бы `spec.system`, а в модель уезжала бы копия
+    из заготовки, снятая в момент создания агента. Теперь системные
+    сообщения переезжают в `spec.system` сразу, и дом у промпта один.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(
+            client,
+            messages=[
+                {"role": "system", "content": "ИЗ ЗАГОТОВКИ"},
+                {"role": "user", "content": "первый вопрос"},
+            ],
+        )
+        full = client.get(f"/api/agents/{agent_id}").json()
+        assert full["system"] == "ИЗ ЗАГОТОВКИ", full["system"]
+
+        client.patch(f"/api/agents/{agent_id}", json={"system": "ПРАВЛЕНЫЙ"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+
+    sent = _stub.CALLS[-1]["messages"]
+    systems = [m["content"] for m in sent if m["role"] == "system"]
+    assert systems == ["ПРАВЛЕНЫЙ"], systems
+    assert "ИЗ ЗАГОТОВКИ" not in " ".join(m["content"] for m in sent), sent
+    return "промпт из messages переехал в конфиг и правится оттуда"
+
+
+@check("stop и response_format правятся из панели и доезжают до тела запроса")
+def check_stop_and_format():
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "раз"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert "stop" not in payload and "response_format" not in payload, payload
+
+        client.patch(
+            f"/api/agents/{agent_id}",
+            json={"stop": ["КОНЕЦ", "СТОП"], "response_format": {"type": "json_object"}},
+        )
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "два"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert payload["stop"] == ["КОНЕЦ", "СТОП"], payload["stop"]
+        assert payload["response_format"] == {"type": "json_object"}, payload["response_format"]
+
+        # Пустое значение снимает параметр: он перестаёт уходить вовсе.
+        client.patch(f"/api/agents/{agent_id}", json={"stop": None, "response_format": None})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "три"})
+        payload = _stub.CALLS[-1]["payload"]
+        assert "stop" not in payload and "response_format" not in payload, payload
+
+        # Пустые строки в списке — не стоп-строки.
+        client.patch(f"/api/agents/{agent_id}", json={"stop": ["", "  "]})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четыре"})
+        assert "stop" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"]
+
+        assert client.patch(f"/api/agents/{agent_id}", json={"stop": "СТОП"}).status_code == 400
+        assert (
+            client.patch(f"/api/agents/{agent_id}", json={"response_format": "json"}).status_code
+            == 400
+        )
+
+    html = read("app/static/index.html")
+    assert 'id="f-stop"' in html and 'id="f-response_format"' in html, "полей нет в панели"
+    return "оба параметра задаются, снимаются и не уходят пустыми"
+
+
+@check("панель правит живого агента: модель, промпт, окно памяти")
 def check_patch_panel():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
@@ -428,12 +566,12 @@ def check_patch_panel():
         assert body["model"] == "stub/new" and body["label"] == "Переименован"
         assert body["history_limit"] == 4
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
-        assert client.patch(f"/api/agents/{agent_id}", json={"group": "День 9"}).status_code == 400
+        assert client.patch(f"/api/agents/{agent_id}", json={"draft": "х"}).status_code == 400
 
     call = _stub.CALLS[-1]
     assert call["model"] == "stub/new", call["model"]
     assert call["messages"][0]["content"] == "новый промпт", call["messages"][0]
-    return "PATCH меняет модель, промпт, имя и окно; group снаружи не правится"
+    return "PATCH меняет модель, промпт, имя и окно; чужие поля не принимаются"
 
 
 # --- 6. лента: рассуждение и перегенерация ------------------------------------
@@ -621,49 +759,115 @@ def check_regenerate_disconnect():
     return "0 кадров, пара на месте, бронь снята"
 
 
-# --- 7. чаты и ростер ---------------------------------------------------------
+# --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
-@check("«Очистить все чаты» не уносит агентов дней 1–5")
-def check_reset_keeps_roster():
+@check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
+def check_no_clear_all():
+    with TestClient(main.app) as client:
+        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
+        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
+    for path in ("app/static/app.js", "app/static/index.html"):
+        source = read(path)
+        for gone in ("Очистить все", "clear-all", "clearAll", "/api/agents/reset"):
+            assert gone not in source, f"{path}: остался {gone}"
+    return "ручки нет, кнопки нет, диалога очистки нет"
+
+
+@check("имена по умолчанию нумеруются, автоимени нет")
+def check_numbered_names():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
-        chat = client.post("/api/agents", json={}).json()["agents"][0]
-        client.post(f"/api/agents/{chat['id']}/messages", json={"text": "привет"})
-        before = client.get("/api/agents").json()
-        assert any(a["id"] == chat["id"] for a in before["agents"])
+        first = client.post("/api/agents", json={}).json()["agents"][0]
+        second = client.post("/api/agents", json={}).json()["agents"][0]
+        assert first["label"] != second["label"], (first["label"], second["label"])
+        import re as _re
 
-        reset = client.post("/api/agents/reset").json()
-        assert chat["id"] in reset["killed"], reset["killed"]
-        after = client.get("/api/agents").json()
+        for agent in (first, second):
+            assert _re.fullmatch(r"Новый чат \d+", agent["label"]), agent["label"]
+        numbers = [int(a["label"].split()[-1]) for a in (first, second)]
+        assert numbers[1] == numbers[0] + 1, numbers
 
-    labels = {a["label"] for a in after["agents"]}
-    for group_labels in PAST_DAYS.values():
-        for label in group_labels:
-            assert label in labels, f"«{label}» пропал после очистки"
-    assert not [a for a in after["agents"] if not a["group"]], "чаты пользователя должны уйти"
-    assert len(after["agents"]) == len(day.AGENTS), (len(after["agents"]), len(day.AGENTS))
-    return f"чат удалён, {len(day.AGENTS)} агентов ростера на месте"
+        # Номер удалённого чата второй раз не выдаётся: двух «Новых чатов N»
+        # одновременно быть не должно.
+        client.delete(f"/api/agents/{second['id']}")
+        third = client.post("/api/agents", json={}).json()["agents"][0]
+        assert third["label"] != second["label"], third["label"]
+        assert int(third["label"].split()[-1]) > numbers[1], third["label"]
+
+        # Первое сообщение имя не меняет — автоимени больше нет.
+        client.post(f"/api/agents/{first['id']}/messages", json={"text": "расскажи про кэш"})
+        again = client.get(f"/api/agents/{first['id']}").json()
+        assert again["label"] == first["label"], again["label"]
+
+        live = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+        assert len(live) == len(set(live)), "имена по умолчанию не должны повторяться"
+
+    js = read("app/static/app.js")
+    for gone in ("maybeAutoName", "chatTitle", "autoname"):
+        assert gone not in js, f"в клиенте осталось автоимя: {gone}"
+    assert "autoname" not in read("app/static/index.html"), "переключатель автоимени жив"
+    return f"{first['label']}, {second['label']}, после удаления — {third['label']}"
 
 
-@check("«Новый чат» создаётся пустым телом и попадает в чаты, а не в ростер")
-def check_new_chat():
+@check("переименование и удаление живут в списке слева")
+def check_list_actions():
+    js = read("app/static/app.js")
+    assert "function startRename" in js and "function askDelete" in js
+    assert "miniButton(\"pencil\"" in js, "карандаша в строке списка нет"
+    assert "miniButton(\"trash\"" in js, "корзины в строке списка нет"
+    assert "Escape" in js and "Enter" in js, "переименование должно слушать Enter и Escape"
+    assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
+
     with TestClient(main.app) as client:
-        created = client.post("/api/agents", json={})
-        assert created.status_code == 200, created.text
-        agent = created.json()["agents"][0]
-        assert agent["label"] == "Новый чат" and agent["group"] == "", agent
-        # Группу извне не подсунуть: иначе чат притворился бы агентом дня
-        # и пережил бы «Очистить все чаты».
-        sneaky = client.post(
-            "/api/agents", json={"agent": {"model": "stub/m", "label": "х", "group": "День 1"}}
-        )
-        assert sneaky.status_code == 200, sneaky.text
-        assert sneaky.json()["agents"][0]["group"] == "", sneaky.json()["agents"][0]
-    return "новый чат без группы, подсунуть группу снаружи нельзя"
+        agent_id = new_agent(client, label="Было")
+        renamed = client.patch(f"/api/agents/{agent_id}", json={"label": "Стало"})
+        assert renamed.status_code == 200 and renamed.json()["label"] == "Стало"
+        assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
+        assert client.delete(f"/api/agents/{agent_id}").status_code == 200
+        assert client.get(f"/api/agents/{agent_id}").status_code == 404
+    return "карандаш и корзина в строке, поля имени в панели нет"
 
 
-# --- 8. ключ и сеть -----------------------------------------------------------
+@check("пояснений прошлой постановки нет ни в данных, ни в разметке")
+def check_no_leftover_texts():
+    with TestClient(main.app) as client:
+        body = client.get("/api/agents").text
+    for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
+        assert leftover not in body, f"наружу уехало пояснение: {leftover}"
+
+    day_source = read("day.py")
+    assert "note=" not in day_source, "в day.py остались пояснения"
+    assert "group=" not in day_source, "в day.py остались группы"
+    for path in ("app/static/app.js", "app/static/index.html"):
+        assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
+    return "ни note, ни group — ни в day.py, ни в ответах, ни в разметке"
+
+
+@check("имени клиента-референса нет нигде в репозитории")
+def check_no_reference_name():
+    """Референс был инструментом разработки, а не частью продукта.
+
+    Имя собирается из кусков намеренно: иначе сама проверка стала бы
+    единственным местом, где оно осталось.
+    """
+    needle = ("o" + "mlx").encode()
+    tracked = subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
+    ).stdout.split()
+    hits = []
+    for name in tracked:
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        if needle.decode() in name.lower():
+            hits.append(name)
+            continue
+        with open(path, "rb") as handle:
+            if needle in handle.read().lower():
+                hits.append(name)
+    assert not hits, f"упоминания остались в: {', '.join(hits)}"
+    return f"проверено {len(tracked)} файлов под контролем версий"
 
 
 @check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
@@ -710,6 +914,24 @@ def check_no_cdn():
     assert html.count("<script") == 1 and 'src="/static/app.js"' in html
     assert html.count("<link") == 1 and 'href="/static/style.css"' in html
     return "в статике только относительные пути и w3.org-неймспейс SVG"
+
+
+@check("поле ввода закреплено внизу и не уезжает вместе с лентой")
+def check_composer_pinned():
+    """Пункт 7: композер уезжал вниз, когда лента становилась длиннее.
+
+    Держится это на `min-height: 0` у колонки чата: без него автоматический
+    минимум grid- и flex-элемента считается по содержимому, лента распирает
+    колонку выше экрана и утаскивает поле ввода за собой.
+    """
+    css = read("app/static/style.css")
+    block = css[css.index(".chat {") : css.index(".chat-body")]
+    for rule in ("min-height: 0", "overflow: hidden", "flex-direction: column"):
+        assert rule in block, f"у .chat нет правила {rule}"
+    assert "min-height: 0" in css[css.index(".chat-body") : css.index(".feed {")]
+    assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
+    assert ".feed {" in css and "overflow-y: auto" in css[css.index(".feed {") :]
+    return "колонка чата не растягивается содержимым, прокручивается лента"
 
 
 @check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
@@ -900,7 +1122,7 @@ def check_cli():
 CHECKS = [
     check_spawn_100,
     check_past_days_transfer,
-    check_roster_live,
+    check_flat_list,
     check_draft_not_sent,
     check_scenarios_gone,
     check_memory,
@@ -909,16 +1131,23 @@ CHECKS = [
     check_rollback,
     check_disconnect,
     check_new_params,
+    check_panel_applies_next_message,
+    check_system_prompt_single_home,
+    check_stop_and_format,
     check_patch_panel,
     check_reasoning,
     check_first_token,
     check_regenerate,
     check_regenerate_failure,
     check_regenerate_disconnect,
-    check_reset_keeps_roster,
-    check_new_chat,
+    check_no_clear_all,
+    check_numbered_names,
+    check_list_actions,
+    check_no_leftover_texts,
+    check_no_reference_name,
     check_no_key_leak,
     check_no_cdn,
+    check_composer_pinned,
     check_browser,
     check_spec_deep_copy,
     check_eviction,
