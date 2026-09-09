@@ -58,6 +58,7 @@ class El {
     this.disabled = false;
     this.checked = false;
     this.selected = false;
+    this._selectCleared = false;
     this.open = false;
     this._text = "";
     this._html = "";
@@ -116,8 +117,15 @@ class El {
 
   // У <select> значение — это значение выбранного <option>, как в браузере:
   // клиент собирает список опций и ставит selected, а читает потом .value.
+  //
+  // Присваивание значения, которого среди опций нет, браузер не игнорирует:
+  // он снимает выбор совсем (selectedIndex = -1), и `.value` становится
+  // пустым. Стенд обязан вести себя так же — иначе поле молча оставалось бы
+  // при старом значении, и проверка «выбрали то, чего в каталоге нет»
+  // проходила бы, ничего не проверив.
   get value() {
     if (this.tagName === "SELECT") {
+      if (this._selectCleared) return "";
       const chosen = this.children.find((c) => c.selected) || this.children[0];
       return chosen ? chosen.value : "";
     }
@@ -125,10 +133,20 @@ class El {
   }
   set value(next) {
     if (this.tagName === "SELECT") {
-      this.children.forEach((c) => { c.selected = c.value === String(next); });
+      const wanted = String(next);
+      const match = this.children.find((c) => c.value === wanted);
+      this.children.forEach((c) => { c.selected = c === match; });
+      this._selectCleared = !match;
       return;
     }
     this._value = next === null || next === undefined ? "" : String(next);
+  }
+
+  get selectedIndex() {
+    if (this.tagName !== "SELECT") return -1;
+    if (this._selectCleared) return -1;
+    const chosen = this.children.findIndex((c) => c.selected);
+    return chosen >= 0 ? chosen : (this.children.length ? 0 : -1);
   }
 
   get className() {
@@ -159,6 +177,8 @@ class El {
   set innerHTML(value) {
     // app.js кладёт сюда либо "" (очистка), либо готовый markdown. Разбирать
     // разметку обратно в узлы не нужно: её проверяет отдельный блок утверждений.
+    // Список опций пересобран — выбор возвращается к умолчанию, как в браузере.
+    this._selectCleared = false;
     this.children.forEach((c) => (c.parentElement = null));
     this.children = [];
     this._text = "";
