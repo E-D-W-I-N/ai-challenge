@@ -899,6 +899,70 @@ def check_no_key_leak():
     return "в клиенте про ключ ни слова, ручки его не отдают"
 
 
+@check("каталог отдаёт данные, по которым панель предупреждает о параметрах")
+def check_catalog_capabilities():
+    """Отбор моделей в чате не нужен, а вот данные о них — нужны.
+
+    С `provider.require_parameters=true` параметр, которого модель не
+    заявляет, выкашивает провайдеров, и вместо ответа приходит невнятная
+    ошибка. Предупредить об этом заранее можно только по каталогу.
+    """
+    import app.catalog as catalog
+
+    plain = catalog._normalize(
+        {
+            "id": "openai/gpt-4o-mini",
+            "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
+            "supported_parameters": ["temperature", "max_tokens", "stop"],
+            "context_length": 128000,
+        }
+    )
+    assert plain["supported_parameters"] == ["temperature", "max_tokens", "stop"], plain
+    assert plain["is_free"] is False and plain["temperature_capped"] is False, plain
+    assert plain["temperature_cap"] is None, plain
+
+    # Ловушка, ради которой мало одного supported_parameters: температуру
+    # семейство заявляет, а на 1.2 всё равно отвечает 400.
+    capped = catalog._normalize(
+        {
+            "id": "anthropic/claude-sonnet-4",
+            "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+            "supported_parameters": ["temperature", "max_tokens"],
+        }
+    )
+    assert "temperature" in capped["supported_parameters"], capped
+    assert capped["temperature_capped"] is True, capped
+    assert capped["temperature_cap"] == catalog.TEMPERATURE_CAP, capped
+
+    free = catalog._normalize({"id": "x/y:free", "pricing": {"prompt": "0", "completion": "0"}})
+    assert free["is_free"] is True, free
+
+    # Отбор при этом не вернулся: чат показывает каталог целиком.
+    assert not hasattr(catalog, "filter_models"), "фильтры каталога вернулись"
+    assert "exclude_free" not in read("app/main.py"), "ручка снова отбирает модели"
+
+    async def catalog_stub():
+        return [plain, capped, free]
+
+    saved = catalog.fetch_models
+    catalog.fetch_models = catalog_stub
+    try:
+        with TestClient(main.app) as client:
+            models = client.get("/api/models").json()["models"]
+    finally:
+        catalog.fetch_models = saved
+    assert len(models) == 3, "каталог отдаётся целиком, включая :free"
+    assert all("supported_parameters" in m for m in models), models[0]
+    assert any(m["temperature_capped"] for m in models), models
+
+    js = read("app/static/app.js")
+    assert "function paramWarnings" in js, "панель не считает предупреждения"
+    for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
+        assert field in js, f"клиент не смотрит на {field}"
+    assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
+    return "три поля на месте, отбор не вернулся, панель их читает"
+
+
 @check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
 def check_no_cdn():
     html = read("app/static/index.html")
@@ -1146,6 +1210,7 @@ CHECKS = [
     check_no_leftover_texts,
     check_no_reference_name,
     check_no_key_leak,
+    check_catalog_capabilities,
     check_no_cdn,
     check_composer_pinned,
     check_browser,

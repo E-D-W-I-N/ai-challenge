@@ -16,7 +16,7 @@ const path = require("path");
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
 
 const app = require(path.join(__dirname, "..", "app", "static", "app.js"));
-const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFormat } = app;
+const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFormat, paramWarnings } = app;
 
 const failures = [];
 let passed = 0;
@@ -130,6 +130,75 @@ check(
   JSON.stringify(layoutFor(false, { sidebar: "0", panel: "0" })) ===
     JSON.stringify({ sidebar: false, panel: false })
 );
+
+// ── предупреждение о параметрах, которых модель не потянет ──
+
+{
+  const plain = {
+    id: "openai/gpt-4o-mini",
+    supported_parameters: ["temperature", "max_tokens", "stop", "response_format"],
+    temperature_capped: false,
+    temperature_cap: null,
+  };
+  const capped = {
+    id: "anthropic/claude-sonnet",
+    supported_parameters: ["temperature", "max_tokens", "top_p"],
+    temperature_capped: true,
+    temperature_cap: 1.0,
+  };
+
+  const unsupported = paramWarnings(plain, { temperature: 0.5, top_k: 40, min_p: 0.05 });
+  check("незаявленный параметр даёт предупреждение", unsupported.length === 1, JSON.stringify(unsupported));
+  check("в предупреждении названы все незаявленные", /top_k, min_p/.test(unsupported[0] || ""), unsupported[0]);
+  check("в предупреждении названа модель", /gpt-4o-mini/.test(unsupported[0] || ""), unsupported[0]);
+  check(
+    "предупреждение объясняет, чем это кончится",
+    /require_parameters/.test(unsupported[0] || ""),
+    unsupported[0]
+  );
+
+  check(
+    "заявленные параметры молчат",
+    paramWarnings(plain, { temperature: 0.5, max_tokens: 100, stop: ["СТОП"] }).length === 0
+  );
+  check(
+    "незаданные параметры не считаются незаявленными",
+    paramWarnings(plain, { temperature: null, top_k: null, min_p: undefined }).length === 0
+  );
+  check(
+    "response_format проверяется наравне с числами",
+    paramWarnings(
+      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
+      { response_format: { type: "json_object" } }
+    ).length === 1
+  );
+  check(
+    "stop проверяется наравне с числами",
+    paramWarnings(
+      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
+      { stop: ["КОНЕЦ"] }
+    ).length === 1
+  );
+
+  // Главная ловушка: модель заявляет temperature и всё равно вернёт 400.
+  const hot = paramWarnings(capped, { temperature: 1.2 });
+  check("обрезанная температура предупреждает, хотя параметр заявлен", hot.length === 1, JSON.stringify(hot));
+  check("в предупреждении назван потолок", /1\.0/.test(hot[0] || ""), hot[0]);
+  check("температура под потолком молчит", paramWarnings(capped, { temperature: 0.9 }).length === 0);
+  check("ровно потолок молчит", paramWarnings(capped, { temperature: 1.0 }).length === 0);
+  check(
+    "оба повода дают два предупреждения",
+    paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }).length === 2,
+    JSON.stringify(paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }))
+  );
+
+  // Не на чем основать — не пугаем.
+  check("модель не найдена в каталоге — молчим", paramWarnings(null, { top_k: 40 }).length === 0);
+  check("модель не отдала supported_parameters — молчим",
+    paramWarnings({ id: "m", supported_parameters: [] }, { top_k: 40 }).length === 0);
+  check("окно памяти в запрос не уходит и не проверяется",
+    paramWarnings(plain, { history_limit: 0 }).length === 0);
+}
 
 // ── что закрывает Escape ──
 

@@ -756,7 +756,7 @@ function fillPanel(agent) {
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
   fillResponseFormat(agent.response_format);
-  fillModels(agent.model);
+  fillModels(agent.model).then(renderWarnings);
   saveStatus("");
 }
 
@@ -849,6 +849,66 @@ function parseResponseFormat(kind, raw) {
   return parsed;
 }
 
+// Параметры панели в терминах OpenRouter: имена совпадают один в один,
+// кроме окна памяти — оно наше и в запрос не уходит.
+const PROVIDER_PARAMS = [
+  "temperature",
+  "max_tokens",
+  "top_p",
+  "top_k",
+  "min_p",
+  "repetition_penalty",
+  "presence_penalty",
+  "frequency_penalty",
+  "stop",
+  "response_format",
+];
+
+// Чем заданные параметры не сойдутся с выбранной моделью. Отдельной функцией
+// без DOM — решение проверяется без браузера.
+//
+// Предупреждать надо **до** отправки: на каждом вызове стоит
+// provider.require_parameters=true, и параметр, которого модель не заявляет,
+// выкашивает провайдеров. Вместо ответа приходит невнятная ошибка, и по ней
+// не понять, что виноват один переключатель в панели.
+function paramWarnings(model, settings) {
+  const warnings = [];
+  // Каталог не загрузился или модель в нём не нашлась — молчим: пугать
+  // предупреждением, которого не на чем основать, хуже, чем не предупредить.
+  if (!model) return warnings;
+
+  const declared = model.supported_parameters || [];
+  if (declared.length) {
+    const missing = PROVIDER_PARAMS.filter(
+      (name) => settings[name] !== null && settings[name] !== undefined && !declared.includes(name)
+    );
+    if (missing.length) {
+      warnings.push(
+        `«${model.id}» не заявляет ${missing.join(", ")}. ` +
+          "Запрос уходит с provider.require_parameters, поэтому подходящего " +
+          "провайдера может не найтись — вместо ответа придёт ошибка."
+      );
+    }
+  }
+
+  const cap = model.temperature_cap;
+  if (
+    model.temperature_capped &&
+    settings.temperature !== null &&
+    settings.temperature !== undefined &&
+    cap !== null &&
+    cap !== undefined &&
+    settings.temperature > cap
+  ) {
+    warnings.push(
+      `«${model.id}» обрезает temperature на ${cap.toFixed(1)}: ` +
+        `на ${settings.temperature} ` +
+        "запрос вернётся с ошибкой, хотя temperature эта модель и заявляет."
+    );
+  }
+  return warnings;
+}
+
 function saveStatus(text, isError) {
   const el = $("#save-status");
   el.className = "save-status" + (isError ? " error" : "");
@@ -859,24 +919,58 @@ function saveStatus(text, isError) {
 // выбор в списке. Отдельной кнопки «Сохранить» нет намеренно: про неё легко
 // забыть, и тогда правка системного промпта молча не доезжает до модели —
 // ровно на это и жаловались.
+// Что сейчас набрано в панели. Бросает, если поле не разобрать.
+function readPanel() {
+  const patch = {
+    system: $("#f-system").value,
+    model: $("#f-model").value,
+    stop: readStopLines($("#f-stop").value),
+    response_format: parseResponseFormat(
+      $("#f-response_format_kind").value,
+      $("#f-response_format").value
+    ),
+  };
+  NUMBER_FIELDS.forEach((name) => { patch[name] = readNumber(name); });
+  return patch;
+}
+
+// Предупреждение пересчитывается на каждое изменение панели и на смену
+// модели — по тому, что набрано прямо сейчас, а не по сохранённому.
+function renderWarnings() {
+  const box = $("#model-warn");
+  const tab = $("#tab-btn-model");
+  let warnings = [];
+  try {
+    const settings = readPanel();
+    warnings = paramWarnings(
+      state.models.find((m) => m.id === settings.model),
+      settings
+    );
+  } catch (e) {
+    warnings = [];   // поле не разобрать — про это скажет строка состояния
+  }
+  box.innerHTML = "";
+  warnings.forEach((text) => {
+    const line = document.createElement("p");
+    line.textContent = text;
+    box.appendChild(line);
+  });
+  box.classList.toggle("hidden", !warnings.length);
+  // Открыта вкладка «Агент» — про предупреждение всё равно должно быть видно.
+  tab.classList.toggle("has-warn", warnings.length > 0);
+}
+
 function applySettings() {
   if (!state.current) return Promise.resolve();
   let patch;
   try {
-    patch = {
-      system: $("#f-system").value,
-      model: $("#f-model").value,
-      stop: readStopLines($("#f-stop").value),
-      response_format: parseResponseFormat(
-        $("#f-response_format_kind").value,
-        $("#f-response_format").value
-      ),
-    };
-    NUMBER_FIELDS.forEach((name) => { patch[name] = readNumber(name); });
+    patch = readPanel();
   } catch (err) {
     saveStatus(String(err.message || err), true);
+    renderWarnings();
     return Promise.resolve();
   }
+  renderWarnings();
 
   const id = state.current.id;
   state.applying = (async () => {
@@ -1195,5 +1289,6 @@ if (typeof module === "undefined") {
     escapeAction,
     readStopLines,
     parseResponseFormat,
+    paramWarnings,
   };
 }

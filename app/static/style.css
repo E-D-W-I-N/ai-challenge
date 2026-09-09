@@ -19,6 +19,9 @@
   --bubble: #f1f2f4;
   --danger: #dc2626;
   --ok: #15803d;
+  --warn-text: #92600e;
+  --warn-bg: #fdf6e7;
+  --warn-line: #efdcb4;
   --code-bg: #f5f5f6;
   --radius: 12px;
   --sidebar-w: 264px;
@@ -40,6 +43,9 @@
   --bubble: #23252b;
   --danger: #f87171;
   --ok: #4ade80;
+  --warn-text: #e8b962;
+  --warn-bg: #2a2415;
+  --warn-line: #4a3d20;
   --code-bg: #1d1f24;
   color-scheme: dark;
 }
@@ -615,6 +621,33 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 
 .field-note, .hint { font-size: 11.5px; line-height: 1.5; color: var(--faint); margin: 0; }
 .field-note:empty { display: none; }
+
+/* Предупреждение о параметрах, которых выбранная модель не заявляет.
+   Не запрет: отправить всё равно можно — но не вслепую. */
+.warn {
+  border: 1px solid var(--warn-line);
+  border-radius: 9px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  padding: 8px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.warn p { margin: 0 0 5px; }
+.warn p:last-child { margin: 0; }
+
+/* Точка на вкладке «Модель», если предупреждение есть, а открыта другая. */
+.tab { position: relative; }
+.tab.has-warn::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warn-text);
+}
 
 .panel-save {
   flex: 0 0 auto;
