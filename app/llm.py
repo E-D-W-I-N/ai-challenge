@@ -101,6 +101,17 @@ class Metrics:
     """Живая статистика одного вызова к модели."""
 
     ttft_ms: float | None = None
+    """Время до первого токена **ответа**. Токены рассуждения его не двигают."""
+
+    first_token_ms: float | None = None
+    """Время до первого токена от модели вообще — рассуждения или ответа.
+
+    На обычной модели совпадает с `ttft_ms`. На думающей — это момент, когда
+    модель заговорила, а `ttft_ms` наступает позже, когда она додумала.
+    Без этой цифры плитка «TTFT» на reasoning-модели показывала бы время
+    вместе со всем размышлением и удивляла бы на записи.
+    """
+
     elapsed_ms: float = 0.0
     tokens_out: int = 0
     tokens_per_second: float = 0.0
@@ -122,6 +133,9 @@ class Metrics:
     def as_dict(self) -> dict:
         return {
             "ttft_ms": round(self.ttft_ms, 1) if self.ttft_ms is not None else None,
+            "first_token_ms": (
+                round(self.first_token_ms, 1) if self.first_token_ms is not None else None
+            ),
             "elapsed_ms": round(self.elapsed_ms, 1),
             "tokens_out": self.tokens_out,
             "tokens_per_second": round(self.tokens_per_second, 2),
@@ -289,6 +303,8 @@ async def stream_completion(
                         # и удваивать эту цифру своей оценкой нельзя.
                         thought = delta.get("reasoning") or ""
                         if thought:
+                            if metrics.first_token_ms is None:
+                                metrics.first_token_ms = (now - started) * 1000
                             reasoning_parts.append(thought)
                             yield {
                                 "type": "reasoning",
@@ -300,6 +316,8 @@ async def stream_completion(
                         if piece:
                             if metrics.ttft_ms is None:
                                 metrics.ttft_ms = (now - started) * 1000
+                            if metrics.first_token_ms is None:
+                                metrics.first_token_ms = metrics.ttft_ms
                             text_parts.append(piece)
                             # оценка «на глаз», пока не пришёл usage: ~4 символа на токен
                             metrics.tokens_out = max(

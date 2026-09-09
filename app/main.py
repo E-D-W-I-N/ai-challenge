@@ -423,9 +423,7 @@ async def reset_chats() -> dict:
     Агенты дней 1–5 — часть стенда, а не переписка: они переживают очистку
     и восстанавливаются, если чего-то не хватает.
     """
-    killed: list[str] = []
-    for agent in _chat_agents():
-        killed.extend(REGISTRY.kill(agent.id))
+    killed = [agent.id for agent in _chat_agents() if REGISTRY.kill(agent.id)]
     ensure_roster()
     return {"killed": killed, **_listing()}
 
@@ -489,8 +487,8 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(agent_id: str) -> dict:
     _agent(agent_id)
-    killed = REGISTRY.kill(agent_id)
-    return {"killed": killed, "live": len(REGISTRY)}
+    REGISTRY.kill(agent_id)
+    return {"killed": [agent_id], "live": len(REGISTRY)}
 
 
 @app.post("/api/agents/{agent_id}/cancel")
@@ -584,17 +582,40 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
 
     Пара «вопрос — ответ» снимается с истории до вызова, поэтому модель видит
     ровно тот же контекст, что и в первый раз, а в ленте остаётся один ответ.
+    Если вызов не отдал ни одного токена, снятое возвращается на место:
+    иначе неудачная перегенерация уносила бы и прошлый ответ, и сам вопрос,
+    а восстановить их было бы неоткуда — историю хранит сервер.
     """
     agent = _agent(agent_id)
     _require_key()
     _reserve(agent)
-    question = agent.drop_last_exchange()
-    if question is None:
+    taken = agent.take_last_exchange()
+    if taken is None:
         agent.release()
         raise HTTPException(
             status_code=409, detail="перегенерировать нечего: последнего ответа в истории нет"
         )
-    return _stream(lambda: _chat_events(agent, question), request, agent.release)
+    return _stream(lambda: _regenerate_events(agent, taken), request, agent.release)
+
+
+async def _regenerate_events(agent: Agent, taken) -> AsyncIterator[dict]:
+    """Обмен перегенерации плюс возврат снятой пары, если ответа не случилось."""
+    restored = False
+    try:
+        stream = _chat_events(agent, taken.question)
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.get("event") == "done" and not event.get("committed"):
+                    # Ответа не было вовсе: место свободно, кладём старое назад
+                    # до того, как клиент перерисует ленту по серверу.
+                    restored = agent.restore(taken)
+                    event = {**event, "restored": restored}
+                yield event
+    finally:
+        # Поток оборвали до `done` — например клиент ушёл со страницы.
+        # `restore` сам проверит, не занял ли место новый обмен.
+        if not restored:
+            agent.restore(taken)
 
 
 async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:

@@ -84,6 +84,10 @@ const fmt = {
 // не может стать разметкой страницы.
 function escapeHtml(text) {
   return String(text)
+    // Меткой inline-кода служит \u0000, и если модель пришлёт его в тексте,
+    // разбор подставил бы на его место чужой кусок. В рендере такому символу
+    // делать нечего — выбрасываем до всего остального.
+    .replace(/\u0000/g, "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -111,7 +115,7 @@ function inlineMarkdown(text) {
   );
   out = out.replace(
     new RegExp(CODE_MARK + "(\\d+)" + CODE_MARK, "g"),
-    (_, i) => "<code>" + codes[Number(i)] + "</code>"
+    (_, i) => "<code>" + (codes[Number(i)] || "") + "</code>"
   );
   return out;
 }
@@ -800,9 +804,22 @@ async function saveSettings() {
 
 // ─────────────────────────── плитки ───────────────────────────
 
+// Первая плитка после скорости — время до первого токена. Показываем момент,
+// когда модель заговорила вообще (first_token_ms), а не когда пошёл ответ:
+// на думающей модели это разные числа, и TTFT там включал бы всё размышление.
+// Насколько ответ отстал от рассуждения, видно подписью справа.
 const TILES = [
   ["Ток/с", (m) => fmt.rate(m.tokens_per_second), (m) => (m.tokens_out ? m.tokens_out + " ток" : "")],
-  ["TTFT, с", (m) => fmt.sec(m.ttft_ms), () => ""],
+  [
+    "Первый токен, с",
+    (m) => fmt.sec(m.first_token_ms === null || m.first_token_ms === undefined ? m.ttft_ms : m.first_token_ms),
+    (m) => {
+      const first = m.first_token_ms;
+      if (first === null || first === undefined || m.ttft_ms === null || m.ttft_ms === undefined) return "";
+      const gap = m.ttft_ms - first;
+      return gap > 1 ? "ответ +" + fmt.sec(gap) + " с" : "";
+    },
+  ],
   ["Промпт, ток", (m) => fmt.num(m.prompt_tokens), () => ""],
   ["Ответ, ток", (m) => fmt.num(m.completion_tokens),
     (m) => (m.reasoning_tokens ? m.reasoning_tokens + " рассужд" : "")],
@@ -867,6 +884,10 @@ function applyTheme(theme) {
   btn.append(ico, label);
 }
 
+// Узкое окно: сайдбар и панель превращаются в ящики поверх ленты. Оба
+// свёрнуты по умолчанию — иначе от чата остаётся полоска посередине.
+const NARROW = window.matchMedia("(max-width: 940px)");
+
 // Свёрнутые сайдбар и панель оставляют на экране кнопку разворота: иначе
 // вернуть их было бы нечем.
 function applyCollapsed(which, collapsed) {
@@ -874,20 +895,77 @@ function applyCollapsed(which, collapsed) {
   const id = which === "sidebar" ? "restore-sidebar" : "restore-panel";
   const existing = document.getElementById(id);
   if (existing) existing.remove();
-  if (!collapsed) return;
-  const btn = iconButton(
-    which === "sidebar" ? "panelLeft" : "panelRight",
-    which === "sidebar" ? "Показать список" : "Показать настройки",
-    () => setCollapsed(which, false)
-  );
-  btn.id = id;
-  btn.classList.add("floating-toggle", which === "sidebar" ? "left" : "right");
-  document.querySelector(".chat").appendChild(btn);
+  if (collapsed) {
+    const btn = iconButton(
+      which === "sidebar" ? "panelLeft" : "panelRight",
+      which === "sidebar" ? "Показать список" : "Показать настройки",
+      () => setCollapsed(which, false)
+    );
+    btn.id = id;
+    btn.classList.add("floating-toggle", which === "sidebar" ? "left" : "right");
+    document.querySelector(".chat").appendChild(btn);
+  }
+  syncBackdrop();
+}
+
+function isCollapsed(which) {
+  return $("#app").classList.contains(which === "sidebar" ? "no-sidebar" : "no-panel");
 }
 
 function setCollapsed(which, collapsed) {
-  store(KEYS[which], collapsed ? "1" : "0");
+  // На узком окне свёрнутость — это состояние ящика, а не выбор пользователя:
+  // запоминать её нельзя, иначе она переедет на широкое окно и там оба борта
+  // окажутся закрыты без причины.
+  if (!NARROW.matches) store(KEYS[which], collapsed ? "1" : "0");
   applyCollapsed(which, collapsed);
+  // Ящики не соседствуют: открыли один — второй закрывается.
+  if (NARROW.matches && !collapsed) {
+    const other = which === "sidebar" ? "panel" : "sidebar";
+    if (!isCollapsed(other)) applyCollapsed(other, true);
+  }
+}
+
+function openDrawers() {
+  return ["sidebar", "panel"].filter((which) => !isCollapsed(which));
+}
+
+function closeDrawers() {
+  openDrawers().forEach((which) => applyCollapsed(which, true));
+}
+
+// Затемнение под открытым ящиком: по клику в него ящик закрывается.
+function syncBackdrop() {
+  const existing = document.querySelector(".backdrop");
+  const needed = NARROW.matches && openDrawers().length > 0;
+  if (!needed) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (existing) return;
+  const backdrop = document.createElement("div");
+  backdrop.className = "backdrop";
+  backdrop.onclick = closeDrawers;
+  document.body.appendChild(backdrop);
+}
+
+// Какие борта должны быть свёрнуты при данной ширине. Вынесено отдельной
+// функцией без DOM: решение проверяется без браузера, в checks/browser_check.js.
+function layoutFor(narrow, stored) {
+  // На узком окне борта — ящики поверх ленты, и оба закрыты: иначе от чата
+  // остаётся полоска посередине.
+  if (narrow) return { sidebar: true, panel: true };
+  return { sidebar: stored.sidebar === "1", panel: stored.panel === "1" };
+}
+
+// Ширина окна изменилась: на узком закрываем оба борта, на широком
+// возвращаем то, что пользователь выбрал сам.
+function applyWidth() {
+  const want = layoutFor(NARROW.matches, {
+    sidebar: read(KEYS.sidebar, "0"),
+    panel: read(KEYS.panel, "0"),
+  });
+  applyCollapsed("sidebar", want.sidebar);
+  applyCollapsed("panel", want.panel);
 }
 
 // ─────────────────── очистка и новый чат ──────────────────────
@@ -955,8 +1033,11 @@ function init() {
     applyTheme(next);
   };
 
-  applyCollapsed("sidebar", read(KEYS.sidebar, "0") === "1");
-  applyCollapsed("panel", read(KEYS.panel, "0") === "1");
+  applyWidth();
+  NARROW.addEventListener("change", applyWidth);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && NARROW.matches && openDrawers().length) closeDrawers();
+  });
 
   $("#autoname").checked = read(KEYS.autoname, "1") === "1";
   $("#autoname").onchange = (ev) => store(KEYS.autoname, ev.target.checked ? "1" : "0");
@@ -989,4 +1070,11 @@ function init() {
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
 
-init();
+// В браузере файл просто запускается. Под node его подключают проверки:
+// checks/browser_check.js гоняет разбор markdown и решение о раскладке
+// настоящими вызовами, а не grep'ом по исходнику.
+if (typeof module === "undefined") {
+  init();
+} else {
+  module.exports = { renderMarkdown, escapeHtml, inlineMarkdown, layoutFor, chatTitle };
+}

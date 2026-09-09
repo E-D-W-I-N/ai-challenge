@@ -92,6 +92,16 @@ class Turn:
         }
 
 
+@dataclass
+class Exchange:
+    """Снятая с истории пара «вопрос — ответ» — то, что можно вернуть назад."""
+
+    question: str
+    turns: list[Turn]
+    depth: int
+    """Длина истории сразу после снятия: по ней видно, занял ли место кто-то другой."""
+
+
 class Agent:
     """Один агент: конфиг + история + один метод обмена.
 
@@ -104,11 +114,10 @@ class Agent:
         spec: AgentSpec,
         *,
         agent_id: str | None = None,
-        parent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Копия конфига, и вглубь тоже: spec может быть колонкой из SCENARIOS,
-        # общей на всех агентов дня, а `replace` копирует только верхний уровень —
+        # Копия конфига, и вглубь тоже: один и тот же spec из ростера может
+        # поднять несколько агентов, а `replace` копирует только верхний уровень —
         # messages, stop, response_format и extra_body остались бы одним
         # объектом на сотню агентов и на сам день. Правка любого из них
         # у одного агента задела бы всех остальных, а день ровно про то,
@@ -121,7 +130,6 @@ class Agent:
             extra_body=copy.deepcopy(spec.extra_body or {}),
         )
         self.id = agent_id or f"ag_{next(_ids):05d}"
-        self.parent_id = parent_id
         self.created_at = time.time()
         self.last_used_at = self.created_at
         self.context_length = context_length
@@ -211,8 +219,8 @@ class Agent:
     def starting_prompt(self) -> list[dict]:
         """Стартовый промпт целиком — системная инструкция и `messages`.
 
-        Не зависит от истории: это то, что показывают в колонке до «Старта»,
-        и то, с чего начинается стенограмма.
+        Не зависит от истории: с него начинается стенограмма, и он же виден
+        в ленте до первого вопроса.
         """
         messages: list[dict] = []
         has_system = any(m.get("role") == "system" for m in self.seed_messages)
@@ -229,7 +237,7 @@ class Agent:
 
         С заданным `user_text` первый вопрос из `messages` в промпт больше
         не подклеивается: он либо приедет окном истории, либо забыт. Именно
-        здесь `history_limit=0` и становится правдой — колонка «без памяти»
+        здесь `history_limit=0` и становится правдой — агент без памяти
         на втором вопросе не знает ни вопроса, ни своего ответа. Пока история
         пуста, вопрос всё же едет: он часть заготовки, и промпт обязан
         сходиться с тем, что показано в стенограмме.
@@ -287,7 +295,6 @@ class Agent:
     def as_dict(self, *, with_transcript: bool = False) -> dict:
         data = {
             "id": self.id,
-            "parent_id": self.parent_id,
             "label": self.spec.label,
             "model": self.spec.model,
             "stop": self.spec.stop,
@@ -427,15 +434,38 @@ class Agent:
         )
         return True
 
-    def drop_last_exchange(self) -> str | None:
-        """Снимает с истории последнюю пару «вопрос — ответ».
+    def take_last_exchange(self) -> Exchange | None:
+        """Снимает с истории последнюю пару «вопрос — ответ» целиком.
 
         Нужна перегенерации: она должна **заменить** последний ответ, а не
-        дописать второй. Возвращает снятый вопрос, чтобы задать его заново.
+        дописать второй, поэтому пара уходит из истории до вызова — модель
+        обязана увидеть тот же контекст, что и в первый раз.
+
+        Возвращает снятое целиком, а не только вопрос: если вызов не отдаст
+        ни одного токена, возвращать в чат будет нечего, и пользователь
+        потеряет и свой вопрос, и уже полученный ответ. `restore` кладёт
+        снятое обратно.
         """
         if not self.history or self.history[-1].role != "assistant":
             return None
-        self.history.pop()
+        taken = [self.history.pop()]
         if self.history and self.history[-1].role == "user":
-            return self.history.pop().content
-        return None
+            taken.insert(0, self.history.pop())
+        question = taken[0].content if taken[0].role == "user" else None
+        if question is None:
+            # Ответ без вопроса переспрашивать нечем — кладём обратно.
+            self.history.extend(taken)
+            return None
+        return Exchange(question=question, turns=taken, depth=len(self.history))
+
+    def restore(self, exchange: Exchange) -> bool:
+        """Кладёт снятую пару обратно, если её место никто не занял.
+
+        Новый обмен успел записаться — значит перегенерация удалась (или
+        оборвалась с частичным ответом, что тоже записано), и возвращать
+        старое поверх нельзя: в ленте оказалось бы два ответа на один вопрос.
+        """
+        if len(self.history) != exchange.depth:
+            return False
+        self.history.extend(exchange.turns)
+        return True

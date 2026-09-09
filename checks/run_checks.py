@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -196,9 +197,22 @@ def check_scenarios_gone():
         assert client.post("/api/scenarios/0/agents").status_code == 404
 
     assert not os.path.exists(os.path.join(ROOT, "app", "commands.py")), "app/commands.py жив"
-    server = read("app/main.py") + read("app/agent.py") + read("app/schema.py")
+    # app/schema.py в этот список не входит намеренно: там `Session` объясняет
+    # в документации, какие поля прошлых дней он отбрасывает, и без слов
+    # «repeats» и «depends_on» объяснить это нельзя. Кода сценариев там нет —
+    # за этим следит отдельная проверка совместимости `Session`.
+    server = read("app/main.py") + read("app/agent.py")
     for word in ("Scenario", "judge", "depends_on", "repeats", "прогон"):
         assert word not in server, f"в серверном коде остался {word}"
+
+    # Родительские связи жили ради субагентов прогона. Спавнить детей больше
+    # некому, и держать каскад, достижимый только из проверок, незачем.
+    registry = read("app/registry.py")
+    for word in ("parent_id", "kill_children", "children"):
+        assert word not in registry, f"в реестре остался {word} — его никто не выставляет"
+    with TestClient(main.app) as client:
+        agent = client.get("/api/agents").json()["agents"][0]
+        assert "parent_id" not in agent, "наружу отдаётся мёртвое поле parent_id"
     client_src = (read("app/static/app.js") + read("app/static/index.html")).lower()
     for word in ("scenario", "прогон", "судья", "колонк"):
         assert word not in client_src, f"в клиенте остался {word}"
@@ -456,6 +470,32 @@ def check_reasoning():
     return "reasoning виден в потоке и в стенограмме, в контекст не возвращается"
 
 
+@check("время до первого токена честное и на думающей модели")
+def check_first_token():
+    """Находка ревью: ttft_ms ставится на первом токене **ответа**.
+
+    На reasoning-модели это момент, когда модель додумала, а не когда
+    заговорила, и плитка удивляла бы на записи. Считаем отдельно первый
+    токен вообще и показываем именно его.
+    """
+    _stub.install(reply="ответ", reasoning="я думаю")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        events = sse(client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"}).text)
+
+    done = next(e for e in events if e["event"] == "done")
+    metrics = done["metrics"]
+    assert "first_token_ms" in metrics, metrics
+    assert metrics["first_token_ms"] is not None, metrics
+    # Рассуждение приходит первым, значит первый токен не позже начала ответа.
+    assert metrics["first_token_ms"] <= metrics["ttft_ms"], metrics
+
+    js = read("app/static/app.js")
+    assert "Первый токен, с" in js, "плитка должна называть то, что показывает"
+    assert "first_token_ms" in js, "клиент обязан брать честное время, а не ttft"
+    return "first_token_ms есть в метриках и стоит на плитке"
+
+
 @check("перегенерация заменяет последний ответ, а не добавляет второй")
 def check_regenerate():
     _stub.install(reply=lambda m, i: f"ответ {i}")
@@ -478,6 +518,61 @@ def check_regenerate():
         empty = new_agent(client)
         assert client.post(f"/api/agents/{empty}/regenerate").status_code == 409
     return "после перегенерации в истории по-прежнему один вопрос и один ответ"
+
+
+@check("неудачная перегенерация возвращает и вопрос, и прошлый ответ")
+def check_regenerate_failure():
+    """Находка ревью: пара снималась с истории до вызова и не возвращалась.
+
+    Сценарий короткий и сам напрашивается: у агента Дня 4 провайдер закреплён
+    через provider.order, смена модели роняет вызов, и «перегенерировать»
+    уносило и вопрос, и уже полученный ответ. Восстановить их было нечем —
+    историю хранит сервер.
+    """
+    _stub.install(reply="живой ответ")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "мой вопрос"})
+
+        def history():
+            body = client.get(f"/api/agents/{agent_id}").json()["transcript"]
+            return [(t["role"], t["content"]) for t in body if not t.get("seed")]
+
+        before = history()
+        assert before == [("user", "мой вопрос"), ("assistant", "живой ответ")], before
+
+        # Вызов падает целиком, не отдав ни одного токена, — как HTTP 402.
+        _stub.install(fail=True)
+        response = client.post(f"/api/agents/{agent_id}/regenerate")
+        assert response.status_code == 200, response.text
+        events = sse(response.text)
+        after = history()
+
+    done = next(e for e in events if e["event"] == "done")
+    assert done["committed"] is False, done
+    assert done["restored"] is True, done
+    assert after == before, f"история должна остаться прежней, а стала {after}"
+
+    # Частичный ответ — другое дело: он записан, и возвращать старое поверх
+    # нельзя, иначе в ленте окажется два ответа на один вопрос.
+    async def partial():
+        agent = REGISTRY.create(AgentSpec(label="частичная", model="stub/model"))
+        agent.remember("user", "вопрос")
+        agent.remember("assistant", "старый ответ")
+
+        async def half(session, *, prompt_override=None, context_length=None):
+            yield {"type": "delta", "text": "новый огрыз", "metrics": {"error": None}}
+            yield {"type": "error", "message": "оборвалось", "metrics": {"error": "оборвалось"}}
+
+        agent_module.stream_completion = half
+        taken = agent.take_last_exchange()
+        await drain(main._regenerate_events(agent, taken))
+        return agent
+
+    agent = asyncio.run(partial())
+    pairs = [(t.role, t.content) for t in agent.history]
+    assert pairs == [("user", "вопрос"), ("assistant", "новый огрыз")], pairs
+    return "провал вернул пару на место, частичный ответ её заменил"
 
 
 # --- 7. чаты и ростер ---------------------------------------------------------
@@ -571,15 +666,27 @@ def check_no_cdn():
     return "в статике только относительные пути и w3.org-неймспейс SVG"
 
 
-@check("markdown рендерится своими силами и не пускает разметку из ответа")
-def check_markdown():
-    js = read("app/static/app.js")
-    assert "function renderMarkdown" in js and "function escapeHtml" in js
-    assert "escapeHtml(text)" in js, "ответ модели обязан экранироваться до разбора"
-    for feature in ("<strong>", "<code>", "<pre>", "<li>", "<blockquote>", "<h"):
-        assert feature in js, f"в разборе markdown нет {feature}"
-    assert "https?:" in js, "ссылки должны ограничиваться http(s)"
-    return "свой разбор: заголовки, списки, цитаты, код, жирный, ссылки только http(s)"
+@check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
+def check_browser():
+    """Находка ревью: прежняя проверка была grep'ом по исходнику.
+
+    Она прошла бы и если экранирование переедет **после** разбора — то есть
+    самая опасная поверхность демо была прикрыта пустышкой. Теперь клиентский
+    код исполняется под node: payload на входе, утверждения про выход.
+    """
+    node = shutil.which("node")
+    assert node, (
+        "нужен node, чтобы исполнить клиентский код: разбор markdown "
+        "проверяется настоящими вызовами, а не чтением исходника"
+    )
+    result = subprocess.run(
+        [node, os.path.join(ROOT, "checks", "browser_check.js")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
 
 
 # --- 9. реестр и инфраструктура -----------------------------------------------
@@ -614,32 +721,29 @@ def check_spec_deep_copy():
     return "правка у одного агента не задела ни день, ни соседа"
 
 
-@check("вытеснение уносит детей вместе с родителем и щадит занятых")
+@check("вытеснение по потолку берёт самых старых простаивающих и щадит занятых")
 def check_eviction():
     from app.registry import AgentRegistry
 
-    registry = AgentRegistry(max_agents=6)
-    parent = registry.create(AgentSpec(label="родитель", model="stub/m"))
-    kids = registry.create_many(
-        [AgentSpec(label=f"ребёнок {i}", model="stub/m") for i in range(3)], parent_id=parent.id
-    )
-    fresh = registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(2)])
+    registry = AgentRegistry(max_agents=5)
+    old = registry.create_many([AgentSpec(label=f"старый {i}", model="stub/m") for i in range(3)])
+    fresh = registry.create_many([AgentSpec(label=f"свежий {i}", model="stub/m") for i in range(2)])
     for agent in fresh:
         agent.last_used_at += 100
-    registry.create_many([AgentSpec(label=f"ещё {i}", model="stub/m") for i in range(2)])
+    registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(3)])
 
-    assert registry.get(parent.id) is None, "родитель должен быть вытеснен"
-    assert not [k.id for k in kids if registry.get(k.id) is not None], "дети остались сиротами"
+    assert len(registry) == 5, len(registry)
+    assert all(registry.get(a.id) is None for a in old), "старые должны быть вытеснены"
     assert all(registry.get(a.id) is not None for a in fresh), "свежие вытесняться не должны"
+    assert registry.evicted == 3, registry.evicted
 
-    busy = AgentRegistry(max_agents=3)
-    held_parent = busy.create(AgentSpec(label="р", model="stub/m"))
-    held = busy.create(AgentSpec(label="д", model="stub/m"), parent_id=held_parent.id)
+    busy = AgentRegistry(max_agents=2)
+    held = busy.create(AgentSpec(label="занят", model="stub/m"))
     held.reserve()
     busy.create_many([AgentSpec(label=f"н {i}", model="stub/m") for i in range(3)])
-    assert busy.get(held.id) is not None and busy.get(held_parent.id) is not None
+    assert busy.get(held.id) is not None, "занятого вытеснять нельзя"
     held.release()
-    return "каскад работает, занятого и его родителя вытеснение не трогает"
+    return "вытеснены три самых старых, свежие и занятый на месте"
 
 
 @check("потолок пачки при спавне")
@@ -698,15 +802,36 @@ def check_no_feed():
     return "лишние поля в теле → 400, в app.js ленты нет"
 
 
-@check("Session остался алиасом AgentSpec")
-def check_session_alias():
+@check("Session собирает колонку прошлых дней и терпит их поля")
+def check_session_compat():
     from app.schema import AgentSpec as Spec
     from app.schema import Session
 
-    assert Session is Spec
-    spec = Session(label="колонка", model="stub/m", messages=[{"role": "user", "content": "x"}])
-    assert spec.history_limit is None and spec.draft == ""
-    return "Session is AgentSpec, конструктор с messages работает"
+    # Ровно то, как объявлял колонку day.py Дня 4: с repeats и extra_body.
+    spec = Session(
+        label="t = 1.2",
+        model="openai/gpt-4o-mini",
+        messages=[{"role": "user", "content": "x"}],
+        temperature=1.2,
+        max_tokens=80,
+        repeats=5,
+        extra_body={"provider": {"order": ["openai"]}},
+        note="n",
+    )
+    assert isinstance(spec, Spec), type(spec)
+    assert spec.temperature == 1.2 and spec.max_tokens == 80
+    assert spec.extra_body == {"provider": {"order": ["openai"]}}
+    assert not hasattr(spec, "repeats"), "серии выпилены, поля быть не должно"
+
+    # И как объявлял колонку Дня 3 — с depends_on.
+    dependent = Session(
+        label="Ответ по своему промпту",
+        model="openai/gpt-4o-mini",
+        messages=[{"role": "user", "content": "y"}],
+        depends_on="Модель пишет промпт",
+    )
+    assert isinstance(dependent, Spec) and not hasattr(dependent, "depends_on")
+    return "repeats и depends_on принимаются и молча отбрасываются"
 
 
 @check("CLI говорит с агентом без веб-слоя")
@@ -740,18 +865,20 @@ CHECKS = [
     check_new_params,
     check_patch_panel,
     check_reasoning,
+    check_first_token,
     check_regenerate,
+    check_regenerate_failure,
     check_reset_keeps_roster,
     check_new_chat,
     check_no_key_leak,
     check_no_cdn,
-    check_markdown,
+    check_browser,
     check_spec_deep_copy,
     check_eviction,
     check_batch_limit,
     check_shared_client,
     check_no_feed,
-    check_session_alias,
+    check_session_compat,
     check_cli,
 ]
 

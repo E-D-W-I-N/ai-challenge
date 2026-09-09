@@ -51,7 +51,7 @@ def make(
     delay — пауза между чанками: нужна проверке обрыва, чтобы успеть оборвать.
     reasoning — рассуждение, которое модель присылает отдельным полем дельты.
     """
-    from app.llm import build_payload
+    from app.llm import Metrics, build_payload
 
     async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
         messages = list(prompt_override if prompt_override is not None else session.messages)
@@ -72,23 +72,26 @@ def make(
         else:
             text = _default_reply(messages, index)
 
-        metrics = {
-            "ttft_ms": 1.0,
-            "elapsed_ms": 2.0,
-            "tokens_out": max(1, len(text) // 4),
-            "tokens_per_second": 10.0,
-            "prompt_tokens": sum(len(m.get("content", "")) for m in messages) // 4,
-            "completion_tokens": max(1, len(text) // 4),
-            "total_tokens": 100,
-            "reasoning_tokens": None,
-            "cost_usd": 0.000123,
-            "finish_reason": "stop",
-            "model": session.model,
-            "provider": "stub",
-            "context_length": context_length,
-            "context_fill_pct": None,
-            "error": None,
-        }
+        # Метрики собираем настоящим датаклассом, а не словарём по памяти:
+        # иначе новое поле появится в app/llm.py, а заглушка о нём не узнает,
+        # и проверка будет смотреть в вымышленный набор ключей.
+        tokens = max(1, len(text) // 4)
+        metrics = Metrics(
+            ttft_ms=1.0,
+            # Рассуждение приходит раньше ответа — на нём и стоит первый токен.
+            first_token_ms=0.5 if reasoning else 1.0,
+            elapsed_ms=2.0,
+            tokens_out=tokens,
+            tokens_per_second=10.0,
+            prompt_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
+            completion_tokens=tokens,
+            total_tokens=100,
+            cost_usd=0.000123,
+            finish_reason="stop",
+            model=session.model,
+            provider="stub",
+            context_length=context_length,
+        ).as_dict()
 
         ACTIVE["now"] += 1
         ACTIVE["peak"] = max(ACTIVE["peak"], ACTIVE["now"])

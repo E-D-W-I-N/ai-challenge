@@ -595,17 +595,17 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .tiles {
   flex: 0 0 auto;
   border-top: 1px solid var(--line);
-  padding: 12px;
+  padding: 14px 14px 16px;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 10px;
   background: var(--bg-soft);
 }
 .tile {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--bg);
-  padding: 8px 10px 9px;
+  padding: 10px 12px 11px;
   min-width: 0;
 }
 .tile-k {
@@ -618,7 +618,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.tile-row { display: flex; align-items: baseline; gap: 6px; }
+.tile-row { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; }
 .tile-v {
   font-size: 18px;
   font-weight: 600;
@@ -661,18 +661,47 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 }
 .confirm-row button.primary { background: var(--danger); border-color: var(--danger); color: #fff; }
 
+/* ── затемнение под ящиками узкого окна ── */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  background: rgba(0, 0, 0, .3);
+  animation: fade-in .12s ease;
+}
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
 /* ── адаптив ── */
+
 @media (max-width: 1180px) {
   :root { --sidebar-w: 232px; --panel-w: 300px; }
 }
+
+/* Узкое окно: лента занимает всё, а сайдбар и панель превращаются в ящики.
+   Оба свёрнуты по умолчанию — иначе на ~900 px от чата остаётся полоска
+   посередине. Открываются кнопками в углах ленты, закрываются кликом вне
+   и по Escape. */
 @media (max-width: 940px) {
   .app { grid-template-columns: minmax(0, 1fr); }
-  .sidebar, .panel { position: fixed; top: 0; bottom: 0; z-index: 20; width: 280px; }
-  .sidebar { left: 0; box-shadow: 2px 0 18px rgba(0,0,0,.1); }
-  .panel { right: 0; width: 320px; box-shadow: -2px 0 18px rgba(0,0,0,.1); }
+  .sidebar, .panel {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 20;
+    width: min(300px, 86vw);
+  }
+  .sidebar { left: 0; box-shadow: 2px 0 24px rgba(0, 0, 0, .16); }
+  .panel { right: 0; box-shadow: -2px 0 24px rgba(0, 0, 0, .16); }
   .app.no-sidebar .sidebar, .app.no-panel .panel { display: none; }
   .feed, .composer { padding-left: 16px; padding-right: 16px; }
+  /* Кнопки разворота уходят под затемнение: пока ящик открыт, жать надо
+     мимо него, а не по ним. */
+  .floating-toggle { z-index: 5; }
 }
+
+/* Затемнение нужно только там, где панели стали ящиками. */
+@media (min-width: 941px) { .backdrop { display: none; } }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
