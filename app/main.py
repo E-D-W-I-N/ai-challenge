@@ -1,11 +1,8 @@
 """FastAPI-сервер чата: реестр агентов процесса и разговор с любым из них.
 
-Список чатов начинается пустым: заводит их пользователь. Заготовок нет —
-ни имён, ни промптов, ни настроек, придуманных за него.
-
-Сервер держит состояние: агент — объект в реестре процесса, историю диалога
-хранит он, а не браузер. Клиент шлёт только новый текст и id агента. Реестр
-живёт в памяти: перезапуск процесса стирает его — это постановка Дня 7.
+Список чатов начинается пустым: заводит их пользователь. Историю диалога
+хранит агент, а не браузер, — клиент шлёт только новый текст и id. Реестр
+живёт в памяти процесса: перезапуск стирает его.
 """
 
 from __future__ import annotations
@@ -35,20 +32,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model="openai/gpt-4o-mini")
 """Чистый чат: то, что получает кнопка «Новый чат».
 
-Пусто всё, кроме модели: без неё запрос некуда отправить. Системного
-промпта нет намеренно — его задаёт пользователь в панели, когда он ему
-нужен, ровно как модель и остальные настройки. Пустой `system` в тело
-запроса не попадает вовсе: ни ключа, ни пустой строки в роли `system`.
-Имя чату выдаёт `_next_chat_label`.
+Пусто всё, кроме модели: без неё запрос некуда отправить. Системного промпта
+нет намеренно — его задаёт пользователь. Пустой `system` в тело запроса
+не попадает вовсе: ни ключа, ни пустой строки в роли `system`.
 """
 
 _chat_numbers = itertools.count(1)
-"""Счётчик имён по умолчанию: «Новый чат 1», «Новый чат 2» и дальше.
-
-Счётчик только растёт и номера не переиспользует. Иначе после удаления
-третьего чата следующий стал бы вторым «Новым чатом 3» — а двух одинаковых
-имён по умолчанию быть не должно.
-"""
+"""«Новый чат 1», «Новый чат 2» и дальше. Только растёт и номера
+не переиспользует: двух одинаковых имён по умолчанию быть не должно."""
 
 
 def _next_chat_label() -> str:
@@ -155,15 +146,9 @@ def _stream(
 
 # --- разбор конфига агента ----------------------------------------------------
 
-_ROLES = ("system", "user", "assistant")
-
 MAX_SPAWN_BATCH = 250
-"""Сколько агентов можно создать одним запросом.
-
-Спавн бесплатен, но список из тела запроса ничем не ограничен, а реестр —
-живая память процесса. Двести пятьдесят с запасом покрывают демонстрацию
-сотни и не дают одним запросом раздуть процесс.
-"""
+"""Сколько агентов можно создать одним запросом: спавн бесплатен, но список
+из тела ничем не ограничен, а реестр — живая память процесса."""
 
 # Целые параметры отделены от дробных: «top_k: 0.5» должен получить 400,
 # а не уехать к провайдеру и вернуться оттуда невнятной ошибкой.
@@ -181,8 +166,8 @@ PATCHABLE = (
 )
 """Что панель справа вправе менять у живого чата.
 
-Всё, что видно в панели, и ничего сверх: стартовая заготовка `messages`
-снаружи не правится, а имя меняют из списка слева тем же полем `label`.
+Всё, что видно в панели, и ничего сверх: имя меняют из списка слева
+тем же полем `label`.
 """
 
 
@@ -235,30 +220,39 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
     return values
 
 
-def _parse_messages(raw, where: str) -> list[dict]:
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail=f"{where}messages: список сообщений или пусто")
-    messages: list[dict] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}] должен быть объектом {{role, content}}",
-            )
-        role = item.get("role")
-        content = item.get("content")
-        if role not in _ROLES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}].role должен быть один из {', '.join(_ROLES)}",
-            )
-        if not isinstance(content, str) or not content.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}].content должен быть непустой строкой",
-            )
-        messages.append({"role": role, "content": content})
-    return messages
+def _text_field(payload: dict, name: str, where: str = "") -> str:
+    """Строка или null. Снятое поле — пустая строка, а не None."""
+    return _optional_field(payload, name, (str,), "строка или null", where) or ""
+
+
+def _stop_field(payload: dict, where: str = "") -> list[str] | None:
+    """Стоп-строки: список строк, пустые не в счёт.
+
+    Поле в панели построчное, и лишний перевод строки не должен превращаться
+    в стоп-строку: пустая строка остановила бы генерацию сразу. Правило одно
+    на создание и на правку — разойдясь, они однажды уже разошлись, и POST
+    сохранял то, что PATCH выбрасывал.
+    """
+    stop = _optional_field(payload, "stop", (list,), "список строк или null", where)
+    if stop is not None and not all(isinstance(x, str) for x in stop):
+        raise HTTPException(status_code=400, detail=f"{where}stop: список строк или null")
+    return [x.strip() for x in (stop or []) if x.strip()] or None
+
+
+def _history_limit_field(payload: dict, where: str = "") -> int | None:
+    limit = _optional_field(payload, "history_limit", (int,), "целое число от нуля или null", where)
+    if limit is not None and limit < 0:
+        raise HTTPException(
+            status_code=400, detail=f"{where}history_limit: целое число от нуля или null"
+        )
+    return limit
+
+
+def _label_field(payload: dict) -> str:
+    label = payload.get("label")
+    if not isinstance(label, str) or not label.strip():
+        raise HTTPException(status_code=400, detail="label: непустая строка")
+    return label.strip()
 
 
 def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
@@ -266,50 +260,17 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail=f"{where[:-1] or 'агент'}: должен быть объектом")
 
-    model = _model_field(payload, where)
-    sampling = _sampling_fields(payload, where)
-
-    stop = _optional_field(payload, "stop", (list,), "список строк или null", where)
-    if stop is not None and not all(isinstance(x, str) for x in stop):
-        raise HTTPException(status_code=400, detail=f"{where}stop: список строк или null")
-
-    response_format = _optional_field(payload, "response_format", (dict,), "объект или null", where)
-    extra_body = _optional_field(payload, "extra_body", (dict,), "объект или null", where) or {}
-
-    history_limit = _optional_field(
-        payload, "history_limit", (int,), "целое число от нуля или null", where
-    )
-    if history_limit is not None and history_limit < 0:
-        raise HTTPException(
-            status_code=400, detail=f"{where}history_limit: целое число от нуля или null"
-        )
-
-    def text(name: str) -> str:
-        return _optional_field(payload, name, (str,), "строка или null", where) or ""
-
-    messages = _parse_messages(payload.get("messages") or [], where)
-    system = text("system")
-    if system and any(m["role"] == "system" for m in messages):
-        # У системного промпта одно место — поле `system`. Если он задан
-        # и там, и сообщением, одно из двух пришлось бы выбросить молча.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{where}system задан и полем, и сообщением в messages: "
-                "у системного промпта одно место — выберите его"
-            ),
-        )
-
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
-        model=model,
-        messages=messages,
-        system=system,
-        stop=stop or None,
-        response_format=response_format,
-        extra_body=extra_body,
-        history_limit=history_limit,
-        **sampling,
+        model=_model_field(payload, where),
+        system=_text_field(payload, "system", where),
+        stop=_stop_field(payload, where),
+        response_format=_optional_field(
+            payload, "response_format", (dict,), "объект или null", where
+        ),
+        extra_body=_optional_field(payload, "extra_body", (dict,), "объект или null", where) or {},
+        history_limit=_history_limit_field(payload, where),
+        **_sampling_fields(payload, where),
     )
 
 
@@ -354,10 +315,8 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
     """Создать агента или пачку агентов.
 
     Тело: {"agents": [конфиг, ...]} — пачка, {"agent": конфиг} — один,
-    пустое тело — «Новый чат» по дефолтному конфигу.
-
-    Пачка и есть ответ на критерий дня: сто разных конфигов одним запросом,
-    сто объектов в одном процессе, ни одного вызова к модели.
+    пустое тело — «Новый чат». Пачка и есть ответ на критерий дня: сто
+    конфигов одним запросом, сто объектов, ни одного вызова к модели.
     """
     if payload is None:
         payload = {}
@@ -420,43 +379,23 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
             status_code=400,
             detail=f"менять можно только {', '.join(PATCHABLE)}, а не {', '.join(sorted(unknown))}",
         )
-    # Правка во время генерации разрешена намеренно. Текущий ответ она
-    # исказить не может: `Agent.ask` снимает слепок конфига в начале обмена
-    # и собирает из него и промпт, и тело запроса, — живой конфиг после
-    # этого не читается вовсе. Зато запрет стоил дорого: 409 приходил ровно
-    # тогда, когда правку и хочется внести — пока читаешь длинный ответ, —
-    # и терялся навсегда, потому что повторять его было нечем. Правка
-    # действует со следующего сообщения, ровно как и обещает строка
-    # состояния под панелью.
+    # Правка во время генерации разрешена намеренно: текущий ответ она
+    # исказить не может — `Agent.ask` снимает слепок конфига в начале обмена
+    # и собирает из него и промпт, и тело, а живой конфиг после этого
+    # не читается вовсе. Действует со следующего сообщения.
 
     sampling = _sampling_fields(payload)
     if "model" in payload:
         agent.spec.model = _model_field(payload)
         agent.context_length = (await _context_lengths()).get(agent.spec.model)
     if "label" in payload:
-        label = payload.get("label")
-        if not isinstance(label, str) or not label.strip():
-            raise HTTPException(status_code=400, detail="label: непустая строка")
-        agent.spec.label = label.strip()
+        agent.spec.label = _label_field(payload)
     if "system" in payload:
-        system = payload.get("system")
-        if system is not None and not isinstance(system, str):
-            raise HTTPException(status_code=400, detail="system: строка или null")
-        agent.spec.system = system or ""
+        agent.spec.system = _text_field(payload, "system")
     if "history_limit" in payload:
-        limit = _optional_field(payload, "history_limit", (int,), "целое число от нуля или null")
-        if limit is not None and limit < 0:
-            raise HTTPException(
-                status_code=400, detail="history_limit: целое число от нуля или null"
-            )
-        agent.spec.history_limit = limit
+        agent.spec.history_limit = _history_limit_field(payload)
     if "stop" in payload:
-        stop = _optional_field(payload, "stop", (list,), "список строк или null")
-        if stop is not None and not all(isinstance(x, str) for x in stop):
-            raise HTTPException(status_code=400, detail="stop: список строк или null")
-        # Пустая строка стоп-строкой не является: поле в панели построчное,
-        # и лишний перевод строки не должен превращаться в параметр.
-        agent.spec.stop = [x.strip() for x in (stop or []) if x.strip()] or None
+        agent.spec.stop = _stop_field(payload)
     if "response_format" in payload:
         agent.spec.response_format = _optional_field(
             payload, "response_format", (dict,), "объект или null"
@@ -553,11 +492,9 @@ async def send_message(
 async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
     """Перегенерация: последний ответ заменяется новым, а не дублируется.
 
-    Пара «вопрос — ответ» снимается с истории до вызова, поэтому модель видит
-    ровно тот же контекст, что и в первый раз, а в ленте остаётся один ответ.
-    Если вызов не отдал ни одного токена, снятое возвращается на место:
-    иначе неудачная перегенерация уносила бы и прошлый ответ, и сам вопрос,
-    а восстановить их было бы неоткуда — историю хранит сервер.
+    Пара «вопрос — ответ» снимается с истории до вызова — модель видит тот же
+    контекст, в ленте остаётся один ответ. Вызов не отдал ни токена — снятое
+    возвращается на место: восстановить его было бы неоткуда.
     """
     agent = _agent(agent_id)
     _require_key()

@@ -487,6 +487,186 @@ async function routeChecks() {
       client.state.current.label);
   }
 
+  // ── «Новый чат» встаёт в конец списка ──
+  //
+  // Порядок списка слева не стерёг никто: разворот сортировки реестра
+  // наоборот не ронял ни одной проверки. Серверная половина —
+  // check_list_order в run_checks.py.
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(30);
+    const names = () =>
+      $("#agent-list").querySelectorAll(".item-title").map((el) => el.textContent);
+
+    check("сначала в списке два заведённых чата",
+      names().join(" | ") === "первый чат | второй чат", names().join(" | "));
+
+    $("#new-chat").dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("новый чат встаёт последним, а не первым",
+      names().length === 3 && /^Новый чат/.test(names()[2]), names().join(" | "));
+    check("и он же открыт",
+      client.state.current && client.state.current.label === names()[2],
+      client.state.current && client.state.current.label);
+    check("порядок прежних не тронут",
+      names()[0] === "первый чат" && names()[1] === "второй чат", names().join(" | "));
+    check("на сервере тот же порядок",
+      server.state.agents.map((a) => a.label).join(" | ") === names().join(" | "),
+      server.state.agents.map((a) => a.label).join(" | "));
+  }
+
+  // ── лента рисуется из стенограммы ──
+  //
+  // Клиент после каждого обмена перечитывает агента и перерисовывает ленту
+  // целиком: на экране должно быть ровно то, что у агента в истории, а не то,
+  // что клиент дорисовал по дороге. Значит формат стенограммы — часть
+  // поведения, и раньше его не стерёг никто: поле можно было убрать из ответа
+  // ручки, и ни одна проверка не краснела. Серверная половина —
+  // check_transcript_shape в run_checks.py.
+  {
+    const talk = [
+      { role: "user", content: "мой вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "**жирный** ответ", error: null, reasoning: "я подумал",
+        metrics: { model: "особая/модель", provider: "поставщик" },
+      },
+      { role: "user", content: "второй вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "огрыз", error: "оборвалось", reasoning: "",
+        metrics: { model: "особая/модель", provider: "поставщик" },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "с историей", transcript: talk, history_len: talk.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const feed = $("#feed");
+    const nodes = feed.children.filter(
+      (el) => el.classList.contains("msg-user") || el.classList.contains("card")
+    );
+    check("в ленте по узлу на реплику стенограммы", nodes.length === talk.length,
+      `узлов ${nodes.length}, реплик ${talk.length}`);
+    check("вопросы — пузырями, ответы — карточками",
+      nodes.map((el) => (el.classList.contains("msg-user") ? "u" : "a")).join("") === "uaua",
+      nodes.map((el) => el.className).join(" | "));
+
+    check("текст вопроса показан", nodes[0].textContent === "мой вопрос", nodes[0].textContent);
+    check("текст ответа показан и разобран как markdown",
+      nodes[1].querySelector(".card-body").innerHTML.includes("<strong>жирный</strong>"),
+      nodes[1].querySelector(".card-body").innerHTML);
+    check("имя модели берётся из метрик реплики, а не из конфига чата",
+      nodes[1].querySelector(".card-model").textContent === "особая/модель",
+      nodes[1].querySelector(".card-model").textContent);
+    check("провайдер показан отдельной меткой",
+      nodes[1].querySelector(".card-tag").textContent === "поставщик",
+      String(nodes[1].querySelector(".card-tag")));
+    check("рассуждение показано свёрнутым блоком",
+      Boolean(nodes[1].querySelector(".think")) &&
+        nodes[1].querySelector(".think-body").textContent === "я подумал",
+      String(nodes[1].querySelector(".think")));
+    check("у целого ответа блока ошибки нет",
+      nodes[1].querySelector(".card-error") === null, "блок ошибки появился");
+
+    check("оборванный ответ помечен",
+      nodes[3].classList.contains("failed"), nodes[3].className);
+    check("и текст ошибки показан",
+      nodes[3].querySelector(".card-error") &&
+        nodes[3].querySelector(".card-error").textContent === "оборвалось",
+      String(nodes[3].querySelector(".card-error")));
+
+    // Пустая стенограмма — это заставка, а не пустая лента с нулём узлов.
+    $("#agent-list").querySelectorAll(".item-open")[0].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("пустой чат показывает заставку, а не пустоту",
+      Boolean($("#feed").querySelector(".empty")), $("#feed").textContent);
+  }
+
+  // ── переименование чата в списке слева ──
+  //
+  // Раньше это стереглось грепом по исходнику: «в app.js есть строка
+  // function startRename», «есть miniButton("pencil")», «встречаются слова
+  // Enter и Escape». Такая проверка описывает реализацию, а не поведение:
+  // переименование можно сломать, не тронув ни одной из этих строк, и она
+  // останется зелёной. Здесь — настоящий маршрут: клик по карандашу,
+  // клавиша, запрос к серверу, имя в списке.
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(30);
+
+    const row = () => $("#agent-list").querySelectorAll(".item")[0];
+    const title = () => row().querySelector(".item-title");
+    const patches = () =>
+      server.state.requests.filter((r) => r.method === "PATCH" && "label" in (r.body || {}));
+
+    check("до переименования в строке показано имя чата",
+      title() && title().textContent === "первый чат",
+      title() && title().textContent);
+
+    // 1. Карандаш открывает поле прямо в строке, со старым именем внутри.
+    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    let field = row().querySelector(".item-rename");
+    check("карандаш открывает поле ввода прямо в строке", Boolean(field), "поля нет");
+    check("в поле стоит нынешнее имя", field && field.value === "первый чат",
+      field && field.value);
+    check("пока переименовываем, кнопки открытия чата в строке нет",
+      row().querySelector(".item-open") === null, "кнопка осталась");
+
+    // 2. Enter сохраняет: правка уходит на сервер и видна в списке.
+    field.value = "новое имя";
+    field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+    await settle(40);
+    check("Enter отправляет новое имя на сервер",
+      patches().length === 1 && patches()[0].body.label === "новое имя",
+      JSON.stringify(patches().map((r) => r.body)));
+    check("имя на сервере поменялось",
+      server.state.agents[0].label === "новое имя", server.state.agents[0].label);
+    check("список показывает новое имя", title() && title().textContent === "новое имя",
+      title() && title().textContent);
+    check("поле ввода закрылось", row().querySelector(".item-rename") === null, "поле осталось");
+
+    // 3. Escape отменяет: ни запроса, ни следа в списке.
+    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    field = row().querySelector(".item-rename");
+    field.value = "передумал";
+    field.dispatchEvent(new Evt("keydown", { key: "Escape" }));
+    await settle(40);
+    check("Escape не шлёт запроса", patches().length === 1,
+      JSON.stringify(patches().map((r) => r.body)));
+    check("Escape оставляет прежнее имя", title() && title().textContent === "новое имя",
+      title() && title().textContent);
+
+    // 4. Потеря фокуса сохраняет: имя не должно теряться молча.
+    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    field = row().querySelector(".item-rename");
+    field.focus();
+    field.value = "по потере фокуса";
+    field.blur();
+    await settle(40);
+    check("потеря фокуса тоже сохраняет",
+      patches().length === 2 && patches()[1].body.label === "по потере фокуса",
+      JSON.stringify(patches().map((r) => r.body)));
+    check("и список это показывает", title() && title().textContent === "по потере фокуса",
+      title() && title().textContent);
+
+    // 5. Пустое имя чат не стирает: запроса нет, имя прежнее.
+    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    field = row().querySelector(".item-rename");
+    field.value = "   ";
+    field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+    await settle(40);
+    check("пустым именем чат не переименовать", patches().length === 2,
+      JSON.stringify(patches().map((r) => r.body)));
+    check("после пустого ввода имя осталось прежним",
+      title() && title().textContent === "по потере фокуса",
+      title() && title().textContent);
+  }
+
   // ── где оказывается лента ──
   //
   // Утверждения здесь про **положение ленты**, а не про внутренний флаг.
@@ -500,8 +680,8 @@ async function routeChecks() {
     // «больше сообщений», как и в браузере.
     const TALK = [];
     for (let i = 1; i <= 6; i += 1) {
-      TALK.push({ role: "user", content: `вопрос ${i}`, seed: false });
-      TALK.push({ role: "assistant", content: `ответ ${i}`, seed: false, metrics: null, reasoning: "" });
+      TALK.push({ role: "user", content: `вопрос ${i}`, error: null, reasoning: "", metrics: null });
+      TALK.push({ role: "assistant", content: `ответ ${i}`, error: null, reasoning: "", metrics: null });
     }
     const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: TALK.length });
     const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
@@ -687,7 +867,11 @@ async function routeChecks() {
     check("а настоящая стоп-строка — считается", /Применено/.test(shown()), shown());
   }
 
-  // ── две правки подряд: таймер не залипает ──
+  // ── две правки подряд: таймер не залипает, и строка гаснет ──
+  //
+  // Единственное место, где проверяется гашение строки состояния: правка
+  // показывает «Применено», вторая правка перевешивает таймер, а не копит
+  // второй, и через пять секунд после последней правки строка пуста.
   {
     const { client, $, settle, Evt } = freshClient();
     const shown = () => $("#save-status").textContent;
@@ -743,24 +927,6 @@ async function routeChecks() {
     card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
     await settle(140);
     check("перегенерация без правок ничего не сообщает", shown() === "", shown());
-  }
-
-  // ── строка состояния гаснет ──
-  {
-    const { client, $, settle, Evt } = freshClient();
-    client.init();
-    await settle(20);
-    $("#f-system").value = "правка";
-    $("#f-system").dispatchEvent(new Evt("change"));
-    await settle(30);
-    check("после применения есть строка состояния",
-      /Применено/.test($("#save-status").textContent), $("#save-status").textContent);
-    // Таймер настоящий, ждать пять секунд в проверке незачем — двигаем время.
-    const fade = client.state.statusTimer;
-    check("гашение назначено таймером", Boolean(fade), "таймера нет");
-    await new Promise((r) => setTimeout(r, 5100));
-    check("через пять секунд строка пуста", $("#save-status").textContent === "",
-      $("#save-status").textContent);
   }
 
   // ── предупреждение про поставщика: только при смене модели ──
