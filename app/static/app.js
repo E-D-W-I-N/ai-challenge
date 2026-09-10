@@ -84,12 +84,40 @@ function iconButton(name, title, onClick, className = "icon-btn") {
 
 const fmt = {
   sec: (ms) => (ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2)),
-  num: (v) => (v === null || v === undefined ? "—" : String(v)),
   rate: (v) => (v ? v.toFixed(1) : "—"),
   cost: (v) => (v === null || v === undefined ? "—" : "$" + Number(v).toFixed(6)),
   pct: (v) => (v === null || v === undefined ? "—" : v.toFixed(1) + " %"),
   text: (v) => v || "—",
+  // Токены: тысячи разделяются, от десяти тысяч — «12.4k». Прочерк остаётся
+  // прочерком: ноль — это ответ, а «неизвестно» — его отсутствие, и на экране
+  // они обязаны выглядеть по-разному.
+  tokens: (v) => {
+    if (v === null || v === undefined) return "—";
+    const n = Number(v);
+    if (!isFinite(n)) return "—";
+    // Порог для «M» стоит там, где округление в «k» уже дало бы «1000k»:
+    // такое число читается как миллион, миллионом его и пишем.
+    if (Math.abs(n) >= 999500) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+    if (Math.abs(n) >= 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  },
 };
+
+// Итог по чату приходит с сервера полем `usage_total` — считает его агент,
+// клиент только показывает. Ни одного слагаемого здесь не складывается:
+// два места, где числа суммируются, разъезжаются молча.
+function chatUsage() {
+  return (state.current && state.current.usage_total) || null;
+}
+
+// Подпись плитки: накопленное по чату рядом с числом последнего обмена.
+function sumSub(field, format) {
+  const total = chatUsage();
+  if (!total) return "";
+  const value = total[field];
+  if (value === null || value === undefined) return "";
+  return "Σ " + format(value);
+}
 
 // ─────────────────────────── markdown ─────────────────────────
 
@@ -497,6 +525,9 @@ function answerCard(agent, turn) {
   body.innerHTML = renderMarkdown(turn.content);
   card.appendChild(body);
 
+  const usage = usageLine(turn);
+  if (usage) card.appendChild(usage);
+
   if (turn.error) {
     const err = document.createElement("div");
     err.className = "card-error";
@@ -504,6 +535,34 @@ function answerCard(agent, turn) {
     card.appendChild(err);
   }
   return card;
+}
+
+// Мелкая строка под ответом: «вход 1 240 · выход 312 · всего 1 552 · $0.000186».
+// Это и есть рост по мере диалога: пролистав чат, видно каждый обмен.
+//
+// Строки нет, только если чисел нет вовсе. Оборванный ответ — со строкой:
+// его метрики идут в сумму по чату, он оплачен, и держать оба правила разом
+// нельзя — сумма видимых строк должна сходиться с итогом в плитках. Пропущенное
+// поле просто не пишется: «вход 0» вместо «неизвестно» было бы неправдой.
+function usageLine(turn) {
+  const m = turn.metrics;
+  if (!m) return null;
+  const parts = [];
+  if (m.prompt_tokens !== null && m.prompt_tokens !== undefined) {
+    parts.push("вход " + fmt.tokens(m.prompt_tokens));
+  }
+  if (m.completion_tokens !== null && m.completion_tokens !== undefined) {
+    parts.push("выход " + fmt.tokens(m.completion_tokens));
+  }
+  if (m.total_tokens !== null && m.total_tokens !== undefined) {
+    parts.push("всего " + fmt.tokens(m.total_tokens));
+  }
+  if (m.cost_usd !== null && m.cost_usd !== undefined) parts.push(fmt.cost(m.cost_usd));
+  if (!parts.length) return null;
+  const row = document.createElement("div");
+  row.className = "card-usage";
+  row.textContent = parts.join(" · ");
+  return row;
 }
 
 function thinkingBlock(text) {
@@ -770,6 +829,9 @@ async function refreshCurrent() {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
+    // Итог по чату приехал вместе с агентом: плитки перерисовываем, иначе
+    // накопленное отстаёт на один обмен.
+    renderTiles();
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
   } catch (e) { /* чат исчез — список обновится при следующем открытии */ }
@@ -1135,7 +1197,11 @@ function applySettings() {
 // на думающей модели это разные числа, и TTFT там включал бы всё размышление.
 // Насколько ответ отстал от рассуждения, видно подписью справа.
 const TILES = [
-  ["Ток/с", (m) => fmt.rate(m.tokens_per_second), (m) => (m.tokens_out ? m.tokens_out + " ток" : "")],
+  // Скорость и время обмена — про одно и то же и стоят вместе: сколько токенов
+  // в секунду и за сколько секунд. Прежняя подпись «N ток» ушла — это ровно
+  // то, что показывает «Выход», а плиток в сетке ровно восемь, 2×4.
+  ["Ток/с", (m) => fmt.rate(m.tokens_per_second),
+    (m) => (m.elapsed_ms ? "за " + fmt.sec(m.elapsed_ms) + " с" : "")],
   [
     "Первый токен, с",
     (m) => fmt.sec(m.first_token_ms === null || m.first_token_ms === undefined ? m.ttft_ms : m.first_token_ms),
@@ -1146,11 +1212,19 @@ const TILES = [
       return gap > 1 ? "ответ +" + fmt.sec(gap) + " с" : "";
     },
   ],
-  ["Промпт, ток", (m) => fmt.num(m.prompt_tokens), () => ""],
-  ["Ответ, ток", (m) => fmt.num(m.completion_tokens),
-    (m) => (m.reasoning_tokens ? m.reasoning_tokens + " рассужд" : "")],
-  ["Стоимость", (m) => fmt.cost(m.cost_usd), () => "", true],
-  ["Время, с", (m) => fmt.sec(m.elapsed_ms), () => ""],
+  // Вход, выход, всего: крупным — последний обмен, мелким рядом — итог по чату.
+  // Рост по мере диалога виден в тех же плитках, новых строк в сетке не надо.
+  ["Вход", (m) => fmt.tokens(m.prompt_tokens), () => sumSub("prompt_tokens", fmt.tokens)],
+  ["Выход", (m) => fmt.tokens(m.completion_tokens),
+    // Рассуждение — про этот же ответ, и оно важнее итога: на думающей модели
+    // выход без него необъясним.
+    (m) => (m.reasoning_tokens ? m.reasoning_tokens + " рассужд" : sumSub("completion_tokens", fmt.tokens))],
+  ["Всего", (m) => fmt.tokens(m.total_tokens), () => sumSub("total_tokens", fmt.tokens)],
+  // У цены девять знаков — она занимает всю ширину плитки целиком. Подпись
+  // рядом отобрала бы у неё место, и на экране осталось бы «$0.000...»:
+  // ровно то число, ради которого затевался день. Поэтому накопленное здесь
+  // идёт **под** значением, отдельной строкой, а не сбоку.
+  ["Стоимость", (m) => fmt.cost(m.cost_usd), () => sumSub("cost_usd", fmt.cost), true, true],
   ["Провайдер", (m) => fmt.text(m.provider), () => "", true],
   ["Контекст", (m) => fmt.pct(m.context_fill_pct), (m) => m.finish_reason || ""],
 ];
@@ -1159,7 +1233,7 @@ function renderTiles() {
   const box = $("#tiles");
   const m = state.lastMetrics || {};
   box.innerHTML = "";
-  TILES.forEach(([label, value, sub, small]) => {
+  TILES.forEach(([label, value, sub, small, stacked]) => {
     const tile = document.createElement("div");
     tile.className = "tile";
     const k = document.createElement("div");
@@ -1172,13 +1246,16 @@ function renderTiles() {
     v.textContent = state.lastMetrics ? value(m) : "—";
     row.appendChild(v);
     const subText = state.lastMetrics ? sub(m) : "";
+    tile.append(k, row);
     if (subText) {
       const s = document.createElement("div");
-      s.className = "tile-sub";
+      // Подпись в одной строке со значением делит с ним ширину плитки.
+      // Плитке, у которой значение длинное, подпись даётся отдельной строкой:
+      // делить нечего, значение обязано быть видно целиком.
+      s.className = stacked ? "tile-sub under" : "tile-sub";
       s.textContent = subText;
-      row.appendChild(s);
+      (stacked ? tile : row).appendChild(s);
     }
-    tile.append(k, row);
     box.appendChild(tile);
   });
 }
@@ -1437,5 +1514,6 @@ if (typeof module === "undefined") {
     paramWarnings,
     sameValue,
     configChanged,
+    fmt,
   };
 }

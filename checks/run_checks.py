@@ -2703,6 +2703,198 @@ def check_list_not_truncated():
     return f"{made} чатов — в списке все, любой открывается"
 
 
+# --- 13. День 8: подсчёт токенов ----------------------------------------------
+
+
+def _usage(prompt, completion, total, cost):
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cost_usd": cost,
+    }
+
+
+@check("сводка по чату — сумма слагаемых, а не выдуманное число")
+def check_usage_summary_sums():
+    """Главное утверждение дня: вход, выход, всего и цена по всему диалогу.
+
+    У каждого ответа свой usage: с одинаковыми числами (а заглушка до этого дня
+    отдавала всем `total_tokens=100`) сумма трёх ответов равнялась бы тремстам
+    и при правильном сложении, и при `100 * len(history)`, и при возврате
+    последней метрики трижды.
+    """
+    plan = [
+        _usage(11, 5, 16, 0.000011),
+        _usage(120, 40, 160, 0.000120),
+        _usage(1300, 7, 1307, 0.001300),
+    ]
+    _stub.install(usage=lambda i: plan[i])
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        for i in range(3):
+            client.post(f"/api/agents/{agent_id}/messages", json={"text": f"вопрос {i}"})
+        body = client.get(f"/api/agents/{agent_id}").json()
+
+    total = body["usage_total"]
+    assert total is not None, "сводки нет вовсе"
+    assert total["prompt_tokens"] == 11 + 120 + 1300, total
+    assert total["completion_tokens"] == 5 + 40 + 7, total
+    assert total["total_tokens"] == 16 + 160 + 1307, total
+    assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
+    assert total["answers"] == 3, total
+
+    # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
+    # и клиент рисует по ним строку под каждым ответом.
+    answers = [t for t in body["transcript"] if t["role"] == "assistant"]
+    assert [a["metrics"]["total_tokens"] for a in answers] == [16, 160, 1307], answers
+    return (
+        f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
+        f"всего {total['total_tokens']} за {total['answers']} обмена — сумма сошлась"
+    )
+
+
+@check("реплики без чисел пропускаются, а не считаются нулём")
+def check_usage_summary_skips_unknown():
+    """Ноль и «неизвестно» — разные вещи, и на экране они выглядят по-разному.
+
+    Провайдер вправе смолчать о цене (или о токенах вовсе): такая реплика
+    в сумму не входит ни слагаемым, ни нулём. Чат, где чисел не принёс никто,
+    даёт `None` — в интерфейсе это прочерк, а не «0 токенов».
+    """
+    from app.agent import Agent
+
+    spec = AgentSpec(label="тихий", model="stub/model")
+    quiet = Agent(spec)
+    quiet.remember("user", "вопрос")
+    quiet.remember("assistant", "ответ", metrics=None)
+    quiet.remember("user", "ещё")
+    quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
+    assert quiet.usage_summary() is None, quiet.usage_summary()
+    assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
+
+    mixed = Agent(spec)
+    mixed.remember("user", "вопрос")
+    mixed.remember("assistant", "ответ", metrics=_usage(100, 10, 110, None))
+    mixed.remember("user", "ещё")
+    mixed.remember("assistant", "ответ", metrics=None)
+    mixed.remember("user", "и ещё")
+    mixed.remember("assistant", "ответ", metrics=_usage(200, 20, 220, 0.0002))
+    total = mixed.usage_summary()
+    assert total["prompt_tokens"] == 300, total
+    assert total["total_tokens"] == 330, total
+    # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
+    assert total["cost_usd"] == 0.0002, total
+    assert total["answers"] == 2, total
+
+    # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
+    sneaky = Agent(spec)
+    sneaky.remember("user", "вопрос", metrics=_usage(999, 999, 999, 9.0))
+    assert sneaky.usage_summary() is None, sneaky.usage_summary()
+    return "ответ без чисел пропущен, чат без чисел даёт None, вопросы не считаются"
+
+
+@check("сводка по чату переживает перезапуск: числа те же из файла базы")
+def check_usage_summary_survives_restart():
+    """Сводка выводится из `messages.metrics`, а не хранится колонкой.
+
+    Значит доказательство — настоящее переоткрытие файла: если бы сумма жила
+    в памяти процесса, после перезапуска она обнулилась бы.
+    """
+    from app.agent import Agent
+
+    path = _temp_db("usage-restart")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="память", model="stub/model"), store=store)
+    agent.remember("user", "вопрос")
+    agent.remember("assistant", "ответ", metrics=_usage(70, 30, 100, 0.00007))
+    agent.remember("user", "ещё")
+    agent.remember("assistant", "ответ", metrics=_usage(230, 90, 320, 0.00023))
+    before = agent.usage_summary()
+    agent_id = agent.id
+    store.close()
+
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        after = revived.usage_summary()
+    finally:
+        again.close()
+
+    assert before == after, (before, after)
+    assert after["total_tokens"] == 420, after
+    assert after["answers"] == 2, after
+    return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
+
+
+@check("перегенерация не удваивает сумму: обмен заменяется, а не добавляется")
+def check_usage_summary_regenerate():
+    plan = [_usage(100, 10, 110, 0.0001), _usage(300, 30, 330, 0.0003)]
+    _stub.install(reply=lambda m, i: f"ответ {i}", usage=lambda i: plan[i])
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        before = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
+        client.post(f"/api/agents/{agent_id}/regenerate")
+        after = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
+
+    assert before["total_tokens"] == 110, before
+    # Второй вызов заменил первый: в сумме числа второго, а не их сложение.
+    assert after["total_tokens"] == 330, after
+    assert after["answers"] == 1, after
+    assert after["prompt_tokens"] == 300, after
+    return f"после перегенерации всего {after['total_tokens']}, а не {110 + 330}"
+
+
+@check("неудачный обмен в сумму не попадает")
+def check_usage_summary_ignores_failed_call():
+    """Вызов, не отдавший ни токена, в историю не пишется — значит и в сумме
+    его нет. Иначе сводка росла бы на ошибках, за которые никто не платил."""
+    _stub.install(usage=lambda i: _usage(50, 5, 55, 0.00005))
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        good = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
+
+        _stub.install(fail=True, usage=lambda i: _usage(700, 70, 770, 0.0007))
+        response = client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+        events = sse(response.text)
+        after = client.get(f"/api/agents/{agent_id}").json()
+
+    assert any(e["event"] == "error" for e in events), events
+    assert len(after["transcript"]) == 2, after["transcript"]
+    assert after["usage_total"] == good, (good, after["usage_total"])
+    assert after["usage_total"]["answers"] == 1, after["usage_total"]
+    return "провалившийся вызов не в истории и не в сумме: всего осталось 55"
+
+
+@check("сводка не заводит колонку в базе и едет тем же путём, что длина истории")
+def check_usage_summary_has_no_column():
+    """Сводка выводится из реплик. Колонка в `sessions` была бы вторым местом,
+    где живёт та же правда, — и разъезжались бы они молча."""
+    from app.agent import spec_as_dict
+
+    path = _temp_db("usage-no-column")
+    store = Store(path).init()
+    try:
+        columns = {r["name"] for r in store.conn.execute("PRAGMA table_info(sessions)")}
+        assert not [c for c in columns if "token" in c or "usage" in c or "cost" in c], columns
+        # Тот же формат описывает и чат, которого нет в памяти: у него сводки
+        # нет, и это `None` — прочерк, а не нули.
+        listed = spec_as_dict(
+            AgentSpec(label="из базы", model="stub/m"),
+            agent_id="ag_00001",
+            history_len=4,
+            created_at=0.0,
+            last_used_at=0.0,
+        )
+        assert listed["usage_total"] is None, listed["usage_total"]
+        assert "usage_total" in listed, listed.keys()
+    finally:
+        store.close()
+    return f"колонок про токены в sessions нет ({len(columns)} прежних), сводка едет полем JSON"
+
+
 def main_() -> int:
     for fn in CHECKS:
         fn()
