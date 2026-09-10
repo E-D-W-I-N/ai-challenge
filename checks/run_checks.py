@@ -1280,34 +1280,118 @@ def check_reasoning():
     return "reasoning виден в потоке и в стенограмме, в контекст не возвращается"
 
 
+class _FakeResponse:
+    """Ответ OpenRouter, разобранный до строк SSE. Пауза между рассуждением
+    и ответом настоящая: на ней и видно, что первый токен наступил раньше."""
+
+    def __init__(self, lines, gap_after=None, status_code=200):
+        self.status_code = status_code
+        self._lines = lines
+        self._gap_after = gap_after
+
+    async def aiter_lines(self):
+        for i, line in enumerate(self._lines):
+            await asyncio.sleep(0)
+            yield line
+            if self._gap_after is not None and i == self._gap_after:
+                await asyncio.sleep(0.02)
+
+    async def aread(self):
+        return b""
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    def __init__(self, response):
+        self._response = response
+
+    def stream(self, *args, **kwargs):
+        return _FakeStream(self._response)
+
+
+def _sse_chunks(*payloads) -> list[str]:
+    return [f"data: {json.dumps(p, ensure_ascii=False)}" for p in payloads] + ["data: [DONE]"]
+
+
 @check("время до первого токена честное и на думающей модели")
 def check_first_token():
-    """`ttft_ms` стоит на первом токене **ответа**.
+    """`ttft_ms` стоит на первом токене **ответа**, `first_token_ms` — на первом
+    токене вообще.
 
-    На reasoning-модели это момент, когда модель додумала, а не когда
-    заговорила, и число удивляло бы на записи. Считаем отдельно первый
-    токен вообще и показываем именно его.
+    На думающей модели это разные моменты: `ttft_ms` наступает, когда модель
+    домыслила, и показывать его значило бы записать всё размышление
+    в «модель молчала».
+
+    Проверяется **настоящий** `stream_completion`, а не заглушка: заглушка
+    сочиняет метрики целиком, и утверждение о них говорило бы только о ней
+    самой. Здесь подменён транспорт — HTTP-ответ отдаётся строками SSE, между
+    рассуждением и ответом стоит настоящая пауза, — а разбор, тайминги
+    и usage считает `app/llm.py`.
 
     Клиентская половина — в `checks/browser_check.js`, блоком «первый токен
     честный и виден под ответом»: там настоящий `app.js` рисует строку под
-    ответом, у которого `first_token_ms` и `ttft_ms` разошлись, и проверяется
-    показанное число. Раньше здесь стоял греп по исходнику на строку «Первый
-    токен, с» — он не стерёг ничего: подпись можно было оставить, а число
-    подменить на `ttft_ms`, и греп оставался бы зелёным. Обратное тоже верно:
-    переезд величины из плитки под ответ ронял греп, ничего не сломав.
+    ответом, у которого `first_token_ms` и `ttft_ms` разошлись. Раньше вместо
+    неё здесь стоял греп по исходнику на строку «Первый токен, с» — он
+    не стерёг ничего: подпись можно было оставить, а число подменить на
+    `ttft_ms`, и греп остался бы зелёным.
     """
-    _stub.install(reply="ответ", reasoning="я думаю")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        events = sse(client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"}).text)
+    import app.llm as llm
 
-    done = next(e for e in events if e["event"] == "done")
-    metrics = done["metrics"]
-    assert "first_token_ms" in metrics, metrics
+    lines = _sse_chunks(
+        {"provider": "стенд", "choices": [{"delta": {"reasoning": "думаю"}}]},
+        {"choices": [{"delta": {"content": "ответ"}, "finish_reason": "stop"}]},
+        {
+            "usage": {
+                "prompt_tokens": 140,
+                "completion_tokens": 60,
+                "total_tokens": 200,
+                "completion_tokens_details": {"reasoning_tokens": 40},
+                "cost": 0.000123456789,
+            }
+        },
+    )
+    saved_client, saved_key = llm.shared_client, llm.api_key
+    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines, gap_after=0))
+    llm.api_key = lambda: "sk-or-проверочный"
+    try:
+        spec = AgentSpec(label="думающая", model="stub/thinking")
+        events = asyncio.run(
+            drain(llm.stream_completion(spec, prompt_override=[], context_length=1000))
+        )
+    finally:
+        llm.shared_client, llm.api_key = saved_client, saved_key
+
+    metrics = next(e for e in events if e["type"] == "done")["metrics"]
     assert metrics["first_token_ms"] is not None, metrics
-    # Рассуждение приходит первым, значит первый токен не позже начала ответа.
-    assert metrics["first_token_ms"] <= metrics["ttft_ms"], metrics
-    return "first_token_ms есть в метриках и наступает не позже ttft"
+    # Рассуждение пришло раньше ответа — значит и первый токен раньше TTFT.
+    # Равенство здесь так же плохо, как отсутствие: оно значит, что размышление
+    # записали в молчание.
+    assert metrics["first_token_ms"] < metrics["ttft_ms"], metrics
+
+    # Тем же разбором приезжает и usage последнего чанка — то, из чего день
+    # собирает и строку под ответом, и итог чата.
+    assert metrics["prompt_tokens"] == 140, metrics
+    assert metrics["completion_tokens"] == 60, metrics
+    assert metrics["total_tokens"] == 200, metrics
+    assert metrics["reasoning_tokens"] == 40, metrics
+    assert metrics["cost_usd"] == 0.00012346, metrics
+    assert metrics["provider"] == "стенд" and metrics["finish_reason"] == "stop", metrics
+    # Контекст считает сервер: 200 из 1000 — двадцать процентов.
+    assert metrics["context_fill_pct"] == 20.0, metrics
+    return (
+        f"первый токен {metrics['first_token_ms']:.1f} мс раньше "
+        f"ttft {metrics['ttft_ms']:.1f} мс, usage разобран настоящим llm.py"
+    )
 
 
 @check("перегенерация заменяет последний ответ, а не добавляет второй")
