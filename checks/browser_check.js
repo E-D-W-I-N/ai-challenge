@@ -950,6 +950,165 @@ async function routeChecks() {
     check("и говорит человеческими словами, без имён полей конфига",
       /поставщик/i.test(text) && !/provider|extra_body|order|404/.test(text), text);
   }
+
+  // ── токены: плитки и строка под ответом показывают одни и те же числа ──
+  //
+  // Про плитки не было ни одного утверждения: их можно было переименовать,
+  // перепутать местами вход с выходом или показать сумму вместо обмена — и
+  // всё осталось бы зелёным. Здесь настоящий маршрут: два обмена с разными
+  // usage, а потом сверка того, что видно глазами, — крупное число плитки,
+  // её подпись с накопленным и мелкая строка под каждым ответом в ленте.
+  {
+    const plan = [
+      { prompt_tokens: 1240, completion_tokens: 312, total_tokens: 1552, cost_usd: 0.000186 },
+      { prompt_tokens: 12000, completion_tokens: 500, total_tokens: 12500, cost_usd: 0.0004 },
+    ];
+    const { client, $, settle } = freshClient({ usage: (i) => plan[i] });
+    client.init();
+    await settle(30);
+
+    const tiles = () => {
+      const out = {};
+      $("#tiles").children.forEach((tile) => {
+        const sub = tile.querySelector(".tile-sub");
+        out[tile.querySelector(".tile-k").textContent] = {
+          v: tile.querySelector(".tile-v").textContent,
+          sub: sub ? sub.textContent : "",
+        };
+      });
+      return out;
+    };
+    const usageLines = () =>
+      $("#feed").querySelectorAll(".card-usage").map((el) => el.textContent);
+
+    const empty = tiles();
+    check("до первого ответа плитка входа — прочерк, а не ноль",
+      empty["Вход"] && empty["Вход"].v === "—", JSON.stringify(empty["Вход"]));
+    check("и накопленного по чату тоже нет",
+      empty["Всего"] && empty["Всего"].sub === "", JSON.stringify(empty["Всего"]));
+
+    $("#input").value = "первый вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+
+    const one = tiles();
+    check("плитка «Вход» показывает prompt_tokens обмена",
+      one["Вход"].v === "1 240", JSON.stringify(one["Вход"]));
+    check("плитка «Выход» показывает completion_tokens обмена",
+      one["Выход"].v === "312", JSON.stringify(one["Выход"]));
+    check("плитка «Всего» показывает total_tokens обмена",
+      one["Всего"].v === "1 552", JSON.stringify(one["Всего"]));
+    check("плитка «Стоимость» показывает цену обмена",
+      one["Стоимость"].v === "$0.000186", JSON.stringify(one["Стоимость"]));
+    check("после первого обмена накопленное равно самому обмену",
+      one["Вход"].sub === "Σ 1 240" && one["Всего"].sub === "Σ 1 552",
+      JSON.stringify([one["Вход"].sub, one["Всего"].sub]));
+    check("и накопленная стоимость тоже",
+      one["Стоимость"].sub === "Σ $0.000186", one["Стоимость"].sub);
+    check("под ответом строка с теми же числами",
+      usageLines().join("|") === "вход 1 240 · выход 312 · всего 1 552 · $0.000186",
+      usageLines().join("|"));
+
+    $("#input").value = "второй вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+
+    const two = tiles();
+    check("крупное число плитки — последний обмен, а не сумма",
+      two["Вход"].v === "12k" && two["Всего"].v === "12.5k",
+      JSON.stringify([two["Вход"].v, two["Всего"].v]));
+    check("подпись плитки — накопленное по чату, и оно выросло",
+      two["Вход"].sub === "Σ 13.2k" && two["Выход"].sub === "Σ 812" &&
+        two["Всего"].sub === "Σ 14.1k",
+      JSON.stringify([two["Вход"].sub, two["Выход"].sub, two["Всего"].sub]));
+    check("накопленная стоимость — сумма двух обменов",
+      two["Стоимость"].sub === "Σ $0.000586", two["Стоимость"].sub);
+    check("в ленте своя строка под каждым ответом, и первая не переписана",
+      usageLines().join(" | ") ===
+        "вход 1 240 · выход 312 · всего 1 552 · $0.000186 | " +
+        "вход 12k · выход 500 · всего 12.5k · $0.000400",
+      usageLines().join(" | "));
+    check("подпись — сумма входов обоих обменов, посчитанная отдельно",
+      two["Вход"].sub === "Σ " + client.fmt.tokens(1240 + 12000), two["Вход"].sub);
+  }
+
+  // ── чисел нет — нет и строки, а плитка показывает прочерк, а не ноль ──
+  {
+    const talk = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ без чисел", error: null, reasoning: "",
+        metrics: { model: "особая/модель", provider: "поставщик" },
+      },
+      { role: "user", content: "второй", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "огрызок", error: "оборвалось", reasoning: "",
+        metrics: { prompt_tokens: 90, completion_tokens: 4, total_tokens: 94, cost_usd: 0.00001 },
+      },
+      { role: "user", content: "третий", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "целый", error: null, reasoning: "",
+        metrics: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "без чисел", transcript: talk, history_len: talk.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const cards = $("#feed").querySelectorAll(".card");
+    check("у ответа без чисел строки токенов нет вовсе",
+      cards[0].querySelector(".card-usage") === null,
+      String(cards[0].querySelector(".card-usage")));
+    check("у оборванного ответа строки тоже нет: числа там неполные",
+      cards[1].querySelector(".card-usage") === null,
+      String(cards[1].querySelector(".card-usage")));
+    check("а нулевые числа — это ответ, и он показан нулями, а не прочерком",
+      cards[2].querySelector(".card-usage").textContent ===
+        "вход 0 · выход 0 · всего 0 · $0.000000",
+      String(cards[2].querySelector(".card-usage")));
+
+    // Ноль и «неизвестно» на экране разные: это единственное, что отличает
+    // «модель ничего не потратила» от «мы не знаем, сколько она потратила».
+    check("формат: ноль остаётся нулём", client.fmt.tokens(0) === "0", client.fmt.tokens(0));
+    check("формат: неизвестное — прочерк",
+      client.fmt.tokens(null) === "—" && client.fmt.tokens(undefined) === "—",
+      client.fmt.tokens(null));
+    check("формат: тысячи разделяются", client.fmt.tokens(1240) === "1 240", client.fmt.tokens(1240));
+    check("формат: девять с половиной тысяч ещё не k",
+      client.fmt.tokens(9999) === "9 999", client.fmt.tokens(9999));
+    check("формат: от десяти тысяч — k", client.fmt.tokens(10000) === "10k", client.fmt.tokens(10000));
+    check("формат: k с десятой долей", client.fmt.tokens(12449) === "12.4k", client.fmt.tokens(12449));
+    check("формат: сотни тысяч тоже k", client.fmt.tokens(128600) === "128.6k",
+      client.fmt.tokens(128600));
+  }
+
+  // ── у стриминговой карточки строки нет: числа приходят последним кадром ──
+  {
+    const { client, $, settle } = freshClient({
+      delay: 25,
+      usage: () => ({ prompt_tokens: 40, completion_tokens: 8, total_tokens: 48, cost_usd: 0.00002 }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(40);   // стрим ещё идёт: кадр с usage не пришёл
+    check("пока идёт генерация, карточка занята",
+      Boolean($("#feed").querySelector(".card.busy")), $("#feed").textContent);
+    check("и строки токенов под ней нет",
+      $("#feed").querySelector(".card-usage") === null,
+      String($("#feed").querySelector(".card-usage")));
+    await settle(160);  // стрим кончился, лента перечитана с сервера
+    check("после ответа строка появляется",
+      $("#feed").querySelector(".card-usage") !== null &&
+        $("#feed").querySelector(".card-usage").textContent ===
+          "вход 40 · выход 8 · всего 48 · $0.000020",
+      String($("#feed").querySelector(".card-usage")));
+  }
 }
 
 // ── сам стенд ──

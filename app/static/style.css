@@ -375,6 +375,15 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card-actions { margin-left: auto; display: flex; gap: 2px; }
 
 .card-body { padding: 14px 16px 16px; }
+/* Строка токенов под ответом — тем же мелким шрифтом, что и подписи плиток:
+   это справка, а не содержание ответа. */
+.card-usage {
+  margin: -6px 16px 12px;
+  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
 .card.failed { border-color: var(--danger); }
 .card-error {
   margin: 0 16px 14px;

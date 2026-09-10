@@ -28,6 +28,19 @@ DEFAULT_HISTORY_LIMIT = 20
 """Окно по умолчанию — десять обменов: помнит начало разговора и не разгоняет
 prompt_tokens."""
 
+USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd")
+"""Поля метрик, которые складываются по чату. Остальные — про один вызов:
+скорость и время до первого токена суммировать бессмысленно."""
+
+
+def _usage_number(value) -> int | float | None:
+    """Число или `None`. В метриках лежит то, что прислал провайдер и что
+    пережило дорогу через JSON, — складывать чужой тип нельзя."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 MAX_STORED_MESSAGES = 400
 """Потолок на хранимое, независимо от окна: без него сотня агентов в долгой
 сессии течёт — в модель уходит хвост, а список растёт вечно."""
@@ -347,6 +360,43 @@ class Agent:
         self.history.clear()
         self.persist()
 
+    def usage_summary(self) -> dict | None:
+        """Итог по чату: вход, выход, всего, стоимость и число ответов с числами.
+
+        Считается здесь, а не в браузере: иначе цифры в плитках и цифры
+        в истории — два разных источника правды, и разъезжаются они молча.
+        Отдельной колонки в базе у сводки нет — она выводится из метрик
+        реплик, которые уже лежат в `messages.metrics`.
+
+        Реплика без метрик и поле с `None` **пропускаются**, а не считаются
+        нулём: неизвестное и ноль на экране обязаны выглядеть по-разному.
+        Поэтому чат, в котором ни один ответ не принёс чисел, даёт `None`,
+        а не сводку из нулей, и клиент рисует прочерк.
+        """
+        totals: dict = {name: None for name in USAGE_FIELDS}
+        answers = 0
+        for turn in self.history:
+            if turn.role != "assistant" or not isinstance(turn.metrics, dict):
+                continue
+            counted = False
+            for name in USAGE_FIELDS:
+                value = _usage_number(turn.metrics.get(name))
+                if value is None:
+                    continue
+                totals[name] = value if totals[name] is None else totals[name] + value
+                counted = True
+            # Ответ, у которого метрики есть, но чисел в них нет, обменом
+            # не считается: иначе делитель рос бы на пустом месте.
+            if counted:
+                answers += 1
+        if not answers:
+            return None
+        if totals["cost_usd"] is not None:
+            # Копейки от сложения float'ов: цена показывается до шестого знака.
+            totals["cost_usd"] = round(totals["cost_usd"], 8)
+        totals["answers"] = answers
+        return totals
+
     def transcript(self) -> list[dict]:
         """Ровно реплики диалога, в порядке разговора.
 
@@ -360,6 +410,7 @@ class Agent:
             self.spec,
             agent_id=self.id,
             history_len=len(self.history),
+            usage_total=self.usage_summary(),
             created_at=self.created_at,
             last_used_at=self.last_used_at,
             busy=self.busy,
@@ -542,6 +593,7 @@ def spec_as_dict(
     created_at: float,
     last_used_at: float,
     busy: bool = False,
+    usage_total: dict | None = None,
 ) -> dict:
     """Конфиг чата так, как его ждут список слева и панель справа.
 
@@ -558,6 +610,10 @@ def spec_as_dict(
         "system": spec.system,
         "history_limit": effective_history_limit(spec.history_limit),
         "history_len": history_len,
+        # Итог по чату едет тем же путём, что и длина истории: клиент не должен
+        # различать «чат поднят в память» и «чат лежит в базе» — у выгруженного
+        # сводки нет, и это `None`, то есть прочерк, а не ноль.
+        "usage_total": usage_total,
         "busy": busy,
         "created_at": created_at,
         "last_used_at": last_used_at,

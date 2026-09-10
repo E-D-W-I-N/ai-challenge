@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import fields as dataclass_fields
 from typing import Callable
 
 CALLS: list[dict] = []
@@ -39,6 +40,7 @@ def make(
     chunks: int = 4,
     delay: float = 0.0,
     reasoning: str = "",
+    usage: Callable[[int], dict] | dict | None = None,
 ):
     """Собирает заглушку `stream_completion`.
 
@@ -46,8 +48,16 @@ def make(
     fail — вместо ответа отдать событие error, как это делает HTTP 4xx.
     delay — пауза между чанками: нужна проверке обрыва, чтобы успеть оборвать.
     reasoning — рассуждение, которое модель присылает отдельным полем дельты.
+    usage — что вернуть в usage: словарь полей `Metrics` или функция
+        (номер вызова) → словарь. Без него у каждого ответа одни и те же
+        числа, и проверка суммы по чату сошлась бы на любом коде: три раза
+        по сто — триста и при правильном сложении, и при `100 * len(history)`.
+        `None` в поле — законное значение: так провайдер молчит о цифре,
+        и она обязана быть пропущена, а не сложена как ноль.
     """
     from app.llm import Metrics, build_payload
+
+    known = {f.name for f in dataclass_fields(Metrics)}
 
     async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
         messages = list(prompt_override or [])
@@ -87,7 +97,19 @@ def make(
             model=session.model,
             provider="stub",
             context_length=context_length,
-        ).as_dict()
+        )
+
+        # Заданный usage кладётся в тот же датакласс, а не поверх словаря:
+        # опечатка в имени поля обязана падать здесь, а не тихо доезжать
+        # до проверки новым ключом, которого нет ни у одной настоящей метрики.
+        if usage is not None:
+            values = usage(index) if callable(usage) else usage
+            unknown = set(values) - known
+            assert not unknown, f"в usage поля, которых нет в Metrics: {sorted(unknown)}"
+            for name, value in values.items():
+                setattr(metrics, name, value)
+
+        metrics = metrics.as_dict()
 
         ACTIVE["now"] += 1
         ACTIVE["peak"] = max(ACTIVE["peak"], ACTIVE["now"])

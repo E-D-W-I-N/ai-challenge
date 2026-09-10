@@ -461,6 +461,10 @@ function buildServer(options) {
     sent: [],       // {id, text, config} — конфиг агента в момент запроса
     requests: [],   // {method, path, body}
     reply: (options && options.reply) || "ответ модели",
+    // Числа usage у каждого ответа: словарь или функция (номер обмена) → словарь.
+    // Без них кадры стрима отдавали бы `metrics: null`, плитки в стенде всегда
+    // показывали бы прочерк, и проверять там было бы нечего.
+    usage: (options && options.usage) || null,
     models: (options && options.models) || [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -484,6 +488,7 @@ function buildServer(options) {
     history_len: 0,
     busy: false,
     transcript: [],
+    usage_total: null,
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
   });
 
@@ -493,9 +498,34 @@ function buildServer(options) {
   let issued = 0;
   const nextId = () => "ag_" + (issued += 1);
 
+  // Итог по чату считает сервер, и стенд считает его теми же правилами:
+  // реплика без метрик и поле `null` пропускаются, а чат без чисел даёт `null`,
+  // а не нули. Клиенту сумму складывать нельзя — он её только показывает.
+  const USAGE_FIELDS = ["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"];
+  function sumUsage(transcript) {
+    const out = { prompt_tokens: null, completion_tokens: null, total_tokens: null, cost_usd: null };
+    let answers = 0;
+    (transcript || []).forEach((turn) => {
+      if (turn.role !== "assistant" || !turn.metrics) return;
+      let counted = false;
+      USAGE_FIELDS.forEach((name) => {
+        const value = turn.metrics[name];
+        if (typeof value !== "number") return;
+        out[name] = out[name] === null ? value : out[name] + value;
+        counted = true;
+      });
+      if (counted) answers += 1;
+    });
+    if (!answers) return null;
+    out.answers = answers;
+    return out;
+  }
+
   // Чаты, заведённые заранее, — как если бы их создали руками до открытия.
   ((options && options.chats) || [{ label: "чат" }]).forEach((seed) => {
-    state.agents.push(Object.assign(blank(nextId(), seed.label), seed));
+    const agent = Object.assign(blank(nextId(), seed.label), seed);
+    if (!("usage_total" in seed)) agent.usage_total = sumUsage(agent.transcript);
+    state.agents.push(agent);
   });
 
   const config = (agent) => {
@@ -513,18 +543,25 @@ function buildServer(options) {
 
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
+    const index = state.sent.length;
     state.sent.push({ id: agent.id, text, config: config(agent) });
+    // Числа приходят последним кадром, как настоящий usage от OpenRouter:
+    // до него в кадрах их нет, и плитки показывают прочерк.
+    const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
+    const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
     agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
       role: "assistant", content: state.reply, error: null, reasoning: "",
-      metrics: { model: agent.model, provider: "стенд" },
+      metrics,
     });
     agent.history_len = agent.transcript.length;
+    agent.usage_total = sumUsage(agent.transcript);
 
     const frames = [
       { event: "start", agent: agent.id },
       { event: "delta", text: state.reply, metrics: null },
-      { event: "done", text: state.reply, reasoning: "", metrics: null, committed: true },
+      { event: "metrics", metrics: usage ? metrics : null },
+      { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
 
     let i = 0;
