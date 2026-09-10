@@ -274,11 +274,14 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg);
   position: relative;
 }
-.chat-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
-
+/* Лента лежит в чате сама: обёртка вокруг неё была нужна только затем,
+   чтобы поставить рядом рельс, и ушла вместе с ним. `min-height: 0` теперь
+   на самой ленте — без него чат не даёт ей сжаться, и вместо прокрутки
+   лента растягивает его, унося композер за нижнюю границу. */
 .feed {
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 24px 28px 8px;
   display: flex;
@@ -292,29 +295,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
    в полоску — видно шапку и обрезанную первую строку. Запрещаем сжатие
    каждому элементу ленты: не помещается — уходит за границу прокрутки. */
 .feed > * { flex: 0 0 auto; }
-
-/* Рельс справа от ленты: точка на сообщение, клик прокручивает к нему. */
-.rail {
-  flex: 0 0 22px;
-  padding: 30px 0 10px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  overflow: hidden;
-}
-.rail-dot {
-  width: 7px; height: 7px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: transparent;
-  padding: 0;
-  cursor: pointer;
-  transition: background .12s ease, border-color .12s ease;
-}
-.rail-dot:hover { border-color: var(--accent); }
-.rail-dot.user { background: var(--accent); border-color: var(--accent); }
 
 .empty {
   margin: auto;

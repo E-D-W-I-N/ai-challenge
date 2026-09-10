@@ -309,7 +309,6 @@ class El {
   }
 
   select() {}
-  scrollIntoView() {}
   requestSubmit() {
     this.dispatchEvent(new Evt("submit"));
   }

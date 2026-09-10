@@ -480,7 +480,6 @@ function renderFeed(agent) {
     p.textContent = "Напишите сообщение — историю разговора хранит сервер, а не браузер.";
     empty.append(h, p);
     feed.appendChild(empty);
-    renderRail();
     feed.scrollTop = 0;
     return;
   }
@@ -488,7 +487,6 @@ function renderFeed(agent) {
   turns.forEach((turn) => {
     feed.appendChild(turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn));
   });
-  renderRail();
   feed.scrollTop = keep === null ? feed.scrollHeight : keep;
 }
 
@@ -654,24 +652,6 @@ async function copyText(text) {
   }
 }
 
-// Рельс справа от ленты: точка на сообщение, клик прокручивает к нему.
-function renderRail() {
-  const rail = $("#rail");
-  rail.innerHTML = "";
-  const nodes = [...$("#feed").children].filter(
-    (el) => el.classList.contains("msg-user") || el.classList.contains("card")
-  );
-  nodes.forEach((node) => {
-    const dot = document.createElement("button");
-    dot.type = "button";
-    const isUser = node.classList.contains("msg-user");
-    dot.className = "rail-dot" + (isUser ? " user" : "");
-    dot.title = isUser ? "Ваше сообщение" : "Ответ";
-    dot.onclick = () => node.scrollIntoView({ behavior: "smooth", block: "center" });
-    rail.appendChild(dot);
-  });
-}
-
 // Лента доматывается вниз, только если читатель и так внизу. Отмотал
 // вверх — новые куски ответа не дёргают её у него под руками.
 function atBottom(feed) {
@@ -783,7 +763,6 @@ async function exchange(path, body, questionText) {
   bodyEl.className = "card-body md";
   card.append(head, bodyEl);
   feed.appendChild(card);
-  renderRail();
   scrollFeed();
 
   setBusy(true);
@@ -1247,7 +1226,7 @@ function applySettings() {
 
 // Плитки справа — про весь диалог, а не про последний ответ: сколько всего
 // ушло в модель, сколько она вернула, во что это обошлось и сколько было
-// обменов. Числа одного обмена написаны под ним самим в ленте, и подписей
+// сообщений. Числа одного обмена написаны под ним самим в ленте, и подписей
 // «накопленное» здесь больше нет — в панели теперь всё и так про разговор.
 //
 // Плиток шесть, сетка 2×3: пустых клеток в последнем ряду не остаётся.
@@ -1256,11 +1235,11 @@ const TILES = [
   ["Выходные токены", () => fmt.tokens(totalField("completion_tokens"))],
   ["Всего токенов", () => fmt.tokens(totalField("total_tokens"))],
   ["Стоимость", () => fmt.cost(totalField("cost_usd")), true],
-  // Обмены считает сервер и считает **все** ответы, а не только принёсшие
+  // Сообщения считает сервер и считает **все** ответы, а не только принёсшие
   // числа: карточек в ленте ровно столько же. Поэтому число едет отдельным
-  // полем, а не внутри сумм: у чата с молчащим usage сумм нет вовсе, а обмены
+  // полем, а не внутри сумм: у чата с молчащим usage сумм нет вовсе, а ответы
   // в нём были.
-  ["Обменов", () => fmt.tokens(state.current ? state.current.exchanges : null)],
+  ["Сообщений", () => fmt.tokens(state.current ? state.current.exchanges : null)],
   ["Контекст", () => fmt.pct(contextFill())],
 ];
 
