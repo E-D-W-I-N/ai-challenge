@@ -30,7 +30,7 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
-from app.llm import SAMPLING_FIELDS  # noqa: E402
+from app.llm import SAMPLING_FIELDS, Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
 from app.store import Store, StoreBusyError  # noqa: E402
@@ -1280,30 +1280,153 @@ def check_reasoning():
     return "reasoning виден в потоке и в стенограмме, в контекст не возвращается"
 
 
+class _FakeResponse:
+    """Ответ OpenRouter, разобранный до строк SSE. Пауза между рассуждением
+    и ответом настоящая: на ней и видно, что первый токен наступил раньше."""
+
+    def __init__(self, lines, gap_after=None, status_code=200):
+        self.status_code = status_code
+        self._lines = lines
+        self._gap_after = gap_after
+
+    async def aiter_lines(self):
+        for i, line in enumerate(self._lines):
+            await asyncio.sleep(0)
+            yield line
+            if self._gap_after is not None and i == self._gap_after:
+                await asyncio.sleep(0.02)
+
+    async def aread(self):
+        return b""
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    def __init__(self, response):
+        self._response = response
+
+    def stream(self, *args, **kwargs):
+        return _FakeStream(self._response)
+
+
+def _sse_chunks(*payloads) -> list[str]:
+    return [f"data: {json.dumps(p, ensure_ascii=False)}" for p in payloads] + ["data: [DONE]"]
+
+
 @check("время до первого токена честное и на думающей модели")
 def check_first_token():
-    """`ttft_ms` стоит на первом токене **ответа**.
+    """`ttft_ms` стоит на первом токене **ответа**, `first_token_ms` — на первом
+    токене вообще.
 
-    На reasoning-модели это момент, когда модель додумала, а не когда
-    заговорила, и плитка удивляла бы на записи. Считаем отдельно первый
-    токен вообще и показываем именно его.
+    На думающей модели это разные моменты: `ttft_ms` наступает, когда модель
+    домыслила, и показывать его значило бы записать всё размышление
+    в «модель молчала».
+
+    Проверяется **настоящий** `stream_completion`, а не заглушка: заглушка
+    сочиняет метрики целиком, и утверждение о них говорило бы только о ней
+    самой. Здесь подменён транспорт — HTTP-ответ отдаётся строками SSE, между
+    рассуждением и ответом стоит настоящая пауза, — а разбор, тайминги
+    и usage считает `app/llm.py`.
+
+    Клиентская половина — в `checks/browser_check.js`, блоком «первый токен
+    честный и виден под ответом»: там настоящий `app.js` рисует строку под
+    ответом, у которого `first_token_ms` и `ttft_ms` разошлись. Раньше вместо
+    неё здесь стоял греп по исходнику на строку «Первый токен, с» — он
+    не стерёг ничего: подпись можно было оставить, а число подменить на
+    `ttft_ms`, и греп остался бы зелёным.
     """
-    _stub.install(reply="ответ", reasoning="я думаю")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        events = sse(client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"}).text)
+    import app.llm as llm
 
-    done = next(e for e in events if e["event"] == "done")
-    metrics = done["metrics"]
-    assert "first_token_ms" in metrics, metrics
+    lines = _sse_chunks(
+        {"provider": "стенд", "choices": [{"delta": {"reasoning": "думаю"}}]},
+        {"choices": [{"delta": {"content": "ответ"}, "finish_reason": "stop"}]},
+        {
+            "usage": {
+                "prompt_tokens": 140,
+                "completion_tokens": 60,
+                "total_tokens": 200,
+                "completion_tokens_details": {"reasoning_tokens": 40},
+                "cost": 0.000123456789,
+            }
+        },
+    )
+    saved_client, saved_key = llm.shared_client, llm.api_key
+    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines, gap_after=0))
+    llm.api_key = lambda: "sk-or-проверочный"
+    try:
+        spec = AgentSpec(label="думающая", model="stub/thinking")
+        events = asyncio.run(
+            drain(llm.stream_completion(spec, prompt_override=[], context_length=1000))
+        )
+    finally:
+        llm.shared_client, llm.api_key = saved_client, saved_key
+
+    metrics = next(e for e in events if e["type"] == "done")["metrics"]
     assert metrics["first_token_ms"] is not None, metrics
-    # Рассуждение приходит первым, значит первый токен не позже начала ответа.
-    assert metrics["first_token_ms"] <= metrics["ttft_ms"], metrics
+    # Рассуждение пришло раньше ответа — значит и первый токен раньше TTFT.
+    # Равенство здесь так же плохо, как отсутствие: оно значит, что размышление
+    # записали в молчание.
+    assert metrics["first_token_ms"] < metrics["ttft_ms"], metrics
 
-    js = read("app/static/app.js")
-    assert "Первый токен, с" in js, "плитка должна называть то, что показывает"
-    assert "first_token_ms" in js, "клиент обязан брать честное время, а не ttft"
-    return "first_token_ms есть в метриках и стоит на плитке"
+    # Тем же разбором приезжает и usage последнего чанка — то, из чего день
+    # собирает и строку под ответом, и итог чата.
+    assert metrics["prompt_tokens"] == 140, metrics
+    assert metrics["completion_tokens"] == 60, metrics
+    assert metrics["total_tokens"] == 200, metrics
+    assert metrics["reasoning_tokens"] == 40, metrics
+    assert metrics["cost_usd"] == 0.00012346, metrics
+    assert metrics["provider"] == "стенд" and metrics["finish_reason"] == "stop", metrics
+    # Контекст считает сервер: 200 из 1000 — двадцать процентов.
+    assert metrics["context_fill_pct"] == 20.0, metrics
+    return (
+        f"первый токен {metrics['first_token_ms']:.1f} мс раньше "
+        f"ttft {metrics['ttft_ms']:.1f} мс, usage разобран настоящим llm.py"
+    )
+
+
+@check("провайдер смолчал о сумме — её досчитывает сервер, а не браузер")
+def check_total_tokens_filled_in():
+    """`total_tokens` в usage не обязателен, и без него «всего» брать неоткуда.
+
+    Досчитывать его в браузере нельзя: итог чата считается по `total_tokens`
+    реплик, и добор на клиенте дал бы на одном экране два разных «всего» —
+    сумму под ответом и другую сумму в плитке. Поэтому сумма появляется один
+    раз, до записи в историю, и дальше её все видят одинаково.
+    """
+    import app.llm as llm
+
+    lines = _sse_chunks(
+        {"choices": [{"delta": {"content": "ответ"}}]},
+        {"usage": {"prompt_tokens": 80, "completion_tokens": 40}},
+    )
+    saved_client, saved_key = llm.shared_client, llm.api_key
+    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines))
+    llm.api_key = lambda: "sk-or-проверочный"
+    try:
+        spec = AgentSpec(label="молчун", model="stub/quiet")
+        events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[])))
+    finally:
+        llm.shared_client, llm.api_key = saved_client, saved_key
+
+    metrics = next(e for e in events if e["type"] == "done")["metrics"]
+    assert metrics["total_tokens"] == 120, metrics
+
+    # Названа только одна часть — досчитывать нечего, и выдумывать сумму
+    # из половины нельзя: «всего» остаётся неизвестным, то есть прочерком.
+    half = Metrics()
+    llm._apply_usage(half, {"prompt_tokens": 80})
+    assert half.total_tokens is None, half
+    return "80 + 40 = 120 названы сервером; из одной половины сумма не выдумывается"
 
 
 @check("перегенерация заменяет последний ответ, а не добавляет второй")
@@ -2742,7 +2865,7 @@ def check_usage_summary_sums():
     assert total["completion_tokens"] == 5 + 40 + 7, total
     assert total["total_tokens"] == 16 + 160 + 1307, total
     assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
-    assert total["answers"] == 3, total
+    assert body["exchanges"] == 3, body["exchanges"]
 
     # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
     # и клиент рисует по ним строку под каждым ответом.
@@ -2750,7 +2873,7 @@ def check_usage_summary_sums():
     assert [a["metrics"]["total_tokens"] for a in answers] == [16, 160, 1307], answers
     return (
         f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
-        f"всего {total['total_tokens']} за {total['answers']} обмена — сумма сошлась"
+        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
     )
 
 
@@ -2772,6 +2895,9 @@ def check_usage_summary_skips_unknown():
     quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
     assert quiet.usage_summary() is None, quiet.usage_summary()
     assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
+    # Сумм нет, а разговор был: плитка «Обменов» считает ответы, а не слагаемые,
+    # и молчащий usage не должен делать вид, что в чате пусто.
+    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
 
     mixed = Agent(spec)
     mixed.remember("user", "вопрос")
@@ -2785,7 +2911,9 @@ def check_usage_summary_skips_unknown():
     assert total["total_tokens"] == 330, total
     # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
     assert total["cost_usd"] == 0.0002, total
-    assert total["answers"] == 2, total
+    # Слагаемых два, а обменов три — и расхождение видно по самим суммам,
+    # а не по счётчику: он про то, сколько раз поговорили.
+    assert mixed.exchanges() == 3, mixed.exchanges()
 
     # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
     sneaky = Agent(spec)
@@ -2823,7 +2951,7 @@ def check_usage_summary_survives_restart():
 
     assert before == after, (before, after)
     assert after["total_tokens"] == 420, after
-    assert after["answers"] == 2, after
+    assert revived.exchanges() == 2, revived.exchanges()
     return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
 
 
@@ -2836,13 +2964,15 @@ def check_usage_summary_regenerate():
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
         before = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
         client.post(f"/api/agents/{agent_id}/regenerate")
-        after = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
+        body = client.get(f"/api/agents/{agent_id}").json()
+        after = body["usage_total"]
 
     assert before["total_tokens"] == 110, before
     # Второй вызов заменил первый: в сумме числа второго, а не их сложение.
     assert after["total_tokens"] == 330, after
-    assert after["answers"] == 1, after
     assert after["prompt_tokens"] == 300, after
+    # И обмен в ленте остался один — перегенерация заменила карточку.
+    assert body["exchanges"] == 1, body["exchanges"]
     return f"после перегенерации всего {after['total_tokens']}, а не {110 + 330}"
 
 
@@ -2864,7 +2994,7 @@ def check_usage_summary_ignores_failed_call():
     assert any(e["event"] == "error" for e in events), events
     assert len(after["transcript"]) == 2, after["transcript"]
     assert after["usage_total"] == good, (good, after["usage_total"])
-    assert after["usage_total"]["answers"] == 1, after["usage_total"]
+    assert after["exchanges"] == 1, after["exchanges"]
     return "провалившийся вызов не в истории и не в сумме: всего осталось 55"
 
 
@@ -2889,7 +3019,7 @@ def check_usage_summary_has_no_column():
             last_used_at=0.0,
         )
         assert listed["usage_total"] is None, listed["usage_total"]
-        assert "usage_total" in listed, listed.keys()
+        assert "usage_total" in listed and "exchanges" in listed, listed.keys()
     finally:
         store.close()
     return f"колонок про токены в sessions нет ({len(columns)} прежних), сводка едет полем JSON"

@@ -353,6 +353,15 @@ def _apply_usage(metrics: Metrics, usage: dict) -> None:
     metrics.prompt_tokens = usage.get("prompt_tokens")
     metrics.completion_tokens = usage.get("completion_tokens")
     metrics.total_tokens = usage.get("total_tokens")
+    if metrics.total_tokens is None and None not in (
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+    ):
+        # Провайдер вправе смолчать о сумме, назвав обе части. Складываем её
+        # здесь, один раз и до записи в историю: сложи её потом браузер — итог
+        # чата (он считается по `total_tokens`) и строка под ответом разошлись бы
+        # молча, и на экране оказались бы два разных «всего».
+        metrics.total_tokens = metrics.prompt_tokens + metrics.completion_tokens
     if metrics.completion_tokens:
         metrics.tokens_out = int(metrics.completion_tokens)
 

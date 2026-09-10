@@ -14,12 +14,13 @@ const state = {
   models: [],          // каталог моделей для дропдауна
   busy: false,
   abort: null,         // AbortController активного потока
-  lastMetrics: null,   // метрики последнего ответа — из них плитки
+  lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
   tab: "model",
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
   stick: true,         // лента примотана к низу — доматывать новые ответы
   baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
+  contextStale: false, // модель сменили — прежняя доля окна к новой не относится
   statusTimer: null,   // таймер, гасящий строку состояния
 };
 
@@ -40,7 +41,6 @@ const ICONS = {
   panelRight: "M3 3h18v18H3zM15 3v18",
   chat: "M21 12a8 8 0 0 1-8 8H7l-4 3v-5a8 8 0 0 1 8-11h2a8 8 0 0 1 8 8z",
   bot: "M12 3v3M6 8h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM9 13h.01M15 13h.01",
-  activity: "M3 12h4l3 8 4-16 3 8h4",
   copy: "M9 9h10v10H9zM5 15H4V4h11v1",
   refresh: "M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5",
   dots: "M12 5h.01M12 12h.01M12 19h.01",
@@ -87,7 +87,6 @@ const fmt = {
   rate: (v) => (v ? v.toFixed(1) : "—"),
   cost: (v) => (v === null || v === undefined ? "—" : "$" + Number(v).toFixed(6)),
   pct: (v) => (v === null || v === undefined ? "—" : v.toFixed(1) + " %"),
-  text: (v) => v || "—",
   // Токены: тысячи разделяются, от десяти тысяч — «12.4k». Прочерк остаётся
   // прочерком: ноль — это ответ, а «неизвестно» — его отсутствие, и на экране
   // они обязаны выглядеть по-разному.
@@ -104,19 +103,44 @@ const fmt = {
 };
 
 // Итог по чату приходит с сервера полем `usage_total` — считает его агент,
-// клиент только показывает. Ни одного слагаемого здесь не складывается:
-// два места, где числа суммируются, разъезжаются молча.
+// клиент только показывает. Здесь не складывается ни одного слагаемого,
+// и досчитать «всего» вместо смолчавшего провайдера клиент тоже не вправе:
+// два места, где числа считаются, разъезжаются молча.
 function chatUsage() {
   return (state.current && state.current.usage_total) || null;
 }
 
-// Подпись плитки: накопленное по чату рядом с числом последнего обмена.
-function sumSub(field, format) {
+// Поле итога по чату. Итога нет вовсе — это `null`, то есть прочерк в плитке,
+// а не ноль: в чате, где не было ни одного ответа с числами, ноль был бы враньём.
+function totalField(name) {
   const total = chatUsage();
-  if (!total) return "";
-  const value = total[field];
-  if (value === null || value === undefined) return "";
-  return "Σ " + format(value);
+  return total ? total[name] : null;
+}
+
+// Заполнение контекста — единственное в правой панели, что не про весь диалог:
+// доля окна, занятая последним обменом. Усреднять её по диалогу нечего, а при
+// смене модели она сбрасывается: окно у новой модели другое, и прежний процент
+// к ней не относится. Плитка молчит прочерком, пока не придёт первый ответ
+// на новой модели.
+//
+// Сброс поднимает сама смена модели в панели (`state.contextStale`), а не
+// расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
+// на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
+// плитку после каждого ответа, навсегда.
+// Метрики нового ответа. Пометку «модель сменили» снимает **только** эта
+// функция: с новыми метриками приходит и свежая доля окна, и разбросать
+// снятие по веткам потока значило бы получить путь, на котором плитка
+// осталась бы погашенной навсегда.
+function keepMetrics(metrics) {
+  state.lastMetrics = metrics;
+  state.contextStale = false;
+}
+
+function contextFill() {
+  if (state.contextStale) return null;
+  const m = state.lastMetrics;
+  if (!m || m.context_fill_pct === null || m.context_fill_pct === undefined) return null;
+  return m.context_fill_pct;
 }
 
 // ─────────────────────────── markdown ─────────────────────────
@@ -413,7 +437,8 @@ async function openAgent(agentId) {
   // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
   // читатель выключил бы доматывание сразу для всех чатов.
   state.stick = true;
-  state.lastMetrics = lastAnswerMetrics(agent);
+  // Чат открыт заново: доля окна относится к той модели, что у него сейчас.
+  keepMetrics(lastAnswerMetrics(agent));
   renderList();
   renderFeed(agent);
   fillPanel(agent);
@@ -474,9 +499,11 @@ function userBubble(text) {
   return el;
 }
 
-// Шапка карточки ответа: иконка, имя модели и, если она известна, метка
-// провайдера. Одна на готовый ответ и на карточку, в которую ещё стримят.
-function cardHead(modelName, provider) {
+// Шапка карточки ответа: иконка и имя модели. Одна на готовый ответ и на
+// карточку, в которую ещё стримят. Провайдер стоит не здесь, а строкой под
+// ответом, рядом со скоростью: это всё про то, как прошёл этот обмен, и жить
+// оно должно в одном месте, а не в двух.
+function cardHead(modelName) {
   const head = document.createElement("header");
   head.className = "card-head";
   const ico = document.createElement("span");
@@ -486,31 +513,20 @@ function cardHead(modelName, provider) {
   name.className = "card-model";
   name.textContent = modelName;
   head.append(ico, name);
-  if (provider) {
-    const tag = document.createElement("span");
-    tag.className = "card-tag";
-    tag.textContent = provider;
-    head.appendChild(tag);
-  }
   return head;
 }
 
 function answerCard(agent, turn) {
   const card = document.createElement("article");
   card.className = "card" + (turn.error ? " failed" : "");
-  const head = cardHead(
-    (turn.metrics && turn.metrics.model) || agent.model,
-    turn.metrics && turn.metrics.provider
-  );
+  const head = cardHead((turn.metrics && turn.metrics.model) || agent.model);
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
   actions.append(
-    iconButton("activity", "Метрики этого ответа", () => {
-      state.lastMetrics = turn.metrics || state.lastMetrics;
-      renderTiles();
-      hint("Плитки справа показывают метрики выбранного ответа.");
-    }),
+    // Кнопки «метрики этого ответа» здесь больше нет: числа обмена написаны
+    // под ним самим, а перекладывать их в плитки значило бы показывать
+    // в панели то, что там больше не живёт, — она про весь диалог.
     iconButton("copy", "Копировать ответ", () => copyText(turn.content)),
     iconButton("refresh", "Перегенерировать", () => regenerate()),
     iconButton("dots", "Показать сырой текст", () => showRaw(card, turn))
@@ -537,30 +553,62 @@ function answerCard(agent, turn) {
   return card;
 }
 
-// Мелкая строка под ответом: «вход 1 240 · выход 312 · всего 1 552 · $0.000186».
-// Это и есть рост по мере диалога: пролистав чат, видно каждый обмен.
+// Что под ответом: всё про этот обмен и только про него. Первой строкой —
+// сколько токенов ушло в модель, сколько она вернула, сколько вышло вместе
+// и во что обошлось; второй — как быстро отвечала и кто отвечал.
 //
-// Строки нет, только если чисел нет вовсе. Оборванный ответ — со строкой:
-// его метрики идут в сумму по чату, он оплачен, и держать оба правила разом
-// нельзя — сумма видимых строк должна сходиться с итогом в плитках. Пропущенное
-// поле просто не пишется: «вход 0» вместо «неизвестно» было бы неправдой.
+// Итог по всему диалогу живёт в плитках справа, и одно и то же число нигде
+// не показывается дважды: лента про обмен, панель про разговор.
+//
+// Пропущенное поле не пишется вовсе: «входные 0» вместо «неизвестно» было бы
+// неправдой, а сумму, о которой смолчал провайдер, досчитывает сервер (см.
+// `_apply_usage` в `app/llm.py`) — сложи её здесь, и «всего» под ответом
+// разошлось бы с «Всего токенов» в плитке. Строки нет, только если чисел нет
+// совсем. У оборванного ответа она есть: его числа идут в итог чата, он оплачен.
 function usageLine(turn) {
   const m = turn.metrics;
   if (!m) return null;
-  const parts = [];
-  if (m.prompt_tokens !== null && m.prompt_tokens !== undefined) {
-    parts.push("вход " + fmt.tokens(m.prompt_tokens));
+  const known = (v) => v !== null && v !== undefined;
+
+  const tokens = [];
+  if (known(m.prompt_tokens)) tokens.push("входные " + fmt.tokens(m.prompt_tokens));
+  if (known(m.completion_tokens)) {
+    // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
+    // думающей модели выход заметно больше видимого текста. Поэтому они
+    // названы отдельным числом, а не вычтены молча: вычитание сделало бы
+    // «выход» не тем, что прислал провайдер.
+    const think = m.reasoning_tokens
+      ? " (из них " + fmt.tokens(m.reasoning_tokens) + " рассуждение)"
+      : "";
+    tokens.push("выходные " + fmt.tokens(m.completion_tokens) + think);
   }
-  if (m.completion_tokens !== null && m.completion_tokens !== undefined) {
-    parts.push("выход " + fmt.tokens(m.completion_tokens));
+  if (known(m.total_tokens)) tokens.push("всего " + fmt.tokens(m.total_tokens));
+  if (known(m.cost_usd)) tokens.push(fmt.cost(m.cost_usd));
+
+  const how = [];
+  if (m.tokens_per_second) {
+    how.push(
+      fmt.rate(m.tokens_per_second) + " ток/с" +
+      (m.elapsed_ms ? " за " + fmt.sec(m.elapsed_ms) + " с" : "")
+    );
   }
-  if (m.total_tokens !== null && m.total_tokens !== undefined) {
-    parts.push("всего " + fmt.tokens(m.total_tokens));
-  }
-  if (m.cost_usd !== null && m.cost_usd !== undefined) parts.push(fmt.cost(m.cost_usd));
-  if (!parts.length) return null;
+  // Первый токен — честный: на думающей модели это момент, когда модель
+  // заговорила вообще, а не когда домыслила и пошёл ответ.
+  const first = known(m.first_token_ms) ? m.first_token_ms : m.ttft_ms;
+  if (known(first)) how.push("первый токен " + fmt.sec(first) + " с");
+  if (m.provider) how.push(m.provider);
+
+  if (!tokens.length && !how.length) return null;
+  const box = document.createElement("div");
+  box.className = "card-usage";
+  if (tokens.length) box.appendChild(usageRow("usage-tokens", tokens));
+  if (how.length) box.appendChild(usageRow("usage-how", how));
+  return box;
+}
+
+function usageRow(className, parts) {
   const row = document.createElement("div");
-  row.className = "card-usage";
+  row.className = className;
   row.textContent = parts.join(" · ");
   return row;
 }
@@ -767,21 +815,22 @@ async function exchange(path, body, questionText) {
           case "delta":
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
-            if (e.metrics) { state.lastMetrics = e.metrics; renderTiles(); }
+            if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
             scrollFeed();
             break;
           case "metrics":
-            state.lastMetrics = e.metrics;
+            // Ответ на новой модели пришёл — контексту снова есть что показать.
+            keepMetrics(e.metrics);
             renderTiles();
             break;
           case "error":
             failure = e.message;
-            if (e.metrics) state.lastMetrics = e.metrics;
+            if (e.metrics) keepMetrics(e.metrics);
             break;
           case "done":
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
-            if (e.metrics) state.lastMetrics = e.metrics;
+            if (e.metrics) keepMetrics(e.metrics);
             bodyEl.innerHTML = renderMarkdown(answer);
             renderTiles();
             break;
@@ -829,8 +878,8 @@ async function refreshCurrent() {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
-    // Итог по чату приехал вместе с агентом: плитки перерисовываем, иначе
-    // накопленное отстаёт на один обмен.
+    // Итог по чату и число обменов приехали вместе с агентом: плитки
+    // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
@@ -1173,6 +1222,10 @@ function applySettings() {
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
       state.panelDirty = false;
+      // Модель сменили — плитка контекста гаснет сразу, а не после следующего
+      // ответа: окно у новой модели другое. Правка температуры её не трогает.
+      if (updated.model !== before.model) state.contextStale = true;
+      renderTiles();
       // Сравнивается не панель с панелью, а конфиг агента до и после:
       // сервер по дороге нормализует (пустой список стоп-строк становится
       // `null`), и панель, разошедшаяся с агентом только формой записи,
@@ -1192,48 +1245,29 @@ function applySettings() {
 
 // ─────────────────────────── плитки ───────────────────────────
 
-// Первая плитка после скорости — время до первого токена. Показываем момент,
-// когда модель заговорила вообще (first_token_ms), а не когда пошёл ответ:
-// на думающей модели это разные числа, и TTFT там включал бы всё размышление.
-// Насколько ответ отстал от рассуждения, видно подписью справа.
+// Плитки справа — про весь диалог, а не про последний ответ: сколько всего
+// ушло в модель, сколько она вернула, во что это обошлось и сколько было
+// обменов. Числа одного обмена написаны под ним самим в ленте, и подписей
+// «накопленное» здесь больше нет — в панели теперь всё и так про разговор.
+//
+// Плиток шесть, сетка 2×3: пустых клеток в последнем ряду не остаётся.
 const TILES = [
-  // Скорость и время обмена — про одно и то же и стоят вместе: сколько токенов
-  // в секунду и за сколько секунд. Прежняя подпись «N ток» ушла — это ровно
-  // то, что показывает «Выход», а плиток в сетке ровно восемь, 2×4.
-  ["Ток/с", (m) => fmt.rate(m.tokens_per_second),
-    (m) => (m.elapsed_ms ? "за " + fmt.sec(m.elapsed_ms) + " с" : "")],
-  [
-    "Первый токен, с",
-    (m) => fmt.sec(m.first_token_ms === null || m.first_token_ms === undefined ? m.ttft_ms : m.first_token_ms),
-    (m) => {
-      const first = m.first_token_ms;
-      if (first === null || first === undefined || m.ttft_ms === null || m.ttft_ms === undefined) return "";
-      const gap = m.ttft_ms - first;
-      return gap > 1 ? "ответ +" + fmt.sec(gap) + " с" : "";
-    },
-  ],
-  // Вход, выход, всего: крупным — последний обмен, мелким рядом — итог по чату.
-  // Рост по мере диалога виден в тех же плитках, новых строк в сетке не надо.
-  ["Вход", (m) => fmt.tokens(m.prompt_tokens), () => sumSub("prompt_tokens", fmt.tokens)],
-  ["Выход", (m) => fmt.tokens(m.completion_tokens),
-    // Рассуждение — про этот же ответ, и оно важнее итога: на думающей модели
-    // выход без него необъясним.
-    (m) => (m.reasoning_tokens ? m.reasoning_tokens + " рассужд" : sumSub("completion_tokens", fmt.tokens))],
-  ["Всего", (m) => fmt.tokens(m.total_tokens), () => sumSub("total_tokens", fmt.tokens)],
-  // У цены девять знаков — она занимает всю ширину плитки целиком. Подпись
-  // рядом отобрала бы у неё место, и на экране осталось бы «$0.000...»:
-  // ровно то число, ради которого затевался день. Поэтому накопленное здесь
-  // идёт **под** значением, отдельной строкой, а не сбоку.
-  ["Стоимость", (m) => fmt.cost(m.cost_usd), () => sumSub("cost_usd", fmt.cost), true, true],
-  ["Провайдер", (m) => fmt.text(m.provider), () => "", true],
-  ["Контекст", (m) => fmt.pct(m.context_fill_pct), (m) => m.finish_reason || ""],
+  ["Входные токены", () => fmt.tokens(totalField("prompt_tokens"))],
+  ["Выходные токены", () => fmt.tokens(totalField("completion_tokens"))],
+  ["Всего токенов", () => fmt.tokens(totalField("total_tokens"))],
+  ["Стоимость", () => fmt.cost(totalField("cost_usd")), true],
+  // Обмены считает сервер и считает **все** ответы, а не только принёсшие
+  // числа: карточек в ленте ровно столько же. Поэтому число едет отдельным
+  // полем, а не внутри сумм: у чата с молчащим usage сумм нет вовсе, а обмены
+  // в нём были.
+  ["Обменов", () => fmt.tokens(state.current ? state.current.exchanges : null)],
+  ["Контекст", () => fmt.pct(contextFill())],
 ];
 
 function renderTiles() {
   const box = $("#tiles");
-  const m = state.lastMetrics || {};
   box.innerHTML = "";
-  TILES.forEach(([label, value, sub, small, stacked]) => {
+  TILES.forEach(([label, value, small]) => {
     const tile = document.createElement("div");
     tile.className = "tile";
     const k = document.createElement("div");
@@ -1242,20 +1276,12 @@ function renderTiles() {
     const row = document.createElement("div");
     row.className = "tile-row";
     const v = document.createElement("div");
+    // Значению отдана вся ширина плитки: подписей рядом больше нет, и цене
+    // в девять знаков ничего не мешает быть видной целиком.
     v.className = "tile-v" + (small ? " small" : "");
-    v.textContent = state.lastMetrics ? value(m) : "—";
+    v.textContent = value();
     row.appendChild(v);
-    const subText = state.lastMetrics ? sub(m) : "";
     tile.append(k, row);
-    if (subText) {
-      const s = document.createElement("div");
-      // Подпись в одной строке со значением делит с ним ширину плитки.
-      // Плитке, у которой значение длинное, подпись даётся отдельной строкой:
-      // делить нечего, значение обязано быть видно целиком.
-      s.className = stacked ? "tile-sub under" : "tile-sub";
-      s.textContent = subText;
-      (stacked ? tile : row).appendChild(s);
-    }
     box.appendChild(tile);
   });
 }

@@ -344,6 +344,28 @@ function freshClient(options) {
 // Плитка по метке — заглушкой, если такой плитки нет. Иначе переименованная
 // плитка роняет весь маршрут исключением, и вместо одного внятного «покраснело»
 // получается «проверка упала», за которой не видно остальных утверждений.
+// Кнопка карточки — по назначению, а не по номеру в ряду. Индекс уже дважды
+// оказывался хрупким: стоит убрать или переставить кнопку, и утверждение
+// начинает жать не то, оставаясь зелёным ровно до тех пор, пока новая кнопка
+// случайно не делает то же самое.
+function cardButton(card, title) {
+  const titles = card.querySelectorAll(".icon-btn").map((b) => b.title);
+  const btn = card.querySelectorAll(".icon-btn").find((b) => b.title === title);
+  if (btn) return btn;
+  // Пропавшая кнопка — это красное утверждение, а не упавший маршрут:
+  // исключение унесло бы с собой все проверки, стоящие после него.
+  check("в карточке есть кнопка «" + title + "»", false, titles.join(" | "));
+  return { dispatchEvent() {} };
+}
+
+// Текст строки под ответом — или внятное «строки нет». Обращение к
+// `.textContent` пропавшего узла роняет весь маршрут вместо одного красного
+// утверждения, а строка под ответом пропадает ровно тогда, когда её ломают.
+function usageText(node, cls) {
+  const el = node && node.querySelector(cls);
+  return el ? el.textContent : "(строки " + cls + " нет)";
+}
+
 const NO_TILE = "(плитки нет)";
 const shownAs = (tile) => tile.v + " / " + tile.sub;
 function tileOf($, name) {
@@ -449,7 +471,7 @@ async function routeChecks() {
     $("#f-system").value = "ПРОМПТ ДЛЯ ПОВТОРА";
     await client.state.applying;
     const card = $("#feed").querySelector(".card");
-    const refresh = card.querySelectorAll(".icon-btn")[2];
+    const refresh = cardButton(card, "Перегенерировать");
     refresh.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("click"));
     await settle(120);
     const last = server.state.sent[server.state.sent.length - 1];
@@ -585,6 +607,17 @@ async function routeChecks() {
       nodes.map((el) => (el.classList.contains("msg-user") ? "u" : "a")).join("") === "uaua",
       nodes.map((el) => el.className).join(" | "));
 
+    // Кнопка «метрики этого ответа» убрана: числа обмена написаны под ним
+    // самим, а плитки справа теперь про весь диалог, и класть в них один
+    // выбранный ответ значило бы показывать в панели не то, что она обещает.
+    check("кнопки «метрики этого ответа» в карточке нет",
+      nodes[1].querySelectorAll(".icon-btn").every((b) => b.title !== "Метрики этого ответа"),
+      nodes[1].querySelectorAll(".icon-btn").map((b) => b.title).join(" | "));
+    check("а копирование, перегенерация и сырой текст на месте",
+      nodes[1].querySelectorAll(".icon-btn").map((b) => b.title).join(" | ") ===
+        "Копировать ответ | Перегенерировать | Показать сырой текст",
+      nodes[1].querySelectorAll(".icon-btn").map((b) => b.title).join(" | "));
+
     check("текст вопроса показан", nodes[0].textContent === "мой вопрос", nodes[0].textContent);
     check("текст ответа показан и разобран как markdown",
       nodes[1].querySelector(".card-body").innerHTML.includes("<strong>жирный</strong>"),
@@ -592,9 +625,12 @@ async function routeChecks() {
     check("имя модели берётся из метрик реплики, а не из конфига чата",
       nodes[1].querySelector(".card-model").textContent === "особая/модель",
       nodes[1].querySelector(".card-model").textContent);
-    check("провайдер показан отдельной меткой",
-      nodes[1].querySelector(".card-tag").textContent === "поставщик",
-      String(nodes[1].querySelector(".card-tag")));
+    check("провайдер показан под ответом, вместе с тем, как прошёл вызов",
+      usageText(nodes[1], ".usage-how") === "поставщик",
+      usageText(nodes[1], ".usage-how"));
+    check("и в шапке карточки его больше нет — одно число живёт в одном месте",
+      nodes[1].querySelector(".card-head").textContent === "особая/модель",
+      nodes[1].querySelector(".card-head").textContent);
     check("рассуждение показано свёрнутым блоком",
       Boolean(nodes[1].querySelector(".think")) &&
         nodes[1].querySelector(".think-body").textContent === "я подумал",
@@ -765,7 +801,7 @@ async function routeChecks() {
       feed.scrollTop = UP;
       feed.dispatchEvent(new Evt("scroll"));
       const card = feed.querySelector(".card");
-      card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+      cardButton(card, "Перегенерировать").dispatchEvent(new Evt("click"));
       await settle(150);
       check("перегенерация при отмотанной ленте показывает новый ответ", atBottom(feed),
         `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
@@ -954,7 +990,7 @@ async function routeChecks() {
     $("#save-status").textContent = "";
 
     const card = $("#feed").querySelector(".card");
-    card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+    cardButton(card, "Перегенерировать").dispatchEvent(new Evt("click"));
     await settle(140);
     check("перегенерация без правок ничего не сообщает", shown() === "", shown());
   }
@@ -981,113 +1017,206 @@ async function routeChecks() {
       /поставщик/i.test(text) && !/provider|extra_body|order|404/.test(text), text);
   }
 
-  // ── токены: плитки и строка под ответом показывают одни и те же числа ──
+  // ── лента про обмен, панель про диалог ──
   //
-  // Про плитки не было ни одного утверждения: их можно было переименовать,
-  // перепутать местами вход с выходом или показать сумму вместо обмена — и
-  // всё осталось бы зелёным. Здесь настоящий маршрут: два обмена с разными
-  // usage, а потом сверка того, что видно глазами, — крупное число плитки,
-  // её подпись с накопленным и мелкая строка под каждым ответом в ленте.
+  // Разделение, ради которого затевалась правка: под ответом — числа этого
+  // обмена, справа — итог по всему разговору. Проверяется оно вместе, одним
+  // маршрутом: два обмена с разными usage, и после второго плитки обязаны
+  // показать **сумму**, а строки в ленте — остаться каждая при своём.
   {
     const plan = [
-      { prompt_tokens: 1240, completion_tokens: 312, total_tokens: 1552, cost_usd: 0.000186 },
-      { prompt_tokens: 12000, completion_tokens: 500, total_tokens: 12500, cost_usd: 0.0004 },
+      { prompt_tokens: 1240, completion_tokens: 312, total_tokens: 1552, cost_usd: 0.000186,
+        tokens_per_second: 12.44, elapsed_ms: 2350, first_token_ms: 420, ttft_ms: 420,
+        context_fill_pct: 1.2 },
+      { prompt_tokens: 12000, completion_tokens: 500, total_tokens: 12500, cost_usd: 0.0004,
+        tokens_per_second: 9.5, elapsed_ms: 5000, first_token_ms: 380, ttft_ms: 380,
+        context_fill_pct: 9.8 },
     ];
     const { client, $, settle } = freshClient({ usage: (i) => plan[i] });
     client.init();
     await settle(30);
 
+    const PANEL = ["Входные токены", "Выходные токены", "Всего токенов",
+                   "Стоимость", "Обменов", "Контекст"];
     const tiles = () => {
       const out = {};
-      ["Ток/с", "Первый токен, с", "Вход", "Выход", "Всего", "Стоимость", "Провайдер", "Контекст"]
-        .forEach((name) => { out[name] = tileOf($, name); });
+      PANEL.forEach((name) => { out[name] = tileOf($, name); });
       return out;
     };
-    const usageLines = () =>
-      $("#feed").querySelectorAll(".card-usage").map((el) => el.textContent);
-
     const labels = () => $("#tiles").children.map((t) => t.querySelector(".tile-k").textContent);
+    const rowOf = (card, cls) => usageText(card, cls);
+    const cards = () => $("#feed").querySelectorAll(".card");
 
-    // Сетка — две колонки на четыре ряда. Девятая плитка занимает пятый ряд
-    // одна, рядом с ней остаётся пустая клетка, и панель над плитками теряет
-    // высоту. Утверждения на **число** плиток не было ни одного: день добавил
-    // девятую, и всё осталось зелёным.
-    check("плиток ровно восемь — сетка 2×4, пятого ряда нет",
-      $("#tiles").children.length === 8, "плиток " + $("#tiles").children.length);
-    check("и это те самые восемь",
-      labels().join(" | ") ===
-        "Ток/с | Первый токен, с | Вход | Выход | Всего | Стоимость | Провайдер | Контекст",
-      labels().join(" | "));
+    // Сетка — две колонки. Плиток пять оставили бы пустую клетку в последнем
+    // ряду, девять — лишний ряд: и то и другое мы уже чинили. Утверждение
+    // на **число** плиток стоит именно поэтому.
+    check("плиток ровно шесть — сетка 2×3, пустых клеток нет",
+      $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
+    check("и это те самые шесть", labels().join(" | ") === PANEL.join(" | "), labels().join(" | "));
 
     const empty = tiles();
-    check("до первого ответа плитка входа — прочерк, а не ноль",
-      empty["Вход"] && empty["Вход"].v === "—", shownAs(empty["Вход"]));
-    check("и накопленного по чату тоже нет",
-      empty["Всего"] && empty["Всего"].sub === "", shownAs(empty["Всего"]));
+    check("до первого ответа входные токены — прочерк, а не ноль",
+      empty["Входные токены"].v === "—", shownAs(empty["Входные токены"]));
+    // Ноль обменов — это знание, а не незнание: разговора не было. Прочерк
+    // здесь стоял бы про то же, про что и в соседних плитках («не знаем»),
+    // а знаем мы точно.
+    check("до первого ответа обменов ноль", empty["Обменов"].v === "0", shownAs(empty["Обменов"]));
+    check("и контекст пуст", empty["Контекст"].v === "—", shownAs(empty["Контекст"]));
 
     $("#input").value = "первый вопрос";
     $("#composer").requestSubmit();
     await settle(90);
 
     const one = tiles();
-    check("плитка «Вход» показывает prompt_tokens обмена",
-      one["Вход"].v === "1 240", shownAs(one["Вход"]));
-    check("плитка «Выход» показывает completion_tokens обмена",
-      one["Выход"].v === "312", shownAs(one["Выход"]));
-    check("плитка «Всего» показывает total_tokens обмена",
-      one["Всего"].v === "1 552", shownAs(one["Всего"]));
-    check("плитка «Стоимость» показывает цену обмена",
-      one["Стоимость"].v === "$0.000186", shownAs(one["Стоимость"]));
-    check("после первого обмена накопленное равно самому обмену",
-      one["Вход"].sub === "Σ 1 240" && one["Всего"].sub === "Σ 1 552",
-      JSON.stringify([one["Вход"].sub, one["Всего"].sub]));
-    check("и накопленная стоимость тоже",
-      one["Стоимость"].sub === "Σ $0.000186", one["Стоимость"].sub);
+    check("после первого обмена панель показывает его целиком",
+      [one["Входные токены"].v, one["Выходные токены"].v, one["Всего токенов"].v,
+       one["Стоимость"].v, one["Обменов"].v].join(" | ") ===
+        "1 240 | 312 | 1 552 | $0.000186 | 1",
+      [one["Входные токены"].v, one["Выходные токены"].v, one["Всего токенов"].v,
+       one["Стоимость"].v, one["Обменов"].v].join(" | "));
+    check("контекст — доля окна по последнему ответу",
+      one["Контекст"].v === "1.2 %", one["Контекст"].v);
+    check("подписей в плитках больше нет: панель и так вся про диалог",
+      PANEL.every((name) => tileOf($, name).sub === ""),
+      PANEL.map((name) => name + ":" + tileOf($, name).sub).join(" | "));
 
-    // Ширины в стенде нет, и обрезку текста он не покажет. Но обрезка берётся
-    // из разметки: подпись в одной строке со значением делит с ним ширину
-    // плитки, а у цены девять знаков — она занимает строку целиком. Поэтому
-    // утверждение про то, откуда обрезка берётся: подпись цены стоит **под**
-    // значением, и в строке значения, кроме него, нет никого.
-    const cost = tileOf($, "Стоимость");
-    check("подпись стоимости стоит под значением, а не отбирает у него ширину",
-      cost.row === "tile-v small", cost.row);
-    check("а сама подпись при этом на месте, отдельной строкой",
-      cost.sub === "Σ $0.000186", cost.sub);
-    // Плиткам с короткими значениями отдельная строка не нужна: там подпись
-    // рядом, и лишнего ряда высоты панель не отдаёт.
-    check("у короткого значения подпись остаётся рядом",
-      tileOf($, "Вход").row === "tile-v,tile-sub", tileOf($, "Вход").row);
-    check("под ответом строка с теми же числами",
-      usageLines().join("|") === "вход 1 240 · выход 312 · всего 1 552 · $0.000186",
-      usageLines().join("|"));
+    // Цена в девять знаков занимает ширину плитки целиком. Ширин стенд
+    // не знает, но обрезка берётся из разметки: если в строке значения
+    // окажется кто-то ещё, на экране останется «$0.000...».
+    check("в строке значения стоимости никого, кроме самого значения",
+      tileOf($, "Стоимость").row === "tile-v small", tileOf($, "Стоимость").row);
+
+    check("под ответом — числа этого обмена",
+      rowOf(cards()[0], ".usage-tokens") === "входные 1 240 · выходные 312 · всего 1 552 · $0.000186",
+      rowOf(cards()[0], ".usage-tokens"));
+    check("и второй строкой — как прошёл вызов",
+      rowOf(cards()[0], ".usage-how") === "12.4 ток/с за 2.35 с · первый токен 0.42 с · стенд",
+      rowOf(cards()[0], ".usage-how"));
 
     $("#input").value = "второй вопрос";
     $("#composer").requestSubmit();
     await settle(90);
 
     const two = tiles();
-    check("крупное число плитки — последний обмен, а не сумма",
-      two["Вход"].v === "12k" && two["Всего"].v === "12.5k",
-      JSON.stringify([two["Вход"].v, two["Всего"].v]));
-    check("подпись плитки — накопленное по чату, и оно выросло",
-      two["Вход"].sub === "Σ 13.2k" && two["Выход"].sub === "Σ 812" &&
-        two["Всего"].sub === "Σ 14.1k",
-      JSON.stringify([two["Вход"].sub, two["Выход"].sub, two["Всего"].sub]));
-    check("накопленная стоимость — сумма двух обменов",
-      two["Стоимость"].sub === "Σ $0.000586", two["Стоимость"].sub);
-    check("в ленте своя строка под каждым ответом, и первая не переписана",
-      usageLines().join(" | ") ===
-        "вход 1 240 · выход 312 · всего 1 552 · $0.000186 | " +
-        "вход 12k · выход 500 · всего 12.5k · $0.000400",
-      usageLines().join(" | "));
-    // Сумма входов обоих обменов — 13 240, и подпись обязана показать её
-    // ожидаемой строкой. Сверять с `fmt.tokens(1240 + 12000)` было нельзя:
-    // так утверждение проверяет само себя тем же кодом, который его и рисует.
-    check("подпись — сумма входов обоих обменов", two["Вход"].sub === "Σ 13.2k", two["Вход"].sub);
+    check("после второго обмена в панели сумма, а не последний обмен",
+      [two["Входные токены"].v, two["Выходные токены"].v, two["Всего токенов"].v,
+       two["Стоимость"].v, two["Обменов"].v].join(" | ") ===
+        "13.2k | 812 | 14.1k | $0.000586 | 2",
+      [two["Входные токены"].v, two["Выходные токены"].v, two["Всего токенов"].v,
+       two["Стоимость"].v, two["Обменов"].v].join(" | "));
+    check("контекст не усредняется — он по последнему ответу",
+      two["Контекст"].v === "9.8 %", two["Контекст"].v);
+    check("а строки в ленте остались каждая при своём обмене",
+      cards().map((c) => rowOf(c, ".usage-tokens")).join(" | ") ===
+        "входные 1 240 · выходные 312 · всего 1 552 · $0.000186 | " +
+        "входные 12k · выходные 500 · всего 12.5k · $0.000400",
+      cards().map((c) => rowOf(c, ".usage-tokens")).join(" | "));
+    check("и «как прошёл вызов» у второго ответа своё",
+      rowOf(cards()[1], ".usage-how") === "9.5 ток/с за 5.00 с · первый токен 0.38 с · стенд",
+      rowOf(cards()[1], ".usage-how"));
   }
 
-  // ── чисел нет — нет и строки, а плитка показывает прочерк, а не ноль ──
+  // ── контекст сбрасывается сменой модели ──
+  //
+  // Окно у новой модели другое, и прежний процент к ней не относится:
+  // показывать его дальше значило бы врать ровно там, где цифра выглядит
+  // убедительнее всего.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("после ответа контекст заполнен", tileOf($, "Контекст").v === "42.5 %",
+      tileOf($, "Контекст").v);
+
+    $("#f-model").value = "вторая/модель";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await client.state.applying;
+    await settle(40);
+    check("сменили модель — контекст погас, не дожидаясь следующего ответа",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+    check("а токены и стоимость чата на месте: они от модели не зависят",
+      tileOf($, "Всего токенов").v === "120" && tileOf($, "Стоимость").v === "$0.000100",
+      tileOf($, "Всего токенов").v + " | " + tileOf($, "Стоимость").v);
+  }
+
+  // ── «всего» никто не досчитывает в браузере ──
+  //
+  // Провайдер вправе смолчать о сумме. Клиент, который сложит её сам, покажет
+  // под ответом 120, а в плитке останется прочерк: итог чата считается
+  // по `total_tokens` реплик, и молчащая реплика в него не входит. Два разных
+  // «всего» на одном экране — ровно то, что ломает инвариант «клиент
+  // показывает, а не считает». Досчитывает сервер, до записи в историю.
+  {
+    const talk = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 100, completion_tokens: 20, total_tokens: null,
+                   cost_usd: 0.0001 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "молчун", transcript: talk, history_len: talk.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const line = usageText($("#feed"), ".usage-tokens");
+    check("сумму, о которой сервер смолчал, клиент не выдумывает",
+      line === "входные 100 · выходные 20 · $0.000100", line);
+    check("и уж точно не пишет 120", !line.includes("120"), line);
+    check("в плитке на этом месте прочерк, а не другое число",
+      tileOf($, "Всего токенов").v === "—", tileOf($, "Всего токенов").v);
+  }
+
+  // ── контекст не гаснет от чужого имени модели и от правки температуры ──
+  //
+  // На `openrouter/auto` провайдер возвращает не то имя, которое просили,
+  // — и сверка имён гасила плитку после **каждого** ответа, навсегда. Гасить
+  // её должна настоящая смена модели пользователем, и только она.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5,
+                      model: "кто-то/другой" }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("провайдер назвал модель иначе — контекст всё равно показан",
+      tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
+
+    $("#f-temperature").value = "0.7";
+    $("#f-temperature").dispatchEvent(new Evt("change"));
+    await client.state.applying;
+    await settle(40);
+    check("правка температуры контекст не гасит: окно то же",
+      tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
+
+    $("#f-model").value = "вторая/модель";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await client.state.applying;
+    await settle(40);
+    check("а смена модели гасит", tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+
+    $("#input").value = "ещё";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("следующий ответ снова заполняет контекст",
+      tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
+  }
+
+  // ── чисел нет — нет и строки с числами, а плитка показывает прочерк ──
   {
     const talk = [
       { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
@@ -1115,31 +1244,35 @@ async function routeChecks() {
     await settle(40);
 
     const cards = $("#feed").querySelectorAll(".card");
-    check("у ответа без чисел строки токенов нет вовсе",
-      cards[0].querySelector(".card-usage") === null,
-      String(cards[0].querySelector(".card-usage")));
-    check("у оборванного ответа строка есть: его числа идут в сумму по чату",
-      Boolean(cards[1].querySelector(".card-usage")) &&
-        cards[1].querySelector(".card-usage").textContent ===
-          "вход 90 · выход 4 · всего 94 · $0.000010",
-      String(cards[1].querySelector(".card-usage")));
-    const zeros = cards[2].querySelector(".card-usage");
+    check("у ответа без чисел строки с токенами нет вовсе",
+      cards[0].querySelector(".usage-tokens") === null,
+      String(cards[0].querySelector(".usage-tokens")));
+    const how = cards[0].querySelector(".usage-how");
+    check("но известное про него показано: поставщик",
+      Boolean(how) && how.textContent === "поставщик",
+      how ? how.textContent : "строки «как прошёл вызов» нет вовсе");
+    check("у оборванного ответа числа есть: они идут в итог чата",
+      usageText(cards[1], ".usage-tokens") === "входные 90 · выходные 4 · всего 94 · $0.000010",
+      usageText(cards[1], ".usage-tokens"));
+    const zeros = cards[2].querySelector(".usage-tokens");
     check("а нулевые числа — это ответ, и он показан нулями, а не прочерком",
-      Boolean(zeros) && zeros.textContent === "вход 0 · выход 0 · всего 0 · $0.000000",
+      Boolean(zeros) && zeros.textContent === "входные 0 · выходные 0 · всего 0 · $0.000000",
       zeros ? zeros.textContent : "строки нет вовсе");
 
-    // Лента и итог обязаны сходиться: строка под каждым ответом — слагаемое,
-    // подпись плитки — их сумма. Пока строки не было у оборванного ответа,
-    // видимые слагаемые давали меньше итога, и объяснить расхождение на экране
-    // было нечем.
-    const shown = $("#feed").querySelectorAll(".card-usage")
-      .map((el) => Number(/всего ([\d ]+)/.exec(el.textContent)[1].replace(/ /g, ""))); 
-    check("строк под ответами столько же, сколько ответов с числами",
+    // Лента и панель обязаны сходиться: строка под каждым ответом — слагаемое,
+    // плитка — их сумма. Расхождение здесь значит, что на экране две разные
+    // правды, и какая из них настоящая, читателю не узнать.
+    const shown = $("#feed").querySelectorAll(".usage-tokens")
+      .map((el) => Number(/всего ([\d ]+)/.exec(el.textContent)[1].replace(/ /g, "")));
+    check("строк с числами столько же, сколько ответов с числами",
       shown.length === 2, JSON.stringify(shown));
-    check("сумма видимых строк сходится с итогом в плитке",
-      shown.reduce((a, b) => a + b, 0) === 94, JSON.stringify(shown));
-    check("и в плитке стоит она же", tileOf($, "Всего").sub === "Σ 94",
-      tileOf($, "Всего").sub);
+    check("сумма видимых строк — 94", shown.reduce((a, b) => a + b, 0) === 94, JSON.stringify(shown));
+    check("и в плитке стоит она же", tileOf($, "Всего токенов").v === "94",
+      tileOf($, "Всего токенов").v);
+    // Обменов три, а слагаемых два: у одного ответа чисел нет вовсе. Плитка
+    // считает разговор, а не слагаемые, и молчать о третьей карточке не вправе.
+    check("обменов столько же, сколько ответов в ленте",
+      tileOf($, "Обменов").v === "3", tileOf($, "Обменов").v);
 
     // Ноль и «неизвестно» на экране разные: это единственное, что отличает
     // «модель ничего не потратила» от «мы не знаем, сколько она потратила».
@@ -1163,11 +1296,12 @@ async function routeChecks() {
       client.fmt.tokens(1250000));
   }
 
-  // ── подпись «Выхода»: рассуждение важнее накопленного ──
+  // ── выход думающей модели: рассуждение названо отдельным числом ──
   //
-  // На думающей модели выход без рассуждения необъясним: 40 токенов ответа
-  // при пяти сотнях потраченных. Поэтому, когда reasoning_tokens есть,
-  // подпись занята им, а накопленное видно в соседних плитках.
+  // Провайдер кладёт токены рассуждения **внутрь** completion_tokens: выход
+  // выходит заметно больше видимого текста, и без оговорки число выглядит
+  // враньём. Вычитать его нельзя — «выход» перестанет быть тем, что прислал
+  // провайдер, и перестанет сходиться с итогом чата.
   {
     const think = [
       { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
@@ -1184,11 +1318,42 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
-    const out = tileOf($, "Выход");
-    check("«Выход» показывает completion_tokens", out.v === "60", out.v);
-    check("а подписью — рассуждение, а не накопленное", out.sub === "40 рассужд", out.sub);
-    check("накопленное по чату при этом видно в соседней плитке",
-      tileOf($, "Всего").sub === "Σ 160", tileOf($, "Всего").sub);
+    const line = usageText($("#feed"), ".usage-tokens");
+    check("рассуждение названо отдельным числом внутри выхода",
+      line === "входные 100 · выходные 60 (из них 40 рассуждение) · всего 160 · $0.000100", line);
+    check("в панели выходные токены — то, что прислал провайдер, без вычитаний",
+      tileOf($, "Выходные токены").v === "60", tileOf($, "Выходные токены").v);
+  }
+
+  // ── первый токен честный и виден под ответом ──
+  //
+  // На думающей модели `ttft_ms` наступает, когда модель домыслила: показывать
+  // его значило бы записать всё размышление в «модель молчала». Раньше это
+  // стерёг греп по `app/static/app.js` на строку «Первый токен, с» — проверка,
+  // которая ничего не проверяла: плитку можно было переименовать, а число
+  // подменить, и греп остался бы зелёным. Здесь настоящий рендер.
+  {
+    const slow = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "долго думал",
+        metrics: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
+                   first_token_ms: 500, ttft_ms: 2000, tokens_per_second: 4.2,
+                   elapsed_ms: 2500, provider: "поставщик" },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "думающая", transcript: slow, history_len: slow.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    const el = $("#feed").querySelector(".usage-how");
+    const line = el ? el.textContent : "строки «как прошёл вызов» нет вовсе";
+    check("под ответом стоит момент, когда модель заговорила вообще",
+      line === "4.2 ток/с за 2.50 с · первый токен 0.50 с · поставщик", line);
+    check("а не тот, когда она домыслила", !line.includes("2.00 с"), line);
   }
 
   // ── итог берётся с сервера, а не складывается в браузере ──
@@ -1207,9 +1372,9 @@ async function routeChecks() {
     ];
     const { client, $, settle, Evt } = freshClient({
       chats: [{
-        label: "чужой счёт", transcript: talk, history_len: talk.length,
+        label: "чужой счёт", transcript: talk, history_len: talk.length, exchanges: 42,
         usage_total: { prompt_tokens: 777777, completion_tokens: 999999,
-                       total_tokens: 1777776, cost_usd: 0.5, answers: 5 },
+                       total_tokens: 1777776, cost_usd: 0.5 },
       }],
     });
     client.init();
@@ -1217,19 +1382,17 @@ async function routeChecks() {
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
 
-    const sub = (name) => tileOf($, name).sub;
-    check("подпись входа — серверная, а не сумма реплик",
-      sub("Вход") === "Σ 777.8k", sub("Вход"));
-    check("подпись выхода — серверная", sub("Выход") === "Σ 1M", sub("Выход"));
-    check("подпись «всего» — серверная", sub("Всего") === "Σ 1.8M", sub("Всего"));
-    check("накопленная стоимость — серверная", sub("Стоимость") === "Σ $0.500000",
-      sub("Стоимость"));
+    const v = (name) => tileOf($, name).v;
+    check("входные токены — серверные, а не сумма реплик", v("Входные токены") === "777.8k", v("Входные токены"));
+    check("выходные токены — серверные", v("Выходные токены") === "1M", v("Выходные токены"));
+    check("всего токенов — серверное", v("Всего токенов") === "1.8M", v("Всего токенов"));
+    check("стоимость — серверная", v("Стоимость") === "$0.500000", v("Стоимость"));
+    check("и обмены считает тоже сервер", v("Обменов") === "42", v("Обменов"));
     // И при этом строка под ответом показывает числа самой реплики: клиент
     // не подгоняет одно под другое, он показывает оба источника как есть.
     check("а строка под ответом — числа своей реплики",
-      $("#feed").querySelector(".card-usage").textContent ===
-        "вход 10 · выход 12 · всего 22 · $0.000002",
-      String($("#feed").querySelector(".card-usage")));
+      usageText($("#feed"), ".usage-tokens") === "входные 10 · выходные 12 · всего 22 · $0.000002",
+      usageText($("#feed"), ".usage-tokens"));
   }
 
   // ── у стриминговой карточки строки нет: числа приходят последним кадром ──
@@ -1250,10 +1413,8 @@ async function routeChecks() {
       String($("#feed").querySelector(".card-usage")));
     await settle(160);  // стрим кончился, лента перечитана с сервера
     check("после ответа строка появляется",
-      $("#feed").querySelector(".card-usage") !== null &&
-        $("#feed").querySelector(".card-usage").textContent ===
-          "вход 40 · выход 8 · всего 48 · $0.000020",
-      String($("#feed").querySelector(".card-usage")));
+      usageText($("#feed"), ".usage-tokens") === "входные 40 · выходные 8 · всего 48 · $0.000020",
+      usageText($("#feed"), ".usage-tokens"));
   }
 }
 
