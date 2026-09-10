@@ -398,13 +398,22 @@ async function routeChecks() {
   // ── каждое поле панели доезжает до запроса, даже без события change ──
   for (const [field, typed, key, expected] of PANEL_ROUTE) {
     const { client, server, $, settle } = freshClient();
-    client.init();
-    await settle(20);
+    // Поле, которого нет в разметке, роняет маршрут исключением — и уносит
+    // с собой все утверждения после себя. Диагностика при поломке важнее
+    // краткости: ловим здесь и краснеем именно этой строкой.
+    try {
+      client.init();
+      await settle(20);
 
-    $("#" + field).value = typed;          // правка есть на экране...
-    $("#input").value = "вопрос";          // ...а `change` не выстрелил
-    $("#composer").requestSubmit();
-    await settle(80);
+      $("#" + field).value = typed;          // правка есть на экране...
+      $("#input").value = "вопрос";          // ...а `change` не выстрелил
+      $("#composer").requestSubmit();
+      await settle(80);
+    } catch (err) {
+      check(`панель → запрос: ${key} доезжает без падения`, false,
+        `клиент упал на поле ${field}: ${err && err.message}`);
+      continue;
+    }
 
     const sent = server.state.sent[0];
     check(`панель → запрос: ${key} без события change`, Boolean(sent), "сообщение не ушло вовсе");
