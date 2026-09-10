@@ -358,6 +358,14 @@ function cardButton(card, title) {
   return { dispatchEvent() {} };
 }
 
+// Текст строки под ответом — или внятное «строки нет». Обращение к
+// `.textContent` пропавшего узла роняет весь маршрут вместо одного красного
+// утверждения, а строка под ответом пропадает ровно тогда, когда её ломают.
+function usageText(node, cls) {
+  const el = node && node.querySelector(cls);
+  return el ? el.textContent : "(строки " + cls + " нет)";
+}
+
 const NO_TILE = "(плитки нет)";
 const shownAs = (tile) => tile.v + " / " + tile.sub;
 function tileOf($, name) {
@@ -618,8 +626,8 @@ async function routeChecks() {
       nodes[1].querySelector(".card-model").textContent === "особая/модель",
       nodes[1].querySelector(".card-model").textContent);
     check("провайдер показан под ответом, вместе с тем, как прошёл вызов",
-      nodes[1].querySelector(".usage-how").textContent === "поставщик",
-      String(nodes[1].querySelector(".usage-how")));
+      usageText(nodes[1], ".usage-how") === "поставщик",
+      usageText(nodes[1], ".usage-how"));
     check("и в шапке карточки его больше нет — одно число живёт в одном месте",
       nodes[1].querySelector(".card-head").textContent === "особая/модель",
       nodes[1].querySelector(".card-head").textContent);
@@ -1035,10 +1043,7 @@ async function routeChecks() {
       return out;
     };
     const labels = () => $("#tiles").children.map((t) => t.querySelector(".tile-k").textContent);
-    const rowOf = (card, cls) => {
-      const el = card.querySelector(cls);
-      return el ? el.textContent : "(строки нет)";
-    };
+    const rowOf = (card, cls) => usageText(card, cls);
     const cards = () => $("#feed").querySelectorAll(".card");
 
     // Сетка — две колонки. Плиток пять оставили бы пустую клетку в последнем
@@ -1172,10 +1177,8 @@ async function routeChecks() {
       Boolean(how) && how.textContent === "поставщик",
       how ? how.textContent : "строки «как прошёл вызов» нет вовсе");
     check("у оборванного ответа числа есть: они идут в итог чата",
-      Boolean(cards[1].querySelector(".usage-tokens")) &&
-        cards[1].querySelector(".usage-tokens").textContent ===
-          "вход 90 · выход 4 · всего 94 · $0.000010",
-      String(cards[1].querySelector(".usage-tokens")));
+      usageText(cards[1], ".usage-tokens") === "вход 90 · выход 4 · всего 94 · $0.000010",
+      usageText(cards[1], ".usage-tokens"));
     const zeros = cards[2].querySelector(".usage-tokens");
     check("а нулевые числа — это ответ, и он показан нулями, а не прочерком",
       Boolean(zeros) && zeros.textContent === "вход 0 · выход 0 · всего 0 · $0.000000",
@@ -1238,7 +1241,7 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
-    const line = $("#feed").querySelector(".usage-tokens").textContent;
+    const line = usageText($("#feed"), ".usage-tokens");
     check("рассуждение названо отдельным числом внутри выхода",
       line === "вход 100 · выход 60 (из них 40 рассуждение) · всего 160 · $0.000100", line);
     check("в панели весь выход — то, что прислал провайдер, без вычитаний",
@@ -1311,9 +1314,8 @@ async function routeChecks() {
     // И при этом строка под ответом показывает числа самой реплики: клиент
     // не подгоняет одно под другое, он показывает оба источника как есть.
     check("а строка под ответом — числа своей реплики",
-      $("#feed").querySelector(".usage-tokens").textContent ===
-        "вход 10 · выход 12 · всего 22 · $0.000002",
-      String($("#feed").querySelector(".usage-tokens")));
+      usageText($("#feed"), ".usage-tokens") === "вход 10 · выход 12 · всего 22 · $0.000002",
+      usageText($("#feed"), ".usage-tokens"));
   }
 
   // ── у стриминговой карточки строки нет: числа приходят последним кадром ──
@@ -1334,10 +1336,8 @@ async function routeChecks() {
       String($("#feed").querySelector(".card-usage")));
     await settle(160);  // стрим кончился, лента перечитана с сервера
     check("после ответа строка появляется",
-      $("#feed").querySelector(".usage-tokens") !== null &&
-        $("#feed").querySelector(".usage-tokens").textContent ===
-          "вход 40 · выход 8 · всего 48 · $0.000020",
-      String($("#feed").querySelector(".usage-tokens")));
+      usageText($("#feed"), ".usage-tokens") === "вход 40 · выход 8 · всего 48 · $0.000020",
+      usageText($("#feed"), ".usage-tokens"));
   }
 }
 
