@@ -514,11 +514,12 @@ function buildServer(options) {
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     state.sent.push({ id: agent.id, text, config: config(agent) });
-    agent.transcript.push({ role: "user", content: text, seed: false });
+    agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
-      role: "assistant", content: state.reply, seed: false, metrics: null, reasoning: "",
+      role: "assistant", content: state.reply, error: null, reasoning: "",
+      metrics: { model: agent.model, provider: "стенд" },
     });
-    agent.history_len = agent.transcript.filter((t) => !t.seed).length;
+    agent.history_len = agent.transcript.length;
 
     const frames = [
       { event: "start", agent: agent.id },

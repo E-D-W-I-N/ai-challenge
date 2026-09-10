@@ -1204,11 +1204,16 @@ def check_numbered_names():
 
 @check("переименование и удаление живут в списке слева")
 def check_list_actions():
-    js = read("app/static/app.js")
-    assert "function startRename" in js and "function askDelete" in js
-    assert "miniButton(\"pencil\"" in js, "карандаша в строке списка нет"
-    assert "miniButton(\"trash\"" in js, "корзины в строке списка нет"
-    assert "Escape" in js and "Enter" in js, "переименование должно слушать Enter и Escape"
+    """Серверная половина: PATCH меняет имя, пустое имя отвергается, DELETE убирает.
+
+    Клиентская половина — в `checks/browser_check.js`, блоком «переименование
+    чата в списке слева»: клик по карандашу, Enter, Escape, потеря фокуса,
+    пустое имя. Раньше она была грепом по исходнику («в app.js есть строка
+    function startRename»), то есть описывала реализацию: переименование
+    ломалось, не тронув ни одной из тех строк, и греп оставался зелёным, —
+    а переименовать `startRename` во что угодно роняло проверку, ничего
+    не сломав.
+    """
     assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
 
     with TestClient(main.app) as client:
@@ -1218,7 +1223,7 @@ def check_list_actions():
         assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
         assert client.delete(f"/api/agents/{agent_id}").status_code == 200
         assert client.get(f"/api/agents/{agent_id}").status_code == 404
-    return "карандаш и корзина в строке, поля имени в панели нет"
+    return "PATCH меняет имя, пустое отвергается, DELETE убирает; поля имени в панели нет"
 
 
 @check("пояснений прошлой постановки нет ни в данных, ни в разметке")
