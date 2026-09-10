@@ -1,7 +1,7 @@
 """Агент — отдельная сущность: конфиг, память и один метод обмена.
 
 `Agent` принимает **текст пользователя**, а не готовую ленту: сам склеивает
-системный промпт, хвост истории и новый вопрос, зовёт `stream_completion`
+системный промпт, всю историю и новый вопрос, зовёт `stream_completion`
 и дописывает ответ себе в историю. Наружу отдаёт поток событий — из него
 и SSE веб-клиента, и вывод CLI.
 
@@ -22,14 +22,6 @@ from typing import AsyncIterator
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import AgentSpec
 
-DEFAULT_HISTORY_LIMIT = 20
-"""Окно по умолчанию — десять обменов: помнит начало разговора и не разгоняет
-prompt_tokens."""
-
-MAX_STORED_MESSAGES = 400
-"""Потолок на хранимое, независимо от окна: без него сотня агентов в долгой
-сессии течёт — в модель уходит хвост, а список растёт вечно."""
-
 _ids = itertools.count(1)
 
 
@@ -46,11 +38,6 @@ def copy_spec(spec: AgentSpec) -> AgentSpec:
         response_format=copy.deepcopy(spec.response_format),
         extra_body=copy.deepcopy(spec.extra_body or {}),
     )
-
-
-def _history_limit(spec: AgentSpec) -> int:
-    limit = spec.history_limit
-    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
 
 
 class AgentBusyError(RuntimeError):
@@ -152,10 +139,6 @@ class Agent:
     def release(self) -> None:
         self._reserved = False
 
-    @property
-    def history_limit(self) -> int:
-        return _history_limit(self.spec)
-
     def cancel(self) -> None:
         """Просит прекратить генерацию. Задачу извне не отменяет: агент сам
         выходит на ближайшем чанке, дописывает частичный ответ и закрывает
@@ -164,19 +147,12 @@ class Agent:
 
     # --- сборка промпта ------------------------------------------------------
 
-    def window(self, spec: AgentSpec | None = None) -> list[dict]:
-        """Хвост истории, который уезжает в модель. При history_limit=0 — пусто."""
-        limit = _history_limit(spec if spec is not None else self.spec)
-        if not limit:
-            return []
-        return [turn.as_message() for turn in self.history[-limit:]]
-
     def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
-        """Системный промпт + окно истории + вопрос этого хода.
+        """Системный промпт + вся история + вопрос этого хода.
 
-        Промпт берётся из конфига каждый раз, поэтому правка в панели видна
-        со следующего сообщения. При `history_limit=0` окно пусто, и агент
-        отвечает каждый вопрос как первый.
+        История уезжает целиком: чат помнит начало разговора, сколько бы он
+        ни длился. Промпт берётся из конфига каждый раз, поэтому правка
+        в панели видна со следующего сообщения.
         """
         # `spec` передаёт обмен: он собирает промпт и тело запроса из одного
         # слепка, чтобы правка панели не могла попасть между ними.
@@ -185,7 +161,7 @@ class Agent:
         messages: list[dict] = []
         if spec.system:
             messages.append({"role": "system", "content": spec.system})
-        messages.extend(self.window(spec))
+        messages.extend(turn.as_message() for turn in self.history)
         messages.append({"role": "user", "content": user_text})
         return messages
 
@@ -203,11 +179,6 @@ class Agent:
         self.history.append(
             Turn(role=role, content=content, error=error, reasoning=reasoning, metrics=metrics)
         )
-        self._trim()
-
-    def _trim(self) -> None:
-        if len(self.history) > MAX_STORED_MESSAGES:
-            del self.history[: len(self.history) - MAX_STORED_MESSAGES]
 
     def forget(self) -> None:
         self.history.clear()
@@ -229,7 +200,6 @@ class Agent:
             "response_format": self.spec.response_format,
             "extra_body": self.spec.extra_body,
             "system": self.spec.system,
-            "history_limit": self.history_limit,
             "history_len": len(self.history),
             "busy": self.busy,
             "created_at": self.created_at,
