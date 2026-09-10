@@ -21,6 +21,15 @@ const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFor
 const failures = [];
 let passed = 0;
 
+// Клиент асинхронный насквозь, и его исключение всплывает необработанным
+// отказом промиса: без этого обработчика node просто убивает процесс, и
+// от набора не остаётся ни одной строки — ни зелёной, ни красной. Ловим,
+// краснеем внятно и доводим набор до конца.
+process.on("unhandledRejection", (err) => {
+  const first = err && err.stack ? String(err.stack).split("\n")[0] : String(err);
+  failures.push("клиент уронил необработанный отказ промиса: " + first);
+});
+
 function check(name, condition, detail) {
   if (condition) passed += 1;
   else failures.push(`${name}${detail ? ": " + detail : ""}`);
@@ -350,6 +359,13 @@ function freshClient(options) {
 // начинает жать не то, оставаясь зелёным ровно до тех пор, пока новая кнопка
 // случайно не делает то же самое.
 function cardButton(card, title) {
+  // Карточки может не быть вовсе — так выглядит обмен, который не состоялся.
+  // Красное утверждение вместо исключения: упавший маршрут уносит с собой
+  // все проверки, стоящие после него, и от диагностики остаётся одна строка.
+  if (!card) {
+    check(`в ленте есть карточка с кнопкой «${title}»`, false, "карточки нет вовсе");
+    return { dispatchEvent() {} };
+  }
   const titles = card.querySelectorAll(".icon-btn").map((b) => b.title);
   const btn = card.querySelectorAll(".icon-btn").find((b) => b.title === title);
   if (btn) return btn;
@@ -463,10 +479,14 @@ async function routeChecks() {
       second && second.config.system === "ПРАВКА НА ЛЕТУ",
       JSON.stringify(server.state.sent.map((x) => x.config.system))
     );
+    // Первого сообщения может не быть вовсе — так выглядит сломанный пролив
+    // панели. Это красное утверждение, а не исключение: упавший маршрут унёс
+    // бы с собой все проверки после себя.
+    const first = server.state.sent[0];
     check(
       "текущий ответ правка не задела",
-      server.state.sent[0].config.system === "СТАРЫЙ ПРОМПТ",
-      server.state.sent[0].config.system
+      Boolean(first) && first.config.system === "СТАРЫЙ ПРОМПТ",
+      first ? first.config.system : "первое сообщение не ушло вовсе"
     );
   }
 
