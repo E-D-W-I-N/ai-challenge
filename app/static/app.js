@@ -558,8 +558,13 @@ function answerCard(agent, turn) {
 // Итог по всему диалогу живёт в плитках справа, и одно и то же число нигде
 // не показывается дважды: лента про обмен, панель про разговор.
 //
-// Пропущенное поле не пишется вовсе: «входные 0» вместо «неизвестно» было бы
-// неправдой, а сумму, о которой смолчал провайдер, досчитывает сервер (см.
+// Подписи полные — «входные токены», а не «входные»: сокращённая подпись
+// оставляет читателя гадать, токены это или что-то другое, а панель справа
+// давно называет те же величины целиком. «Всего токенов» названо так же, как
+// плитка; цене подпись не нужна — её называет знак доллара.
+//
+// Пропущенное поле не пишется вовсе: «входные токены 0» вместо «неизвестно»
+// было бы неправдой, а сумму, о которой смолчал провайдер, считает сервер (см.
 // `_apply_usage` в `app/llm.py`) — сложи её здесь, и «всего» под ответом
 // разошлось бы с «Всего токенов» в плитке. Строки нет, только если чисел нет
 // совсем. У оборванного ответа она есть: его числа идут в итог чата, он оплачен.
@@ -569,7 +574,7 @@ function usageLine(turn) {
   const known = (v) => v !== null && v !== undefined;
 
   const tokens = [];
-  if (known(m.prompt_tokens)) tokens.push("входные " + fmt.tokens(m.prompt_tokens));
+  if (known(m.prompt_tokens)) tokens.push("входные токены " + fmt.tokens(m.prompt_tokens));
   if (known(m.completion_tokens)) {
     // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
     // думающей модели выход заметно больше видимого текста. Поэтому они
@@ -578,9 +583,9 @@ function usageLine(turn) {
     const think = m.reasoning_tokens
       ? " (из них " + fmt.tokens(m.reasoning_tokens) + " рассуждение)"
       : "";
-    tokens.push("выходные " + fmt.tokens(m.completion_tokens) + think);
+    tokens.push("выходные токены " + fmt.tokens(m.completion_tokens) + think);
   }
-  if (known(m.total_tokens)) tokens.push("всего " + fmt.tokens(m.total_tokens));
+  if (known(m.total_tokens)) tokens.push("всего токенов " + fmt.tokens(m.total_tokens));
   if (known(m.cost_usd)) tokens.push(fmt.cost(m.cost_usd));
 
   const how = [];
