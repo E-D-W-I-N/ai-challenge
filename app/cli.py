@@ -85,7 +85,6 @@ def build_agent(args: argparse.Namespace) -> Agent:
     spec = AgentSpec(
         label=args.label,
         model=args.model,
-        messages=[],
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         system=args.system,

@@ -179,8 +179,6 @@ def _stream(
 
 # --- разбор конфига агента ----------------------------------------------------
 
-_ROLES = ("system", "user", "assistant")
-
 MAX_SPAWN_BATCH = 250
 """Сколько агентов можно создать одним запросом.
 
@@ -205,8 +203,8 @@ PATCHABLE = (
 )
 """Что панель справа вправе менять у живого чата.
 
-Всё, что видно в панели, и ничего сверх: стартовая заготовка `messages`
-снаружи не правится, а имя меняют из списка слева тем же полем `label`.
+Всё, что видно в панели, и ничего сверх. Имя меняют из списка слева
+тем же полем `label`.
 """
 
 
@@ -259,32 +257,6 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
     return values
 
 
-def _parse_messages(raw, where: str) -> list[dict]:
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail=f"{where}messages: список сообщений или пусто")
-    messages: list[dict] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}] должен быть объектом {{role, content}}",
-            )
-        role = item.get("role")
-        content = item.get("content")
-        if role not in _ROLES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}].role должен быть один из {', '.join(_ROLES)}",
-            )
-        if not isinstance(content, str) or not content.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"{where}messages[{index}].content должен быть непустой строкой",
-            )
-        messages.append({"role": role, "content": content})
-    return messages
-
-
 def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     """Конфиг агента из JSON. Все ошибки — 400 с текстом, а не 500."""
     if not isinstance(payload, dict):
@@ -311,24 +283,10 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     def text(name: str) -> str:
         return _optional_field(payload, name, (str,), "строка или null", where) or ""
 
-    messages = _parse_messages(payload.get("messages") or [], where)
-    system = text("system")
-    if system and any(m["role"] == "system" for m in messages):
-        # У системного промпта одно место — поле `system`. Если он задан
-        # и там, и сообщением, одно из двух пришлось бы выбросить молча.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{where}system задан и полем, и сообщением в messages: "
-                "у системного промпта одно место — выберите его"
-            ),
-        )
-
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
         model=model,
-        messages=messages,
-        system=system,
+        system=text("system"),
         stop=stop or None,
         response_format=response_format,
         extra_body=extra_body,

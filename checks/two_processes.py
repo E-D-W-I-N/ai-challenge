@@ -82,7 +82,7 @@ def _child_long(db: str, folder: str) -> dict:
 
     early = []
     for i in range(3):
-        agent = registry.create(AgentSpec(label=f"A-ранняя-{i}", model="stub/m", messages=[]))
+        agent = registry.create(AgentSpec(label=f"A-ранняя-{i}", model="stub/m"))
         _talk(agent, f"A-РАННЯЯ-{i}")
         early.append(agent.id)
 
@@ -90,7 +90,7 @@ def _child_long(db: str, folder: str) -> dict:
     _wait_for(os.path.join(folder, "gate"))
 
     # Тот самый момент: процесс живёт давно, а база с тех пор ушла вперёд.
-    late = registry.create(AgentSpec(label="A-поздняя", model="stub/m", messages=[]))
+    late = registry.create(AgentSpec(label="A-поздняя", model="stub/m"))
     _talk(late, "A-ПОЗДНЯЯ")
     return {"early": early, "late": late.id}
 
@@ -98,7 +98,7 @@ def _child_long(db: str, folder: str) -> dict:
 def _child_second(db: str) -> dict:
     """Процесс B: стартует позже, заводит одну сессию с секретом и уходит."""
     registry, AgentSpec = _prepare(db)
-    agent = registry.create(AgentSpec(label="B-консоль", model="stub/m", messages=[]))
+    agent = registry.create(AgentSpec(label="B-консоль", model="stub/m"))
     _talk(agent, "СЕКРЕТ_B: пароль от сейфа 1234")
     return {"session": agent.id}
 
@@ -111,7 +111,7 @@ def _child_writer(db: str, folder: str, index: int, count: int) -> dict:
 
     made = []
     for j in range(count):
-        agent = registry.create(AgentSpec(label=f"писатель{index}-{j}", model="stub/m", messages=[]))
+        agent = registry.create(AgentSpec(label=f"писатель{index}-{j}", model="stub/m"))
         _talk(agent, f"СЕКРЕТ-{index}-{j}")
         made.append(agent.id)
     return {"sessions": made}

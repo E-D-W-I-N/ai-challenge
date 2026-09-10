@@ -7,9 +7,8 @@
 Две таблицы, потому что восстанавливать надо сессию целиком, а не только текст:
 
 * `sessions` — id, имя и **конфиг агента одним JSON-полем**: модель, системный
-  промпт, черновик, группа в списке слева, окно памяти и все параметры
-  сэмплирования. Одним полем — чтобы новое поле конфига сохранялось само,
-  а не требовало не забыть про колонку;
+  промпт, окно памяти и все параметры сэмплирования. Одним полем — чтобы новое
+  поле конфига сохранялось само, а не требовало не забыть про колонку;
 * `messages` — реплики, у каждой обязателен `session_id` и порядковый номер
   внутри сессии;
 * `meta` — счётчики, общие на всю базу. Сейчас там один: номер, из которого
@@ -72,7 +71,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
     label       TEXT NOT NULL DEFAULT '',
     config      TEXT NOT NULL DEFAULT '{}',
-    seed        TEXT NOT NULL DEFAULT '[]',
     context_length INTEGER,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
@@ -365,28 +363,26 @@ class Store:
         *,
         label: str,
         config: dict,
-        seed: list[dict],
         created_at: float,
         context_length: int | None = None,
     ) -> None:
         """Заводит сессию или обновляет её конфиг. `created_at` не перетирается.
 
         Конфиг едет одним JSON-полем целиком, поэтому новое поле в `AgentSpec`
-        сохраняется само: имя, системный промпт, группа, черновик, окно памяти
-        и все параметры сэмплирования — это `asdict(spec)`, а не список колонок,
-        который надо не забыть дополнить.
+        сохраняется само: имя, системный промпт, окно памяти и все параметры
+        сэмплирования — это `asdict(spec)`, а не список колонок, который надо
+        не забыть дополнить.
         """
         now = time.time()
         with self.tx() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions
-                    (id, label, config, seed, context_length, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, label, config, context_length, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     label     = excluded.label,
                     config    = excluded.config,
-                    seed      = excluded.seed,
                     context_length = excluded.context_length,
                     updated_at = excluded.updated_at
                 """,
@@ -394,7 +390,6 @@ class Store:
                     session_id,
                     label,
                     _dumps(redact(config)),
-                    _dumps(redact(seed)),
                     context_length,
                     created_at,
                     now,
@@ -412,7 +407,6 @@ class Store:
             "id": row["id"],
             "label": row["label"],
             "config": _loads(row["config"], {}),
-            "seed": _loads(row["seed"], []),
             "context_length": row["context_length"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
