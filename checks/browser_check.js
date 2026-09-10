@@ -1167,9 +1167,10 @@ async function routeChecks() {
     check("у ответа без чисел строки с токенами нет вовсе",
       cards[0].querySelector(".usage-tokens") === null,
       String(cards[0].querySelector(".usage-tokens")));
+    const how = cards[0].querySelector(".usage-how");
     check("но известное про него показано: поставщик",
-      cards[0].querySelector(".usage-how").textContent === "поставщик",
-      String(cards[0].querySelector(".usage-how")));
+      Boolean(how) && how.textContent === "поставщик",
+      how ? how.textContent : "строки «как прошёл вызов» нет вовсе");
     check("у оборванного ответа числа есть: они идут в итог чата",
       Boolean(cards[1].querySelector(".usage-tokens")) &&
         cards[1].querySelector(".usage-tokens").textContent ===
@@ -1268,10 +1269,11 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
-    const how = $("#feed").querySelector(".usage-how").textContent;
+    const el = $("#feed").querySelector(".usage-how");
+    const line = el ? el.textContent : "строки «как прошёл вызов» нет вовсе";
     check("под ответом стоит момент, когда модель заговорила вообще",
-      how === "4.2 ток/с за 2.50 с · первый токен 0.50 с · поставщик", how);
-    check("а не тот, когда она домыслила", !how.includes("2.00 с"), how);
+      line === "4.2 ток/с за 2.50 с · первый токен 0.50 с · поставщик", line);
+    check("а не тот, когда она домыслила", !line.includes("2.00 с"), line);
   }
 
   // ── итог берётся с сервера, а не складывается в браузере ──
