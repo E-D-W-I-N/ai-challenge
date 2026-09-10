@@ -1066,10 +1066,10 @@ async function routeChecks() {
     check("у оборванного ответа строки тоже нет: числа там неполные",
       cards[1].querySelector(".card-usage") === null,
       String(cards[1].querySelector(".card-usage")));
+    const zeros = cards[2].querySelector(".card-usage");
     check("а нулевые числа — это ответ, и он показан нулями, а не прочерком",
-      cards[2].querySelector(".card-usage").textContent ===
-        "вход 0 · выход 0 · всего 0 · $0.000000",
-      String(cards[2].querySelector(".card-usage")));
+      Boolean(zeros) && zeros.textContent === "вход 0 · выход 0 · всего 0 · $0.000000",
+      zeros ? zeros.textContent : "строки нет вовсе");
 
     // Ноль и «неизвестно» на экране разные: это единственное, что отличает
     // «модель ничего не потратила» от «мы не знаем, сколько она потратила».
@@ -1084,6 +1084,39 @@ async function routeChecks() {
     check("формат: k с десятой долей", client.fmt.tokens(12449) === "12.4k", client.fmt.tokens(12449));
     check("формат: сотни тысяч тоже k", client.fmt.tokens(128600) === "128.6k",
       client.fmt.tokens(128600));
+  }
+
+  // ── подпись «Выхода»: рассуждение важнее накопленного ──
+  //
+  // На думающей модели выход без рассуждения необъясним: 40 токенов ответа
+  // при пяти сотнях потраченных. Поэтому, когда reasoning_tokens есть,
+  // подпись занята им, а накопленное видно в соседних плитках.
+  {
+    const think = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "думал",
+        metrics: { prompt_tokens: 100, completion_tokens: 60, total_tokens: 160,
+                   cost_usd: 0.0001, reasoning_tokens: 40 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "думающая", transcript: think, history_len: think.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    const out = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === "Выход");
+    check("«Выход» показывает completion_tokens", out.querySelector(".tile-v").textContent === "60",
+      out.querySelector(".tile-v").textContent);
+    check("а подписью — рассуждение, а не накопленное",
+      out.querySelector(".tile-sub").textContent === "40 рассужд",
+      out.querySelector(".tile-sub").textContent);
+    const total = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === "Всего");
+    check("накопленное по чату при этом видно в соседней плитке",
+      total.querySelector(".tile-sub").textContent === "Σ 160",
+      total.querySelector(".tile-sub").textContent);
   }
 
   // ── у стриминговой карточки строки нет: числа приходят последним кадром ──
