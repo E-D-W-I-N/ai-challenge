@@ -477,7 +477,6 @@ function buildServer(options) {
     label,
     model: state.models[0].id,
     system: "",
-    history_limit: null,
     stop: null,
     response_format: null,
     extra_body: {},
@@ -499,7 +498,7 @@ function buildServer(options) {
   });
 
   const config = (agent) => {
-    const out = { model: agent.model, system: agent.system, history_limit: agent.history_limit,
+    const out = { model: agent.model, system: agent.system,
                   stop: agent.stop, response_format: agent.response_format };
     SAMPLING.forEach((n) => { out[n] = agent[n]; });
     return out;

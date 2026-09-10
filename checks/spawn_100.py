@@ -31,14 +31,13 @@ MODELS = [
 
 
 def configs(n: int = N) -> list[dict]:
-    """Сто разных конфигов: модель, температура, потолок токенов, память, промпт."""
+    """Сто разных конфигов: модель, температура, потолок токенов, промпт."""
     return [
         {
             "label": f"агент-{i:03d}",
             "model": MODELS[i % len(MODELS)],
             "temperature": round(0.1 + (i % 10) / 10, 2),
             "max_tokens": 200 + i,
-            "history_limit": i % 7,
             "system": f"Ты агент номер {i}. Отвечай одной строкой.",
         }
         for i in range(n)
@@ -59,7 +58,6 @@ def main() -> int:
             model=c["model"],
             temperature=c["temperature"],
             max_tokens=c["max_tokens"],
-            history_limit=c["history_limit"],
             system=c["system"],
         )
         for c in configs()
