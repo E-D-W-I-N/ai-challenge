@@ -19,7 +19,7 @@ import os
 import time
 import weakref
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import AsyncIterator
 
 import httpx
@@ -126,29 +126,26 @@ class Metrics:
 
     error: str | None = None
 
+    _ROUND = {
+        "ttft_ms": 1,
+        "first_token_ms": 1,
+        "elapsed_ms": 1,
+        "tokens_per_second": 2,
+        "context_fill_pct": 2,
+    }
+    """Поля, которые округляются по дороге наружу. Остальные едут как есть."""
+
     def as_dict(self) -> dict:
-        return {
-            "ttft_ms": round(self.ttft_ms, 1) if self.ttft_ms is not None else None,
-            "first_token_ms": (
-                round(self.first_token_ms, 1) if self.first_token_ms is not None else None
-            ),
-            "elapsed_ms": round(self.elapsed_ms, 1),
-            "tokens_out": self.tokens_out,
-            "tokens_per_second": round(self.tokens_per_second, 2),
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "cost_usd": self.cost_usd,
-            "finish_reason": self.finish_reason,
-            "model": self.model,
-            "provider": self.provider,
-            "context_length": self.context_length,
-            "context_fill_pct": (
-                round(self.context_fill_pct, 2) if self.context_fill_pct is not None else None
-            ),
-            "error": self.error,
-        }
+        """Все поля метрик, а не перечисленные руками.
+
+        Список руками означал бы, что новое поле появится здесь, а наружу
+        не поедет, — и плитка будет молча показывать прочерк.
+        """
+        data = asdict(self)
+        for name, digits in self._ROUND.items():
+            if data[name] is not None:
+                data[name] = round(data[name], digits)
+        return data
 
 
 @dataclass

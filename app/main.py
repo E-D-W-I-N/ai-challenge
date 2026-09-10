@@ -220,41 +220,57 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
     return values
 
 
+def _text_field(payload: dict, name: str, where: str = "") -> str:
+    """Строка или null. Снятое поле — пустая строка, а не None."""
+    return _optional_field(payload, name, (str,), "строка или null", where) or ""
+
+
+def _stop_field(payload: dict, where: str = "") -> list[str] | None:
+    """Стоп-строки: список строк, пустые не в счёт.
+
+    Поле в панели построчное, и лишний перевод строки не должен превращаться
+    в стоп-строку: пустая строка остановила бы генерацию сразу. Правило одно
+    на создание и на правку — разойдясь, они однажды уже разошлись, и POST
+    сохранял то, что PATCH выбрасывал.
+    """
+    stop = _optional_field(payload, "stop", (list,), "список строк или null", where)
+    if stop is not None and not all(isinstance(x, str) for x in stop):
+        raise HTTPException(status_code=400, detail=f"{where}stop: список строк или null")
+    return [x.strip() for x in (stop or []) if x.strip()] or None
+
+
+def _history_limit_field(payload: dict, where: str = "") -> int | None:
+    limit = _optional_field(payload, "history_limit", (int,), "целое число от нуля или null", where)
+    if limit is not None and limit < 0:
+        raise HTTPException(
+            status_code=400, detail=f"{where}history_limit: целое число от нуля или null"
+        )
+    return limit
+
+
+def _label_field(payload: dict) -> str:
+    label = payload.get("label")
+    if not isinstance(label, str) or not label.strip():
+        raise HTTPException(status_code=400, detail="label: непустая строка")
+    return label.strip()
+
+
 def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
     """Конфиг агента из JSON. Все ошибки — 400 с текстом, а не 500."""
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail=f"{where[:-1] or 'агент'}: должен быть объектом")
 
-    model = _model_field(payload, where)
-    sampling = _sampling_fields(payload, where)
-
-    stop = _optional_field(payload, "stop", (list,), "список строк или null", where)
-    if stop is not None and not all(isinstance(x, str) for x in stop):
-        raise HTTPException(status_code=400, detail=f"{where}stop: список строк или null")
-
-    response_format = _optional_field(payload, "response_format", (dict,), "объект или null", where)
-    extra_body = _optional_field(payload, "extra_body", (dict,), "объект или null", where) or {}
-
-    history_limit = _optional_field(
-        payload, "history_limit", (int,), "целое число от нуля или null", where
-    )
-    if history_limit is not None and history_limit < 0:
-        raise HTTPException(
-            status_code=400, detail=f"{where}history_limit: целое число от нуля или null"
-        )
-
-    def text(name: str) -> str:
-        return _optional_field(payload, name, (str,), "строка или null", where) or ""
-
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
-        model=model,
-        system=text("system"),
-        stop=stop or None,
-        response_format=response_format,
-        extra_body=extra_body,
-        history_limit=history_limit,
-        **sampling,
+        model=_model_field(payload, where),
+        system=_text_field(payload, "system", where),
+        stop=_stop_field(payload, where),
+        response_format=_optional_field(
+            payload, "response_format", (dict,), "объект или null", where
+        ),
+        extra_body=_optional_field(payload, "extra_body", (dict,), "объект или null", where) or {},
+        history_limit=_history_limit_field(payload, where),
+        **_sampling_fields(payload, where),
     )
 
 
@@ -373,29 +389,13 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         agent.spec.model = _model_field(payload)
         agent.context_length = (await _context_lengths()).get(agent.spec.model)
     if "label" in payload:
-        label = payload.get("label")
-        if not isinstance(label, str) or not label.strip():
-            raise HTTPException(status_code=400, detail="label: непустая строка")
-        agent.spec.label = label.strip()
+        agent.spec.label = _label_field(payload)
     if "system" in payload:
-        system = payload.get("system")
-        if system is not None and not isinstance(system, str):
-            raise HTTPException(status_code=400, detail="system: строка или null")
-        agent.spec.system = system or ""
+        agent.spec.system = _text_field(payload, "system")
     if "history_limit" in payload:
-        limit = _optional_field(payload, "history_limit", (int,), "целое число от нуля или null")
-        if limit is not None and limit < 0:
-            raise HTTPException(
-                status_code=400, detail="history_limit: целое число от нуля или null"
-            )
-        agent.spec.history_limit = limit
+        agent.spec.history_limit = _history_limit_field(payload)
     if "stop" in payload:
-        stop = _optional_field(payload, "stop", (list,), "список строк или null")
-        if stop is not None and not all(isinstance(x, str) for x in stop):
-            raise HTTPException(status_code=400, detail="stop: список строк или null")
-        # Пустая строка стоп-строкой не является: поле в панели построчное,
-        # и лишний перевод строки не должен превращаться в параметр.
-        agent.spec.stop = [x.strip() for x in (stop or []) if x.strip()] or None
+        agent.spec.stop = _stop_field(payload)
     if "response_format" in payload:
         agent.spec.response_format = _optional_field(
             payload, "response_format", (dict,), "объект или null"

@@ -28,6 +28,7 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+from app.llm import SAMPLING_FIELDS  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
 
@@ -657,6 +658,68 @@ def check_stop_and_format():
     html = read("app/static/index.html")
     assert 'id="f-stop"' in html and 'id="f-response_format"' in html, "полей нет в панели"
     return "оба параметра задаются, снимаются и не уходят пустыми"
+
+
+@check("создание и правка разбирают конфиг одинаково")
+def check_create_and_patch_agree():
+    """Дефект аудита: POST и PATCH расходились на пустых стоп-строках.
+
+    POST сохранял ["", "  ", "КОНЕЦ"] как есть, PATCH выбрасывал пустые.
+    Пустая стоп-строка не косметика: она остановила бы генерацию сразу,
+    а с provider.require_parameters ещё и сузила бы список провайдеров.
+    Ни одна проверка расхождения не ловила — обе ручки разбирали поля
+    двумя независимыми кусками кода.
+
+    Правильное поведение — то, которое было у PATCH и которого ждёт панель:
+    поле стоп-строк построчное, и лишний перевод строки не параметр.
+    `readStopLines` в клиенте делает ровно это.
+
+    Проверяется не «PATCH чистит», а **согласие двух ручек**: любое поле,
+    заданное при создании и той же правкой, обязано дать один конфиг.
+    """
+    cases = [
+        {"stop": ["", "  ", "КОНЕЦ", " СТОП "]},
+        {"stop": ["", "   "]},
+        {"system": None},
+        {"history_limit": 0},
+        {"response_format": {"type": "json_object"}},
+        {"temperature": 0.0, "top_p": 0, "max_tokens": 7},
+    ]
+    watched = ("stop", "system", "history_limit", "response_format", *SAMPLING_FIELDS)
+    with TestClient(main.app) as client:
+        for case in cases:
+            created = client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", **case}}
+            )
+            assert created.status_code == 200, created.text
+            born = created.json()["agents"][0]
+
+            blank_id = new_agent(client)
+            patched = client.patch(f"/api/agents/{blank_id}", json=case)
+            assert patched.status_code == 200, patched.text
+            grown = patched.json()
+
+            for field in watched:
+                assert born[field] == grown[field], (
+                    f"{case}: поле {field} после создания {born[field]!r}, "
+                    f"после правки {grown[field]!r} — ручки разбирают его по-разному"
+                )
+
+        # Согласие в отказах тоже: кривой тип обе ручки обязаны отвергнуть.
+        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"history_limit": -1}):
+            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
+            grown = client.patch(f"/api/agents/{new_agent(client)}", json=bad)
+            assert born.status_code == 400 and grown.status_code == 400, (
+                bad, born.status_code, grown.status_code
+            )
+
+    # И то, ради чего чистка нужна: пустая стоп-строка не уезжает в модель.
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, stop=["", "  ", "КОНЕЦ"])
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
+        assert _stub.CALLS[-1]["payload"]["stop"] == ["КОНЕЦ"], _stub.CALLS[-1]["payload"]
+    return f"{len(cases)} конфигов и 3 отказа: создание и правка сходятся"
 
 
 @check("панель правит живого агента: модель, промпт, окно памяти")

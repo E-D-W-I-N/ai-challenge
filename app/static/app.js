@@ -67,10 +67,12 @@ function icon(name) {
   return svg;
 }
 
-function iconButton(name, title, onClick) {
+// Кнопка с иконкой. `className` разводит два размера: крупные кнопки шапок
+// и мелкие в строке списка.
+function iconButton(name, title, onClick, className = "icon-btn") {
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "icon-btn";
+  btn.className = className;
   btn.title = title;
   btn.setAttribute("aria-label", title);
   btn.appendChild(icon(name));
@@ -300,22 +302,13 @@ function listItem(agent) {
   const actions = document.createElement("div");
   actions.className = "item-actions";
   actions.append(
-    miniButton("pencil", "Переименовать", (ev) => { ev.stopPropagation(); startRename(row, agent); }),
-    miniButton("trash", "Удалить чат", (ev) => { ev.stopPropagation(); askDelete(agent); }, true)
+    iconButton("pencil", "Переименовать",
+      (ev) => { ev.stopPropagation(); startRename(row, agent); }, "mini"),
+    iconButton("trash", "Удалить чат",
+      (ev) => { ev.stopPropagation(); askDelete(agent); }, "mini danger")
   );
   row.appendChild(actions);
   return row;
-}
-
-function miniButton(name, title, onClick, danger) {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "mini" + (danger ? " danger" : "");
-  btn.title = title;
-  btn.setAttribute("aria-label", title);
-  btn.appendChild(icon(name));
-  btn.onclick = onClick;
-  return btn;
 }
 
 // Переименование прямо в списке: Enter сохраняет, Escape отменяет,
@@ -453,10 +446,9 @@ function userBubble(text) {
   return el;
 }
 
-function answerCard(agent, turn) {
-  const card = document.createElement("article");
-  card.className = "card" + (turn.error ? " failed" : "");
-
+// Шапка карточки ответа: иконка, имя модели и, если она известна, метка
+// провайдера. Одна на готовый ответ и на карточку, в которую ещё стримят.
+function cardHead(modelName, provider) {
   const head = document.createElement("header");
   head.className = "card-head";
   const ico = document.createElement("span");
@@ -464,15 +456,24 @@ function answerCard(agent, turn) {
   ico.appendChild(icon("bot"));
   const name = document.createElement("span");
   name.className = "card-model";
-  name.textContent = (turn.metrics && turn.metrics.model) || agent.model;
+  name.textContent = modelName;
   head.append(ico, name);
-
-  if (turn.metrics && turn.metrics.provider) {
+  if (provider) {
     const tag = document.createElement("span");
     tag.className = "card-tag";
-    tag.textContent = turn.metrics.provider;
+    tag.textContent = provider;
     head.appendChild(tag);
   }
+  return head;
+}
+
+function answerCard(agent, turn) {
+  const card = document.createElement("article");
+  card.className = "card" + (turn.error ? " failed" : "");
+  const head = cardHead(
+    (turn.metrics && turn.metrics.model) || agent.model,
+    turn.metrics && turn.metrics.provider
+  );
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
@@ -670,15 +671,7 @@ async function exchange(path, body, questionText) {
 
   const card = document.createElement("article");
   card.className = "card busy";
-  const head = document.createElement("header");
-  head.className = "card-head";
-  const ico = document.createElement("span");
-  ico.className = "card-icon";
-  ico.appendChild(icon("bot"));
-  const name = document.createElement("span");
-  name.className = "card-model";
-  name.textContent = agent.model;
-  head.append(ico, name);
+  const head = cardHead(agent.model);
   const bodyEl = document.createElement("div");
   bodyEl.className = "card-body md";
   card.append(head, bodyEl);

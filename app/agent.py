@@ -16,7 +16,7 @@ import contextlib
 import copy
 import itertools
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
@@ -84,14 +84,8 @@ class Turn:
         return {"role": self.role, "content": self.content}
 
     def as_dict(self) -> dict:
-        return {
-            "role": self.role,
-            "content": self.content,
-            "error": self.error,
-            "reasoning": self.reasoning,
-            "metrics": self.metrics,
-            "at": self.at,
-        }
+        """Реплика для стенограммы — все поля, а не перечисленные руками."""
+        return asdict(self)
 
 
 @dataclass
