@@ -7,19 +7,15 @@
 Значит, одновременные писатели — штатный режим, а не экзотика, и проверять его
 надо процессами, которые **живут одновременно**, а не по очереди.
 
-Проверка состоит из двух частей.
+Две части:
 
-1. **Долгий процесс и второй рядом** — ровно то, что нашёл ревьюер. Процесс A
-   поднимается на пустой базе, заводит три сессии и остаётся жить. Процесс B
-   стартует, видит в базе максимум `ag_00003` и занимает `ag_00004`, пишет туда
-   секрет и уходит. После этого A заводит **ещё одного** агента — со счётчиком
-   в памяти процесса он выдал бы `ag_00004` второй раз, и первая же запись
+1. **Долгий процесс и второй рядом.** A заводит три чата и остаётся жить,
+   B занимает `ag_00004` и уходит, после чего A заводит ещё одного — со
+   счётчиком в памяти он выдал бы `ag_00004` второй раз, и первая же запись
    истории (`DELETE FROM messages WHERE session_id = ?`) стёрла бы диалог B.
 
-2. **Четыре писателя одновременно.** Процессы стартуют, докладывают о
-   готовности и ждут общего сигнала, чтобы писать действительно вперехлёст.
-   Каждый заводит по пять сессий со своим секретом; в базе должны оказаться
-   все двадцать, ни одной потерянной и ни одного общего id.
+2. **Четыре писателя одновременно**, по общему сигналу: в базе должны
+   оказаться все двадцать чатов, ни одного потерянного и ни одного общего id.
 
 Живых вызовов к модели нет: стрим подменён заглушкой в каждом процессе.
 """
@@ -38,11 +34,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 GATE_TIMEOUT = 30.0
-"""Сколько ребёнок ждёт общего сигнала, прежде чем сдаться.
-
-Проверка не должна висеть вечно, если родитель умер: лучше упасть с внятным
-текстом, чем оставить процесс в фоне.
-"""
+"""Сколько ребёнок ждёт общего сигнала: лучше упасть с внятным текстом,
+чем висеть вечно, если родитель умер."""
 
 
 def _wait_for(path: str) -> None:
@@ -82,7 +75,7 @@ def _child_long(db: str, folder: str) -> dict:
 
     early = []
     for i in range(3):
-        agent = registry.create(AgentSpec(label=f"A-ранняя-{i}", model="stub/m", messages=[]))
+        agent = registry.create(AgentSpec(label=f"A-ранняя-{i}", model="stub/m"))
         _talk(agent, f"A-РАННЯЯ-{i}")
         early.append(agent.id)
 
@@ -90,7 +83,7 @@ def _child_long(db: str, folder: str) -> dict:
     _wait_for(os.path.join(folder, "gate"))
 
     # Тот самый момент: процесс живёт давно, а база с тех пор ушла вперёд.
-    late = registry.create(AgentSpec(label="A-поздняя", model="stub/m", messages=[]))
+    late = registry.create(AgentSpec(label="A-поздняя", model="stub/m"))
     _talk(late, "A-ПОЗДНЯЯ")
     return {"early": early, "late": late.id}
 
@@ -98,7 +91,7 @@ def _child_long(db: str, folder: str) -> dict:
 def _child_second(db: str) -> dict:
     """Процесс B: стартует позже, заводит одну сессию с секретом и уходит."""
     registry, AgentSpec = _prepare(db)
-    agent = registry.create(AgentSpec(label="B-консоль", model="stub/m", messages=[]))
+    agent = registry.create(AgentSpec(label="B-консоль", model="stub/m"))
     _talk(agent, "СЕКРЕТ_B: пароль от сейфа 1234")
     return {"session": agent.id}
 
@@ -111,7 +104,7 @@ def _child_writer(db: str, folder: str, index: int, count: int) -> dict:
 
     made = []
     for j in range(count):
-        agent = registry.create(AgentSpec(label=f"писатель{index}-{j}", model="stub/m", messages=[]))
+        agent = registry.create(AgentSpec(label=f"писатель{index}-{j}", model="stub/m"))
         _talk(agent, f"СЕКРЕТ-{index}-{j}")
         made.append(agent.id)
     return {"sessions": made}

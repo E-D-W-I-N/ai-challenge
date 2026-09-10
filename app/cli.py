@@ -1,14 +1,8 @@
 """Разговор с агентом из консоли — без браузера и без запущенного сервера.
 
-Это самое короткое доказательство главных требований дня: агент самостоятелен,
-веб-слой ему не нужен, и его память переживает перезапуск. Тот же класс `Agent`,
-тот же `stream_completion`, та же история — просто вывод идёт в терминал.
-
-    .venv/bin/python -m app.cli
-    .venv/bin/python -m app.cli --model openai/gpt-4o-mini --history-limit 0
-    echo "привет" | .venv/bin/python -m app.cli --once
-
-Демонстрация памяти между запусками — два запуска подряд, разные процессы:
+Самое короткое доказательство требований дня: агент самостоятелен, веб-слой
+ему не нужен, память переживает перезапуск. Демонстрация — два запуска подряд,
+разными процессами:
 
     .venv/bin/python -m app.cli                       # представьтесь, запомните id
     .venv/bin/python -m app.cli --session ag_00001    # спросите, как вас зовут
@@ -67,11 +61,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_agent(args: argparse.Namespace) -> Agent:
-    """Агент по аргументам командной строки. Он же кладётся в реестр процесса.
+    """Агент по аргументам командной строки. Он же кладётся в реестр.
 
-    С `--session` агент не создаётся, а поднимается из базы: конфиг и история
-    приезжают оттуда, аргументы командной строки к нему уже не применяются —
-    иначе продолжение разговора молча сменило бы модель на дефолтную.
+    С `--session` он не создаётся, а поднимается из базы, и аргументы к нему
+    не применяются: иначе продолжение молча сменило бы модель на дефолтную.
     """
     if args.session:
         agent = REGISTRY.load(args.session)
@@ -85,7 +78,6 @@ def build_agent(args: argparse.Namespace) -> Agent:
     spec = AgentSpec(
         label=args.label,
         model=args.model,
-        messages=[],
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         system=args.system,
@@ -134,8 +126,8 @@ def _print_sessions(out=sys.stdout) -> None:
     if not sessions:
         out.write("[сохранённых сессий нет]\n")
         return
-    # В консоль печатаем хвост, но говорим и общее число: молча показать
-    # тридцать из двухсот значит соврать про то, что сохранилось.
+    # Печатаем хвост, но говорим и общее число: молча показать тридцать
+    # из двухсот значит соврать про то, что сохранилось.
     shown = sessions[:SESSIONS_SHOWN]
     tail = f", показаны последние {len(shown)}" if len(sessions) > len(shown) else ""
     out.write(f"сохранённых сессий: {len(sessions)}{tail} · база {store.db_path()}\n")

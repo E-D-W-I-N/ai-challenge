@@ -57,7 +57,6 @@ def main() -> int:
         AgentSpec(
             label=c["label"],
             model=c["model"],
-            messages=[],
             temperature=c["temperature"],
             max_tokens=c["max_tokens"],
             history_limit=c["history_limit"],

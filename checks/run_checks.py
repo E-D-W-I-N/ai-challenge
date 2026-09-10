@@ -2,8 +2,8 @@
 
     .venv/bin/python checks/run_checks.py
 
-Главный критерий дня вынесен в отдельный скрипт (`checks/spawn_100.py`) и
-запускается отсюда же первым пунктом.
+Отдельные скрипты (`spawn_100.py`, `restart.py`, `two_processes.py`)
+запускаются отсюда же.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,11 +30,19 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+from app.llm import SAMPLING_FIELDS  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
-from app.store import Store  # noqa: E402
+from app.store import Store, StoreBusyError  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
+
+CHECKS: list = []
+"""Проверки в порядке объявления. Наполняет декоратор `check`.
+
+Списка руками нет намеренно: он дублировал объявления, и забыть в нём
+строчку значило тихо не запустить проверку.
+"""
 
 
 def check(name):
@@ -50,6 +59,7 @@ def check(name):
                 RESULTS.append((name, False, f"{type(exc).__name__}: {exc}"))
 
         run.__name__ = fn.__name__
+        CHECKS.append(run)
         return run
 
     return wrap
@@ -108,22 +118,70 @@ def check_flat_list():
         assert client.delete(f"/api/agents/{agent['id']}").status_code == 200
         assert client.get("/api/agents").json()["agents"] == []
 
-    js = read("app/static/app.js")
-    for gone in ("list-group", "state.groups", "agent.note", "agent.draft"):
-        assert gone not in js, f"в клиенте осталась механика заготовок: {gone}"
-    assert "list-group" not in read("app/static/style.css"), "в стилях остался .list-group"
     return "на старте пусто, заведённый чат ничем не особенный"
+
+
+@check("список чатов идёт в порядке создания, новый — последним")
+def check_list_order():
+    """Порядок списка слева не стерёг никто.
+
+    Развернул сортировку `catalogue()` наоборот — все проверки остались
+    зелёными, хотя список слева перевернулся бы целиком. Порядок здесь
+    видимое поведение: чаты нумеруются возрастающе, и «Новый чат 7» выше
+    «Новый чат 3» — это не тот список, который завёл пользователь.
+
+    Отдельно про день памяти: порядок обязан пережить перезапуск, а список
+    строится по базе, где строки лежат свежими сверху. Значит сортировка
+    в `catalogue()` — не украшение, а единственное, что держит порядок.
+    """
+    with TestClient(main.app) as client:
+        made = [client.post("/api/agents", json={}).json()["agents"][0] for _ in range(4)]
+        listed = client.get("/api/agents").json()["agents"]
+        assert [a["id"] for a in listed] == [a["id"] for a in made], (
+            [a["label"] for a in listed], [a["label"] for a in made]
+        )
+
+        # Удаление из середины порядок остальных не трогает.
+        client.delete(f"/api/agents/{made[1]['id']}")
+        after = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert after == [made[0]["id"], made[2]["id"], made[3]["id"]], after
+
+        # Разговор в старом чате не поднимает его наверх: список не по свежести.
+        _stub.install(reply="ок")
+        client.post(f"/api/agents/{made[0]['id']}/messages", json={"text": "?"})
+        talked = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert talked == after, talked
+
+        # А новый встаёт последним.
+        fresh = client.post("/api/agents", json={}).json()["agents"][0]
+        tail = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert tail[-1] == fresh["id"], tail
+
+    # И тот же порядок после настоящего переоткрытия файла базы.
+    path = _temp_db("order")
+    store = Store(path).init()
+    saved_registry = main.REGISTRY
+    try:
+        _restart(store)
+        with TestClient(main.app) as client:
+            born = [client.post("/api/agents", json={}).json()["agents"][0]["id"] for _ in range(4)]
+            client.post(f"/api/agents/{born[0]}/messages", json={"text": "?"})
+        store.close()
+        again = Store(path).init()
+        _restart(again)
+        revived = [a["id"] for a in main._listing()["agents"]]
+    finally:
+        main.REGISTRY = saved_registry
+        again.close()
+    assert revived == born, (revived, born)
+    return "порядок создания держится при удалении, разговоре и переоткрытии файла"
 
 
 @check("у свежего чата нет системного промпта, и в теле его нет вовсе")
 def check_new_chat_is_blank():
-    """Стенд ничего не решает за пользователя — промпт тоже.
-
-    Проверяется не только поле в ответе ручки, но и то, что ушло в модель:
-    пустой `system` обязан пропасть из промпта целиком. Пустая строка в роли
-    `system` — это не «промпта нет», это заданный пустой промпт, и модель
-    получила бы лишнее сообщение ни о чём.
-    """
+    """Смотрим не на поле в ответе ручки, а на то, что ушло в модель: пустой
+    `system` обязан пропасть из промпта целиком. Пустая строка в роли `system` —
+    это не «промпта нет», это заданный пустой промпт."""
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         fresh = client.post("/api/agents", json={}).json()["agents"][0]
@@ -148,66 +206,259 @@ def check_new_chat_is_blank():
     return "свежий чат пуст, промпт появляется только заданный руками"
 
 
-@check("заготовок дней 1–5 не осталось нигде")
-def check_no_presets():
-    """Заготовки появились ради вопроса «как открыть агентов прошлых дней».
+# --- выпиленное осталось выпиленным ------------------------------------------
 
-    Ответ оказался дороже вопроса: ради двадцати одного чата в ветке жил
-    целый слой. Теперь их заводят руками, а слоя быть не должно — ни кода,
-    ни файла с описаниями, ни проверок, которые его стерегли.
-    """
-    assert not os.path.exists(os.path.join(ROOT, "day.py")), "day.py жив"
-    assert not os.path.exists(os.path.join(ROOT, "checks", "_daysrc.py")), "_daysrc.py жив"
+# Слово и чем оно было. Одна таблица вместо пяти проверок, делавших одно
+# и то же: обход файлов в поисках слов удалённой механики.
+#
+# Скоупа у правила нет намеренно. Он и был источником бед: в Дне 6 слияние
+# шести проверок в таблицу потеряло три правила ровно тем, что сузило скоуп,
+# и потеря прошла зелёной. Поэтому правило смотрит **во все файлы под
+# контролем версий**, а сузить его можно только записью в ONLY — с областью
+# и причиной. Забытая запись делает правило шире, а не уже.
+#
+# Списка расширений здесь тоже нет: он был и сужался молча. Двоичные читаются
+# байтами и декодируются с заменой — пропустить файл из-за кодировки значит
+# сузить обход. Поиск регистронезависимый: «прогон» и «судья» жили в клиенте
+# текстом для пользователя, а он пишется с большой буквы.
 
-    tracked = subprocess.run(
+# Единственный файл, которому запретные слова положены: он их и запрещает.
+SELF = "checks/run_checks.py"
+
+# Сузить правило можно только здесь, областью-префиксом пути и причиной.
+# Сужение обязано быть оправданным: слово должно законно встречаться
+# за пределами области — иначе это выключенное правило, ждущее, когда слово
+# вернётся, и проверка это скажет.
+#
+# «children» вне реестра — свойство DOM-узла. «карандаш» вне разметки —
+# обычное слово, которым README и проверки описывают кнопку. «колонк» вне
+# клиента — колонка таблицы SQLite, и в Дне 7 это её основное значение:
+# в `app/store.py` и README она встречается по делу.
+ONLY = {
+    "children": ("app/registry.py", "вне реестра это свойство DOM-узла"),
+    "карандаш": ("app/static/index.html", "вне разметки это обычное слово"),
+    "колонк": ("app/static/", "вне клиента это колонка таблицы SQLite"),
+}
+
+# Растяжка: сужения заморожены вместе с областями. Это не доказательство —
+# проверку, которая стережёт саму себя, написать нельзя, — а требование
+# сделать ослабление явным: тронуть придётся и эту строку, а она затем
+# и стоит, чтобы в дифф попало «я ослабляю проверку».
+NARROWED = (
+    ("children", "app/registry.py"),
+    ("колонк", "app/static/"),
+    ("карандаш", "app/static/index.html"),
+)
+
+GONE = [
+    # заготовки дней 1–5: файл описаний, поднятие на старте, черновик
+    *[(f"День {n}", "заготовки дней 1–5") for n in range(1, 6)],
+    ("PRESET_CHATS", "заготовки дней 1–5"),
+    ("bootstrap_chats", "заготовки дней 1–5"),
+    ("draft", "черновик с подставленным вопросом"),
+    # сценарии: прогон, судья, зависимости, серии
+    ("Scenario", "сценарии"),
+    ("judge", "модель-судья"),
+    ("depends_on", "зависимости сценариев"),
+    ("repeats", "серии прогонов"),
+    ("прогон", "сценарии"),
+    ("судья", "модель-судья"),
+    ("колонк", "витрина сценариев"),
+    # родительские связи жили ради субагентов прогона
+    ("parent_id", "каскад субагентов"),
+    ("kill_children", "каскад субагентов"),
+    ("children", "каскад субагентов"),
+    # витрина: группы, пояснения, кнопка очистки, автоимя
+    ("list-group", "группы чатов"),
+    ("state.groups", "группы чатов"),
+    ("note", "пояснения из описаний сценариев"),
+    ("Очистить все", "кнопка «Очистить все чаты»"),
+    ("clear-all", "кнопка «Очистить все чаты»"),
+    ("clearAll", "кнопка «Очистить все чаты»"),
+    ("/api/agents/reset", "ручка очистки"),
+    ("maybeAutoName", "автоимя по первому сообщению"),
+    ("chatTitle", "автоимя по первому сообщению"),
+    ("autoname", "автоимя по первому сообщению"),
+    ("карандаш", "подпись, объясняющая интерфейс сам себе"),
+    # заготовка диалога: поле конфига и колонка базы, снятые этой веткой
+    ("seed_messages", "заготовка диалога"),
+    ("starting_prompt", "заготовка диалога"),
+]
+
+# Имя клиента-референса: он был инструментом разработки, а не частью продукта,
+# и не должен встречаться нигде — ни в коде, ни в именах файлов, ни в двоичных.
+REFERENCE_NAME = "o" + "mlx"
+
+# Файлы, которых не должно быть вовсе.
+GONE_FILES = ("day.py", "checks/_daysrc.py", "app/commands.py")
+
+
+def _tracked() -> list[str]:
+    names = subprocess.run(
         ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
     ).stdout.split()
-    # .md здесь наравне с кодом: README описывает устройство стенда, и
-    # заготовки, оставшиеся в описании, — такой же след, как в коде.
-    code = [
-        name
-        for name in tracked
-        if name.endswith((".py", ".js", ".html", ".css", ".md"))
-        and os.path.isfile(os.path.join(ROOT, name))
-    ]
-    # Слова собраны из кусков намеренно: иначе сама проверка стала бы
-    # последним местом, где упоминание осталось.
-    words = [f"День {n}" for n in range(1, 6)] + ["PRESET" + "_CHATS", "bootstrap" + "_chats"]
+    return [n for n in names if os.path.isfile(os.path.join(ROOT, n))]
+
+
+def _read_any(name: str) -> str:
+    """Содержимое файла. Двоичное — с заменой: пропускать файл нельзя."""
+    with open(os.path.join(ROOT, name), "rb") as handle:
+        return handle.read().decode("utf-8", "replace")
+
+
+def _files_for(word: str, tracked: list[str]) -> list[str]:
+    """Где действует правило: всё под контролем версий, кроме самой проверки.
+
+    Или файлы под областью из ONLY, если правило сужено.
+    """
+    scope, _ = ONLY.get(word.lower(), (None, ""))
+    files = [n for n in tracked if n != SELF and (scope is None or n.startswith(scope))]
+    assert files, f"правилу «{word}» не осталось ни одного файла"
+    return files
+
+
+def _found(word: str, body: str) -> bool:
+    """Регистр не спасает: слово есть, как бы его ни написали."""
+    return word.lower() in body.lower()
+
+
+@check("выпиленное осталось выпиленным: ни слова в исходниках")
+def check_nothing_left_behind():
+    """Одна проверка вместо пяти, обходивших файлы в поисках одних и тех же слов.
+
+    Печатает **все** совпадения разом, а не первое: раньше пять проверок
+    падали по одной с понятным именем, и от слияния диагностика не должна
+    стать хуже.
+
+    Перед обходом — самопроверка. Потерянное правило молчит ровно так же,
+    как соблюдённое, поэтому зелёный прогон о потере не говорит ничего:
+    каждое правило обязано доказать, что вообще способно сработать, а каждая
+    оговорка — что она рабочая, а не прикрывает настоящий след.
+
+    Ручки выпиленных механик проверяются отдельно — тем, что они отвечают
+    404, а не тем, что слова нет в исходнике.
+    """
+    tracked = _tracked()
+    body_of = {n: _read_any(n) for n in tracked}
+
+    assert SELF in tracked, f"{SELF} не под контролем версий — поблажка про себя не сработает"
+    words = {w.lower() for w, _ in GONE}
+    assert len(words) == len(GONE), "в таблице повторяются слова"
+
+    # 0. Обход покрывает всё, что под контролем версий. Считать слепые файлы
+    #    от того же списка, который вернул `_tracked()`, мало: так видны
+    #    сужения ниже него, но не он сам. Поэтому сверяемся со свежим
+    #    `git ls-files`, взятым здесь и мимо всех помощников.
+    listed = subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
+    ).stdout.split()
+    assert listed, "git ls-files не вернул ничего — сверять обход не с чем"
+    on_disk = [n for n in listed if os.path.isfile(os.path.join(ROOT, n))]
+    dropped = sorted(set(on_disk) - set(tracked))
+    assert not dropped, (
+        f"из обхода выпали файлы под контролем версий: {', '.join(dropped)} — "
+        "список подрезан в самом `_tracked()`"
+    )
+
+    wide = [w for w, _ in GONE if w.lower() not in ONLY]
+    assert wide, "сужены все правила до одного — обходить стало нечего"
+    for word in wide:
+        seen = set(_files_for(word, tracked))
+        blind = [n for n in tracked if n != SELF and n not in seen]
+        assert not blind, (
+            f"правило «{word}» не смотрит в {', '.join(sorted(blind))} — "
+            "обход сузился; несуженное правило обязано видеть всё под контролем версий"
+        )
+
+    # 1. Правило срабатывает на своём же слове, в любом регистре.
+    for word, what in GONE:
+        _files_for(word, tracked)
+        for probe in (word, word.upper(), word.lower(), f"// хвост {word.title()} хвост"):
+            assert _found(word, probe), (
+                f"правило «{word}» ({what}) не сработало бы даже на {probe!r} — "
+                "оно ничего не стережёт"
+            )
+    assert _found(REFERENCE_NAME, REFERENCE_NAME.upper()), "правило про референс не сработает"
+
+    # 2. Сужений ровно столько, сколько заявлено, и все они про живые правила.
+    narrowed_now = tuple(sorted((w, scope) for w, (scope, _) in ONLY.items()))
+    assert narrowed_now == tuple(sorted(NARROWED)), (
+        f"сужения изменились: было {sorted(NARROWED)}, стало {list(narrowed_now)}. "
+        "Сужение правила ослабляет проверку — если это осознанно, поправьте NARROWED"
+    )
+    stale = [w for w in ONLY if w not in words]
+    assert not stale, f"скоуп есть, а правила нет: {', '.join(stale)}"
+
+    # 3. Каждое сужение оправдано. Область нужна затем, что слово законно
+    #    встречается ЗА её пределами; если не встречается — сужение
+    #    бессмысленно, и это выключенное правило, ждущее, когда слово вернётся.
+    pointless = []
+    for word, (scope, why) in ONLY.items():
+        inside = [n for n in tracked if n.startswith(scope)]
+        assert inside, f"область «{word}» не покрывает ни одного файла: {scope}"
+        outside = [
+            n for n in tracked
+            if n != SELF and not n.startswith(scope) and _found(word, body_of[n])
+        ]
+        if not outside:
+            pointless.append(f"«{word}» ({why}) за пределами {scope} не встречается")
+    assert not pointless, (
+        "сужение ничем не оправдано, снимите его — иначе оно молча прикроет "
+        "настоящий след:\n  " + "\n  ".join(pointless)
+    )
+
+    # 4. Сам обход.
     hits = []
-    for name in code:
-        body = open(os.path.join(ROOT, name), encoding="utf-8").read()
-        for word in words:
-            if word in body:
-                hits.append(f"{name}: {word}")
-    assert not hits, "упоминания заготовок остались — " + "; ".join(hits)
-    assert "draft" not in read("app/schema.py"), "черновик остался в конфиге"
-    return f"проверено {len(code)} файлов с кодом, упоминаний нет"
+    for word, what in GONE:
+        for name in _files_for(word, tracked):
+            if _found(word, body_of[name]):
+                hits.append(f"{name}: «{word}» ({what})")
+
+    # Референс — по всем файлам разом, включая имена, двоичные и сам файл
+    # проверки: имя собрано из кусков и буквально в нём не встречается.
+    for name in tracked:
+        if REFERENCE_NAME in name.lower():
+            hits.append(f"{name}: имя референса в имени файла")
+        elif _found(REFERENCE_NAME, body_of[name]):
+            hits.append(f"{name}: имя референса в содержимом")
+
+    for path in GONE_FILES:
+        assert not os.path.exists(os.path.join(ROOT, path)), f"{path} жив"
+
+    assert not hits, f"осталось {len(hits)} упоминаний:\n  " + "\n  ".join(hits)
+    return (
+        f"{len(GONE) + 1} правил по {len(tracked)} файлам под контролем версий, "
+        f"регистр не спасает, сужено {len(ONLY)} — ни одного совпадения"
+    )
 
 
-@check("сценарии выпилены: ни ручек, ни кода, ни следов в клиенте")
-def check_scenarios_gone():
+@check("ручек выпиленных механик нет, и мёртвых полей наружу тоже")
+def check_removed_endpoints():
+    """Поведенческая половина: ручки отвечают 404, а поля не торчат наружу."""
     with TestClient(main.app) as client:
         for path in ("/api/scenarios", "/api/run/0"):
             assert client.get(path).status_code == 404, path
         assert client.post("/api/scenarios/0/agents").status_code == 404
+        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
+        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
 
-    assert not os.path.exists(os.path.join(ROOT, "app", "commands.py")), "app/commands.py жив"
-    server = read("app/main.py") + read("app/agent.py") + read("app/schema.py")
-    for word in ("Scenario", "judge", "depends_on", "repeats", "прогон"):
-        assert word not in server, f"в серверном коде остался {word}"
-
-    # Родительские связи жили ради субагентов прогона. Спавнить детей больше
-    # некому, и держать каскад, достижимый только из проверок, незачем.
-    registry = read("app/registry.py")
-    for word in ("parent_id", "kill_children", "children"):
-        assert word not in registry, f"в реестре остался {word} — его никто не выставляет"
-    with TestClient(main.app) as client:
         agent = client.post("/api/agents", json={}).json()["agents"][0]
-        assert "parent_id" not in agent, "наружу отдаётся мёртвое поле parent_id"
-    client_src = (read("app/static/app.js") + read("app/static/index.html")).lower()
-    for word in ("scenario", "прогон", "судья", "колонк"):
-        assert word not in client_src, f"в клиенте остался {word}"
-    return "ручки отдают 404, слов Scenario/judge/depends_on/repeats в коде нет"
+        for gone in ("parent_id", "group", "note", "origin", "draft", "children", "seed"):
+            assert gone not in agent, f"наружу торчит мёртвое поле {gone}"
+
+        # Каскад субагентов — ещё и поведением, не только словом в исходнике:
+        # греп по `children` сужен до реестра, и упоминание в комментарии
+        # ловит, а поле, выставленное из кода, — нет.
+        for owner, name in ((REGISTRY, "реестр"), (REGISTRY.require(agent["id"]), "агент")):
+            for attr in ("children", "parent", "parent_id", "kill_children", "seed_messages"):
+                assert not hasattr(owner, attr), f"у {name} снова есть {attr}"
+
+        listing = client.get("/api/agents").json()
+        assert "groups" not in listing, "групп в ответе быть не должно"
+        body = client.get("/api/agents").text
+        for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
+            assert leftover not in body, f"наружу уехало пояснение: {leftover}"
+    return "четыре ручки отдают 404/405, мёртвых полей в ответах нет"
 
 
 # --- 4. агент: память, окно, откат, 409, обрыв --------------------------------
@@ -419,11 +670,8 @@ PANEL_FIELDS = {
 
 @check("правка в панели применяется к следующему сообщению, а не к следующему чату")
 def check_panel_applies_next_message():
-    """Жалоба заказчика: сменил системный промпт — уезжает старый.
-
-    Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
-    и каждое поле панели, и окно памяти.
-    """
+    """Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
+    и каждое поле панели, и окно памяти."""
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         agent_id = new_agent(client, model="старая/модель", system="СТАРЫЙ ПРОМПТ")
@@ -455,16 +703,9 @@ def check_panel_applies_next_message():
 
 @check("правка панели во время генерации не теряется")
 def check_patch_during_generation():
-    """Находка ревью: PATCH на занятом агенте отдавал 409 и правка пропадала.
-
-    Повторить её было нечем — единственный триггер применения уже отработал,
-    и следующее сообщение уезжало со старым промптом при новом тексте
-    в панели. Ровно та жалоба, с которой начинался девятый пункт.
-
-    Запрет был не нужен: `stream_completion` собирает тело запроса и метрики
-    синхронно, до первого await, поэтому правка конфига текущий ответ
-    и не могла бы исказить.
-    """
+    """Запрет был не нужен: обмен снимает слепок конфига в начале, поэтому
+    правка панели текущий ответ исказить не может. А стоил дорого: 409 приходил
+    ровно тогда, когда правку и хочется внести, и терялся навсегда."""
 
     async def scenario():
         from httpx import ASGITransport, AsyncClient
@@ -510,16 +751,14 @@ def check_patch_during_generation():
     ], following[0]["messages"]
     assert following[0]["payload"]["temperature"] == 0.9, following[0]["payload"]
 
-    # Клиент, кроме того, не отправит сообщение, пока правка не доехала.
-    js = read("app/static/app.js")
-    assert "panelDirty" in js, "клиент не помнит о недоехавшей правке"
-    assert "сообщение не отправлено" in js, "клиент отправляет при непринятой правке"
+    # Клиентская половина — в `checks/browser_check.js`: там правка панели
+    # доезжает до тела запроса **исполнением**, а не строкой в исходнике.
     return "PATCH во время генерации принят, текущий ответ цел, следующий — новый"
 
 
 @check("обмен идёт целиком на одном конфиге: смешанного запроса не бывает")
 def check_config_snapshot():
-    """Находка ревью: конфиг читается в двух точках, а не в одной.
+    """Конфиг читается в двух точках, а не в одной.
 
     Промпт собирает `build_prompt`, тело — `build_payload`, и между ними
     стоит `yield` события `start`. Правка, попавшая туда, дала бы смешанный
@@ -581,64 +820,102 @@ def check_config_snapshot():
     return "правка в окне между промптом и телом не смешала конфиги"
 
 
-@check("системный промпт живёт в одном месте и не фиксируется при создании")
+@check("системный промпт не фиксируется при создании: в модель едет нынешний")
 def check_system_prompt_single_home():
-    """Корень той же жалобы: промпт мог приехать внутри `messages`.
+    """Корень жалобы «сменил промпт — уезжает старый».
 
-    Тогда панель правила бы `spec.system`, а в модель уезжала бы копия
-    из заготовки, снятая в момент создания агента. Теперь системные
-    сообщения переезжают в `spec.system` сразу, и дом у промпта один.
+    Раньше промпт мог приехать двумя путями: полем `system` и системным
+    сообщением внутри `messages`. Второй дом фиксировал текст в момент
+    создания агента: панель правила `spec.system`, а в модель уезжала копия
+    из заготовки. Дома теперь физически один — поля `messages` у конфига
+    больше нет, — и нарушить это нечем.
+
+    Но само поведение, ради которого дом делали одним, проверять надо
+    по-прежнему: промпт читается из конфига **на каждом обращении**,
+    а не запоминается при создании. И переживает перезапуск: после
+    переоткрытия файла в модель обязан ехать тот же текст.
     """
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
-        agent_id = new_agent(
-            client,
-            messages=[
-                {"role": "system", "content": "ИЗ ЗАГОТОВКИ"},
-                {"role": "user", "content": "первый вопрос"},
-            ],
-        )
-        full = client.get(f"/api/agents/{agent_id}").json()
-        assert full["system"] == "ИЗ ЗАГОТОВКИ", full["system"]
+        agent_id = new_agent(client, system="ИСХОДНЫЙ")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+        assert _stub.CALLS[-1]["messages"][0] == {"role": "system", "content": "ИСХОДНЫЙ"}
 
         client.patch(f"/api/agents/{agent_id}", json={"system": "ПРАВЛЕНЫЙ"})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+        sent = _stub.CALLS[-1]["messages"]
+        systems = [m["content"] for m in sent if m["role"] == "system"]
+        assert systems == ["ПРАВЛЕНЫЙ"], systems
+        assert "ИСХОДНЫЙ" not in " ".join(m["content"] for m in sent), sent
 
-    sent = _stub.CALLS[-1]["messages"]
-    systems = [m["content"] for m in sent if m["role"] == "system"]
-    assert systems == ["ПРАВЛЕНЫЙ"], systems
-    assert "ИЗ ЗАГОТОВКИ" not in " ".join(m["content"] for m in sent), sent
+        # И ещё раз, третьим сообщением: промпт не «применяется однажды».
+        client.patch(f"/api/agents/{agent_id}", json={"system": "ТРЕТИЙ"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "третий"})
+        assert _stub.CALLS[-1]["messages"][0]["content"] == "ТРЕТИЙ", _stub.CALLS[-1]["messages"][0]
 
-    # Два дома сразу — ошибка, а не молчаливая потеря одного из промптов.
+        # Снятый промпт исчезает из тела целиком: пустая строка в роли
+        # `system` — это не «промпта нет», это заданный пустой промпт.
+        client.patch(f"/api/agents/{agent_id}", json={"system": None})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четвёртый"})
+        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
+
+    # Второго дома нет по построению: конфиг агента его не описывает,
+    # а ручка создания не принимает.
+    assert not hasattr(AgentSpec("л", "m"), "messages"), "у конфига снова есть messages"
     with TestClient(main.app) as client:
-        both = client.post(
+        extra = client.post(
             "/api/agents",
-            json={
-                "agent": {
-                    "model": "stub/m",
-                    "system": "полем",
-                    "messages": [{"role": "system", "content": "сообщением"}],
-                }
-            },
+            json={"agent": {"model": "stub/m", "messages": [{"role": "system", "content": "х"}]}},
         )
-        assert both.status_code == 400, both.text
-        assert "одно место" in both.json()["detail"], both.text
+        assert extra.status_code == 200, extra.text
+        created = extra.json()["agents"][0]
+        assert created["system"] == "", f"messages протекли в промпт: {created['system']}"
+        client.post(f"/api/agents/{created['id']}/messages", json={"text": "?"})
+        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
+    return "промпт читается из конфига на каждом обращении; второго дома нет"
 
-    # Тот же запрет и в конструкторе: ошибку видно на создании агента,
-    # а не на живом вызове.
-    try:
-        REGISTRY.create(
-            AgentSpec(
-                label="двойной",
-                model="stub/m",
-                system="полем",
-                messages=[{"role": "system", "content": "сообщением"}],
-            )
+
+@check("provider.require_parameters стоит на каждом вызове")
+def check_require_parameters():
+    """Стерёг его только текст предупреждения в панели, а не тело запроса.
+
+    Убрал `require_parameters` из `build_payload` — ни одна проверка не
+    покраснела, хотя это правило, на котором держится весь смысл панели:
+    без него OpenRouter вправе увести запрос к провайдеру, который молча
+    проигнорирует temperature или stop, и стенд покажет неправду.
+
+    Проверяется на всех путях: обычное сообщение, перегенерация, чат
+    с закреплённым поставщиком и чат без единого заданного параметра.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        bare = new_agent(client)
+        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
+        client.post(f"/api/agents/{bare}/regenerate")
+
+        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
+        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
+
+        # Закреплённый поставщик дополняет provider, а не затирает его:
+        # extra_body мержится поверх, и require_parameters обязан уцелеть.
+        pinned = new_agent(client, extra_body={"provider": {"order": ["openai"]}})
+        client.post(f"/api/agents/{pinned}/messages", json={"text": "три"})
+
+    assert len(_stub.CALLS) == 4, len(_stub.CALLS)
+    for call in _stub.CALLS:
+        provider = call["payload"].get("provider")
+        assert provider and provider.get("require_parameters") is True, (
+            f"вызов ушёл без provider.require_parameters: {call['payload'].get('provider')!r}"
         )
-        raise AssertionError("конструктор проглотил два системных промпта")
-    except ValueError as exc:
-        assert "одно" in str(exc), exc
-    return "промпт из messages переехал в конфиг; два дома сразу — 400 и ValueError"
+    assert _stub.CALLS[-1]["payload"]["provider"]["order"] == ["openai"], _stub.CALLS[-1]["payload"]
+
+    # И то же самое напрямую, без веб-слоя: правило живёт в build_payload,
+    # а не в ручке, поэтому CLI и любой другой вызывающий получают его тоже.
+    from app.llm import build_payload
+
+    payload = build_payload(AgentSpec(label="без веба", model="stub/m"))
+    assert payload["provider"]["require_parameters"] is True, payload["provider"]
+    return "4 вызова через ручки и один напрямую — все с require_parameters"
 
 
 @check("stop и response_format правятся из панели и доезжают до тела запроса")
@@ -681,6 +958,214 @@ def check_stop_and_format():
     return "оба параметра задаются, снимаются и не уходят пустыми"
 
 
+@check("создание и правка разбирают конфиг одинаково")
+def check_create_and_patch_agree():
+    """Дефект аудита: POST и PATCH расходились на пустых стоп-строках.
+
+    POST сохранял ["", "  ", "КОНЕЦ"] как есть, PATCH выбрасывал пустые.
+    Пустая стоп-строка не косметика: она остановила бы генерацию сразу,
+    а с provider.require_parameters ещё и сузила бы список провайдеров.
+    Ни одна проверка расхождения не ловила — обе ручки разбирали поля
+    двумя независимыми кусками кода.
+
+    Правильное поведение — то, которое было у PATCH и которого ждёт панель:
+    поле стоп-строк построчное, и лишний перевод строки не параметр.
+    `readStopLines` в клиенте делает ровно это.
+
+    Проверяется не «PATCH чистит», а **согласие двух ручек**: любое поле,
+    заданное при создании и той же правкой, обязано дать один конфиг.
+    """
+    cases = [
+        {"stop": ["", "  ", "КОНЕЦ", " СТОП "]},
+        {"stop": ["", "   "]},
+        {"system": None},
+        {"history_limit": 0},
+        {"response_format": {"type": "json_object"}},
+        {"temperature": 0.0, "top_p": 0, "max_tokens": 7},
+    ]
+    watched = ("stop", "system", "history_limit", "response_format", *SAMPLING_FIELDS)
+    with TestClient(main.app) as client:
+        for case in cases:
+            created = client.post("/api/agents", json={"agent": {"model": "stub/model", **case}})
+            assert created.status_code == 200, created.text
+            born = created.json()["agents"][0]
+
+            blank_id = new_agent(client)
+            patched = client.patch(f"/api/agents/{blank_id}", json=case)
+            assert patched.status_code == 200, patched.text
+            grown = patched.json()
+
+            for field in watched:
+                assert born[field] == grown[field], (
+                    f"{case}: поле {field} после создания {born[field]!r}, "
+                    f"после правки {grown[field]!r} — ручки разбирают его по-разному"
+                )
+
+        # Согласие в отказах тоже: кривой тип обе ручки обязаны отвергнуть.
+        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"history_limit": -1}):
+            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
+            grown = client.patch(f"/api/agents/{new_agent(client)}", json=bad)
+            assert born.status_code == 400 and grown.status_code == 400, (
+                bad, born.status_code, grown.status_code
+            )
+
+    # И то, ради чего чистка нужна: пустая стоп-строка не уезжает в модель.
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, stop=["", "  ", "КОНЕЦ"])
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
+        assert _stub.CALLS[-1]["payload"]["stop"] == ["КОНЕЦ"], _stub.CALLS[-1]["payload"]
+    return f"{len(cases)} конфигов и 3 отказа: создание и правка сходятся"
+
+
+@check("любое поле конфига переживает переоткрытие файла, включая ещё не придуманные")
+def check_config_survives_by_construction():
+    """Дыра аудита: `_migrate` можно было удалить, не уронив ни одной проверки.
+
+    Значит схему базы не стерёг никто: колонку можно было потерять молча,
+    а «конфиг едет одним JSON-полем, поэтому новое поле сохраняется само»
+    было обещанием без сторожа.
+
+    Список полей здесь **выводится** из `AgentSpec`, а не перечисляется:
+    перечисленный отстал бы от датакласса ровно тогда, когда поле добавили
+    и забыли — то есть в единственном случае, ради которого проверка нужна.
+    Значения подбираются по типу поля, тоже без ручного списка.
+    """
+    from dataclasses import fields as spec_fields
+
+    from app.agent import Agent
+
+    # Значение, отличное от умолчания, для каждого поля конфига.
+    probes: dict = {}
+    for f in spec_fields(AgentSpec):
+        kind = str(f.type)
+        if f.name == "model":
+            probes[f.name] = "проверка/модель"
+        elif "list[str]" in kind:
+            probes[f.name] = [f"СТОП-{f.name}"]
+        elif "str" in kind:
+            probes[f.name] = f"текст-{f.name}"
+        elif "int" in kind:
+            probes[f.name] = 7
+        elif "float" in kind:
+            probes[f.name] = 0.25
+        elif "dict" in kind:
+            probes[f.name] = {"метка": f.name}
+        else:
+            raise AssertionError(f"поле {f.name}: {f.type} — тип неизвестен, подберите значение")
+    assert len(probes) == len(spec_fields(AgentSpec)), probes
+
+    path = _temp_db("schema-roundtrip")
+    store = Store(path).init()
+    spec = AgentSpec(**probes)
+    agent = Agent(spec, store=store)
+    agent.remember("user", "вопрос")
+    agent.remember("assistant", "ответ", metrics={"provider": "stub"})
+    agent_id = agent.id
+    store.close()
+
+    # Настоящее переоткрытие файла, а не тот же объект в памяти.
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        lost = {
+            f.name: (probes[f.name], getattr(revived.spec, f.name))
+            for f in spec_fields(AgentSpec)
+            if getattr(revived.spec, f.name) != probes[f.name]
+        }
+        assert not lost, f"поля конфига не пережили переоткрытие файла: {lost}"
+        assert [t.content for t in revived.history] == ["вопрос", "ответ"], revived.history
+        assert revived.history[1].metrics == {"provider": "stub"}, revived.history[1].metrics
+
+        # Колонки схемы и колонки, которые читает код, — один набор.
+        # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,
+        # либо её кто-то пишет мимо `_session_row`.
+        in_db = {r["name"] for r in again.conn.execute("PRAGMA table_info(sessions)")}
+        row = again.load_session(agent_id)
+        expected = set(row) | {"updated_at"}
+        assert in_db == expected, f"схема и код разошлись: в базе {in_db}, код читает {expected}"
+    finally:
+        again.close()
+    return f"{len(probes)} полей конфига пережили переоткрытие файла, схема сходится с кодом"
+
+
+@check("мимо redact() записать нельзя: пути записи выводятся из класса")
+def check_every_write_path_redacts():
+    """Дыра аудита: явные `redact()` в `save_session`/`save_history` можно было
+    убрать, не уронив ничего.
+
+    И правильно — несущий слой не они, а `_Writer`: транзакция отдаёт обёртку,
+    и чистится любой строковый параметр. Но само это свойство никто не стерёг:
+    `check_no_key_in_db` ходит теми путями записи, которые знает, а новый путь
+    мимо транзакции прошёл бы зелёным.
+
+    Поэтому список путей здесь **выводится** из класса `Store`: всякий метод,
+    в теле которого есть INSERT/UPDATE/DELETE/REPLACE, обязан идти через
+    `tx()`, а не через голое соединение. Перечисленный список пропустил бы
+    ровно тот метод, который забыли в него внести.
+    """
+    import inspect
+
+    import app.store as store_module
+
+    # Слова целиком, а не подстроки: `updated_at` — это не UPDATE, и по
+    # подстроке в список путей записи попадал весь `list_sessions`.
+    mutating = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE)\b")
+    checked = []
+    for name, fn in inspect.getmembers(Store, inspect.isfunction):
+        body = inspect.getsource(fn)
+        if not mutating.search(body.upper()):
+            continue
+        checked.append(name)
+        if name == "init":
+            continue  # схему заводит executescript, параметров у него нет
+        for bypass in ("self.conn.execute", "self._conn.execute", "self.reading("):
+            assert bypass not in body, (
+                f"Store.{name} пишет через {bypass} — мимо `_Writer`, а значит "
+                "мимо redact(). Писать можно только внутри tx()"
+            )
+    assert len(checked) >= 5, f"путей записи нашлось всего {checked} — обход сузился"
+
+    # Транзакция отдаёт обёртку, а не соединение: иначе обещание держалось бы
+    # на внимательности автора каждого метода.
+    store = Store(store_module.MEMORY).init()
+    key = "sk-or-v1-" + "e" * 64
+    saved_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = key
+    try:
+        with store.tx() as conn:
+            assert not isinstance(conn, sqlite3.Connection), (
+                "tx() отдаёт голое соединение — redact() перестал быть по построению"
+            )
+            # Все три формы параметров, какие принимает обёртка.
+            conn.execute(
+                "INSERT INTO sessions (id, label, config, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0)",
+                (f"ag_{key}", key, key),
+            )
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (:k, :v)", {"k": "т", "v": key}
+            )
+            conn.executemany(
+                "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
+                [("s", 0, "user", key), ("s", 1, "assistant", key)],
+            )
+        leaked = []
+        for table in ("sessions", "messages", "meta"):
+            for row in store.conn.execute(f"SELECT * FROM {table}"):
+                for column in row.keys():
+                    if isinstance(row[column], str) and key in row[column]:
+                        leaked.append(f"{table}.{column}")
+        assert not leaked, f"ключ уехал в базу через tx(): {sorted(set(leaked))}"
+    finally:
+        if saved_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+        store.close()
+    return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
+
+
 @check("панель правит живого агента: модель, промпт, окно памяти")
 def check_patch_panel():
     _stub.install(reply="ок")
@@ -709,6 +1194,59 @@ def check_patch_panel():
 
 
 # --- 6. лента: рассуждение и перегенерация ------------------------------------
+
+
+@check("стенограмма — это ровно диалог, и в ней есть всё, что рисует клиент")
+def check_transcript_shape():
+    """Формат стенограммы не стерёг никто: поля можно было убрать молча.
+
+    Так и вышло — удаление seed-реплик из `transcript()` и поля
+    `seed_messages` из ответа ручки не уронило ни одной из 65 проверок.
+    Клиент рисует ленту **из ответа ручки**, а не из того, что дорисовал
+    по дороге: после каждого обмена он перечитывает агента и перерисовывает
+    всё заново. Значит контракт стенограммы — часть поведения, и он такой:
+    в ней ровно реплики диалога, по одной на ход, в порядке разговора,
+    и у каждой есть поля, которые клиент читает.
+    """
+    _stub.install(reply="ответ", reasoning="я подумал")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, system="СИСТЕМА")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        body = client.get(f"/api/agents/{agent_id}").json()
+
+    transcript = body["transcript"]
+    # Ровно диалог: системный промпт — это конфиг, а не реплика разговора,
+    # и в ленте ему делать нечего. Он виден в панели, полем `system`.
+    assert [t["role"] for t in transcript] == ["user", "assistant"], transcript
+    assert body["system"] == "СИСТЕМА", body["system"]
+    assert transcript[0]["content"] == "вопрос", transcript[0]
+    assert transcript[1]["content"] == "ответ", transcript[1]
+    assert "seed_messages" not in body, "наружу вернулась заготовка"
+
+    # Поля, которые читает клиент. Убрать любое молча нельзя: карточка
+    # перестанет показывать то, что показывала, а ошибку — вовсе проглотит.
+    for turn in transcript:
+        for field in ("role", "content", "error", "reasoning", "metrics"):
+            assert field in turn, f"в реплике нет поля {field}: {turn}"
+    answer = transcript[1]
+    assert answer["reasoning"] == "я подумал", answer
+    assert answer["error"] is None, answer
+    assert answer["metrics"] and answer["metrics"]["provider"] == "stub", answer["metrics"]
+
+    # Длина стенограммы и history_len — про одно и то же: клиент по второму
+    # обновляет строку списка, не перечитывая ленту.
+    assert body["history_len"] == len(transcript), (body["history_len"], len(transcript))
+
+    # Оборванный ответ помечен ошибкой, и она доезжает до стенограммы.
+    _stub.install(fail=True)
+    with TestClient(main.app) as client:
+        broken = new_agent(client)
+        agent = REGISTRY.require(broken)
+        agent.remember("user", "вопрос")
+        agent.remember("assistant", "огрыз", error="оборвалось")
+        failed = client.get(f"/api/agents/{broken}").json()["transcript"][-1]
+    assert failed["error"] == "оборвалось", failed
+    return f"{len(transcript)} реплики, поля на месте, ошибка доезжает"
 
 
 @check("рассуждение приезжает отдельным событием и в ответ не входит")
@@ -744,7 +1282,7 @@ def check_reasoning():
 
 @check("время до первого токена честное и на думающей модели")
 def check_first_token():
-    """Находка ревью: ttft_ms ставится на первом токене **ответа**.
+    """`ttft_ms` стоит на первом токене **ответа**.
 
     На reasoning-модели это момент, когда модель додумала, а не когда
     заговорила, и плитка удивляла бы на записи. Считаем отдельно первый
@@ -794,7 +1332,7 @@ def check_regenerate():
 
 @check("неудачная перегенерация возвращает и вопрос, и прошлый ответ")
 def check_regenerate_failure():
-    """Находка ревью: пара снималась с истории до вызова и не возвращалась.
+    """Пара снимается с истории до вызова, и её надо вернуть, если ответа нет.
 
     Сценарий короткий и сам напрашивается: у агента закреплён провайдер
     через provider.order, смена модели роняет вызов, и «перегенерировать»
@@ -808,7 +1346,7 @@ def check_regenerate_failure():
 
         def history():
             body = client.get(f"/api/agents/{agent_id}").json()["transcript"]
-            return [(t["role"], t["content"]) for t in body if not t.get("seed")]
+            return [(t["role"], t["content"]) for t in body]
 
         before = history()
         assert before == [("user", "мой вопрос"), ("assistant", "живой ответ")], before
@@ -896,18 +1434,6 @@ def check_regenerate_disconnect():
 # --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
-@check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
-def check_no_clear_all():
-    with TestClient(main.app) as client:
-        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
-        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
-    for path in ("app/static/app.js", "app/static/index.html"):
-        source = read(path)
-        for gone in ("Очистить все", "clear-all", "clearAll", "/api/agents/reset"):
-            assert gone not in source, f"{path}: остался {gone}"
-    return "ручки нет, кнопки нет, диалога очистки нет"
-
-
 @check("имена по умолчанию нумеруются, автоимени нет")
 def check_numbered_names():
     _stub.install(reply="ок")
@@ -937,20 +1463,21 @@ def check_numbered_names():
         live = [a["label"] for a in client.get("/api/agents").json()["agents"]]
         assert len(live) == len(set(live)), "имена по умолчанию не должны повторяться"
 
-    js = read("app/static/app.js")
-    for gone in ("maybeAutoName", "chatTitle", "autoname"):
-        assert gone not in js, f"в клиенте осталось автоимя: {gone}"
-    assert "autoname" not in read("app/static/index.html"), "переключатель автоимени жив"
     return f"{first['label']}, {second['label']}, после удаления — {third['label']}"
 
 
 @check("переименование и удаление живут в списке слева")
 def check_list_actions():
-    js = read("app/static/app.js")
-    assert "function startRename" in js and "function askDelete" in js
-    assert "miniButton(\"pencil\"" in js, "карандаша в строке списка нет"
-    assert "miniButton(\"trash\"" in js, "корзины в строке списка нет"
-    assert "Escape" in js and "Enter" in js, "переименование должно слушать Enter и Escape"
+    """Серверная половина: PATCH меняет имя, пустое имя отвергается, DELETE убирает.
+
+    Клиентская половина — в `checks/browser_check.js`, блоком «переименование
+    чата в списке слева»: клик по карандашу, Enter, Escape, потеря фокуса,
+    пустое имя. Раньше она была грепом по исходнику («в app.js есть строка
+    function startRename»), то есть описывала реализацию: переименование
+    ломалось, не тронув ни одной из тех строк, и греп оставался зелёным, —
+    а переименовать `startRename` во что угодно роняло проверку, ничего
+    не сломав.
+    """
     assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
 
     with TestClient(main.app) as client:
@@ -960,51 +1487,7 @@ def check_list_actions():
         assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
         assert client.delete(f"/api/agents/{agent_id}").status_code == 200
         assert client.get(f"/api/agents/{agent_id}").status_code == 404
-    return "карандаш и корзина в строке, поля имени в панели нет"
-
-
-@check("пояснений прошлой постановки нет ни в данных, ни в разметке")
-def check_no_leftover_texts():
-    with TestClient(main.app) as client:
-        client.post("/api/agents", json={})
-        body = client.get("/api/agents").text
-    for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
-        assert leftover not in body, f"наружу уехало пояснение: {leftover}"
-
-    for path in ("app/static/app.js", "app/static/index.html"):
-        assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
-
-    # Подписи, объясняющие интерфейс сам себе, — тоже приписки: карандаш
-    # в списке виден и без пояснения под панелью.
-    html = read("app/static/index.html")
-    assert "карандаш" not in html, "приписка про карандаш осталась"
-    return "ни note, ни group, ни подписей к очевидному"
-
-
-@check("имени клиента-референса нет нигде в репозитории")
-def check_no_reference_name():
-    """Референс был инструментом разработки, а не частью продукта.
-
-    Имя собирается из кусков намеренно: иначе сама проверка стала бы
-    единственным местом, где оно осталось.
-    """
-    needle = ("o" + "mlx").encode()
-    tracked = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
-    ).stdout.split()
-    hits = []
-    for name in tracked:
-        path = os.path.join(ROOT, name)
-        if not os.path.isfile(path):
-            continue
-        if needle.decode() in name.lower():
-            hits.append(name)
-            continue
-        with open(path, "rb") as handle:
-            if needle in handle.read().lower():
-                hits.append(name)
-    assert not hits, f"упоминания остались в: {', '.join(hits)}"
-    return f"проверено {len(tracked)} файлов под контролем версий"
+    return "PATCH меняет имя, пустое отвергается, DELETE убирает; поля имени в панели нет"
 
 
 @check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
@@ -1124,7 +1607,7 @@ def check_no_cdn():
 
 @check("лента прокручивается, а не сжимает карточки; композер закреплён")
 def check_feed_scrolls():
-    """Находка заказчика: карточки сплющивались в полоску вместо прокрутки.
+    """Карточки сплющивались в полоску вместо прокрутки.
 
     Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
     У карточки к тому же `overflow: hidden`, из-за чего её автоматический
@@ -1151,12 +1634,10 @@ def check_feed_scrolls():
 
 @check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
 def check_browser():
-    """Находка ревью: прежняя проверка была grep'ом по исходнику.
-
-    Она прошла бы и если экранирование переедет **после** разбора — то есть
-    самая опасная поверхность демо была прикрыта пустышкой. Теперь клиентский
-    код исполняется под node: payload на входе, утверждения про выход.
-    """
+    """Клиентский код исполняется под node: payload на входе, утверждения
+    про выход. Греп по исходнику прошёл бы и если экранирование переедет
+    **после** разбора — то есть самая опасная поверхность демо была бы
+    прикрыта пустышкой."""
     node = shutil.which("node")
     assert node, (
         "нужен node, чтобы исполнить клиентский код: разбор markdown "
@@ -1182,7 +1663,6 @@ def check_spec_deep_copy():
     shared = AgentSpec(
         label="общий",
         model="stub/model",
-        messages=[{"role": "system", "content": "СИС"}],
         stop=["\n"],
         response_format={"type": "json_object"},
         extra_body={"provider": {"allow_fallbacks": False}},
@@ -1193,14 +1673,17 @@ def check_spec_deep_copy():
     assert first.spec.extra_body is not shared.extra_body
     assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
     assert first.spec.extra_body is not second.spec.extra_body
-    assert first.spec.messages[0] is not shared.messages[0]
     assert first.spec.stop is not shared.stop
+    assert first.spec.response_format is not shared.response_format
 
     first.spec.extra_body["provider"]["order"] = ["only-me"]
-    first.spec.messages[0]["content"] = "ДРУГОЕ"
+    first.spec.stop.append("ДРУГОЕ")
+    first.spec.response_format["type"] = "json_schema"
     assert "order" not in shared.extra_body["provider"], shared.extra_body
     assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
-    assert shared.messages[0]["content"] == "СИС", shared.messages
+    assert shared.stop == ["\n"], shared.stop
+    assert shared.response_format == {"type": "json_object"}, shared.response_format
+    assert second.spec.stop == ["\n"], second.spec.stop
     return "правка у одного агента не задела ни общий конфиг, ни соседа"
 
 
@@ -1342,7 +1825,6 @@ def check_store_reopen():
         "ag_00042",
         label="Нина",
         config={"model": "stub/m", "history_limit": 7, "top_p": 0.9},
-        seed=[{"role": "user", "content": "заготовка"}],
         created_at=100.0,
         context_length=128_000,
     )
@@ -1358,7 +1840,6 @@ def check_store_reopen():
     assert saved is not None, "чат не пережил закрытие файла"
     assert saved["config"]["history_limit"] == 7 and saved["config"]["top_p"] == 0.9
     assert saved["created_at"] == 100.0 and saved["context_length"] == 128_000
-    assert saved["seed"] == [{"role": "user", "content": "заготовка"}], saved["seed"]
     rows = second.message_rows("ag_00042")
     assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
     assert second.max_agent_seq() == 42, second.max_agent_seq()
@@ -1635,7 +2116,7 @@ def check_list_beyond_cap():
 
         with TestClient(main.app) as client:
             body = client.get(f"/api/agents/{made[0]}").json()
-        texts = [t["content"] for t in body["transcript"] if not t.get("seed")]
+        texts = [t["content"] for t in body["transcript"]]
         assert texts == ["вопрос 0", "ответ"], texts
     finally:
         main.REGISTRY = saved_registry
@@ -1880,6 +2361,68 @@ def check_redact_floor():
     return f"ключ короче {MIN_SECRET_LENGTH} символов данные не трогает, настоящий — режется"
 
 
+@check("транзакция берёт блокировку сразу, а не при первой записи")
+def check_tx_locks_immediately():
+    """Седьмая дыра, найденная уже сверкой инвариантов после сокращения:
+    `BEGIN IMMEDIATE` не стерёг никто.
+
+    Подменил его на голый `BEGIN` — все 65 проверок остались зелёными,
+    включая `two_processes.py`. Тот его и не ловит: все пути записи там
+    начинаются с записи, а отложенная транзакция ломается на другом —
+    когда она началась с чтения и повышает блокировку до записи. Тогда
+    SQLite отвечает SQLITE_BUSY **без** ретрая по `busy_timeout`, и второй
+    процесс получает ошибку вместо очереди.
+
+    Проверяется наблюдаемым: пока транзакция открыта и не сделала ни одного
+    запроса, второй писатель обязан её видеть. Соединение берём с нулевым
+    таймаутом — ждать нам нечего, нужен сам факт блокировки.
+    """
+    path = _temp_db("immediate")
+    store = Store(path).init()
+    entered = None
+    try:
+        with store.tx():
+            # Ни одного запроса внутри транзакции ещё не было.
+            rival = sqlite3.connect(path, timeout=0)
+            try:
+                rival.execute("BEGIN IMMEDIATE")
+                entered = True
+            except sqlite3.OperationalError as exc:
+                entered = False
+                reason = str(exc).lower()
+                assert "locked" in reason or "busy" in reason, exc
+            finally:
+                rival.close()
+        assert entered is False, (
+            "второй писатель вошёл в базу, пока транзакция открыта: значит она "
+            "отложенная. Отложенная берёт блокировку только на первой записи, "
+            "и повышение из чтения в запись даёт SQLITE_BUSY мимо busy_timeout"
+        )
+
+        # И то, ради чего блокировка нужна: занятая база — это внятный 503,
+        # а не срыв записи. Транзакция, не дождавшаяся своей очереди,
+        # откатывается целиком.
+        holder = sqlite3.connect(path, timeout=0)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            waiting = Store(path).init()
+            waiting.conn.execute(f"PRAGMA busy_timeout=50")
+            try:
+                waiting.save_session(
+                    "ag_00001", label="не пройдёт", config={"model": "m"}, created_at=0.0
+                )
+                raise AssertionError("занятая база пропустила запись")
+            except StoreBusyError as exc:
+                assert "занята" in str(exc), exc
+            waiting.close()
+        finally:
+            holder.rollback()
+            holder.close()
+    finally:
+        store.close()
+    return "открытая транзакция видна второму писателю сразу; занятая база даёт StoreBusyError"
+
+
 @check("занятая база — внятный 503, а не голый 500")
 def check_busy_message():
     import sqlite3
@@ -1982,59 +2525,14 @@ def check_cli_session():
 
 
 
-@check("чистый старт: чатов нет, заведённый переживает перезапуск вместе с перепиской")
-def check_clean_start_survives_restart():
-    """Список начинается пустым — заготовок больше нет.
-
-    Дальше всё как у любого чата: завели, поговорили, перезапустились —
-    он на месте, с перепиской и со всеми правками панели.
-    """
-    _stub.install(reply="и тебе привет")
-    path = _temp_db("clean-start")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        first = _restart(store)
-        assert main._listing()["agents"] == [], "на чистой базе чатов быть не должно"
-
-        chat = first.create(AgentSpec(label="Мой чат", model="stub/m"))
-        asyncio.run(drain(chat.ask("привет")))
-        chat.spec.system = "ты гид"
-        chat.spec.top_p = 0.42
-        chat.spec.stop = ["СТОП"]
-        chat.spec.response_format = {"type": "json_object"}
-        chat.spec.history_limit = 4
-        chat.save_config()
-        chat_id = chat.id
-
-        store.close()
-        # Настоящее переоткрытие файла, а не тот же объект в памяти.
-        again = Store(path).init()
-        second = _restart(again)
-        listing = main._listing()["agents"]
-        revived = second.require(chat_id)
-    finally:
-        main.REGISTRY = saved_registry
-
-    assert [a["label"] for a in listing] == ["Мой чат"], listing
-    assert [t.content for t in revived.history] == ["привет", "и тебе привет"]
-    assert revived.spec.system == "ты гид" and revived.spec.top_p == 0.42
-    assert revived.spec.stop == ["СТОП"] and revived.spec.history_limit == 4
-    assert revived.spec.response_format == {"type": "json_object"}
-    again.close()
-    return "пустой старт, один чат, после переоткрытия файла переписка и панель на месте"
-
-
 @check("поднятый из базы чат отдаёт те же поля панели: повторный PATCH ничего не меняет")
 def check_panel_stable_after_restart():
     """«Применено» не должно появляться на чате, поднятом из базы.
 
-    Клиент показывает эту строку, только если правка что-то изменила: сравнивает
-    конфиг до и после `PATCH` по полям панели. Значит, чат после перезапуска
-    обязан отдавать ровно те же значения — если хоть одно поле изменит тип или
-    форму по дороге через JSON (`stop` — список, `response_format` — объект,
-    незаданный параметр — `null`, а не ноль), первое же сообщение показало бы
-    «Применено», хотя пользователь ничего не трогал.
+    Клиент показывает строку, только если правка что-то изменила, — сравнивает
+    конфиг до и после `PATCH`. Значит, чат после перезапуска обязан отдавать
+    ровно те же значения: измени хоть одно поле тип по дороге через JSON,
+    и первое же сообщение показало бы «Применено» на пустом месте.
 
     Стенд клиента этого поймать не может: у него свой сервер и своя память.
     """
@@ -2116,8 +2614,6 @@ def check_rename_survives_restart():
 
     Проверяется настоящим переоткрытием файла, а не тем же объектом в памяти:
     имя лежит и отдельной колонкой, и внутри конфига, и разойтись они не должны.
-    Номер, из которого имя собиралось, при этом не переиспользуется — иначе
-    следующий чат получил бы имя, только что освобождённое переименованием.
     """
     _stub.install(reply="ответ")
     path = _temp_db("rename")
@@ -2139,8 +2635,6 @@ def check_rename_survives_restart():
         again = Store(path).init()
         second = _restart(again)
         listing = main._listing()["agents"]
-        with TestClient(main.app) as client:
-            after = client.post("/api/agents", json={}).json()["agents"][0]["label"]
     finally:
         main.REGISTRY = saved_registry
 
@@ -2153,40 +2647,30 @@ def check_rename_survives_restart():
     assert row["config"]["label"] == "Про Казань", row["config"]["label"]
     # Переписка при переименовании не пострадала.
     assert [t.content for t in revived.history] == ["привет", "ответ"], revived.history
-    # И освободившийся номер не переиспользован.
-    assert after == "Новый чат 2", after
     again.close()
-    return f"«{created['label']}» → «Про Казань» пережило переоткрытие файла, следующий — {after}"
+    return f"«{created['label']}» → «Про Казань» пережило переоткрытие файла"
 
 
-@check("удалили последний чат — список пуст, а номер следующего не повторяется")
+@check("удалили последний чат — список пуст, а строки в базе не осталось")
 def check_last_chat_deleted():
-    """Клиент на пустом списке заводит чат сам, и номер ему нужен свежий."""
+    """Удаление — из обоих слоёв. Номера здесь не проверяются: их стережёт
+    `check_numbering_survives_restart`, и привязываться к ним второй раз
+    значит ронять эту проверку на чужой поломке."""
     path = _temp_db("last-chat")
     store = Store(path).init()
     saved_registry = main.REGISTRY
     try:
-        registry = _restart(store)
+        _restart(store)
         with TestClient(main.app) as client:
             first = client.post("/api/agents", json={}).json()["agents"][0]
             assert client.delete(f"/api/agents/{first['id']}").status_code == 200
             assert client.get("/api/agents").json()["agents"] == [], "чат остался в списке"
             assert store.load_session(first["id"]) is None, "строка чата осталась в базе"
-            second = client.post("/api/agents", json={}).json()["agents"][0]
-
-        # Перезапуск — и номер по-прежнему не отматывается назад.
-        _restart(store)
-        with TestClient(main.app) as client:
-            third = client.post("/api/agents", json={}).json()["agents"][0]
-            labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
+            assert store.message_rows(first["id"]) == [], "реплики удалённого чата остались"
     finally:
         main.REGISTRY = saved_registry
         store.close()
-
-    numbers = [int(a["label"].split()[-1]) for a in (first, second, third)]
-    assert numbers == [1, 2, 3], numbers
-    assert len(labels) == len(set(labels)), labels
-    return f"после удаления {first['label']} следующим стал {second['label']}, после рестарта {third['label']}"
+    return "после удаления список пуст, строки и реплик в базе нет"
 
 
 @check("список не обрезается: тысяча с лишним чатов видна целиком")
@@ -2207,7 +2691,6 @@ def check_list_not_truncated():
                     f"chat_{i:05d}",
                     label=f"чат {i}",
                     config={"model": "stub/m", "label": f"чат {i}"},
-                    seed=[],
                     created_at=now + i,
                 )
         entries = main._listing()["agents"]
@@ -2218,76 +2701,6 @@ def check_list_not_truncated():
         main.REGISTRY = saved_registry
         store.close()
     return f"{made} чатов — в списке все, любой открывается"
-
-
-CHECKS = [
-    check_spawn_100,
-    check_flat_list,
-    check_new_chat_is_blank,
-    check_no_presets,
-    check_scenarios_gone,
-    check_memory,
-    check_history_window,
-    check_parallel,
-    check_rollback,
-    check_disconnect,
-    check_new_params,
-    check_panel_applies_next_message,
-    check_patch_during_generation,
-    check_config_snapshot,
-    check_system_prompt_single_home,
-    check_stop_and_format,
-    check_patch_panel,
-    check_reasoning,
-    check_first_token,
-    check_regenerate,
-    check_regenerate_failure,
-    check_regenerate_disconnect,
-    check_no_clear_all,
-    check_numbered_names,
-    check_list_actions,
-    check_no_leftover_texts,
-    check_no_reference_name,
-    check_no_key_leak,
-    check_catalog_capabilities,
-    check_no_cdn,
-    check_feed_scrolls,
-    check_browser,
-    check_spec_deep_copy,
-    check_eviction,
-    check_batch_limit,
-    check_shared_client,
-    check_no_feed,
-    check_cli,
-    # --- День 7: память между запусками ---
-    check_store_reopen,
-    check_restart_process,
-    check_two_processes,
-    check_restore_in_constructor,
-    check_session_isolation,
-    check_seq_renumbered,
-    check_partial_persisted,
-    check_reasoning_not_stored,
-    check_regenerate_failure_db,
-    check_numbering_survives_restart,
-    check_list_beyond_cap,
-    check_eviction_keeps_session,
-    check_detached_does_not_clobber,
-    check_parallel_writes,
-    check_id_claimed_in_store,
-    check_claim_rolled_back,
-    check_context_length_restored,
-    check_no_key_in_db,
-    check_redact_floor,
-    check_busy_message,
-    check_gitignore_db,
-    check_cli_session,
-    check_clean_start_survives_restart,
-    check_panel_stable_after_restart,
-    check_rename_survives_restart,
-    check_last_chat_deleted,
-    check_list_not_truncated,
-]
 
 
 def main_() -> int:

@@ -6,10 +6,9 @@
 Без него OpenRouter вправе увести запрос к провайдеру, который молча
 проигнорирует temperature или stop, и день покажет неправду.
 
-HTTP-клиент на процесс один, и одновременных вызовов к модели не больше
-`LLM_MAX_CONCURRENCY`. До Дня 6 клиент создавался внутри каждого вызова:
-пока агент был один, это стоило лишнего рукопожатия, а на сотне агентов
-это сотня пулов соединений и сотня одновременных запросов к OpenRouter.
+HTTP-клиент на процесс один, и одновременных вызовов не больше
+`LLM_MAX_CONCURRENCY`: клиент внутри каждого вызова — это на сотне агентов
+сотня пулов соединений и сотня одновременных запросов к OpenRouter.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import os
 import time
 import weakref
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import AsyncIterator
 
 import httpx
@@ -37,11 +36,10 @@ DEFAULT_MAX_CONCURRENCY = 16
 
 
 def max_concurrency() -> int:
-    """LLM_MAX_CONCURRENCY: потолок одновременных вызовов к модели.
+    """LLM_MAX_CONCURRENCY: потолок одновременных вызовов.
 
-    Спавн агентов бесплатен и мгновенен, а вот сто одновременных стримов —
-    это сто открытых соединений и счёт от OpenRouter. Лишние вызовы не
-    падают, а ждут в очереди на семафоре.
+    Спавн бесплатен, а сто одновременных стримов — это сто соединений и счёт
+    от OpenRouter. Лишние вызовы не падают, а ждут на семафоре.
     """
     raw = os.environ.get("LLM_MAX_CONCURRENCY", "").strip()
     try:
@@ -104,12 +102,10 @@ class Metrics:
     """Время до первого токена **ответа**. Токены рассуждения его не двигают."""
 
     first_token_ms: float | None = None
-    """Время до первого токена от модели вообще — рассуждения или ответа.
+    """Время до первого токена вообще — рассуждения или ответа.
 
-    На обычной модели совпадает с `ttft_ms`. На думающей — это момент, когда
-    модель заговорила, а `ttft_ms` наступает позже, когда она додумала.
-    Без этой цифры плитка «TTFT» на reasoning-модели показывала бы время
-    вместе со всем размышлением и удивляла бы на записи.
+    На обычной модели совпадает с `ttft_ms`; на думающей `ttft_ms` наступает
+    позже, когда она додумала, и включал бы всё размышление.
     """
 
     elapsed_ms: float = 0.0
@@ -130,29 +126,26 @@ class Metrics:
 
     error: str | None = None
 
+    _ROUND = {
+        "ttft_ms": 1,
+        "first_token_ms": 1,
+        "elapsed_ms": 1,
+        "tokens_per_second": 2,
+        "context_fill_pct": 2,
+    }
+    """Поля, которые округляются по дороге наружу. Остальные едут как есть."""
+
     def as_dict(self) -> dict:
-        return {
-            "ttft_ms": round(self.ttft_ms, 1) if self.ttft_ms is not None else None,
-            "first_token_ms": (
-                round(self.first_token_ms, 1) if self.first_token_ms is not None else None
-            ),
-            "elapsed_ms": round(self.elapsed_ms, 1),
-            "tokens_out": self.tokens_out,
-            "tokens_per_second": round(self.tokens_per_second, 2),
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "cost_usd": self.cost_usd,
-            "finish_reason": self.finish_reason,
-            "model": self.model,
-            "provider": self.provider,
-            "context_length": self.context_length,
-            "context_fill_pct": (
-                round(self.context_fill_pct, 2) if self.context_fill_pct is not None else None
-            ),
-            "error": self.error,
-        }
+        """Все поля метрик, а не перечисленные руками.
+
+        Список руками означал бы, что новое поле появится здесь, а наружу
+        не поедет, — и плитка будет молча показывать прочерк.
+        """
+        data = asdict(self)
+        for name, digits in self._ROUND.items():
+            if data[name] is not None:
+                data[name] = round(data[name], digits)
+        return data
 
 
 @dataclass
@@ -189,11 +182,15 @@ SAMPLING_FIELDS = (
 """
 
 
-def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None) -> dict:
-    """Тело запроса к OpenRouter. require_parameters — на каждом вызове."""
+def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
+    """Тело запроса к OpenRouter. require_parameters — на каждом вызове.
+
+    Промпт приходит снаружи: собирает его агент, из слепка конфига. Конфиг
+    ленту не хранит, и брать её здесь неоткуда.
+    """
     payload: dict = {
         "model": session.model,
-        "messages": prompt_override if prompt_override is not None else session.messages,
+        "messages": messages or [],
         "stream": True,
         # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
         "usage": {"include": True},
