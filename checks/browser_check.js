@@ -196,8 +196,10 @@ check(
   check("модель не найдена в каталоге — молчим", paramWarnings(null, { top_k: 40 }).length === 0);
   check("модель не отдала supported_parameters — молчим",
     paramWarnings({ id: "m", supported_parameters: [] }, { top_k: 40 }).length === 0);
-  check("окно памяти в запрос не уходит и не проверяется",
-    paramWarnings(plain, { history_limit: 0 }).length === 0);
+  // Проверяются только параметры запроса: `system` и `model` — наши поля
+  // панели, и предупреждать про них по `supported_parameters` не о чем.
+  check("свои поля панели в запрос не уходят и не проверяются",
+    paramWarnings(plain, { system: "ПРОМПТ", model: plain.id }).length === 0);
 }
 
 // ── привязка к поставщику: говорим в момент смены модели ──
@@ -319,7 +321,6 @@ const PANEL_ROUTE = [
   ["f-repetition_penalty", "1.2", "repetition_penalty", 1.2],
   ["f-presence_penalty", "0.4", "presence_penalty", 0.4],
   ["f-frequency_penalty", "0.6", "frequency_penalty", 0.6],
-  ["f-history_limit", "0", "history_limit", 0],
   ["f-stop", "КОНЕЦ\nСТОП", "stop", ["КОНЕЦ", "СТОП"]],
 ];
 

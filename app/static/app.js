@@ -874,7 +874,7 @@ async function refreshCurrent() {
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
-  "repetition_penalty", "presence_penalty", "frequency_penalty", "history_limit",
+  "repetition_penalty", "presence_penalty", "frequency_penalty",
 ];
 
 function fillPanel(agent) {
@@ -987,8 +987,9 @@ function parseResponseFormat(kind, raw) {
   return parsed;
 }
 
-// Параметры панели в терминах OpenRouter: имена совпадают один в один,
-// кроме окна памяти — оно наше и в запрос не уходит.
+// Параметры панели в терминах OpenRouter: имена совпадают один в один.
+// Наши поля — `system` и `model` — в тело запроса параметрами не уходят
+// и по `supported_parameters` не проверяются.
 const PROVIDER_PARAMS = [
   "temperature",
   "max_tokens",

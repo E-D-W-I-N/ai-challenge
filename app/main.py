@@ -162,7 +162,6 @@ PATCHABLE = (
     "label",
     "system",
     "model",
-    "history_limit",
     "stop",
     "response_format",
     *SAMPLING_FIELDS,
@@ -238,15 +237,6 @@ def _stop_field(payload: dict, where: str = "") -> list[str] | None:
     return [x.strip() for x in (stop or []) if x.strip()] or None
 
 
-def _history_limit_field(payload: dict, where: str = "") -> int | None:
-    limit = _optional_field(payload, "history_limit", (int,), "целое число от нуля или null", where)
-    if limit is not None and limit < 0:
-        raise HTTPException(
-            status_code=400, detail=f"{where}history_limit: целое число от нуля или null"
-        )
-    return limit
-
-
 def _label_field(payload: dict) -> str:
     label = payload.get("label")
     if not isinstance(label, str) or not label.strip():
@@ -268,7 +258,6 @@ def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
             payload, "response_format", (dict,), "объект или null", where
         ),
         extra_body=_optional_field(payload, "extra_body", (dict,), "объект или null", where) or {},
-        history_limit=_history_limit_field(payload, where),
         **_sampling_fields(payload, where),
     )
 
@@ -389,8 +378,6 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         agent.spec.label = _label_field(payload)
     if "system" in payload:
         agent.spec.system = _text_field(payload, "system")
-    if "history_limit" in payload:
-        agent.spec.history_limit = _history_limit_field(payload)
     if "stop" in payload:
         agent.spec.stop = _stop_field(payload)
     if "response_format" in payload:

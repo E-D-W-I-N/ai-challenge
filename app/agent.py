@@ -1,7 +1,7 @@
 """Агент — отдельная сущность: конфиг, память и один метод обмена.
 
 `Agent` принимает **текст пользователя**, а не готовую ленту: сам склеивает
-системный промпт, хвост истории и новый вопрос, зовёт `stream_completion`
+системный промпт, всю историю и новый вопрос, зовёт `stream_completion`
 и дописывает ответ себе в историю. Наружу отдаёт поток событий — из него
 и SSE веб-клиента, и вывод CLI.
 
@@ -24,10 +24,6 @@ from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import AgentSpec
 from .store import Store
 
-DEFAULT_HISTORY_LIMIT = 20
-"""Окно по умолчанию — десять обменов: помнит начало разговора и не разгоняет
-prompt_tokens."""
-
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd")
 """Поля метрик, которые складываются по чату. Остальные — про один вызов:
 скорость и время до первого токена суммировать бессмысленно."""
@@ -40,10 +36,6 @@ def _usage_number(value) -> int | float | None:
         return None
     return value
 
-
-MAX_STORED_MESSAGES = 400
-"""Потолок на хранимое, независимо от окна: без него сотня агентов в долгой
-сессии течёт — в модель уходит хвост, а список растёт вечно."""
 
 _last_id = 0
 _id_lock = threading.Lock()
@@ -82,19 +74,6 @@ def copy_spec(spec: AgentSpec) -> AgentSpec:
         response_format=copy.deepcopy(spec.response_format),
         extra_body=copy.deepcopy(spec.extra_body or {}),
     )
-
-
-def _history_limit(spec: AgentSpec) -> int:
-    return effective_history_limit(spec.history_limit)
-
-
-def effective_history_limit(limit: int | None) -> int:
-    """Окно в сообщениях: None — дефолт агента, отрицательное — ноль.
-
-    Отдельной функцией: то же число нужно списку слева для чата, которого
-    сейчас нет в памяти, — у него есть только строка из базы.
-    """
-    return DEFAULT_HISTORY_LIMIT if limit is None else max(0, int(limit))
 
 
 class AgentBusyError(RuntimeError):
@@ -264,10 +243,6 @@ class Agent:
     def release(self) -> None:
         self._reserved = False
 
-    @property
-    def history_limit(self) -> int:
-        return _history_limit(self.spec)
-
     def cancel(self) -> None:
         """Просит прекратить генерацию. Задачу извне не отменяет: агент сам
         выходит на ближайшем чанке, дописывает частичный ответ и закрывает
@@ -276,19 +251,13 @@ class Agent:
 
     # --- сборка промпта ------------------------------------------------------
 
-    def window(self, spec: AgentSpec | None = None) -> list[dict]:
-        """Хвост истории, который уезжает в модель. При history_limit=0 — пусто."""
-        limit = _history_limit(spec if spec is not None else self.spec)
-        if not limit:
-            return []
-        return [turn.as_message() for turn in self.history[-limit:]]
-
     def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
-        """Системный промпт + окно истории + вопрос этого хода.
+        """Системный промпт + вся история + вопрос этого хода.
 
+        История уезжает целиком: чат помнит начало разговора, сколько бы он
+        ни длился, и после перезапуска — тоже, потому что вся она лежит в базе.
         Промпт берётся из конфига каждый раз, поэтому правка в панели видна
-        со следующего сообщения. При `history_limit=0` окно пусто, и агент
-        отвечает каждый вопрос как первый.
+        со следующего сообщения.
         """
         # `spec` передаёт обмен: он собирает промпт и тело запроса из одного
         # слепка, чтобы правка панели не могла попасть между ними.
@@ -297,7 +266,7 @@ class Agent:
         messages: list[dict] = []
         if spec.system:
             messages.append({"role": "system", "content": spec.system})
-        messages.extend(self.window(spec))
+        messages.extend(turn.as_message() for turn in self.history)
         messages.append({"role": "user", "content": user_text})
         return messages
 
@@ -316,7 +285,6 @@ class Agent:
         self.history.append(
             Turn(role=role, content=content, error=error, reasoning=reasoning, metrics=metrics)
         )
-        self._trim()
         if persist:
             self.persist()
 
@@ -351,10 +319,6 @@ class Agent:
             created_at=self.created_at,
             context_length=self.context_length,
         )
-
-    def _trim(self) -> None:
-        if len(self.history) > MAX_STORED_MESSAGES:
-            del self.history[: len(self.history) - MAX_STORED_MESSAGES]
 
     def forget(self) -> None:
         self.history.clear()
@@ -620,7 +584,6 @@ def spec_as_dict(
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
         "system": spec.system,
-        "history_limit": effective_history_limit(spec.history_limit),
         "history_len": history_len,
         # Итог по чату едет тем же путём, что и длина истории: клиент не должен
         # различать «чат поднят в память» и «чат лежит в базе» — у выгруженного
