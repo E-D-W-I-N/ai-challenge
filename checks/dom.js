@@ -557,10 +557,12 @@ function buildServer(options) {
     agent.history_len = agent.transcript.length;
     agent.usage_total = sumUsage(agent.transcript);
 
+    // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
+    // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
       { event: "start", agent: agent.id },
       { event: "delta", text: state.reply, metrics: null },
-      { event: "metrics", metrics: usage ? metrics : null },
+      ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
 

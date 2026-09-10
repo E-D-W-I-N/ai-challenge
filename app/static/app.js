@@ -84,7 +84,6 @@ function iconButton(name, title, onClick, className = "icon-btn") {
 
 const fmt = {
   sec: (ms) => (ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2)),
-  num: (v) => (v === null || v === undefined ? "—" : String(v)),
   rate: (v) => (v ? v.toFixed(1) : "—"),
   cost: (v) => (v === null || v === undefined ? "—" : "$" + Number(v).toFixed(6)),
   pct: (v) => (v === null || v === undefined ? "—" : v.toFixed(1) + " %"),
