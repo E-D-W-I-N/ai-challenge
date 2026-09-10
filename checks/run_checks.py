@@ -191,6 +191,10 @@ def check_new_chat_is_blank():
 #
 # Слова собраны из кусков намеренно: иначе сама проверка стала бы последним
 # местом, где упоминание осталось, и искала бы себя.
+#
+# Поиск регистронезависимый. Это не придирка: слова вроде «прогон», «судья»
+# и «колонка» жили в клиенте текстом для пользователя, а он пишется с большой
+# буквы. Правило здесь про слово, а не про его написание.
 SOURCES = ("*.py", "*.js", "*.html", "*.css", "*.md")
 SERVER = ("app/main.py", "app/agent.py", "app/schema.py")
 CLIENT = ("app/static/app.js", "app/static/index.html")
@@ -200,9 +204,9 @@ GONE = [
     *[(f"День {n}", SOURCES, "заготовки дней 1–5") for n in range(1, 6)],
     ("PRESET" + "_CHATS", SOURCES, "заготовки дней 1–5"),
     ("bootstrap" + "_chats", SOURCES, "заготовки дней 1–5"),
-    ("draft", ("app/schema.py",), "черновик в конфиге"),
+    ("draft", ("app/schema.py",) + CLIENT, "черновик с подставленным вопросом"),
     # сценарии: прогон, судья, зависимости, серии
-    ("Scenario", SERVER, "сценарии"),
+    ("Scenario", SERVER + CLIENT, "сценарии"),
     ("judge", SERVER, "сценарии"),
     ("depends" + "_on", SERVER, "сценарии"),
     ("repeats", SERVER, "сценарии"),
@@ -227,9 +231,19 @@ GONE = [
     ("карандаш", ("app/static/index.html",), "подпись, объясняющая интерфейс сам себе"),
 ]
 
+# Слова, которые жили в клиенте текстом для пользователя. Скоуп каждого обязан
+# включать клиент целиком — ровно эти правила слияние шести проверок в таблицу
+# однажды и потеряло, сузив скоуп до сервера или до одного файла конфига.
+# Самопроверка ниже сужение скоупа сама по себе не видит, поэтому оно названо
+# здесь списком.
+MUST_COVER_CLIENT = ("Scenario", "draft", "прогон", "судья", "колонк", "note")
+
 # Имя клиента-референса: он был инструментом разработки, а не частью продукта,
 # и не должен встречаться нигде — ни в коде, ни в именах файлов, ни в двоичных.
 REFERENCE_NAME = "o" + "mlx"
+
+# Файлы, которых не должно быть вовсе.
+GONE_FILES = ("day.py", "checks/_daysrc.py", "app/commands.py")
 
 
 def _tracked() -> list[str]:
@@ -237,6 +251,23 @@ def _tracked() -> list[str]:
         ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
     ).stdout.split()
     return [n for n in names if os.path.isfile(os.path.join(ROOT, n))]
+
+
+def _scope_files(scope, tracked: list[str]) -> list[str]:
+    """Файлы, в которых действует правило. Пустой список — ошибка, а не «нечего искать»."""
+    if tuple(scope) == SOURCES:
+        files = [n for n in tracked if n.endswith(tuple(g[1:] for g in SOURCES))]
+    else:
+        missing = [n for n in scope if n not in tracked]
+        assert not missing, f"правило смотрит в несуществующие файлы: {missing}"
+        files = list(scope)
+    assert files, f"правило смотрит в пустой список файлов: {scope}"
+    return files
+
+
+def _found(word: str, body: str) -> bool:
+    """Регистр не спасает: слово есть, как бы его ни написали."""
+    return word.lower() in body.lower()
 
 
 @check("выпиленное осталось выпиленным: ни слова в исходниках")
@@ -247,22 +278,49 @@ def check_nothing_left_behind():
     падали по одной с понятным именем, и от слияния диагностика не должна
     стать хуже.
 
+    Перед обходом — самопроверка таблицы. Слияние однажды уже потеряло три
+    правила незаметно (`scenario` и `draft` по клиенту, регистронезависимость):
+    набор проверок остался зелёным, а стерёг меньше прежнего. Поймать такое
+    зелёным прогоном нельзя — потерянное правило молчит ровно так же, как
+    соблюдённое. Поэтому каждое правило обязано доказать, что оно вообще
+    способно сработать.
+
     Ручки выпиленных механик проверяются отдельно — тем, что они отвечают
     404, а не тем, что слова нет в исходнике.
     """
     tracked = _tracked()
-    hits = []
 
+    # Самопроверка: правило срабатывает на своём же слове, включая чужой
+    # регистр, и смотрит хотя бы в один существующий файл.
     for word, scope, what in GONE:
-        if scope is SOURCES or scope == SOURCES:
-            files = [n for n in tracked if n.endswith(tuple(g[1:] for g in SOURCES))]
-        else:
-            files = [n for n in scope if n in tracked]
-            missing = [n for n in scope if n not in tracked]
-            assert not missing, f"проверка смотрит в несуществующие файлы: {missing}"
-        for name in files:
+        _scope_files(scope, tracked)
+        for probe in (word, word.upper(), word.lower(), f"// хвост {word.title()} хвост"):
+            assert _found(word, probe), (
+                f"правило «{word}» ({what}) не сработало бы даже на {probe!r} — "
+                "оно ничего не стережёт"
+            )
+    assert _found(REFERENCE_NAME, REFERENCE_NAME.upper()), "правило про референс не сработает"
+
+    # Сужение скоупа самопроверка выше не увидит: правило и на одном файле
+    # сработает на самом себе. Поэтому слова, жившие в клиенте, названы явно.
+    for word in MUST_COVER_CLIENT:
+        covered = {
+            name
+            for w, scope, _ in GONE
+            if w.lower() == word.lower()
+            for name in (_scope_files(scope, tracked) if tuple(scope) != SOURCES else CLIENT)
+        }
+        missing = [n for n in CLIENT if n not in covered]
+        assert not missing, (
+            f"правило «{word}» больше не смотрит в {', '.join(missing)} — "
+            "это слово жило в клиенте, и скоуп сузился"
+        )
+
+    hits = []
+    for word, scope, what in GONE:
+        for name in _scope_files(scope, tracked):
             body = open(os.path.join(ROOT, name), encoding="utf-8").read()
-            if word in body:
+            if _found(word, body):
                 hits.append(f"{name}: «{word}» ({what})")
 
     # Референс — по всем файлам разом, включая имена и двоичные.
@@ -275,12 +333,14 @@ def check_nothing_left_behind():
             if needle in handle.read().lower():
                 hits.append(f"{name}: имя референса в содержимом")
 
-    # Файлы, которых не должно быть вовсе.
-    for path in ("day.py", "checks/_daysrc.py", "app/commands.py"):
+    for path in GONE_FILES:
         assert not os.path.exists(os.path.join(ROOT, path)), f"{path} жив"
 
     assert not hits, f"осталось {len(hits)} упоминаний:\n  " + "\n  ".join(hits)
-    return f"{len(GONE) + 1} слов по {len(tracked)} файлам — ни одного совпадения"
+    return (
+        f"{len(GONE) + 1} правил по {len(tracked)} файлам, регистр не спасает — "
+        "ни одного совпадения"
+    )
 
 
 @check("ручек выпиленных механик нет, и мёртвых полей наружу тоже")
