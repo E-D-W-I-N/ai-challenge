@@ -487,6 +487,35 @@ async function routeChecks() {
       client.state.current.label);
   }
 
+  // ── «Новый чат» встаёт в конец списка ──
+  //
+  // Порядок списка слева не стерёг никто: разворот сортировки реестра
+  // наоборот не ронял ни одной проверки. Серверная половина —
+  // check_list_order в run_checks.py.
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(30);
+    const names = () =>
+      $("#agent-list").querySelectorAll(".item-title").map((el) => el.textContent);
+
+    check("сначала в списке два заведённых чата",
+      names().join(" | ") === "первый чат | второй чат", names().join(" | "));
+
+    $("#new-chat").dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("новый чат встаёт последним, а не первым",
+      names().length === 3 && /^Новый чат/.test(names()[2]), names().join(" | "));
+    check("и он же открыт",
+      client.state.current && client.state.current.label === names()[2],
+      client.state.current && client.state.current.label);
+    check("порядок прежних не тронут",
+      names()[0] === "первый чат" && names()[1] === "второй чат", names().join(" | "));
+    check("на сервере тот же порядок",
+      server.state.agents.map((a) => a.label).join(" | ") === names().join(" | "),
+      server.state.agents.map((a) => a.label).join(" | "));
+  }
+
   // ── лента рисуется из стенограммы ──
   //
   // Клиент после каждого обмена перечитывает агента и перерисовывает ленту

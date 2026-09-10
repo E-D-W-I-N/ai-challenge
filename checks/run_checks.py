@@ -122,6 +122,43 @@ def check_flat_list():
     return "на старте пусто, заведённый чат ничем не особенный"
 
 
+@check("список чатов идёт в порядке создания, новый — последним")
+def check_list_order():
+    """Порядок списка слева не стерёг никто.
+
+    Развернул сортировку реестра наоборот — все проверки остались зелёными,
+    хотя список слева перевернулся бы целиком. Порядок здесь видимое
+    поведение, а не деталь: чаты нумеруются возрастающе, и «Новый чат 7»
+    выше «Новый чат 3» — это не тот список, который завёл пользователь.
+
+    Клиентская половина — в `checks/browser_check.js`: кнопка «Новый чат»
+    добавляет строку в конец, а не в начало.
+    """
+    with TestClient(main.app) as client:
+        made = [client.post("/api/agents", json={}).json()["agents"][0] for _ in range(4)]
+        listed = client.get("/api/agents").json()["agents"]
+        assert [a["id"] for a in listed] == [a["id"] for a in made], (
+            [a["label"] for a in listed], [a["label"] for a in made]
+        )
+
+        # Удаление из середины порядок остальных не трогает.
+        client.delete(f"/api/agents/{made[1]['id']}")
+        after = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert after == [made[0]["id"], made[2]["id"], made[3]["id"]], after
+
+        # Разговор в старом чате не поднимает его наверх: список не по свежести.
+        _stub.install(reply="ок")
+        client.post(f"/api/agents/{made[0]['id']}/messages", json={"text": "?"})
+        talked = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert talked == after, talked
+
+        # А новый встаёт последним.
+        fresh = client.post("/api/agents", json={}).json()["agents"][0]
+        tail = [a["id"] for a in client.get("/api/agents").json()["agents"]]
+        assert tail[-1] == fresh["id"], tail
+    return "порядок создания, удаление из середины и разговор его не меняют"
+
+
 @check("у свежего чата нет системного промпта, и в теле его нет вовсе")
 def check_new_chat_is_blank():
     """Смотрим не на поле в ответе ручки, а на то, что ушло в модель: пустой
