@@ -30,7 +30,7 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
-from app.llm import SAMPLING_FIELDS  # noqa: E402
+from app.llm import SAMPLING_FIELDS, Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
 from app.store import Store, StoreBusyError  # noqa: E402
@@ -1392,6 +1392,41 @@ def check_first_token():
         f"первый токен {metrics['first_token_ms']:.1f} мс раньше "
         f"ttft {metrics['ttft_ms']:.1f} мс, usage разобран настоящим llm.py"
     )
+
+
+@check("провайдер смолчал о сумме — её досчитывает сервер, а не браузер")
+def check_total_tokens_filled_in():
+    """`total_tokens` в usage не обязателен, и без него «всего» брать неоткуда.
+
+    Досчитывать его в браузере нельзя: итог чата считается по `total_tokens`
+    реплик, и добор на клиенте дал бы на одном экране два разных «всего» —
+    сумму под ответом и другую сумму в плитке. Поэтому сумма появляется один
+    раз, до записи в историю, и дальше её все видят одинаково.
+    """
+    import app.llm as llm
+
+    lines = _sse_chunks(
+        {"choices": [{"delta": {"content": "ответ"}}]},
+        {"usage": {"prompt_tokens": 80, "completion_tokens": 40}},
+    )
+    saved_client, saved_key = llm.shared_client, llm.api_key
+    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines))
+    llm.api_key = lambda: "sk-or-проверочный"
+    try:
+        spec = AgentSpec(label="молчун", model="stub/quiet")
+        events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[])))
+    finally:
+        llm.shared_client, llm.api_key = saved_client, saved_key
+
+    metrics = next(e for e in events if e["type"] == "done")["metrics"]
+    assert metrics["total_tokens"] == 120, metrics
+
+    # Названа только одна часть — досчитывать нечего, и выдумывать сумму
+    # из половины нельзя: «всего» остаётся неизвестным, то есть прочерком.
+    half = Metrics()
+    llm._apply_usage(half, {"prompt_tokens": 80})
+    assert half.total_tokens is None, half
+    return "80 + 40 = 120 названы сервером; из одной половины сумма не выдумывается"
 
 
 @check("перегенерация заменяет последний ответ, а не добавляет второй")
@@ -2830,7 +2865,7 @@ def check_usage_summary_sums():
     assert total["completion_tokens"] == 5 + 40 + 7, total
     assert total["total_tokens"] == 16 + 160 + 1307, total
     assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
-    assert total["answers"] == 3, total
+    assert body["exchanges"] == 3, body["exchanges"]
 
     # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
     # и клиент рисует по ним строку под каждым ответом.
@@ -2838,7 +2873,7 @@ def check_usage_summary_sums():
     assert [a["metrics"]["total_tokens"] for a in answers] == [16, 160, 1307], answers
     return (
         f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
-        f"всего {total['total_tokens']} за {total['answers']} обмена — сумма сошлась"
+        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
     )
 
 
@@ -2860,6 +2895,9 @@ def check_usage_summary_skips_unknown():
     quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
     assert quiet.usage_summary() is None, quiet.usage_summary()
     assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
+    # Сумм нет, а разговор был: плитка «Обменов» считает ответы, а не слагаемые,
+    # и молчащий usage не должен делать вид, что в чате пусто.
+    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
 
     mixed = Agent(spec)
     mixed.remember("user", "вопрос")
@@ -2873,7 +2911,9 @@ def check_usage_summary_skips_unknown():
     assert total["total_tokens"] == 330, total
     # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
     assert total["cost_usd"] == 0.0002, total
-    assert total["answers"] == 2, total
+    # Слагаемых два, а обменов три — и расхождение видно по самим суммам,
+    # а не по счётчику: он про то, сколько раз поговорили.
+    assert mixed.exchanges() == 3, mixed.exchanges()
 
     # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
     sneaky = Agent(spec)
@@ -2911,7 +2951,7 @@ def check_usage_summary_survives_restart():
 
     assert before == after, (before, after)
     assert after["total_tokens"] == 420, after
-    assert after["answers"] == 2, after
+    assert revived.exchanges() == 2, revived.exchanges()
     return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
 
 
@@ -2924,13 +2964,15 @@ def check_usage_summary_regenerate():
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
         before = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
         client.post(f"/api/agents/{agent_id}/regenerate")
-        after = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
+        body = client.get(f"/api/agents/{agent_id}").json()
+        after = body["usage_total"]
 
     assert before["total_tokens"] == 110, before
     # Второй вызов заменил первый: в сумме числа второго, а не их сложение.
     assert after["total_tokens"] == 330, after
-    assert after["answers"] == 1, after
     assert after["prompt_tokens"] == 300, after
+    # И обмен в ленте остался один — перегенерация заменила карточку.
+    assert body["exchanges"] == 1, body["exchanges"]
     return f"после перегенерации всего {after['total_tokens']}, а не {110 + 330}"
 
 
@@ -2952,7 +2994,7 @@ def check_usage_summary_ignores_failed_call():
     assert any(e["event"] == "error" for e in events), events
     assert len(after["transcript"]) == 2, after["transcript"]
     assert after["usage_total"] == good, (good, after["usage_total"])
-    assert after["usage_total"]["answers"] == 1, after["usage_total"]
+    assert after["exchanges"] == 1, after["exchanges"]
     return "провалившийся вызов не в истории и не в сумме: всего осталось 55"
 
 
@@ -2977,7 +3019,7 @@ def check_usage_summary_has_no_column():
             last_used_at=0.0,
         )
         assert listed["usage_total"] is None, listed["usage_total"]
-        assert "usage_total" in listed, listed.keys()
+        assert "usage_total" in listed and "exchanges" in listed, listed.keys()
     finally:
         store.close()
     return f"колонок про токены в sessions нет ({len(columns)} прежних), сводка едет полем JSON"

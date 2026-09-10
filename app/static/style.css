@@ -659,9 +659,11 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   letter-spacing: .07em;
   text-transform: uppercase;
   color: var(--faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Подпись переносится, а не обрезается многоточием. На узком окне панель
+     уходит с 340 px на 300, плитка — со 125 на 105, а «ВЫХОДНЫЕ ТОКЕНЫ»
+     требует 112: с прежним nowrap там оставалось «ВЫХОДНЫЕ ТОК…», то есть
+     подпись переставала говорить, что стоит в плитке. */
+  overflow-wrap: anywhere;
 }
 .tile-row { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; }
 .tile-v {

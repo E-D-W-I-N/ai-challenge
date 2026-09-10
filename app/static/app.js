@@ -14,12 +14,13 @@ const state = {
   models: [],          // каталог моделей для дропдауна
   busy: false,
   abort: null,         // AbortController активного потока
-  lastMetrics: null,   // метрики последнего ответа — из них плитки
+  lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
   tab: "model",
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
   stick: true,         // лента примотана к низу — доматывать новые ответы
   baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
+  contextStale: false, // модель сменили — прежняя доля окна к новой не относится
   statusTimer: null,   // таймер, гасящий строку состояния
 };
 
@@ -102,8 +103,9 @@ const fmt = {
 };
 
 // Итог по чату приходит с сервера полем `usage_total` — считает его агент,
-// клиент только показывает. Ни одного слагаемого здесь не складывается:
-// два места, где числа суммируются, разъезжаются молча.
+// клиент только показывает. Здесь не складывается ни одного слагаемого,
+// и досчитать «всего» вместо смолчавшего провайдера клиент тоже не вправе:
+// два места, где числа считаются, разъезжаются молча.
 function chatUsage() {
   return (state.current && state.current.usage_total) || null;
 }
@@ -120,11 +122,15 @@ function totalField(name) {
 // смене модели она сбрасывается: окно у новой модели другое, и прежний процент
 // к ней не относится. Плитка молчит прочерком, пока не придёт первый ответ
 // на новой модели.
+//
+// Сброс поднимает сама смена модели в панели (`state.contextStale`), а не
+// расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
+// на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
+// плитку после каждого ответа, навсегда.
 function contextFill() {
+  if (state.contextStale) return null;
   const m = state.lastMetrics;
   if (!m || m.context_fill_pct === null || m.context_fill_pct === undefined) return null;
-  const model = state.current && state.current.model;
-  if (model && m.model && m.model !== model) return null;
   return m.context_fill_pct;
 }
 
@@ -423,6 +429,8 @@ async function openAgent(agentId) {
   // читатель выключил бы доматывание сразу для всех чатов.
   state.stick = true;
   state.lastMetrics = lastAnswerMetrics(agent);
+  // Чат открыт заново: доля окна относится к той модели, что у него сейчас.
+  state.contextStale = false;
   renderList();
   renderFeed(agent);
   fillPanel(agent);
@@ -509,7 +517,7 @@ function answerCard(agent, turn) {
   actions.className = "card-actions";
   actions.append(
     // Кнопки «метрики этого ответа» здесь больше нет: числа обмена написаны
-    // под ним самим, а перекладывать их в плитки справа значило бы показывать
+    // под ним самим, а перекладывать их в плитки значило бы показывать
     // в панели то, что там больше не живёт, — она про весь диалог.
     iconButton("copy", "Копировать ответ", () => copyText(turn.content)),
     iconButton("refresh", "Перегенерировать", () => regenerate()),
@@ -544,16 +552,18 @@ function answerCard(agent, turn) {
 // Итог по всему диалогу живёт в плитках справа, и одно и то же число нигде
 // не показывается дважды: лента про обмен, панель про разговор.
 //
-// Пропущенное поле не пишется вовсе: «вход 0» вместо «неизвестно» было бы
-// неправдой. Строки нет, только если чисел нет совсем. У оборванного ответа
-// она есть: его числа идут в итог чата, он оплачен.
+// Пропущенное поле не пишется вовсе: «входные 0» вместо «неизвестно» было бы
+// неправдой, а сумму, о которой смолчал провайдер, досчитывает сервер (см.
+// `_apply_usage` в `app/llm.py`) — сложи её здесь, и «всего» под ответом
+// разошлось бы с «Всего токенов» в плитке. Строки нет, только если чисел нет
+// совсем. У оборванного ответа она есть: его числа идут в итог чата, он оплачен.
 function usageLine(turn) {
   const m = turn.metrics;
   if (!m) return null;
   const known = (v) => v !== null && v !== undefined;
 
   const tokens = [];
-  if (known(m.prompt_tokens)) tokens.push("вход " + fmt.tokens(m.prompt_tokens));
+  if (known(m.prompt_tokens)) tokens.push("входные " + fmt.tokens(m.prompt_tokens));
   if (known(m.completion_tokens)) {
     // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
     // думающей модели выход заметно больше видимого текста. Поэтому они
@@ -562,10 +572,9 @@ function usageLine(turn) {
     const think = m.reasoning_tokens
       ? " (из них " + fmt.tokens(m.reasoning_tokens) + " рассуждение)"
       : "";
-    tokens.push("выход " + fmt.tokens(m.completion_tokens) + think);
+    tokens.push("выходные " + fmt.tokens(m.completion_tokens) + think);
   }
-  const whole = exchangeTotal(m);
-  if (known(whole)) tokens.push("всего " + fmt.tokens(whole));
+  if (known(m.total_tokens)) tokens.push("всего " + fmt.tokens(m.total_tokens));
   if (known(m.cost_usd)) tokens.push(fmt.cost(m.cost_usd));
 
   const how = [];
@@ -594,17 +603,6 @@ function usageRow(className, parts) {
   row.className = className;
   row.textContent = parts.join(" · ");
   return row;
-}
-
-// «Всего» этого обмена — вход плюс выход. Число берётся у провайдера, а своя
-// сумма считается только там, где он промолчал, а обе части известны: считать
-// заново то, что уже посчитано, значит завести второй источник правды.
-function exchangeTotal(m) {
-  if (m.total_tokens !== null && m.total_tokens !== undefined) return m.total_tokens;
-  if (typeof m.prompt_tokens === "number" && typeof m.completion_tokens === "number") {
-    return m.prompt_tokens + m.completion_tokens;
-  }
-  return null;
 }
 
 function thinkingBlock(text) {
@@ -814,6 +812,8 @@ async function exchange(path, body, questionText) {
             break;
           case "metrics":
             state.lastMetrics = e.metrics;
+            // Ответ на новой модели пришёл — контексту снова есть что показать.
+            state.contextStale = false;
             renderTiles();
             break;
           case "error":
@@ -823,7 +823,7 @@ async function exchange(path, body, questionText) {
           case "done":
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
-            if (e.metrics) state.lastMetrics = e.metrics;
+            if (e.metrics) { state.lastMetrics = e.metrics; state.contextStale = false; }
             bodyEl.innerHTML = renderMarkdown(answer);
             renderTiles();
             break;
@@ -871,8 +871,8 @@ async function refreshCurrent() {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
-    // Итог по чату приехал вместе с агентом: плитки перерисовываем, иначе
-    // накопленное отстаёт на один обмен.
+    // Итог по чату и число обменов приехали вместе с агентом: плитки
+    // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
@@ -1215,8 +1215,9 @@ function applySettings() {
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
       state.panelDirty = false;
-      // Модель могли сменить — плитка контекста обязана погаснуть сразу,
-      // а не после следующего ответа: окно у новой модели другое.
+      // Модель сменили — плитка контекста гаснет сразу, а не после следующего
+      // ответа: окно у новой модели другое. Правка температуры её не трогает.
+      if (updated.model !== before.model) state.contextStale = true;
       renderTiles();
       // Сравнивается не панель с панелью, а конфиг агента до и после:
       // сервер по дороге нормализует (пустой список стоп-строк становится
@@ -1244,13 +1245,15 @@ function applySettings() {
 //
 // Плиток шесть, сетка 2×3: пустых клеток в последнем ряду не остаётся.
 const TILES = [
-  ["Весь вход", () => fmt.tokens(totalField("prompt_tokens"))],
-  ["Весь выход", () => fmt.tokens(totalField("completion_tokens"))],
+  ["Входные токены", () => fmt.tokens(totalField("prompt_tokens"))],
+  ["Выходные токены", () => fmt.tokens(totalField("completion_tokens"))],
   ["Всего токенов", () => fmt.tokens(totalField("total_tokens"))],
   ["Стоимость", () => fmt.cost(totalField("cost_usd")), true],
-  // Обмены считаются по ответам, принёсшим числа: столько слагаемых
-  // в остальных пяти плитках.
-  ["Обменов", () => fmt.tokens(totalField("answers"))],
+  // Обмены считает сервер и считает **все** ответы, а не только принёсшие
+  // числа: карточек в ленте ровно столько же. Поэтому число едет отдельным
+  // полем, а не внутри сумм: у чата с молчащим usage сумм нет вовсе, а обмены
+  // в нём были.
+  ["Обменов", () => fmt.tokens(state.current ? state.current.exchanges : null)],
   ["Контекст", () => fmt.pct(contextFill())],
 ];
 

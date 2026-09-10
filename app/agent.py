@@ -394,8 +394,17 @@ class Agent:
         if totals["cost_usd"] is not None:
             # Копейки от сложения float'ов: цена показывается до шестого знака.
             totals["cost_usd"] = round(totals["cost_usd"], 8)
-        totals["answers"] = answers
         return totals
+
+    def exchanges(self) -> int:
+        """Сколько ответов модели в истории — столько обменов в ленте.
+
+        Считаются **все** ответы, а не только принёсшие числа: плитка «Обменов»
+        отвечает на вопрос «сколько раз поговорили», и карточек в ленте ровно
+        столько же. Слагаемых в суммах может быть меньше — провайдер вправе
+        смолчать о usage, — но это видно по самим суммам, а не по счётчику.
+        """
+        return sum(1 for turn in self.history if turn.role == "assistant")
 
     def transcript(self) -> list[dict]:
         """Ровно реплики диалога, в порядке разговора.
@@ -411,6 +420,7 @@ class Agent:
             agent_id=self.id,
             history_len=len(self.history),
             usage_total=self.usage_summary(),
+            exchanges=self.exchanges(),
             created_at=self.created_at,
             last_used_at=self.last_used_at,
             busy=self.busy,
@@ -594,6 +604,7 @@ def spec_as_dict(
     last_used_at: float,
     busy: bool = False,
     usage_total: dict | None = None,
+    exchanges: int | None = None,
 ) -> dict:
     """Конфиг чата так, как его ждут список слева и панель справа.
 
@@ -614,6 +625,10 @@ def spec_as_dict(
         # различать «чат поднят в память» и «чат лежит в базе» — у выгруженного
         # сводки нет, и это `None`, то есть прочерк, а не ноль.
         "usage_total": usage_total,
+        # Число обменов едет отдельно от сумм: у чата без единого usage сумм
+        # нет вовсе (`None`), а обмены в нём всё равно были, и плитка обязана
+        # их назвать.
+        "exchanges": exchanges,
         "busy": busy,
         "created_at": created_at,
         "last_used_at": last_used_at,
