@@ -127,6 +127,15 @@ function totalField(name) {
 // расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
 // на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
 // плитку после каждого ответа, навсегда.
+// Метрики нового ответа. Пометку «модель сменили» снимает **только** эта
+// функция: с новыми метриками приходит и свежая доля окна, и разбросать
+// снятие по веткам потока значило бы получить путь, на котором плитка
+// осталась бы погашенной навсегда.
+function keepMetrics(metrics) {
+  state.lastMetrics = metrics;
+  state.contextStale = false;
+}
+
 function contextFill() {
   if (state.contextStale) return null;
   const m = state.lastMetrics;
@@ -428,9 +437,8 @@ async function openAgent(agentId) {
   // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
   // читатель выключил бы доматывание сразу для всех чатов.
   state.stick = true;
-  state.lastMetrics = lastAnswerMetrics(agent);
   // Чат открыт заново: доля окна относится к той модели, что у него сейчас.
-  state.contextStale = false;
+  keepMetrics(lastAnswerMetrics(agent));
   renderList();
   renderFeed(agent);
   fillPanel(agent);
@@ -807,23 +815,22 @@ async function exchange(path, body, questionText) {
           case "delta":
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
-            if (e.metrics) { state.lastMetrics = e.metrics; renderTiles(); }
+            if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
             scrollFeed();
             break;
           case "metrics":
-            state.lastMetrics = e.metrics;
             // Ответ на новой модели пришёл — контексту снова есть что показать.
-            state.contextStale = false;
+            keepMetrics(e.metrics);
             renderTiles();
             break;
           case "error":
             failure = e.message;
-            if (e.metrics) state.lastMetrics = e.metrics;
+            if (e.metrics) keepMetrics(e.metrics);
             break;
           case "done":
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
-            if (e.metrics) { state.lastMetrics = e.metrics; state.contextStale = false; }
+            if (e.metrics) keepMetrics(e.metrics);
             bodyEl.innerHTML = renderMarkdown(answer);
             renderTiles();
             break;
