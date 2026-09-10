@@ -714,6 +714,49 @@ def check_system_prompt_single_home():
     return "промпт читается из конфига на каждом обращении; второго дома нет"
 
 
+@check("provider.require_parameters стоит на каждом вызове")
+def check_require_parameters():
+    """Стерёг его только текст предупреждения в панели, а не тело запроса.
+
+    Убрал `require_parameters` из build_payload — ни одна проверка не
+    покраснела, хотя это правило, на котором держится весь смысл панели:
+    без него OpenRouter вправе увести запрос к провайдеру, который молча
+    проигнорирует temperature или stop, и стенд покажет неправду.
+
+    Проверяется на всех путях: обычное сообщение, перегенерация, чат
+    с закреплённым поставщиком и чат без единого заданного параметра.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        bare = new_agent(client)
+        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
+        client.post(f"/api/agents/{bare}/regenerate")
+
+        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
+        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
+
+        # Закреплённый поставщик дополняет provider, а не затирает его:
+        # extra_body мержится поверх, и require_parameters обязан уцелеть.
+        pinned = new_agent(client, extra_body={"provider": {"order": ["openai"]}})
+        client.post(f"/api/agents/{pinned}/messages", json={"text": "три"})
+
+    assert len(_stub.CALLS) == 4, len(_stub.CALLS)
+    for call in _stub.CALLS:
+        provider = call["payload"].get("provider")
+        assert provider and provider.get("require_parameters") is True, (
+            f"вызов ушёл без provider.require_parameters: {call['payload'].get('provider')!r}"
+        )
+    assert _stub.CALLS[-1]["payload"]["provider"]["order"] == ["openai"], _stub.CALLS[-1]["payload"]
+
+    # И то же самое напрямую, без веб-слоя: правило живёт в build_payload,
+    # а не в ручке, поэтому CLI и любой другой вызывающий получают его тоже.
+    from app.llm import build_payload
+
+    payload = build_payload(AgentSpec(label="без веба", model="stub/m"))
+    assert payload["provider"]["require_parameters"] is True, payload["provider"]
+    return "4 вызова через ручки и один напрямую — все с require_parameters"
+
+
 @check("stop и response_format правятся из панели и доезжают до тела запроса")
 def check_stop_and_format():
     _stub.install(reply="ок")

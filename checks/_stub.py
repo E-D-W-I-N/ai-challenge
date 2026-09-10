@@ -50,7 +50,7 @@ def make(
     from app.llm import Metrics, build_payload
 
     async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
-        messages = list(prompt_override if prompt_override is not None else session.messages)
+        messages = list(prompt_override or [])
         index = len(CALLS)
         CALLS.append(
             {

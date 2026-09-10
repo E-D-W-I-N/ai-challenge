@@ -182,11 +182,15 @@ SAMPLING_FIELDS = (
 """
 
 
-def build_payload(session: AgentSpec, prompt_override: list[dict] | None = None) -> dict:
-    """Тело запроса к OpenRouter. require_parameters — на каждом вызове."""
+def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
+    """Тело запроса к OpenRouter. require_parameters — на каждом вызове.
+
+    Промпт приходит снаружи: собирает его агент, из слепка конфига. Конфиг
+    ленту не хранит, и брать её здесь неоткуда.
+    """
     payload: dict = {
         "model": session.model,
-        "messages": prompt_override if prompt_override is not None else session.messages,
+        "messages": messages or [],
         "stream": True,
         # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
         "usage": {"include": True},
