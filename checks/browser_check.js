@@ -341,6 +341,24 @@ function freshClient(options) {
   return { ...env, ...dom, client, $: (sel) => env.document.querySelector(sel) };
 }
 
+// Плитка по метке — заглушкой, если такой плитки нет. Иначе переименованная
+// плитка роняет весь маршрут исключением, и вместо одного внятного «покраснело»
+// получается «проверка упала», за которой не видно остальных утверждений.
+const NO_TILE = "(плитки нет)";
+const shownAs = (tile) => tile.v + " / " + tile.sub;
+function tileOf($, name) {
+  const el = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
+  if (!el) return { el: null, v: NO_TILE, sub: NO_TILE, row: NO_TILE };
+  const sub = el.querySelector(".tile-sub");
+  const row = el.querySelector(".tile-row");
+  return {
+    el,
+    v: row.querySelector(".tile-v").textContent,
+    sub: sub ? sub.textContent : "",
+    row: row.children.map((c) => c.className).join(","),
+  };
+}
+
 async function routeChecks() {
   // ── шапка страницы называет тот день, который в ней лежит ──
   //
@@ -981,13 +999,8 @@ async function routeChecks() {
 
     const tiles = () => {
       const out = {};
-      $("#tiles").children.forEach((tile) => {
-        const sub = tile.querySelector(".tile-sub");
-        out[tile.querySelector(".tile-k").textContent] = {
-          v: tile.querySelector(".tile-v").textContent,
-          sub: sub ? sub.textContent : "",
-        };
-      });
+      ["Ток/с", "Первый токен, с", "Вход", "Выход", "Всего", "Стоимость", "Провайдер", "Контекст"]
+        .forEach((name) => { out[name] = tileOf($, name); });
       return out;
     };
     const usageLines = () =>
@@ -1008,9 +1021,9 @@ async function routeChecks() {
 
     const empty = tiles();
     check("до первого ответа плитка входа — прочерк, а не ноль",
-      empty["Вход"] && empty["Вход"].v === "—", JSON.stringify(empty["Вход"]));
+      empty["Вход"] && empty["Вход"].v === "—", shownAs(empty["Вход"]));
     check("и накопленного по чату тоже нет",
-      empty["Всего"] && empty["Всего"].sub === "", JSON.stringify(empty["Всего"]));
+      empty["Всего"] && empty["Всего"].sub === "", shownAs(empty["Всего"]));
 
     $("#input").value = "первый вопрос";
     $("#composer").requestSubmit();
@@ -1018,13 +1031,13 @@ async function routeChecks() {
 
     const one = tiles();
     check("плитка «Вход» показывает prompt_tokens обмена",
-      one["Вход"].v === "1 240", JSON.stringify(one["Вход"]));
+      one["Вход"].v === "1 240", shownAs(one["Вход"]));
     check("плитка «Выход» показывает completion_tokens обмена",
-      one["Выход"].v === "312", JSON.stringify(one["Выход"]));
+      one["Выход"].v === "312", shownAs(one["Выход"]));
     check("плитка «Всего» показывает total_tokens обмена",
-      one["Всего"].v === "1 552", JSON.stringify(one["Всего"]));
+      one["Всего"].v === "1 552", shownAs(one["Всего"]));
     check("плитка «Стоимость» показывает цену обмена",
-      one["Стоимость"].v === "$0.000186", JSON.stringify(one["Стоимость"]));
+      one["Стоимость"].v === "$0.000186", shownAs(one["Стоимость"]));
     check("после первого обмена накопленное равно самому обмену",
       one["Вход"].sub === "Σ 1 240" && one["Всего"].sub === "Σ 1 552",
       JSON.stringify([one["Вход"].sub, one["Всего"].sub]));
@@ -1036,22 +1049,15 @@ async function routeChecks() {
     // плитки, а у цены девять знаков — она занимает строку целиком. Поэтому
     // утверждение про то, откуда обрезка берётся: подпись цены стоит **под**
     // значением, и в строке значения, кроме него, нет никого.
-    const tileNamed = (name) =>
-      $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
-    const inRow = (tile) =>
-      tile.querySelector(".tile-row").children.map((el) => el.className).join(",");
-
-    const cost = tileNamed("Стоимость");
+    const cost = tileOf($, "Стоимость");
     check("подпись стоимости стоит под значением, а не отбирает у него ширину",
-      inRow(cost) === "tile-v small", inRow(cost));
+      cost.row === "tile-v small", cost.row);
     check("а сама подпись при этом на месте, отдельной строкой",
-      Boolean(cost.querySelector(".tile-sub")) &&
-        cost.querySelector(".tile-sub").textContent === "Σ $0.000186",
-      String(cost.querySelector(".tile-sub")));
+      cost.sub === "Σ $0.000186", cost.sub);
     // Плиткам с короткими значениями отдельная строка не нужна: там подпись
     // рядом, и лишнего ряда высоты панель не отдаёт.
     check("у короткого значения подпись остаётся рядом",
-      inRow(tileNamed("Вход")) === "tile-v,tile-sub", inRow(tileNamed("Вход")));
+      tileOf($, "Вход").row === "tile-v,tile-sub", tileOf($, "Вход").row);
     check("под ответом строка с теми же числами",
       usageLines().join("|") === "вход 1 240 · выход 312 · всего 1 552 · $0.000186",
       usageLines().join("|"));
@@ -1132,11 +1138,8 @@ async function routeChecks() {
       shown.length === 2, JSON.stringify(shown));
     check("сумма видимых строк сходится с итогом в плитке",
       shown.reduce((a, b) => a + b, 0) === 94, JSON.stringify(shown));
-    const totalTile = $("#tiles").children.find(
-      (t) => t.querySelector(".tile-k").textContent === "Всего");
-    check("и в плитке стоит она же",
-      totalTile.querySelector(".tile-sub").textContent === "Σ 94",
-      totalTile.querySelector(".tile-sub").textContent);
+    check("и в плитке стоит она же", tileOf($, "Всего").sub === "Σ 94",
+      tileOf($, "Всего").sub);
 
     // Ноль и «неизвестно» на экране разные: это единственное, что отличает
     // «модель ничего не потратила» от «мы не знаем, сколько она потратила».
@@ -1181,16 +1184,11 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
-    const out = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === "Выход");
-    check("«Выход» показывает completion_tokens", out.querySelector(".tile-v").textContent === "60",
-      out.querySelector(".tile-v").textContent);
-    check("а подписью — рассуждение, а не накопленное",
-      out.querySelector(".tile-sub").textContent === "40 рассужд",
-      out.querySelector(".tile-sub").textContent);
-    const total = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === "Всего");
+    const out = tileOf($, "Выход");
+    check("«Выход» показывает completion_tokens", out.v === "60", out.v);
+    check("а подписью — рассуждение, а не накопленное", out.sub === "40 рассужд", out.sub);
     check("накопленное по чату при этом видно в соседней плитке",
-      total.querySelector(".tile-sub").textContent === "Σ 160",
-      total.querySelector(".tile-sub").textContent);
+      tileOf($, "Всего").sub === "Σ 160", tileOf($, "Всего").sub);
   }
 
   // ── итог берётся с сервера, а не складывается в браузере ──
@@ -1219,9 +1217,7 @@ async function routeChecks() {
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
 
-    const sub = (name) => $("#tiles").children
-      .find((t) => t.querySelector(".tile-k").textContent === name)
-      .querySelector(".tile-sub").textContent;
+    const sub = (name) => tileOf($, name).sub;
     check("подпись входа — серверная, а не сумма реплик",
       sub("Вход") === "Σ 777.8k", sub("Вход"));
     check("подпись выхода — серверная", sub("Выход") === "Σ 1M", sub("Выход"));
