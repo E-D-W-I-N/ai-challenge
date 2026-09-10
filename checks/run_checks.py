@@ -238,6 +238,7 @@ ONLY = {
     "children": ("app/registry.py", "вне реестра это свойство DOM-узла"),
     "карандаш": ("app/static/index.html", "вне разметки это обычное слово"),
     "колонк": ("app/static/", "вне клиента это колонка таблицы SQLite"),
+    "памяти": ("app/static/", "вне клиента это память между запусками и память процесса"),
 }
 
 # Растяжка: сужения заморожены вместе с областями. Это не доказательство —
@@ -248,6 +249,7 @@ NARROWED = (
     ("children", "app/registry.py"),
     ("колонк", "app/static/"),
     ("карандаш", "app/static/index.html"),
+    ("памяти", "app/static/"),
 )
 
 GONE = [
@@ -285,6 +287,16 @@ GONE = [
     ("starting_prompt", "заготовка диалога"),
     # рельс справа от ленты: полоса точек по числу сообщений
     ("rail", "рельс с точками справа от ленты"),
+    # управление контекстом: оно станет заданием Дня 9 и вернётся осознанно
+    ("history_limit", "окно памяти в конфиге агента"),
+    ("history-limit", "ключ CLI, задававший окно памяти"),
+    ("MAX_STORED_MESSAGES", "потолок хранимых реплик"),
+    ("окно памяти", "поле панели «Окно памяти, сообщений»"),
+    # Подстрока склонение не берёт: правило выше не поймало «ноль в окне
+    # памяти» в подсказке панели — она пережила выпиливание и разъехала
+    # клиент с Днём 7. Поэтому в клиенте запрещено само слово: там ему
+    # взяться неоткуда, пока управление контекстом не вернётся Днём 9.
+    ("памяти", "разговоры про окно памяти в панели, в любом падеже"),
 ]
 
 # Имя клиента-референса: он был инструментом разработки, а не частью продукта,
@@ -445,8 +457,17 @@ def check_removed_endpoints():
         assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
 
         agent = client.post("/api/agents", json={}).json()["agents"][0]
-        for gone in ("parent_id", "group", "note", "origin", "draft", "children", "seed"):
+        for gone in (
+            "parent_id", "group", "note", "origin", "draft", "children", "seed",
+            "history_limit",
+        ):
             assert gone not in agent, f"наружу торчит мёртвое поле {gone}"
+
+        # Окно памяти ушло и из ручки правки: панель такого поля не показывает,
+        # а PATCH принимает ровно то, что в панели есть.
+        assert client.patch(
+            f"/api/agents/{agent['id']}", json={"history_limit": 4}
+        ).status_code == 400, "PATCH всё ещё принимает history_limit"
 
         # Каскад субагентов — ещё и поведением, не только словом в исходнике:
         # греп по `children` сужен до реестра, и упоминание в комментарии
@@ -460,10 +481,10 @@ def check_removed_endpoints():
         body = client.get("/api/agents").text
         for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
             assert leftover not in body, f"наружу уехало пояснение: {leftover}"
-    return "четыре ручки отдают 404/405, мёртвых полей в ответах нет"
+    return "четыре ручки отдают 404/405, мёртвых полей в ответах и в PATCH нет"
 
 
-# --- 4. агент: память, окно, откат, 409, обрыв --------------------------------
+# --- 4. агент: память, откат, 409, обрыв -------------------------------------
 
 
 @check("диалог помнит предыдущее: в третьем запросе виден первый вопрос")
@@ -486,22 +507,52 @@ def check_memory():
     return "3-й запрос: 6 сообщений, первый вопрос в контексте"
 
 
-@check("окно памяти режет: history_limit=0 отвечает каждый вопрос как первый")
-def check_history_window():
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        blank = new_agent(client, history_limit=0, system="СИС")
-        narrow = new_agent(client, history_limit=2, system="СИС")
-        for agent_id in (blank, narrow):
-            for text in ("первый", "второй", "третий"):
-                client.post(f"/api/agents/{agent_id}/messages", json={"text": text})
+@check("в модель уезжает вся история: ни хвоста, ни отсечки по росту")
+def check_whole_history_goes_to_model():
+    """На месте выпиленного окна памяти.
 
-    calls = [c["messages"] for c in _stub.CALLS]
-    assert all(len(m) == 2 for m in calls[:3]), [len(m) for m in calls[:3]]
-    # Окно 2 — это один обмен: системный промпт, пара из истории и новый вопрос.
-    assert [len(m) for m in calls[3:]] == [2, 4, 4], [len(m) for m in calls[3:]]
-    assert calls[5][1]["content"] == "второй", calls[5][1]
-    return "окно 0 — по 2 сообщения, окно 2 — 2/4/4"
+    Прежняя проверка стерегла обрезку: окно `history_limit` резало хвост,
+    а `MAX_STORED_MESSAGES` — само хранилище. Обрезки больше нет, и стеречь
+    надо ровно обратное: что в промпт попадают **все** реплики и что рост
+    истории ничего из неё не выбрасывает.
+
+    Пороги взяты заведомо выше прежних отсечек — 20 сообщений в окне
+    по умолчанию и 400 хранимых: вернись любая из них, здесь станет красно.
+    """
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+
+    # 1. Живой маршрут: 25 обменов — больше прежнего окна по умолчанию.
+    turns = 25
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, system="СИС")
+        for i in range(turns):
+            response = client.post(
+                f"/api/agents/{agent_id}/messages", json={"text": f"вопрос {i}"}
+            )
+            assert response.status_code == 200, response.text
+
+    sent = _stub.CALLS[-1]["messages"]
+    # Системный промпт + вся переписка (по две реплики на обмен) + новый вопрос.
+    assert len(sent) == 1 + 2 * (turns - 1) + 1, len(sent)
+    assert sent[0]["role"] == "system", sent[0]
+    assert sent[1]["content"] == "вопрос 0", sent[1]
+    assert sent[-1]["content"] == f"вопрос {turns - 1}", sent[-1]
+    assert [m["content"] for m in sent[1:-1:2]] == [f"вопрос {i}" for i in range(turns - 1)]
+
+    agent = REGISTRY.require(agent_id)
+    assert len(agent.history) == 2 * turns, len(agent.history)
+
+    # 2. Рост истории: 500 реплик — больше прежнего потолка хранимого.
+    long_chat = agent_module.Agent(AgentSpec(label="длинный", model="stub/model", system="СИС"))
+    for i in range(500):
+        long_chat.remember("user", f"реплика {i}")
+    assert len(long_chat.history) == 500, "история подрезана при росте"
+    assert long_chat.history[0].content == "реплика 0", "у истории отъели начало"
+
+    prompt = long_chat.build_prompt("последний вопрос")
+    assert len(prompt) == 502, len(prompt)
+    assert prompt[1]["content"] == "реплика 0", prompt[1]
+    return f"{len(sent)} сообщений в промпте после {turns} обменов, 500 реплик хранятся целиком"
 
 
 @check("два параллельных запроса к одному агенту: 409, история не перемешана")
@@ -673,7 +724,7 @@ PANEL_FIELDS = {
 @check("правка в панели применяется к следующему сообщению, а не к следующему чату")
 def check_panel_applies_next_message():
     """Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
-    и каждое поле панели, и окно памяти."""
+    и каждое поле панели."""
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         agent_id = new_agent(client, model="старая/модель", system="СТАРЫЙ ПРОМПТ")
@@ -682,7 +733,7 @@ def check_panel_applies_next_message():
 
         patched = client.patch(
             f"/api/agents/{agent_id}",
-            json={"system": "НОВЫЙ ПРОМПТ", "history_limit": 0, **PANEL_FIELDS},
+            json={"system": "НОВЫЙ ПРОМПТ", **PANEL_FIELDS},
         )
         assert patched.status_code == 200, patched.text
 
@@ -698,9 +749,11 @@ def check_panel_applies_next_message():
         if name == "model":
             continue
         assert payload.get(name) == value, (name, payload.get(name), value)
-    # history_limit=0 — окно тоже применилось: в промпте только промпт и вопрос.
-    assert [m["role"] for m in sent] == ["system", "user"], sent
-    return "промпт, модель, окно и все параметры уехали новыми"
+    # Новый промпт встал на место старого, а прошлый обмен из истории никуда
+    # не делся: правка панели меняет конфиг, а не переписку.
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"], sent
+    assert sent[1]["content"] == "первый", sent[1]
+    return "промпт, модель и все параметры уехали новыми, история на месте"
 
 
 @check("правка панели во время генерации не теряется")
@@ -981,11 +1034,10 @@ def check_create_and_patch_agree():
         {"stop": ["", "  ", "КОНЕЦ", " СТОП "]},
         {"stop": ["", "   "]},
         {"system": None},
-        {"history_limit": 0},
         {"response_format": {"type": "json_object"}},
         {"temperature": 0.0, "top_p": 0, "max_tokens": 7},
     ]
-    watched = ("stop", "system", "history_limit", "response_format", *SAMPLING_FIELDS)
+    watched = ("stop", "system", "response_format", *SAMPLING_FIELDS)
     with TestClient(main.app) as client:
         for case in cases:
             created = client.post("/api/agents", json={"agent": {"model": "stub/model", **case}})
@@ -1004,7 +1056,7 @@ def check_create_and_patch_agree():
                 )
 
         # Согласие в отказах тоже: кривой тип обе ручки обязаны отвергнуть.
-        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"history_limit": -1}):
+        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"max_tokens": 0}):
             born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
             grown = client.patch(f"/api/agents/{new_agent(client)}", json=bad)
             assert born.status_code == 400 and grown.status_code == 400, (
@@ -1168,7 +1220,7 @@ def check_every_write_path_redacts():
     return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
 
 
-@check("панель правит живого агента: модель, промпт, окно памяти")
+@check("панель правит живого агента: модель, промпт, имя")
 def check_patch_panel():
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
@@ -1179,20 +1231,18 @@ def check_patch_panel():
                 "model": "stub/new",
                 "system": "новый промпт",
                 "label": "Переименован",
-                "history_limit": 4,
             },
         )
         assert patched.status_code == 200, patched.text
         body = patched.json()
         assert body["model"] == "stub/new" and body["label"] == "Переименован"
-        assert body["history_limit"] == 4
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
         assert client.patch(f"/api/agents/{agent_id}", json={"note": "х"}).status_code == 400
 
     call = _stub.CALLS[-1]
     assert call["model"] == "stub/new", call["model"]
     assert call["messages"][0]["content"] == "новый промпт", call["messages"][0]
-    return "PATCH меняет модель, промпт, имя и окно; чужие поля не принимаются"
+    return "PATCH меняет модель, промпт и имя; чужие поля не принимаются"
 
 
 # --- 6. лента: рассуждение и перегенерация ------------------------------------
@@ -1903,7 +1953,7 @@ def check_cli():
 
     from app import cli
 
-    args = cli._parse_args(["--model", "stub/m", "--label", "консоль", "--history-limit", "5"])
+    args = cli._parse_args(["--model", "stub/m", "--label", "консоль"])
     agent = cli.build_agent(args)
     out = io.StringIO()
     answer = asyncio.run(cli.ask(agent, "как дела?", out))
@@ -1952,7 +2002,7 @@ def check_store_reopen():
     first.save_session(
         "ag_00042",
         label="Нина",
-        config={"model": "stub/m", "history_limit": 7, "top_p": 0.9},
+        config={"model": "stub/m", "max_tokens": 7, "top_p": 0.9},
         created_at=100.0,
         context_length=128_000,
     )
@@ -1966,7 +2016,7 @@ def check_store_reopen():
     second = Store(path).init()
     saved = second.load_session("ag_00042")
     assert saved is not None, "чат не пережил закрытие файла"
-    assert saved["config"]["history_limit"] == 7 and saved["config"]["top_p"] == 0.9
+    assert saved["config"]["max_tokens"] == 7 and saved["config"]["top_p"] == 0.9
     assert saved["created_at"] == 100.0 and saved["context_length"] == 128_000
     rows = second.message_rows("ag_00042")
     assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
@@ -2054,9 +2104,9 @@ def check_session_isolation():
     return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
 
 
-@check("порядковые номера без дыр: откат и кап окна пересчитывают seq от нуля")
+@check("порядковые номера без дыр: откат и укорачивание пересчитывают seq от нуля")
 def check_seq_renumbered():
-    from app.agent import MAX_STORED_MESSAGES, Agent
+    from app.agent import Agent
 
     path = _temp_db("seq")
     store = Store(path).init()
@@ -2067,28 +2117,71 @@ def check_seq_renumbered():
     asyncio.run(drain(agent.ask("вопрос, на который не ответили")))
     assert store.message_rows(agent.id) == [], store.message_rows(agent.id)
 
-    # 2) Обычные обмены и кап хранимого.
+    # 2) Обычные обмены и укорачивание истории.
     _stub.reset()
     _stub.install(reply="ок")
     for i in range(3):
         asyncio.run(drain(agent.ask(f"вопрос {i}")))
     assert [row[0] for row in store.message_rows(agent.id)] == list(range(6))
 
-    agent.history = agent.history[-2:]  # так выглядит история после кап-а окна
+    agent.history = agent.history[-2:]  # так выглядит история после отката обмена
     agent.persist()
     seqs = [row[0] for row in store.message_rows(agent.id)]
     assert seqs == [0, 1], f"после укорачивания номера должны идти от нуля: {seqs}"
 
-    # 3) Жёсткий потолок хранимого держится и в базе.
-    agent.history = [_Turn("user", f"т{i}") for i in range(MAX_STORED_MESSAGES + 10)]
-    agent._trim()
+    # 3) Потолка хранимого больше нет, и это половина, которую стеречь надо
+    #    теперь: длинная история пишется в базу целиком, без отсечки.
+    long_history = 500
+    agent.history = [_Turn("user", f"т{i}") for i in range(long_history)]
     agent.persist()
     rows = store.message_rows(agent.id)
-    assert len(rows) == MAX_STORED_MESSAGES and [r[0] for r in rows] == list(
-        range(MAX_STORED_MESSAGES)
-    )
+    assert len(rows) == long_history, f"историю подрезали при записи: {len(rows)}"
+    assert [r[0] for r in rows] == list(range(long_history)), "номера пошли с дырами"
+    assert rows[0][2] == "т0", rows[0]
     store.close()
-    return f"нет ответа — нет записи; после укорачивания seq = 0..N, потолок {MAX_STORED_MESSAGES}"
+    return f"нет ответа — нет записи; seq = 0..N; {long_history} реплик записаны целиком"
+
+
+@check("длинный чат поднимается из базы целиком: ни отсечки, ни потерянного начала")
+def check_long_chat_survives_restart():
+    """Половина выпиленного окна, которая живёт в слое памяти.
+
+    Окна и потолка хранимого больше нет — значит история идёт целиком и в базу,
+    и обратно, и оттуда в модель. Порог заведомо выше прежних отсечек (20
+    сообщений в окне, 400 хранимых): вернись любая из них при записи или
+    при восстановлении — здесь станет красно.
+
+    Проверяется настоящим переоткрытием файла, а не тем же объектом в памяти:
+    обрезка при чтении из базы выглядела бы точно так же, как её отсутствие,
+    если смотреть на объект, который ничего не перечитывал.
+    """
+    from app.agent import Agent
+
+    path = _temp_db("long-chat")
+    store = Store(path).init()
+    messages = 500
+    agent = Agent(AgentSpec(label="долгий", model="stub/m", system="СИС"), store=store)
+    for i in range(messages):
+        role = "user" if i % 2 == 0 else "assistant"
+        agent.remember(role, f"реплика {i}", persist=False)
+    agent.persist()
+    agent_id = agent.id
+    store.close()
+
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        assert len(revived.history) == messages, f"из базы поднялось {len(revived.history)}"
+        assert revived.history[0].content == "реплика 0", "у поднятого чата отъели начало"
+        assert revived.history[-1].content == f"реплика {messages - 1}", revived.history[-1]
+
+        # И это же целиком уезжает в модель: восстановленная история — обычная.
+        prompt = revived.build_prompt("новый вопрос")
+        assert len(prompt) == 1 + messages + 1, len(prompt)
+        assert prompt[1]["content"] == "реплика 0", prompt[1]
+    finally:
+        again.close()
+    return f"{messages} реплик записаны, подняты из файла и уехали в промпт целиком"
 
 
 @check("частичный ответ пишется в базу с пометкой ошибки, парой с вопросом")
@@ -2677,7 +2770,6 @@ def check_panel_stable_after_restart():
         "repetition_penalty",
         "presence_penalty",
         "frequency_penalty",
-        "history_limit",
     )
     settings = {
         "system": "ты гид",
@@ -2692,7 +2784,6 @@ def check_panel_stable_after_restart():
         "repetition_penalty": 1.1,
         "presence_penalty": 0.2,
         "frequency_penalty": 0.3,
-        "history_limit": 6,
     }
 
     path = _temp_db("panel-stable")
@@ -2705,8 +2796,6 @@ def check_panel_stable_after_restart():
             saved = client.patch(f"/api/agents/{chat_id}", json=settings).json()
         before = {name: saved[name] for name in panel}
         assert before["top_p"] == 0.0 and before["temperature"] == 0.0, before
-        # Незаданные параметры остаются null, а не превращаются в ноль.
-        assert saved["history_limit"] == 6, saved["history_limit"]
 
         store.close()
         again = Store(path).init()

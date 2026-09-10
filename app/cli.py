@@ -41,12 +41,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument(
-        "--history-limit",
-        type=int,
-        default=None,
-        help="сколько сообщений истории уходит в модель; 0 — агент без памяти",
-    )
-    parser.add_argument(
         "--session",
         default=None,
         metavar="ID",
@@ -81,7 +75,6 @@ def build_agent(args: argparse.Namespace) -> Agent:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         system=args.system,
-        history_limit=args.history_limit,
     )
     return REGISTRY.create(spec)
 
@@ -148,7 +141,7 @@ def _print_agents(out=sys.stdout) -> None:
 
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
     """Цикл «вопрос — ответ». Возвращает код возврата процесса."""
-    out.write(f"агент {agent.id} · {agent.spec.model} · окно памяти {agent.history_limit}\n")
+    out.write(f"агент {agent.id} · {agent.spec.model}\n")
     if agent.history:
         # Ради этой строки день и делался: процесс новый, разговор старый.
         out.write(

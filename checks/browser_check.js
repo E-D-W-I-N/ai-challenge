@@ -21,6 +21,15 @@ const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFor
 const failures = [];
 let passed = 0;
 
+// Клиент асинхронный насквозь, и его исключение всплывает необработанным
+// отказом промиса: без этого обработчика node просто убивает процесс, и
+// от набора не остаётся ни одной строки — ни зелёной, ни красной. Ловим,
+// краснеем внятно и доводим набор до конца.
+process.on("unhandledRejection", (err) => {
+  const first = err && err.stack ? String(err.stack).split("\n")[0] : String(err);
+  failures.push("клиент уронил необработанный отказ промиса: " + first);
+});
+
 function check(name, condition, detail) {
   if (condition) passed += 1;
   else failures.push(`${name}${detail ? ": " + detail : ""}`);
@@ -196,8 +205,10 @@ check(
   check("модель не найдена в каталоге — молчим", paramWarnings(null, { top_k: 40 }).length === 0);
   check("модель не отдала supported_parameters — молчим",
     paramWarnings({ id: "m", supported_parameters: [] }, { top_k: 40 }).length === 0);
-  check("окно памяти в запрос не уходит и не проверяется",
-    paramWarnings(plain, { history_limit: 0 }).length === 0);
+  // Проверяются только параметры запроса: `system` и `model` — наши поля
+  // панели, и предупреждать про них по `supported_parameters` не о чем.
+  check("свои поля панели в запрос не уходят и не проверяются",
+    paramWarnings(plain, { system: "ПРОМПТ", model: plain.id }).length === 0);
 }
 
 // ── привязка к поставщику: говорим в момент смены модели ──
@@ -319,7 +330,6 @@ const PANEL_ROUTE = [
   ["f-repetition_penalty", "1.2", "repetition_penalty", 1.2],
   ["f-presence_penalty", "0.4", "presence_penalty", 0.4],
   ["f-frequency_penalty", "0.6", "frequency_penalty", 0.6],
-  ["f-history_limit", "0", "history_limit", 0],
   ["f-stop", "КОНЕЦ\nСТОП", "stop", ["КОНЕЦ", "СТОП"]],
 ];
 
@@ -349,6 +359,13 @@ function freshClient(options) {
 // начинает жать не то, оставаясь зелёным ровно до тех пор, пока новая кнопка
 // случайно не делает то же самое.
 function cardButton(card, title) {
+  // Карточки может не быть вовсе — так выглядит обмен, который не состоялся.
+  // Красное утверждение вместо исключения: упавший маршрут уносит с собой
+  // все проверки, стоящие после него, и от диагностики остаётся одна строка.
+  if (!card) {
+    check(`в ленте есть карточка с кнопкой «${title}»`, false, "карточки нет вовсе");
+    return { dispatchEvent() {} };
+  }
   const titles = card.querySelectorAll(".icon-btn").map((b) => b.title);
   const btn = card.querySelectorAll(".icon-btn").find((b) => b.title === title);
   if (btn) return btn;
@@ -397,13 +414,22 @@ async function routeChecks() {
   // ── каждое поле панели доезжает до запроса, даже без события change ──
   for (const [field, typed, key, expected] of PANEL_ROUTE) {
     const { client, server, $, settle } = freshClient();
-    client.init();
-    await settle(20);
+    // Поле, которого нет в разметке, роняет маршрут исключением — и уносит
+    // с собой все утверждения после себя. Диагностика при поломке важнее
+    // краткости: ловим здесь и краснеем именно этой строкой.
+    try {
+      client.init();
+      await settle(20);
 
-    $("#" + field).value = typed;          // правка есть на экране...
-    $("#input").value = "вопрос";          // ...а `change` не выстрелил
-    $("#composer").requestSubmit();
-    await settle(80);
+      $("#" + field).value = typed;          // правка есть на экране...
+      $("#input").value = "вопрос";          // ...а `change` не выстрелил
+      $("#composer").requestSubmit();
+      await settle(80);
+    } catch (err) {
+      check(`панель → запрос: ${key} доезжает без падения`, false,
+        `клиент упал на поле ${field}: ${err && err.message}`);
+      continue;
+    }
 
     const sent = server.state.sent[0];
     check(`панель → запрос: ${key} без события change`, Boolean(sent), "сообщение не ушло вовсе");
@@ -453,10 +479,14 @@ async function routeChecks() {
       second && second.config.system === "ПРАВКА НА ЛЕТУ",
       JSON.stringify(server.state.sent.map((x) => x.config.system))
     );
+    // Первого сообщения может не быть вовсе — так выглядит сломанный пролив
+    // панели. Это красное утверждение, а не исключение: упавший маршрут унёс
+    // бы с собой все проверки после себя.
+    const first = server.state.sent[0];
     check(
       "текущий ответ правка не задела",
-      server.state.sent[0].config.system === "СТАРЫЙ ПРОМПТ",
-      server.state.sent[0].config.system
+      Boolean(first) && first.config.system === "СТАРЫЙ ПРОМПТ",
+      first ? first.config.system : "первое сообщение не ушло вовсе"
     );
   }
 
