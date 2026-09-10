@@ -350,6 +350,22 @@ def check_nothing_left_behind():
     # 0. Обход покрывает всё, что под контролем версий. Список файлов, который
     #    можно подрезать молча, — то же ослабление, что суженное правило:
     #    оба оставляют набор зелёным и стерегущим меньше прежнего.
+    #
+    #    Считать слепые файлы от того же списка, который вернул `_tracked()`,
+    #    мало: так видны сужения ниже него, но не он сам — отбросить `.css`
+    #    прямо в `_tracked()` проходило зелёным. Поэтому сверяемся со свежим
+    #    `git ls-files`, взятым здесь и мимо всех помощников.
+    listed = subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
+    ).stdout.split()
+    assert listed, "git ls-files не вернул ничего — сверять обход не с чем"
+    on_disk = [n for n in listed if os.path.isfile(os.path.join(ROOT, n))]
+    dropped = sorted(set(on_disk) - set(tracked))
+    assert not dropped, (
+        f"из обхода выпали файлы под контролем версий: {', '.join(dropped)} — "
+        "список подрезан в самом `_tracked()`"
+    )
+
     wide = [w for w, _ in GONE if w.lower() not in ONLY]
     assert wide, "сужены все правила до одного — обходить стало нечего"
     for word in wide:
