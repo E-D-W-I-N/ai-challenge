@@ -196,19 +196,30 @@ def check_new_chat_is_blank():
 # сам был местом, где правило можно забыть, и прикрывал шесть строк из
 # пятнадцати.
 #
-# Поэтому правило смотрит **во все исходники**, а сузить его можно только
-# оговоркой в EXCUSED — с указанием файла и причины. Забытая оговорка делает
-# правило шире, а не уже: промах теперь в безопасную сторону.
+# Поэтому правило смотрит **во все файлы под контролем версий**, а сузить его
+# можно только записью в ONLY — с файлом и причиной. Забытая запись делает
+# правило шире, а не уже: промах в безопасную сторону.
+#
+# Списка расширений здесь тоже нет, и по той же причине. Он был — «.py, .js,
+# .html, .css, .md», — и сужался молча: убрать из него `.css` и вернуть
+# `list-group` в стили проходило зелёным. Список файлов, который можно
+# незаметно подрезать, — та же болезнь, что скоуп у правила, только этажом
+# выше. Двоичные читаются байтами и декодируются с заменой: пропустить файл
+# из-за кодировки — то же самое сужение.
 #
 # Поиск регистронезависимый: слова вроде «прогон», «судья» и «колонка» жили
 # в клиенте текстом для пользователя, а он пишется с большой буквы.
-SOURCES = (".py", ".js", ".html", ".css", ".md")
 
 # Единственный файл, которому запретные слова положены: он их и запрещает.
 # Раньше слова собирались из кусков ("PRESET" + "_CHATS"), чтобы проверка
 # не находила саму себя. С регистронезависимым поиском этого уже мало —
 # `autoname` находил `AutoName` в соседней строке таблицы, — да и приём был
 # хрупкий: достаточно один раз написать слово целиком.
+#
+# Поблажка эта — только для слов из таблицы. Имя референса собрано из кусков
+# и в этом файле буквально не встречается, поэтому его обход идёт по ВСЕМ
+# файлам, включая сам файл проверки: иначе в нём одном имя можно было бы
+# спрятать. Так и было до этого коммита.
 SELF = "checks/run_checks.py"
 
 # Правило по умолчанию смотрит во ВСЕ исходники. Сузить его можно только здесь,
@@ -286,16 +297,26 @@ def _tracked() -> list[str]:
     return [n for n in names if os.path.isfile(os.path.join(ROOT, n))]
 
 
-def _sources(tracked: list[str]) -> list[str]:
-    return [n for n in tracked if n.endswith(SOURCES)]
+def _read(name: str) -> str:
+    """Содержимое файла. Двоичное — с заменой: пропускать файл нельзя."""
+    with open(os.path.join(ROOT, name), "rb") as handle:
+        return handle.read().decode("utf-8", "replace")
 
 
 def _files_for(word: str, tracked: list[str]) -> list[str]:
-    """Где действует правило: все исходники, кроме самой проверки. Или скоуп из ONLY."""
+    """Где действует правило: всё под контролем версий, кроме самой проверки.
+
+    Или один файл из ONLY, если правило сужено.
+    """
     only, _ = ONLY.get(word.lower(), (None, ""))
-    files = [n for n in ([only] if only else _sources(tracked)) if n != SELF]
+    files = [n for n in ([only] if only else tracked) if n != SELF]
     assert files, f"правилу «{word}» не осталось ни одного файла"
     return files
+
+
+def _reference_files(tracked: list[str]) -> list[str]:
+    """Имя референса ищется везде, без единого исключения — включая SELF."""
+    return list(tracked)
 
 
 def _found(word: str, body: str) -> bool:
@@ -320,12 +341,29 @@ def check_nothing_left_behind():
     404, а не тем, что слова нет в исходнике.
     """
     tracked = _tracked()
-    sources = _sources(tracked)
-    body_of = {n: open(os.path.join(ROOT, n), encoding="utf-8").read() for n in sources}
+    body_of = {n: _read(n) for n in tracked}
 
-    assert SELF in tracked, f"{SELF} не под контролем версий — оговорка про себя не сработает"
+    assert SELF in tracked, f"{SELF} не под контролем версий — поблажка про себя не сработает"
     words = {w.lower() for w, _ in GONE}
     assert len(words) == len(GONE), "в таблице повторяются слова"
+
+    # 0. Обход покрывает всё, что под контролем версий. Список файлов, который
+    #    можно подрезать молча, — то же ослабление, что суженное правило:
+    #    оба оставляют набор зелёным и стерегущим меньше прежнего.
+    wide = [w for w, _ in GONE if w.lower() not in ONLY]
+    assert wide, "сужены все правила до одного — обходить стало нечего"
+    for word in wide:
+        seen = set(_files_for(word, tracked))
+        blind = [n for n in tracked if n != SELF and n not in seen]
+        assert not blind, (
+            f"правило «{word}» не смотрит в {', '.join(sorted(blind))} — "
+            "обход сузился; несуженное правило обязано видеть всё под контролем версий"
+        )
+    blind_ref = [n for n in tracked if n not in _reference_files(tracked)]
+    assert not blind_ref, (
+        f"имя референса не ищется в {', '.join(sorted(blind_ref))} — "
+        "его обход идёт по всем файлам, включая сам файл проверки"
+    )
 
     # 1. Правило срабатывает на своём же слове, в любом регистре.
     for word, what in GONE:
@@ -351,9 +389,9 @@ def check_nothing_left_behind():
     #    бессмысленно, и это выключенное правило, ждущее, когда слово вернётся.
     pointless = []
     for word, (only, why) in ONLY.items():
-        assert only in body_of, f"скоуп «{word}» указывает на файл вне исходников: {only}"
+        assert only in body_of, f"скоуп «{word}» указывает на файл вне репозитория: {only}"
         outside = [
-            n for n in _sources(tracked)
+            n for n in tracked
             if n != SELF and n != only and _found(word, body_of[n])
         ]
         if not outside:
@@ -370,25 +408,21 @@ def check_nothing_left_behind():
             if _found(word, body_of[name]):
                 hits.append(f"{name}: «{word}» ({what})")
 
-    # Референс — по всем файлам разом, включая имена и двоичные.
-    needle = REFERENCE_NAME.encode()
-    for name in tracked:
-        if name == SELF:
-            continue
+    # Референс — по всем файлам разом, включая имена, двоичные и сам файл
+    # проверки: имя собрано из кусков и буквально в нём не встречается.
+    for name in _reference_files(tracked):
         if REFERENCE_NAME in name.lower():
             hits.append(f"{name}: имя референса в имени файла")
-            continue
-        with open(os.path.join(ROOT, name), "rb") as handle:
-            if needle in handle.read().lower():
-                hits.append(f"{name}: имя референса в содержимом")
+        elif _found(REFERENCE_NAME, body_of[name]):
+            hits.append(f"{name}: имя референса в содержимом")
 
     for path in GONE_FILES:
         assert not os.path.exists(os.path.join(ROOT, path)), f"{path} жив"
 
     assert not hits, f"осталось {len(hits)} упоминаний:\n  " + "\n  ".join(hits)
     return (
-        f"{len(GONE) + 1} правил по {len(sources) - 1} исходникам, регистр не спасает, "
-        f"сужено {len(ONLY)} — ни одного совпадения"
+        f"{len(GONE) + 1} правил по {len(tracked)} файлам под контролем версий, "
+        f"регистр не спасает, сужено {len(ONLY)} — ни одного совпадения"
     )
 
 
