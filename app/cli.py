@@ -5,7 +5,7 @@
 история — просто вывод идёт в терминал.
 
     .venv/bin/python -m app.cli
-    .venv/bin/python -m app.cli --model openai/gpt-4o-mini --history-limit 0
+    .venv/bin/python -m app.cli --model openai/gpt-4o-mini
     echo "привет" | .venv/bin/python -m app.cli --once
 
 Команды внутри диалога: /выход, /история, /забыть, /агенты.
@@ -38,12 +38,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument(
-        "--history-limit",
-        type=int,
-        default=None,
-        help="сколько сообщений истории уходит в модель; 0 — агент без памяти",
-    )
-    parser.add_argument(
         "--once",
         action="store_true",
         help="прочитать один вопрос со stdin, ответить и выйти",
@@ -59,7 +53,6 @@ def build_agent(args: argparse.Namespace) -> Agent:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         system=args.system,
-        history_limit=args.history_limit,
     )
     return REGISTRY.create(spec)
 
@@ -106,7 +99,7 @@ def _print_agents(out=sys.stdout) -> None:
 
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
     """Цикл «вопрос — ответ». Возвращает код возврата процесса."""
-    out.write(f"агент {agent.id} · {agent.spec.model} · окно памяти {agent.history_limit}\n")
+    out.write(f"агент {agent.id} · {agent.spec.model}\n")
     if not has_key():
         out.write("[нет ключа] OPENROUTER_API_KEY не найден — вызова не будет.\n")
     if not once:
