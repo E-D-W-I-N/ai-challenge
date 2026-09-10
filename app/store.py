@@ -235,19 +235,7 @@ class Store:
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.executescript(SCHEMA)
         self._conn = conn
-        self._migrate(conn)
         return self
-
-    @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
-        """Догоняет схему базы, записанной прошлой версией сервера:
-        `CREATE TABLE IF NOT EXISTS` новую колонку не добавит."""
-        have = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
-        if "context_length" not in have:
-            conn.execute("ALTER TABLE sessions ADD COLUMN context_length INTEGER")
-        have = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
-        if "metrics" not in have:
-            conn.execute("ALTER TABLE messages ADD COLUMN metrics TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -335,7 +323,7 @@ class Store:
                 (
                     session_id,
                     label,
-                    _dumps(redact(config)),
+                    _dumps(config),
                     context_length,
                     created_at,
                     now,
@@ -421,9 +409,9 @@ class Store:
                 session_id,
                 seq,
                 turn.role,
-                redact(turn.content),
-                redact(turn.error),
-                _dumps(redact(turn.metrics)) if turn.metrics else None,
+                turn.content,
+                turn.error,
+                _dumps(turn.metrics) if turn.metrics else None,
                 turn.at,
             )
             for seq, turn in enumerate(turns)

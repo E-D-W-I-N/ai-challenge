@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+from app.llm import SAMPLING_FIELDS  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
 from app.store import Store  # noqa: E402
@@ -674,6 +676,214 @@ def check_stop_and_format():
     html = read("app/static/index.html")
     assert 'id="f-stop"' in html and 'id="f-response_format"' in html, "полей нет в панели"
     return "оба параметра задаются, снимаются и не уходят пустыми"
+
+
+@check("создание и правка разбирают конфиг одинаково")
+def check_create_and_patch_agree():
+    """Дефект аудита: POST и PATCH расходились на пустых стоп-строках.
+
+    POST сохранял ["", "  ", "КОНЕЦ"] как есть, PATCH выбрасывал пустые.
+    Пустая стоп-строка не косметика: она остановила бы генерацию сразу,
+    а с provider.require_parameters ещё и сузила бы список провайдеров.
+    Ни одна проверка расхождения не ловила — обе ручки разбирали поля
+    двумя независимыми кусками кода.
+
+    Правильное поведение — то, которое было у PATCH и которого ждёт панель:
+    поле стоп-строк построчное, и лишний перевод строки не параметр.
+    `readStopLines` в клиенте делает ровно это.
+
+    Проверяется не «PATCH чистит», а **согласие двух ручек**: любое поле,
+    заданное при создании и той же правкой, обязано дать один конфиг.
+    """
+    cases = [
+        {"stop": ["", "  ", "КОНЕЦ", " СТОП "]},
+        {"stop": ["", "   "]},
+        {"system": None},
+        {"history_limit": 0},
+        {"response_format": {"type": "json_object"}},
+        {"temperature": 0.0, "top_p": 0, "max_tokens": 7},
+    ]
+    watched = ("stop", "system", "history_limit", "response_format", *SAMPLING_FIELDS)
+    with TestClient(main.app) as client:
+        for case in cases:
+            created = client.post("/api/agents", json={"agent": {"model": "stub/model", **case}})
+            assert created.status_code == 200, created.text
+            born = created.json()["agents"][0]
+
+            blank_id = new_agent(client)
+            patched = client.patch(f"/api/agents/{blank_id}", json=case)
+            assert patched.status_code == 200, patched.text
+            grown = patched.json()
+
+            for field in watched:
+                assert born[field] == grown[field], (
+                    f"{case}: поле {field} после создания {born[field]!r}, "
+                    f"после правки {grown[field]!r} — ручки разбирают его по-разному"
+                )
+
+        # Согласие в отказах тоже: кривой тип обе ручки обязаны отвергнуть.
+        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"history_limit": -1}):
+            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
+            grown = client.patch(f"/api/agents/{new_agent(client)}", json=bad)
+            assert born.status_code == 400 and grown.status_code == 400, (
+                bad, born.status_code, grown.status_code
+            )
+
+    # И то, ради чего чистка нужна: пустая стоп-строка не уезжает в модель.
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, stop=["", "  ", "КОНЕЦ"])
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
+        assert _stub.CALLS[-1]["payload"]["stop"] == ["КОНЕЦ"], _stub.CALLS[-1]["payload"]
+    return f"{len(cases)} конфигов и 3 отказа: создание и правка сходятся"
+
+
+@check("любое поле конфига переживает переоткрытие файла, включая ещё не придуманные")
+def check_config_survives_by_construction():
+    """Дыра аудита: `_migrate` можно было удалить, не уронив ни одной проверки.
+
+    Значит схему базы не стерёг никто: колонку можно было потерять молча,
+    а «конфиг едет одним JSON-полем, поэтому новое поле сохраняется само»
+    было обещанием без сторожа.
+
+    Список полей здесь **выводится** из `AgentSpec`, а не перечисляется:
+    перечисленный отстал бы от датакласса ровно тогда, когда поле добавили
+    и забыли — то есть в единственном случае, ради которого проверка нужна.
+    Значения подбираются по типу поля, тоже без ручного списка.
+    """
+    from dataclasses import fields as spec_fields
+
+    from app.agent import Agent
+
+    # Значение, отличное от умолчания, для каждого поля конфига.
+    probes: dict = {}
+    for f in spec_fields(AgentSpec):
+        kind = str(f.type)
+        if f.name == "model":
+            probes[f.name] = "проверка/модель"
+        elif "list[str]" in kind:
+            probes[f.name] = [f"СТОП-{f.name}"]
+        elif "str" in kind:
+            probes[f.name] = f"текст-{f.name}"
+        elif "int" in kind:
+            probes[f.name] = 7
+        elif "float" in kind:
+            probes[f.name] = 0.25
+        elif "dict" in kind:
+            probes[f.name] = {"метка": f.name}
+        else:
+            raise AssertionError(f"поле {f.name}: {f.type} — тип неизвестен, подберите значение")
+    assert len(probes) == len(spec_fields(AgentSpec)), probes
+
+    path = _temp_db("schema-roundtrip")
+    store = Store(path).init()
+    spec = AgentSpec(**probes)
+    agent = Agent(spec, store=store)
+    agent.remember("user", "вопрос")
+    agent.remember("assistant", "ответ", metrics={"provider": "stub"})
+    agent_id = agent.id
+    store.close()
+
+    # Настоящее переоткрытие файла, а не тот же объект в памяти.
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        lost = {
+            f.name: (probes[f.name], getattr(revived.spec, f.name))
+            for f in spec_fields(AgentSpec)
+            if getattr(revived.spec, f.name) != probes[f.name]
+        }
+        assert not lost, f"поля конфига не пережили переоткрытие файла: {lost}"
+        assert [t.content for t in revived.history] == ["вопрос", "ответ"], revived.history
+        assert revived.history[1].metrics == {"provider": "stub"}, revived.history[1].metrics
+
+        # Колонки схемы и колонки, которые читает код, — один набор.
+        # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,
+        # либо её кто-то пишет мимо `_session_row`.
+        in_db = {r["name"] for r in again.conn.execute("PRAGMA table_info(sessions)")}
+        row = again.load_session(agent_id)
+        expected = set(row) | {"updated_at"}
+        assert in_db == expected, f"схема и код разошлись: в базе {in_db}, код читает {expected}"
+    finally:
+        again.close()
+    return f"{len(probes)} полей конфига пережили переоткрытие файла, схема сходится с кодом"
+
+
+@check("мимо redact() записать нельзя: пути записи выводятся из класса")
+def check_every_write_path_redacts():
+    """Дыра аудита: явные `redact()` в `save_session`/`save_history` можно было
+    убрать, не уронив ничего.
+
+    И правильно — несущий слой не они, а `_Writer`: транзакция отдаёт обёртку,
+    и чистится любой строковый параметр. Но само это свойство никто не стерёг:
+    `check_no_key_in_db` ходит теми путями записи, которые знает, а новый путь
+    мимо транзакции прошёл бы зелёным.
+
+    Поэтому список путей здесь **выводится** из класса `Store`: всякий метод,
+    в теле которого есть INSERT/UPDATE/DELETE/REPLACE, обязан идти через
+    `tx()`, а не через голое соединение. Перечисленный список пропустил бы
+    ровно тот метод, который забыли в него внести.
+    """
+    import inspect
+
+    import app.store as store_module
+
+    # Слова целиком, а не подстроки: `updated_at` — это не UPDATE, и по
+    # подстроке в список путей записи попадал весь `list_sessions`.
+    mutating = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE)\b")
+    checked = []
+    for name, fn in inspect.getmembers(Store, inspect.isfunction):
+        body = inspect.getsource(fn)
+        if not mutating.search(body.upper()):
+            continue
+        checked.append(name)
+        if name == "init":
+            continue  # схему заводит executescript, параметров у него нет
+        for bypass in ("self.conn.execute", "self._conn.execute", "self.reading("):
+            assert bypass not in body, (
+                f"Store.{name} пишет через {bypass} — мимо `_Writer`, а значит "
+                "мимо redact(). Писать можно только внутри tx()"
+            )
+    assert len(checked) >= 5, f"путей записи нашлось всего {checked} — обход сузился"
+
+    # Транзакция отдаёт обёртку, а не соединение: иначе обещание держалось бы
+    # на внимательности автора каждого метода.
+    store = Store(store_module.MEMORY).init()
+    key = "sk-or-v1-" + "e" * 64
+    saved_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = key
+    try:
+        with store.tx() as conn:
+            assert not isinstance(conn, sqlite3.Connection), (
+                "tx() отдаёт голое соединение — redact() перестал быть по построению"
+            )
+            # Все три формы параметров, какие принимает обёртка.
+            conn.execute(
+                "INSERT INTO sessions (id, label, config, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0)",
+                (f"ag_{key}", key, key),
+            )
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (:k, :v)", {"k": "т", "v": key}
+            )
+            conn.executemany(
+                "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
+                [("s", 0, "user", key), ("s", 1, "assistant", key)],
+            )
+        leaked = []
+        for table in ("sessions", "messages", "meta"):
+            for row in store.conn.execute(f"SELECT * FROM {table}"):
+                for column in row.keys():
+                    if isinstance(row[column], str) and key in row[column]:
+                        leaked.append(f"{table}.{column}")
+        assert not leaked, f"ключ уехал в базу через tx(): {sorted(set(leaked))}"
+    finally:
+        if saved_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+        store.close()
+    return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
 
 
 @check("панель правит живого агента: модель, промпт, окно памяти")
@@ -2284,6 +2494,9 @@ CHECKS = [
     check_config_snapshot,
     check_system_prompt_single_home,
     check_stop_and_format,
+    check_create_and_patch_agree,
+    check_config_survives_by_construction,
+    check_every_write_path_redacts,
     check_patch_panel,
     check_transcript_shape,
     check_reasoning,
