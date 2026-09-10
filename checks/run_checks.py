@@ -565,64 +565,58 @@ def check_config_snapshot():
     return "правка в окне между промптом и телом не смешала конфиги"
 
 
-@check("системный промпт живёт в одном месте и не фиксируется при создании")
+@check("системный промпт не фиксируется при создании: в модель едет нынешний")
 def check_system_prompt_single_home():
-    """Корень той же жалобы: промпт мог приехать внутри `messages`.
+    """Корень жалобы «сменил промпт — уезжает старый».
 
-    Тогда панель правила бы `spec.system`, а в модель уезжала бы копия
-    из заготовки, снятая в момент создания агента. Теперь системные
-    сообщения переезжают в `spec.system` сразу, и дом у промпта один.
+    Раньше промпт мог приехать двумя путями: полем `system` и системным
+    сообщением внутри `messages`. Второй дом фиксировал текст в момент
+    создания агента: панель правила `spec.system`, а в модель уезжала копия
+    из заготовки. Дома теперь физически один — поля `messages` у конфига
+    больше нет, — и нарушить это нечем.
+
+    Но само поведение, ради которого дом делали одним, проверять надо
+    по-прежнему: промпт читается из конфига **на каждом обращении**,
+    а не запоминается при создании.
     """
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
-        agent_id = new_agent(
-            client,
-            messages=[
-                {"role": "system", "content": "ИЗ ЗАГОТОВКИ"},
-                {"role": "user", "content": "первый вопрос"},
-            ],
-        )
-        full = client.get(f"/api/agents/{agent_id}").json()
-        assert full["system"] == "ИЗ ЗАГОТОВКИ", full["system"]
+        agent_id = new_agent(client, system="ИСХОДНЫЙ")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
+        assert _stub.CALLS[-1]["messages"][0] == {"role": "system", "content": "ИСХОДНЫЙ"}
 
         client.patch(f"/api/agents/{agent_id}", json={"system": "ПРАВЛЕНЫЙ"})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+        sent = _stub.CALLS[-1]["messages"]
+        systems = [m["content"] for m in sent if m["role"] == "system"]
+        assert systems == ["ПРАВЛЕНЫЙ"], systems
+        assert "ИСХОДНЫЙ" not in " ".join(m["content"] for m in sent), sent
 
-    sent = _stub.CALLS[-1]["messages"]
-    systems = [m["content"] for m in sent if m["role"] == "system"]
-    assert systems == ["ПРАВЛЕНЫЙ"], systems
-    assert "ИЗ ЗАГОТОВКИ" not in " ".join(m["content"] for m in sent), sent
+        # И ещё раз, третьим сообщением: промпт не «применяется однажды».
+        client.patch(f"/api/agents/{agent_id}", json={"system": "ТРЕТИЙ"})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "третий"})
+        assert _stub.CALLS[-1]["messages"][0]["content"] == "ТРЕТИЙ", _stub.CALLS[-1]["messages"][0]
 
-    # Два дома сразу — ошибка, а не молчаливая потеря одного из промптов.
+        # Снятый промпт исчезает из тела целиком: пустая строка в роли
+        # `system` — это не «промпта нет», это заданный пустой промпт.
+        client.patch(f"/api/agents/{agent_id}", json={"system": None})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четвёртый"})
+        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
+
+    # Второго дома нет по построению: конфиг агента его не описывает,
+    # а ручка создания не принимает.
+    assert not hasattr(AgentSpec("л", "m"), "messages"), "у конфига снова есть messages"
     with TestClient(main.app) as client:
-        both = client.post(
+        extra = client.post(
             "/api/agents",
-            json={
-                "agent": {
-                    "model": "stub/m",
-                    "system": "полем",
-                    "messages": [{"role": "system", "content": "сообщением"}],
-                }
-            },
+            json={"agent": {"model": "stub/m", "messages": [{"role": "system", "content": "х"}]}},
         )
-        assert both.status_code == 400, both.text
-        assert "одно место" in both.json()["detail"], both.text
-
-    # Тот же запрет и в конструкторе: ошибку видно на создании агента,
-    # а не на живом вызове.
-    try:
-        REGISTRY.create(
-            AgentSpec(
-                label="двойной",
-                model="stub/m",
-                system="полем",
-                messages=[{"role": "system", "content": "сообщением"}],
-            )
-        )
-        raise AssertionError("конструктор проглотил два системных промпта")
-    except ValueError as exc:
-        assert "одно" in str(exc), exc
-    return "промпт из messages переехал в конфиг; два дома сразу — 400 и ValueError"
+        assert extra.status_code == 200, extra.text
+        created = extra.json()["agents"][0]
+        assert created["system"] == "", f"messages протекли в промпт: {created['system']}"
+        client.post(f"/api/agents/{created['id']}/messages", json={"text": "?"})
+        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
+    return "промпт читается из конфига на каждом обращении; второго дома нет"
 
 
 @check("stop и response_format правятся из панели и доезжают до тела запроса")
@@ -693,6 +687,60 @@ def check_patch_panel():
 
 
 # --- 6. лента: рассуждение и перегенерация ------------------------------------
+
+
+@check("стенограмма — это ровно диалог, и в ней есть всё, что рисует клиент")
+def check_transcript_shape():
+    """Формат стенограммы не стерёг никто: поля можно было убрать молча.
+
+    Клиент рисует ленту **из ответа ручки**, а не из того, что дорисовал
+    по дороге: после каждого обмена он перечитывает агента и перерисовывает
+    всё заново. Значит контракт стенограммы — часть поведения, и он такой:
+    в ней ровно реплики диалога, по одной на ход, в порядке разговора,
+    и у каждой есть поля, которые клиент читает.
+
+    Клиентская половина — в `checks/browser_check.js`, блоком «лента рисуется
+    из стенограммы»: по реплике на узел, текст, имя модели, провайдер,
+    рассуждение, ошибка.
+    """
+    _stub.install(reply="ответ", reasoning="я подумал")
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, system="СИСТЕМА")
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+        body = client.get(f"/api/agents/{agent_id}").json()
+
+    transcript = body["transcript"]
+    # Ровно диалог: системный промпт — это конфиг, а не реплика разговора,
+    # и в ленте ему делать нечего. Он виден в панели, полем `system`.
+    assert [t["role"] for t in transcript] == ["user", "assistant"], transcript
+    assert body["system"] == "СИСТЕМА", body["system"]
+    assert transcript[0]["content"] == "вопрос", transcript[0]
+    assert transcript[1]["content"] == "ответ", transcript[1]
+
+    # Поля, которые читает клиент. Убрать любое молча нельзя: карточка
+    # перестанет показывать то, что показывала, а ошибку — вовсе проглотит.
+    for turn in transcript:
+        for field in ("role", "content", "error", "reasoning", "metrics"):
+            assert field in turn, f"в реплике нет поля {field}: {turn}"
+    answer = transcript[1]
+    assert answer["reasoning"] == "я подумал", answer
+    assert answer["error"] is None, answer
+    assert answer["metrics"] and answer["metrics"]["provider"] == "stub", answer["metrics"]
+
+    # Длина стенограммы и history_len — про одно и то же: клиент по второму
+    # обновляет строку списка, не перечитывая ленту.
+    assert body["history_len"] == len(transcript), (body["history_len"], len(transcript))
+
+    # Оборванный ответ помечен ошибкой, и она доезжает до стенограммы.
+    _stub.install(fail=True)
+    with TestClient(main.app) as client:
+        broken = new_agent(client)
+        agent = REGISTRY.require(broken)
+        agent.remember("user", "вопрос")
+        agent.remember("assistant", "огрыз", error="оборвалось")
+        failed = client.get(f"/api/agents/{broken}").json()["transcript"][-1]
+    assert failed["error"] == "оборвалось", failed
+    return f"{len(transcript)} реплики, поля на месте, ошибка доезжает"
 
 
 @check("рассуждение приезжает отдельным событием и в ответ не входит")
@@ -1150,7 +1198,6 @@ def check_spec_deep_copy():
     shared = AgentSpec(
         label="общий",
         model="stub/model",
-        messages=[{"role": "system", "content": "СИС"}],
         stop=["\n"],
         response_format={"type": "json_object"},
         extra_body={"provider": {"allow_fallbacks": False}},
@@ -1158,17 +1205,23 @@ def check_spec_deep_copy():
     registry = AgentRegistry(max_agents=100)
     first, second = registry.create_many([shared, shared])
 
+    # Все изменяемые поля конфига: их ровно три, и каждое обязано быть своим.
     assert first.spec.extra_body is not shared.extra_body
     assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
     assert first.spec.extra_body is not second.spec.extra_body
-    assert first.spec.messages[0] is not shared.messages[0]
-    assert first.spec.stop is not shared.stop
+    assert first.spec.stop is not shared.stop and first.spec.stop is not second.spec.stop
+    assert first.spec.response_format is not shared.response_format
+    assert first.spec.response_format is not second.spec.response_format
 
     first.spec.extra_body["provider"]["order"] = ["only-me"]
-    first.spec.messages[0]["content"] = "ДРУГОЕ"
+    first.spec.stop.append("ЕЩЁ")
+    first.spec.response_format["type"] = "json_schema"
     assert "order" not in shared.extra_body["provider"], shared.extra_body
     assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
-    assert shared.messages[0]["content"] == "СИС", shared.messages
+    assert shared.stop == ["\n"], shared.stop
+    assert second.spec.stop == ["\n"], second.spec.stop
+    assert shared.response_format == {"type": "json_object"}, shared.response_format
+    assert second.spec.response_format == {"type": "json_object"}, second.spec.response_format
     return "правка у одного агента не задела ни общий конфиг, ни соседа"
 
 

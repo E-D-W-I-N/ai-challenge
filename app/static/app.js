@@ -424,7 +424,7 @@ function renderFeed(agent) {
   const keep = state.stick ? null : feed.scrollTop;
   feed.innerHTML = "";
 
-  const turns = agent.transcript.filter((t) => !t.seed);
+  const turns = agent.transcript;
   if (!turns.length) {
     const empty = document.createElement("div");
     empty.className = "empty";

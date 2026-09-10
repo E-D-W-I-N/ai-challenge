@@ -487,6 +487,76 @@ async function routeChecks() {
       client.state.current.label);
   }
 
+  // ── лента рисуется из стенограммы ──
+  //
+  // Клиент после каждого обмена перечитывает агента и перерисовывает ленту
+  // целиком: на экране должно быть ровно то, что у агента в истории, а не то,
+  // что клиент дорисовал по дороге. Значит формат стенограммы — часть
+  // поведения, и раньше его не стерёг никто: поле можно было убрать из ответа
+  // ручки, и ни одна проверка не краснела. Серверная половина —
+  // check_transcript_shape в run_checks.py.
+  {
+    const talk = [
+      { role: "user", content: "мой вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "**жирный** ответ", error: null, reasoning: "я подумал",
+        metrics: { model: "особая/модель", provider: "поставщик" },
+      },
+      { role: "user", content: "второй вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "огрыз", error: "оборвалось", reasoning: "",
+        metrics: { model: "особая/модель", provider: "поставщик" },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "с историей", transcript: talk, history_len: talk.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const feed = $("#feed");
+    const nodes = feed.children.filter(
+      (el) => el.classList.contains("msg-user") || el.classList.contains("card")
+    );
+    check("в ленте по узлу на реплику стенограммы", nodes.length === talk.length,
+      `узлов ${nodes.length}, реплик ${talk.length}`);
+    check("вопросы — пузырями, ответы — карточками",
+      nodes.map((el) => (el.classList.contains("msg-user") ? "u" : "a")).join("") === "uaua",
+      nodes.map((el) => el.className).join(" | "));
+
+    check("текст вопроса показан", nodes[0].textContent === "мой вопрос", nodes[0].textContent);
+    check("текст ответа показан и разобран как markdown",
+      nodes[1].querySelector(".card-body").innerHTML.includes("<strong>жирный</strong>"),
+      nodes[1].querySelector(".card-body").innerHTML);
+    check("имя модели берётся из метрик реплики, а не из конфига чата",
+      nodes[1].querySelector(".card-model").textContent === "особая/модель",
+      nodes[1].querySelector(".card-model").textContent);
+    check("провайдер показан отдельной меткой",
+      nodes[1].querySelector(".card-tag").textContent === "поставщик",
+      String(nodes[1].querySelector(".card-tag")));
+    check("рассуждение показано свёрнутым блоком",
+      Boolean(nodes[1].querySelector(".think")) &&
+        nodes[1].querySelector(".think-body").textContent === "я подумал",
+      String(nodes[1].querySelector(".think")));
+    check("у целого ответа блока ошибки нет",
+      nodes[1].querySelector(".card-error") === null, "блок ошибки появился");
+
+    check("оборванный ответ помечен",
+      nodes[3].classList.contains("failed"), nodes[3].className);
+    check("и текст ошибки показан",
+      nodes[3].querySelector(".card-error") &&
+        nodes[3].querySelector(".card-error").textContent === "оборвалось",
+      String(nodes[3].querySelector(".card-error")));
+
+    // Пустая стенограмма — это заставка, а не пустая лента с нулём узлов.
+    $("#agent-list").querySelectorAll(".item-open")[0].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("пустой чат показывает заставку, а не пустоту",
+      Boolean($("#feed").querySelector(".empty")), $("#feed").textContent);
+  }
+
   // ── переименование чата в списке слева ──
   //
   // Раньше это стереглось грепом по исходнику: «в app.js есть строка
@@ -581,8 +651,8 @@ async function routeChecks() {
     // «больше сообщений», как и в браузере.
     const TALK = [];
     for (let i = 1; i <= 6; i += 1) {
-      TALK.push({ role: "user", content: `вопрос ${i}`, seed: false });
-      TALK.push({ role: "assistant", content: `ответ ${i}`, seed: false, metrics: null, reasoning: "" });
+      TALK.push({ role: "user", content: `вопрос ${i}`, error: null, reasoning: "", metrics: null });
+      TALK.push({ role: "assistant", content: `ответ ${i}`, error: null, reasoning: "", metrics: null });
     }
     const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: TALK.length });
     const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
