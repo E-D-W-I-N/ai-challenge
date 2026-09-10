@@ -33,7 +33,7 @@ import app.main as main  # noqa: E402
 from app.llm import SAMPLING_FIELDS  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
-from app.store import Store  # noqa: E402
+from app.store import Store, StoreBusyError  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -2359,6 +2359,68 @@ def check_redact_floor():
             os.environ["OPENROUTER_API_KEY"] = saved_key
         store.close()
     return f"ключ короче {MIN_SECRET_LENGTH} символов данные не трогает, настоящий — режется"
+
+
+@check("транзакция берёт блокировку сразу, а не при первой записи")
+def check_tx_locks_immediately():
+    """Седьмая дыра, найденная уже сверкой инвариантов после сокращения:
+    `BEGIN IMMEDIATE` не стерёг никто.
+
+    Подменил его на голый `BEGIN` — все 65 проверок остались зелёными,
+    включая `two_processes.py`. Тот его и не ловит: все пути записи там
+    начинаются с записи, а отложенная транзакция ломается на другом —
+    когда она началась с чтения и повышает блокировку до записи. Тогда
+    SQLite отвечает SQLITE_BUSY **без** ретрая по `busy_timeout`, и второй
+    процесс получает ошибку вместо очереди.
+
+    Проверяется наблюдаемым: пока транзакция открыта и не сделала ни одного
+    запроса, второй писатель обязан её видеть. Соединение берём с нулевым
+    таймаутом — ждать нам нечего, нужен сам факт блокировки.
+    """
+    path = _temp_db("immediate")
+    store = Store(path).init()
+    entered = None
+    try:
+        with store.tx():
+            # Ни одного запроса внутри транзакции ещё не было.
+            rival = sqlite3.connect(path, timeout=0)
+            try:
+                rival.execute("BEGIN IMMEDIATE")
+                entered = True
+            except sqlite3.OperationalError as exc:
+                entered = False
+                reason = str(exc).lower()
+                assert "locked" in reason or "busy" in reason, exc
+            finally:
+                rival.close()
+        assert entered is False, (
+            "второй писатель вошёл в базу, пока транзакция открыта: значит она "
+            "отложенная. Отложенная берёт блокировку только на первой записи, "
+            "и повышение из чтения в запись даёт SQLITE_BUSY мимо busy_timeout"
+        )
+
+        # И то, ради чего блокировка нужна: занятая база — это внятный 503,
+        # а не срыв записи. Транзакция, не дождавшаяся своей очереди,
+        # откатывается целиком.
+        holder = sqlite3.connect(path, timeout=0)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            waiting = Store(path).init()
+            waiting.conn.execute(f"PRAGMA busy_timeout=50")
+            try:
+                waiting.save_session(
+                    "ag_00001", label="не пройдёт", config={"model": "m"}, created_at=0.0
+                )
+                raise AssertionError("занятая база пропустила запись")
+            except StoreBusyError as exc:
+                assert "занята" in str(exc), exc
+            waiting.close()
+        finally:
+            holder.rollback()
+            holder.close()
+    finally:
+        store.close()
+    return "открытая транзакция видна второму писателю сразу; занятая база даёт StoreBusyError"
 
 
 @check("занятая база — внятный 503, а не голый 500")
