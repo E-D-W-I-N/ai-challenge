@@ -115,10 +115,6 @@ def check_flat_list():
         assert client.delete(f"/api/agents/{agent['id']}").status_code == 200
         assert client.get("/api/agents").json()["agents"] == []
 
-    js = read("app/static/app.js")
-    for gone in ("list-group", "state.groups", "agent.note", "agent.draft"):
-        assert gone not in js, f"в клиенте осталась механика заготовок: {gone}"
-    assert "list-group" not in read("app/static/style.css"), "в стилях остался .list-group"
     return "на старте пусто, заведённый чат ничем не особенный"
 
 
@@ -188,64 +184,125 @@ def check_new_chat_is_blank():
     return "свежий чат пуст, промпт появляется только заданный руками"
 
 
-@check("заготовок дней 1–5 не осталось нигде")
-def check_no_presets():
-    """Ни кода, ни файла с описаниями, ни проверок, которые его стерегли."""
-    assert not os.path.exists(os.path.join(ROOT, "day.py")), "day.py жив"
-    assert not os.path.exists(os.path.join(ROOT, "checks", "_daysrc.py")), "_daysrc.py жив"
+# --- 3. выпиленное осталось выпиленным ----------------------------------------
 
-    tracked = subprocess.run(
+# Слово, где его искать и чем оно было. Одна таблица вместо шести проверок,
+# делавших одно и то же: обход файлов в поисках слов удалённой механики.
+#
+# Слова собраны из кусков намеренно: иначе сама проверка стала бы последним
+# местом, где упоминание осталось, и искала бы себя.
+SOURCES = ("*.py", "*.js", "*.html", "*.css", "*.md")
+SERVER = ("app/main.py", "app/agent.py", "app/schema.py")
+CLIENT = ("app/static/app.js", "app/static/index.html")
+
+GONE = [
+    # заготовки дней 1–5: файл описаний, поднятие на старте, черновик
+    *[(f"День {n}", SOURCES, "заготовки дней 1–5") for n in range(1, 6)],
+    ("PRESET" + "_CHATS", SOURCES, "заготовки дней 1–5"),
+    ("bootstrap" + "_chats", SOURCES, "заготовки дней 1–5"),
+    ("draft", ("app/schema.py",), "черновик в конфиге"),
+    # сценарии: прогон, судья, зависимости, серии
+    ("Scenario", SERVER, "сценарии"),
+    ("judge", SERVER, "сценарии"),
+    ("depends" + "_on", SERVER, "сценарии"),
+    ("repeats", SERVER, "сценарии"),
+    ("прогон", SERVER + CLIENT, "сценарии"),
+    ("судья", CLIENT, "сценарии"),
+    ("колонк", CLIENT, "витрина сценариев"),
+    # родительские связи жили ради субагентов прогона
+    ("parent" + "_id", ("app/registry.py",), "каскад субагентов"),
+    ("kill" + "_children", ("app/registry.py",), "каскад субагентов"),
+    ("children", ("app/registry.py",), "каскад субагентов"),
+    # витрина: группы, пояснения, кнопка очистки, автоимя
+    ("list-group", CLIENT + ("app/static/style.css",), "группы чатов"),
+    ("state.groups", CLIENT, "группы чатов"),
+    ("note", CLIENT, "пояснения из описаний сценариев"),
+    ("Очистить все", CLIENT, "кнопка «Очистить все чаты»"),
+    ("clear-all", CLIENT, "кнопка «Очистить все чаты»"),
+    ("clearAll", CLIENT, "кнопка «Очистить все чаты»"),
+    ("/api/agents/reset", CLIENT, "ручка очистки"),
+    ("maybe" + "AutoName", CLIENT, "автоимя по первому сообщению"),
+    ("chat" + "Title", CLIENT, "автоимя по первому сообщению"),
+    ("auto" + "name", CLIENT, "автоимя по первому сообщению"),
+    ("карандаш", ("app/static/index.html",), "подпись, объясняющая интерфейс сам себе"),
+]
+
+# Имя клиента-референса: он был инструментом разработки, а не частью продукта,
+# и не должен встречаться нигде — ни в коде, ни в именах файлов, ни в двоичных.
+REFERENCE_NAME = "o" + "mlx"
+
+
+def _tracked() -> list[str]:
+    names = subprocess.run(
         ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
     ).stdout.split()
-    # .md здесь наравне с кодом: README описывает устройство стенда, и
-    # заготовки, оставшиеся в описании, — такой же след, как в коде.
-    code = [
-        name
-        for name in tracked
-        if name.endswith((".py", ".js", ".html", ".css", ".md"))
-        and os.path.isfile(os.path.join(ROOT, name))
-    ]
-    # Слова собраны из кусков намеренно: иначе сама проверка стала бы
-    # последним местом, где упоминание осталось.
-    words = [f"День {n}" for n in range(1, 6)] + ["PRESET" + "_CHATS", "bootstrap" + "_chats"]
+    return [n for n in names if os.path.isfile(os.path.join(ROOT, n))]
+
+
+@check("выпиленное осталось выпиленным: ни слова в исходниках")
+def check_nothing_left_behind():
+    """Одна проверка вместо шести, обходивших файлы в поисках одних и тех же слов.
+
+    Печатает **все** совпадения разом, а не первое: раньше шесть проверок
+    падали по одной с понятным именем, и от слияния диагностика не должна
+    стать хуже.
+
+    Ручки выпиленных механик проверяются отдельно — тем, что они отвечают
+    404, а не тем, что слова нет в исходнике.
+    """
+    tracked = _tracked()
     hits = []
-    for name in code:
-        body = open(os.path.join(ROOT, name), encoding="utf-8").read()
-        for word in words:
+
+    for word, scope, what in GONE:
+        if scope is SOURCES or scope == SOURCES:
+            files = [n for n in tracked if n.endswith(tuple(g[1:] for g in SOURCES))]
+        else:
+            files = [n for n in scope if n in tracked]
+            missing = [n for n in scope if n not in tracked]
+            assert not missing, f"проверка смотрит в несуществующие файлы: {missing}"
+        for name in files:
+            body = open(os.path.join(ROOT, name), encoding="utf-8").read()
             if word in body:
-                hits.append(f"{name}: {word}")
-    assert not hits, "упоминания заготовок остались — " + "; ".join(hits)
-    assert "draft" not in read("app/schema.py"), "черновик остался в конфиге"
-    return f"проверено {len(code)} файлов с кодом, упоминаний нет"
+                hits.append(f"{name}: «{word}» ({what})")
+
+    # Референс — по всем файлам разом, включая имена и двоичные.
+    needle = REFERENCE_NAME.encode()
+    for name in tracked:
+        if REFERENCE_NAME in name.lower():
+            hits.append(f"{name}: имя референса в имени файла")
+            continue
+        with open(os.path.join(ROOT, name), "rb") as handle:
+            if needle in handle.read().lower():
+                hits.append(f"{name}: имя референса в содержимом")
+
+    # Файлы, которых не должно быть вовсе.
+    for path in ("day.py", "checks/_daysrc.py", "app/commands.py"):
+        assert not os.path.exists(os.path.join(ROOT, path)), f"{path} жив"
+
+    assert not hits, f"осталось {len(hits)} упоминаний:\n  " + "\n  ".join(hits)
+    return f"{len(GONE) + 1} слов по {len(tracked)} файлам — ни одного совпадения"
 
 
-@check("сценарии выпилены: ни ручек, ни кода, ни следов в клиенте")
-def check_scenarios_gone():
+@check("ручек выпиленных механик нет, и мёртвых полей наружу тоже")
+def check_removed_endpoints():
+    """Поведенческая половина: ручки отвечают 404, а поля не торчат наружу."""
     with TestClient(main.app) as client:
         for path in ("/api/scenarios", "/api/run/0"):
             assert client.get(path).status_code == 404, path
         assert client.post("/api/scenarios/0/agents").status_code == 404
+        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
+        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
 
-    assert not os.path.exists(os.path.join(ROOT, "app", "commands.py")), "app/commands.py жив"
-    server = read("app/main.py") + read("app/agent.py") + read("app/schema.py")
-    for word in ("Scenario", "judge", "depends_on", "repeats", "прогон"):
-        assert word not in server, f"в серверном коде остался {word}"
-
-    # Родительские связи жили ради субагентов прогона. Спавнить детей больше
-    # некому, и держать каскад, достижимый только из проверок, незачем.
-    registry = read("app/registry.py")
-    for word in ("parent_id", "kill_children", "children"):
-        assert word not in registry, f"в реестре остался {word} — его никто не выставляет"
-    with TestClient(main.app) as client:
         agent = client.post("/api/agents", json={}).json()["agents"][0]
-        assert "parent_id" not in agent, "наружу отдаётся мёртвое поле parent_id"
-    client_src = (read("app/static/app.js") + read("app/static/index.html")).lower()
-    for word in ("scenario", "прогон", "судья", "колонк"):
-        assert word not in client_src, f"в клиенте остался {word}"
-    return "ручки отдают 404, слов Scenario/judge/depends_on/repeats в коде нет"
+        for gone in ("parent_id", "group", "note", "origin", "draft"):
+            assert gone not in agent, f"наружу торчит мёртвое поле {gone}"
 
-
-# --- 4. агент: память, окно, откат, 409, обрыв --------------------------------
+        listing = client.get("/api/agents").json()
+        assert "groups" not in listing, "групп в ответе быть не должно"
+        body = client.get("/api/agents").text
+        for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
+            assert leftover not in body, f"наружу уехало пояснение: {leftover}"
+    return "четыре ручки отдают 404/405, мёртвых полей в ответах нет"
 
 
 @check("диалог помнит предыдущее: в третьем запросе виден первый вопрос")
@@ -1018,18 +1075,6 @@ def check_regenerate_disconnect():
 # --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
 
 
-@check("«Очистить все чаты» убрана вместе с ручкой и диалогом")
-def check_no_clear_all():
-    with TestClient(main.app) as client:
-        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
-        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
-    for path in ("app/static/app.js", "app/static/index.html"):
-        source = read(path)
-        for gone in ("Очистить все", "clear-all", "clearAll", "/api/agents/reset"):
-            assert gone not in source, f"{path}: остался {gone}"
-    return "ручки нет, кнопки нет, диалога очистки нет"
-
-
 @check("имена по умолчанию нумеруются, автоимени нет")
 def check_numbered_names():
     _stub.install(reply="ок")
@@ -1059,10 +1104,6 @@ def check_numbered_names():
         live = [a["label"] for a in client.get("/api/agents").json()["agents"]]
         assert len(live) == len(set(live)), "имена по умолчанию не должны повторяться"
 
-    js = read("app/static/app.js")
-    for gone in ("maybeAutoName", "chatTitle", "autoname"):
-        assert gone not in js, f"в клиенте осталось автоимя: {gone}"
-    assert "autoname" not in read("app/static/index.html"), "переключатель автоимени жив"
     return f"{first['label']}, {second['label']}, после удаления — {third['label']}"
 
 
@@ -1086,50 +1127,6 @@ def check_list_actions():
         assert client.delete(f"/api/agents/{agent_id}").status_code == 200
         assert client.get(f"/api/agents/{agent_id}").status_code == 404
     return "PATCH меняет имя, пустое отвергается, DELETE убирает; поля имени в панели нет"
-
-
-@check("пояснений прошлой постановки нет ни в данных, ни в разметке")
-def check_no_leftover_texts():
-    with TestClient(main.app) as client:
-        client.post("/api/agents", json={})
-        body = client.get("/api/agents").text
-    for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
-        assert leftover not in body, f"наружу уехало пояснение: {leftover}"
-
-    for path in ("app/static/app.js", "app/static/index.html"):
-        assert "note" not in read(path).replace("field-note", ""), f"{path}: остались пояснения"
-
-    # Подписи, объясняющие интерфейс сам себе, — тоже приписки: карандаш
-    # в списке виден и без пояснения под панелью.
-    html = read("app/static/index.html")
-    assert "карандаш" not in html, "приписка про карандаш осталась"
-    return "ни note, ни group, ни подписей к очевидному"
-
-
-@check("имени клиента-референса нет нигде в репозитории")
-def check_no_reference_name():
-    """Референс был инструментом разработки, а не частью продукта.
-
-    Имя собирается из кусков намеренно: иначе сама проверка стала бы
-    единственным местом, где оно осталось.
-    """
-    needle = ("o" + "mlx").encode()
-    tracked = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
-    ).stdout.split()
-    hits = []
-    for name in tracked:
-        path = os.path.join(ROOT, name)
-        if not os.path.isfile(path):
-            continue
-        if needle.decode() in name.lower():
-            hits.append(name)
-            continue
-        with open(path, "rb") as handle:
-            if needle in handle.read().lower():
-                hits.append(name)
-    assert not hits, f"упоминания остались в: {', '.join(hits)}"
-    return f"проверено {len(tracked)} файлов под контролем версий"
 
 
 @check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
