@@ -364,19 +364,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.card-tag {
-  flex: 0 0 auto;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--bg-soft);
-  color: var(--muted);
-}
 .card-actions { margin-left: auto; display: flex; gap: 2px; }
 
 .card-body { padding: 14px 16px 16px; }
-/* Строка токенов под ответом — тем же мелким шрифтом, что и подписи плиток:
-   это справка, а не содержание ответа. */
+/* Числа обмена под ответом — мелким шрифтом: это справка, а не содержание
+   ответа. Две строчки: токены с ценой и то, как прошёл вызов. */
 .card-usage {
   margin: -6px 16px 12px;
   font-size: 10px;
@@ -384,6 +376,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+.usage-how { margin-top: 2px; opacity: .85; }
 .card.failed { border-color: var(--danger); }
 .card-error {
   margin: 0 16px 14px;
@@ -681,9 +674,6 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   white-space: nowrap;
 }
 .tile-v.small { font-size: 13px; font-weight: 550; }
-.tile-sub { margin-left: auto; font-size: 10px; color: var(--faint); white-space: nowrap; }
-/* Подпись под значением, а не сбоку: значение получает всю ширину плитки. */
-.tile-sub.under { margin: 2px 0 0; }
 
 /* ── подтверждение ── */
 .confirm {
