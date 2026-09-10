@@ -95,6 +95,9 @@ const fmt = {
     if (v === null || v === undefined) return "—";
     const n = Number(v);
     if (!isFinite(n)) return "—";
+    // Порог для «M» стоит там, где округление в «k» уже дало бы «1000k»:
+    // такое число читается как миллион, миллионом его и пишем.
+    if (Math.abs(n) >= 999500) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
     if (Math.abs(n) >= 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
     return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
   },
@@ -537,13 +540,13 @@ function answerCard(agent, turn) {
 // Мелкая строка под ответом: «вход 1 240 · выход 312 · всего 1 552 · $0.000186».
 // Это и есть рост по мере диалога: пролистав чат, видно каждый обмен.
 //
-// Ни строки, если чисел нет вовсе или ответ оборвался: у оборванного числа
-// неполные, и место им в плитках по кнопке «метрики», а не мелким шрифтом
-// над текстом ошибки. Пропущенное поле просто не пишется — «вход 0» вместо
-// «неизвестно» было бы неправдой.
+// Строки нет, только если чисел нет вовсе. Оборванный ответ — со строкой:
+// его метрики идут в сумму по чату, он оплачен, и держать оба правила разом
+// нельзя — сумма видимых строк должна сходиться с итогом в плитках. Пропущенное
+// поле просто не пишется: «вход 0» вместо «неизвестно» было бы неправдой.
 function usageLine(turn) {
   const m = turn.metrics;
-  if (!m || turn.error) return null;
+  if (!m) return null;
   const parts = [];
   if (m.prompt_tokens !== null && m.prompt_tokens !== undefined) {
     parts.push("вход " + fmt.tokens(m.prompt_tokens));
@@ -1194,7 +1197,11 @@ function applySettings() {
 // на думающей модели это разные числа, и TTFT там включал бы всё размышление.
 // Насколько ответ отстал от рассуждения, видно подписью справа.
 const TILES = [
-  ["Ток/с", (m) => fmt.rate(m.tokens_per_second), (m) => (m.tokens_out ? m.tokens_out + " ток" : "")],
+  // Скорость и время обмена — про одно и то же и стоят вместе: сколько токенов
+  // в секунду и за сколько секунд. Прежняя подпись «N ток» ушла — это ровно
+  // то, что показывает «Выход», а плиток в сетке ровно восемь, 2×4.
+  ["Ток/с", (m) => fmt.rate(m.tokens_per_second),
+    (m) => (m.elapsed_ms ? "за " + fmt.sec(m.elapsed_ms) + " с" : "")],
   [
     "Первый токен, с",
     (m) => fmt.sec(m.first_token_ms === null || m.first_token_ms === undefined ? m.ttft_ms : m.first_token_ms),
@@ -1213,8 +1220,11 @@ const TILES = [
     // выход без него необъясним.
     (m) => (m.reasoning_tokens ? m.reasoning_tokens + " рассужд" : sumSub("completion_tokens", fmt.tokens))],
   ["Всего", (m) => fmt.tokens(m.total_tokens), () => sumSub("total_tokens", fmt.tokens)],
-  ["Стоимость", (m) => fmt.cost(m.cost_usd), () => sumSub("cost_usd", fmt.cost), true],
-  ["Время, с", (m) => fmt.sec(m.elapsed_ms), () => ""],
+  // У цены девять знаков — она занимает всю ширину плитки целиком. Подпись
+  // рядом отобрала бы у неё место, и на экране осталось бы «$0.000...»:
+  // ровно то число, ради которого затевался день. Поэтому накопленное здесь
+  // идёт **под** значением, отдельной строкой, а не сбоку.
+  ["Стоимость", (m) => fmt.cost(m.cost_usd), () => sumSub("cost_usd", fmt.cost), true, true],
   ["Провайдер", (m) => fmt.text(m.provider), () => "", true],
   ["Контекст", (m) => fmt.pct(m.context_fill_pct), (m) => m.finish_reason || ""],
 ];
@@ -1223,7 +1233,7 @@ function renderTiles() {
   const box = $("#tiles");
   const m = state.lastMetrics || {};
   box.innerHTML = "";
-  TILES.forEach(([label, value, sub, small]) => {
+  TILES.forEach(([label, value, sub, small, stacked]) => {
     const tile = document.createElement("div");
     tile.className = "tile";
     const k = document.createElement("div");
@@ -1236,13 +1246,16 @@ function renderTiles() {
     v.textContent = state.lastMetrics ? value(m) : "—";
     row.appendChild(v);
     const subText = state.lastMetrics ? sub(m) : "";
+    tile.append(k, row);
     if (subText) {
       const s = document.createElement("div");
-      s.className = "tile-sub";
+      // Подпись в одной строке со значением делит с ним ширину плитки.
+      // Плитке, у которой значение длинное, подпись даётся отдельной строкой:
+      // делить нечего, значение обязано быть видно целиком.
+      s.className = stacked ? "tile-sub under" : "tile-sub";
       s.textContent = subText;
-      row.appendChild(s);
+      (stacked ? tile : row).appendChild(s);
     }
-    tile.append(k, row);
     box.appendChild(tile);
   });
 }

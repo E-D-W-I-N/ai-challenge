@@ -682,6 +682,8 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 }
 .tile-v.small { font-size: 13px; font-weight: 550; }
 .tile-sub { margin-left: auto; font-size: 10px; color: var(--faint); white-space: nowrap; }
+/* Подпись под значением, а не сбоку: значение получает всю ширину плитки. */
+.tile-sub.under { margin: 2px 0 0; }
 
 /* ── подтверждение ── */
 .confirm {

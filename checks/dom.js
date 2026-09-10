@@ -395,8 +395,21 @@ function buildDocument(html) {
   const stack = [body];
   const tagRe = /<(\/?)([a-zA-Z][\w-]*)([^>]*?)(\/?)>/g;
   let match;
+  let textFrom = 0;
   while ((match = tagRe.exec(html))) {
     const [, closing, tag, attrs, selfClose] = match;
+
+    // Текст между тегами — тоже часть разметки: в шапке им написан номер дня,
+    // и раньше стенд его не видел вовсе. Достаётся он только листу, у которого
+    // ещё нет детей: узел, у которого textContent собирается из детей,
+    // подписывать нечем.
+    const between = html.slice(textFrom, match.index).trim();
+    textFrom = tagRe.lastIndex;
+    const holder = stack[stack.length - 1];
+    if (between && !between.startsWith("<") && !holder.children.length) {
+      holder.textContent = between;
+    }
+
     if (closing) {
       if (stack.length > 1) stack.pop();
       continue;

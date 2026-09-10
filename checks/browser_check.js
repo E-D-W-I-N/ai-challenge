@@ -342,6 +342,18 @@ function freshClient(options) {
 }
 
 async function routeChecks() {
+  // ── шапка страницы называет тот день, который в ней лежит ──
+  //
+  // Ветку с чужим номером дня видно первым же кадром записи, а из проверок
+  // на это не смотрел никто.
+  {
+    const { client, $, settle } = freshClient();
+    client.init();
+    await settle(20);
+    check("в шапке стоит номер этого дня",
+      $(".brand-sub").textContent === "чат · день 8", $(".brand-sub").textContent);
+  }
+
   // ── каждое поле панели доезжает до запроса, даже без события change ──
   for (const [field, typed, key, expected] of PANEL_ROUTE) {
     const { client, server, $, settle } = freshClient();
@@ -981,6 +993,19 @@ async function routeChecks() {
     const usageLines = () =>
       $("#feed").querySelectorAll(".card-usage").map((el) => el.textContent);
 
+    const labels = () => $("#tiles").children.map((t) => t.querySelector(".tile-k").textContent);
+
+    // Сетка — две колонки на четыре ряда. Девятая плитка занимает пятый ряд
+    // одна, рядом с ней остаётся пустая клетка, и панель над плитками теряет
+    // высоту. Утверждения на **число** плиток не было ни одного: день добавил
+    // девятую, и всё осталось зелёным.
+    check("плиток ровно восемь — сетка 2×4, пятого ряда нет",
+      $("#tiles").children.length === 8, "плиток " + $("#tiles").children.length);
+    check("и это те самые восемь",
+      labels().join(" | ") ===
+        "Ток/с | Первый токен, с | Вход | Выход | Всего | Стоимость | Провайдер | Контекст",
+      labels().join(" | "));
+
     const empty = tiles();
     check("до первого ответа плитка входа — прочерк, а не ноль",
       empty["Вход"] && empty["Вход"].v === "—", JSON.stringify(empty["Вход"]));
@@ -1005,6 +1030,28 @@ async function routeChecks() {
       JSON.stringify([one["Вход"].sub, one["Всего"].sub]));
     check("и накопленная стоимость тоже",
       one["Стоимость"].sub === "Σ $0.000186", one["Стоимость"].sub);
+
+    // Ширины в стенде нет, и обрезку текста он не покажет. Но обрезка берётся
+    // из разметки: подпись в одной строке со значением делит с ним ширину
+    // плитки, а у цены девять знаков — она занимает строку целиком. Поэтому
+    // утверждение про то, откуда обрезка берётся: подпись цены стоит **под**
+    // значением, и в строке значения, кроме него, нет никого.
+    const tileNamed = (name) =>
+      $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
+    const inRow = (tile) =>
+      tile.querySelector(".tile-row").children.map((el) => el.className).join(",");
+
+    const cost = tileNamed("Стоимость");
+    check("подпись стоимости стоит под значением, а не отбирает у него ширину",
+      inRow(cost) === "tile-v small", inRow(cost));
+    check("а сама подпись при этом на месте, отдельной строкой",
+      Boolean(cost.querySelector(".tile-sub")) &&
+        cost.querySelector(".tile-sub").textContent === "Σ $0.000186",
+      String(cost.querySelector(".tile-sub")));
+    // Плиткам с короткими значениями отдельная строка не нужна: там подпись
+    // рядом, и лишнего ряда высоты панель не отдаёт.
+    check("у короткого значения подпись остаётся рядом",
+      inRow(tileNamed("Вход")) === "tile-v,tile-sub", inRow(tileNamed("Вход")));
     check("под ответом строка с теми же числами",
       usageLines().join("|") === "вход 1 240 · выход 312 · всего 1 552 · $0.000186",
       usageLines().join("|"));
@@ -1028,8 +1075,10 @@ async function routeChecks() {
         "вход 1 240 · выход 312 · всего 1 552 · $0.000186 | " +
         "вход 12k · выход 500 · всего 12.5k · $0.000400",
       usageLines().join(" | "));
-    check("подпись — сумма входов обоих обменов, посчитанная отдельно",
-      two["Вход"].sub === "Σ " + client.fmt.tokens(1240 + 12000), two["Вход"].sub);
+    // Сумма входов обоих обменов — 13 240, и подпись обязана показать её
+    // ожидаемой строкой. Сверять с `fmt.tokens(1240 + 12000)` было нельзя:
+    // так утверждение проверяет само себя тем же кодом, который его и рисует.
+    check("подпись — сумма входов обоих обменов", two["Вход"].sub === "Σ 13.2k", two["Вход"].sub);
   }
 
   // ── чисел нет — нет и строки, а плитка показывает прочерк, а не ноль ──
@@ -1063,13 +1112,31 @@ async function routeChecks() {
     check("у ответа без чисел строки токенов нет вовсе",
       cards[0].querySelector(".card-usage") === null,
       String(cards[0].querySelector(".card-usage")));
-    check("у оборванного ответа строки тоже нет: числа там неполные",
-      cards[1].querySelector(".card-usage") === null,
+    check("у оборванного ответа строка есть: его числа идут в сумму по чату",
+      Boolean(cards[1].querySelector(".card-usage")) &&
+        cards[1].querySelector(".card-usage").textContent ===
+          "вход 90 · выход 4 · всего 94 · $0.000010",
       String(cards[1].querySelector(".card-usage")));
     const zeros = cards[2].querySelector(".card-usage");
     check("а нулевые числа — это ответ, и он показан нулями, а не прочерком",
       Boolean(zeros) && zeros.textContent === "вход 0 · выход 0 · всего 0 · $0.000000",
       zeros ? zeros.textContent : "строки нет вовсе");
+
+    // Лента и итог обязаны сходиться: строка под каждым ответом — слагаемое,
+    // подпись плитки — их сумма. Пока строки не было у оборванного ответа,
+    // видимые слагаемые давали меньше итога, и объяснить расхождение на экране
+    // было нечем.
+    const shown = $("#feed").querySelectorAll(".card-usage")
+      .map((el) => Number(/всего ([\d ]+)/.exec(el.textContent)[1].replace(/ /g, ""))); 
+    check("строк под ответами столько же, сколько ответов с числами",
+      shown.length === 2, JSON.stringify(shown));
+    check("сумма видимых строк сходится с итогом в плитке",
+      shown.reduce((a, b) => a + b, 0) === 94, JSON.stringify(shown));
+    const totalTile = $("#tiles").children.find(
+      (t) => t.querySelector(".tile-k").textContent === "Всего");
+    check("и в плитке стоит она же",
+      totalTile.querySelector(".tile-sub").textContent === "Σ 94",
+      totalTile.querySelector(".tile-sub").textContent);
 
     // Ноль и «неизвестно» на экране разные: это единственное, что отличает
     // «модель ничего не потратила» от «мы не знаем, сколько она потратила».
@@ -1084,6 +1151,13 @@ async function routeChecks() {
     check("формат: k с десятой долей", client.fmt.tokens(12449) === "12.4k", client.fmt.tokens(12449));
     check("формат: сотни тысяч тоже k", client.fmt.tokens(128600) === "128.6k",
       client.fmt.tokens(128600));
+    // «1000k» читается как миллион и им же и является — так и пишем.
+    check("формат: у k есть потолок", client.fmt.tokens(999999) === "1M",
+      client.fmt.tokens(999999));
+    check("формат: до потолка всё ещё k", client.fmt.tokens(999499) === "999.5k",
+      client.fmt.tokens(999499));
+    check("формат: миллионы с десятой долей", client.fmt.tokens(1250000) === "1.3M",
+      client.fmt.tokens(1250000));
   }
 
   // ── подпись «Выхода»: рассуждение важнее накопленного ──
@@ -1117,6 +1191,49 @@ async function routeChecks() {
     check("накопленное по чату при этом видно в соседней плитке",
       total.querySelector(".tile-sub").textContent === "Σ 160",
       total.querySelector(".tile-sub").textContent);
+  }
+
+  // ── итог берётся с сервера, а не складывается в браузере ──
+  //
+  // Инвариант дня: сумму считает агент, клиент её только показывает. Держался
+  // он на честном слове — клиент, складывающий метрики стенограммы сам, проходил
+  // все проверки насквозь. Здесь сервер называет заведомо другие числа, чем те,
+  // что лежат в репликах: показать клиент обязан серверные.
+  {
+    const talk = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22, cost_usd: 0.000002 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{
+        label: "чужой счёт", transcript: talk, history_len: talk.length,
+        usage_total: { prompt_tokens: 777777, completion_tokens: 999999,
+                       total_tokens: 1777776, cost_usd: 0.5, answers: 5 },
+      }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const sub = (name) => $("#tiles").children
+      .find((t) => t.querySelector(".tile-k").textContent === name)
+      .querySelector(".tile-sub").textContent;
+    check("подпись входа — серверная, а не сумма реплик",
+      sub("Вход") === "Σ 777.8k", sub("Вход"));
+    check("подпись выхода — серверная", sub("Выход") === "Σ 1M", sub("Выход"));
+    check("подпись «всего» — серверная", sub("Всего") === "Σ 1.8M", sub("Всего"));
+    check("накопленная стоимость — серверная", sub("Стоимость") === "Σ $0.500000",
+      sub("Стоимость"));
+    // И при этом строка под ответом показывает числа самой реплики: клиент
+    // не подгоняет одно под другое, он показывает оба источника как есть.
+    check("а строка под ответом — числа своей реплики",
+      $("#feed").querySelector(".card-usage").textContent ===
+        "вход 10 · выход 12 · всего 22 · $0.000002",
+      String($("#feed").querySelector(".card-usage")));
   }
 
   // ── у стриминговой карточки строки нет: числа приходят последним кадром ──
