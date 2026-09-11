@@ -134,8 +134,23 @@
         <section class="tab-page hidden" id="tab-agent">
           <label class="field">
             <span class="field-label">Системный промпт</span>
-            <textarea id="f-system" class="control area" rows="16" placeholder="без системного промпта"></textarea>
+            <textarea id="f-system" class="control area" rows="14" placeholder="без системного промпта"></textarea>
           </label>
+
+          <div class="grid2">
+            <label class="field">
+              <span class="field-label">Окно памяти, реплик</span>
+              <input id="f-keep_last" class="control" type="number" step="1" placeholder="без сжатия">
+            </label>
+            <label class="field">
+              <span class="field-label">Сжимать каждые, реплик</span>
+              <input id="f-compress_every" class="control" type="number" step="1" placeholder="—">
+            </label>
+          </div>
+
+          <p class="hint">Пустое окно — вся история уезжает в модель целиком. Заполните
+            оба поля, и всё, что старше окна, заменится пересказом: под ответом будет
+            написано, сколько реплик уехало сводкой.</p>
         </section>
       </div>
 

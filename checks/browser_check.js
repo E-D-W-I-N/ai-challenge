@@ -172,6 +172,11 @@ const PANEL_ROUTE = [
   ["f-presence_penalty", "0.4", "presence_penalty", 0.4],
   ["f-frequency_penalty", "0.6", "frequency_penalty", 0.6],
   ["f-stop", "КОНЕЦ\nСТОП", "stop", ["КОНЕЦ", "СТОП"]],
+  // Управление контекстом — тоже поля панели, а не константы в коде: два чата
+  // рядом, у одного окно памяти задано, у другого нет, — это и есть сравнение
+  // расхода «до/после», которого просит задание дня.
+  ["f-keep_last", "6", "keep_last", 6],
+  ["f-compress_every", "10", "compress_every", 10],
 ];
 
 function freshClient(options) {
@@ -485,6 +490,61 @@ async function routeChecks() {
       line === "входные токены 100 · выходные токены 60 (из них 40 рассуждение) · всего токенов 160 · $0.000100", line);
     check("в панели выходные токены — то, что прислал провайдер, без вычитаний",
       tileOf($, "Выходные токены").v === "60", tileOf($, "Выходные токены").v);
+  }
+
+  // ── сжатый обмен говорит, сколько реплик уехало сводкой ──
+  //
+  // Седьмой плитки у сжатия нет намеренно: плитки — про весь диалог, а
+  // свернулось — в этом обмене, и место факту рядом с числом, которое он
+  // уменьшил. Сравнение «до/после» держат два чата рядом и плитка «Всего
+  // токенов», а не новая клетка в сетке.
+  {
+    const folded = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 400, completion_tokens: 50, total_tokens: 450,
+                   cost_usd: 0.0001, summarized: 10 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "сжатый", transcript: folded, history_len: folded.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("под сжатым ответом сказано, сколько реплик уехало сводкой",
+      usageText($("#feed"), ".usage-tokens") ===
+        "входные токены 400 (сводка вместо 10 реплик) · выходные токены 50 · всего токенов 450 · $0.000100",
+      usageText($("#feed"), ".usage-tokens"));
+    check("а седьмой плитки у сжатия нет — сетка осталась 2×3",
+      $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
+  }
+
+  // ── несжатый обмен об этом молчит ──
+  //
+  // Пометка появляется только там, где сводка действительно уехала: «сводка
+  // вместо 0 реплик» под каждым ответом чата без сжатия была бы шумом.
+  {
+    const plain = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 400, completion_tokens: 50, total_tokens: 450, cost_usd: 0.0001 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "несжатый", transcript: plain, history_len: plain.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("без сжатия под ответом про сводку ни слова",
+      usageText($("#feed"), ".usage-tokens") ===
+        "входные токены 400 · выходные токены 50 · всего токенов 450 · $0.000100",
+      usageText($("#feed"), ".usage-tokens"));
   }
 
   // ── итог берётся с сервера, а не складывается в браузере ──
