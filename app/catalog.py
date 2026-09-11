@@ -56,13 +56,11 @@ def _normalize(raw: dict) -> dict:
     capped = model_id.startswith(TEMPERATURE_CAPPED_PREFIXES)
     return {
         "id": model_id,
-        "name": raw.get("name") or model_id,
         "context_length": raw.get("context_length") or 0,
         "supported_parameters": raw.get("supported_parameters") or [],
         # цены за 1M токенов — то, в чём их привычно читать
         "prompt_price_per_m": round(prompt_price * 1_000_000, 4),
         "completion_price_per_m": round(completion_price * 1_000_000, 4),
-        "is_free": model_id.endswith(":free") or (prompt_price == 0 and completion_price == 0),
         "temperature_capped": capped,
         "temperature_cap": TEMPERATURE_CAP if capped else None,
     }

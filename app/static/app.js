@@ -108,18 +108,15 @@ const fmt = {
   },
 };
 
-// Итог по чату приходит с сервера полем `usage_total` — считает его агент,
-// клиент только показывает. Здесь не складывается ни одного слагаемого,
-// и досчитать «всего» вместо смолчавшего провайдера клиент тоже не вправе:
-// два места, где числа считаются, разъезжаются молча.
-function chatUsage() {
-  return (state.current && state.current.usage_total) || null;
-}
-
-// Поле итога по чату. Итога нет вовсе — это `null`, то есть прочерк в плитке,
-// а не ноль: в чате, где не было ни одного ответа с числами, ноль был бы враньём.
+// Поле итога по чату. Итог приходит с сервера полем `usage_total` — считает
+// его агент, клиент только показывает: здесь не складывается ни одного
+// слагаемого, и досчитать «всего» вместо смолчавшего провайдера клиент тоже
+// не вправе — два места, где числа считаются, разъезжаются молча.
+//
+// Итога нет вовсе — это `null`, то есть прочерк в плитке, а не ноль: в чате,
+// где не было ни одного ответа с числами, ноль был бы враньём.
 function totalField(name) {
-  const total = chatUsage();
+  const total = state.current && state.current.usage_total;
   return total ? total[name] : null;
 }
 
@@ -326,7 +323,7 @@ function renderMarkdown(text) {
 async function api(path, options) {
   const res = await fetch(path, options);
   if (!res.ok) throw new Error(await detail(res));
-  return res.status === 204 ? null : res.json();
+  return res.json();
 }
 
 async function detail(res) {
@@ -388,7 +385,7 @@ async function loadAgents(selectId) {
   renderList();
   const wanted = selectId || (state.current && state.current.id);
   const exists = state.agents.some((a) => a.id === wanted);
-  await openAgent(exists ? wanted : (state.agents[0] || {}).id);
+  await openAgent(exists ? wanted : state.agents[0].id);
 }
 
 function renderList() {
@@ -564,9 +561,6 @@ function answerCard(agent, turn) {
 
   const actions = el("div", "card-actions");
   actions.append(
-    // Кнопки «метрики этого ответа» здесь больше нет: числа обмена написаны
-    // под ним самим, а перекладывать их в плитки значило бы показывать
-    // в панели то, что там больше не живёт, — она про весь диалог.
     iconButton("copy", "Копировать ответ", () => copyText(turn.content)),
     iconButton("refresh", "Перегенерировать", () => regenerate()),
     iconButton("dots", "Показать сырой текст", () => showRaw(card, turn))
@@ -607,11 +601,10 @@ function answerCard(agent, turn) {
 function usageLine(turn) {
   const m = turn.metrics;
   if (!m) return null;
-  const known = (v) => v !== null && v !== undefined;
 
   const tokens = [];
-  if (known(m.prompt_tokens)) tokens.push("входные токены " + fmt.tokens(m.prompt_tokens));
-  if (known(m.completion_tokens)) {
+  if (has(m.prompt_tokens)) tokens.push("входные токены " + fmt.tokens(m.prompt_tokens));
+  if (has(m.completion_tokens)) {
     // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
     // думающей модели выход заметно больше видимого текста. Поэтому они
     // названы отдельным числом, а не вычтены молча: вычитание сделало бы
@@ -621,8 +614,8 @@ function usageLine(turn) {
       : "";
     tokens.push("выходные токены " + fmt.tokens(m.completion_tokens) + think);
   }
-  if (known(m.total_tokens)) tokens.push("всего токенов " + fmt.tokens(m.total_tokens));
-  if (known(m.cost_usd)) tokens.push(fmt.cost(m.cost_usd));
+  if (has(m.total_tokens)) tokens.push("всего токенов " + fmt.tokens(m.total_tokens));
+  if (has(m.cost_usd)) tokens.push(fmt.cost(m.cost_usd));
 
   const how = [];
   if (m.tokens_per_second) {
@@ -633,8 +626,8 @@ function usageLine(turn) {
   }
   // Первый токен — честный: на думающей модели это момент, когда модель
   // заговорила вообще, а не когда домыслила и пошёл ответ.
-  const first = known(m.first_token_ms) ? m.first_token_ms : m.ttft_ms;
-  if (known(first)) how.push("первый токен " + fmt.sec(first) + " с");
+  const first = has(m.first_token_ms) ? m.first_token_ms : m.ttft_ms;
+  if (has(first)) how.push("первый токен " + fmt.sec(first) + " с");
   if (m.provider) how.push(m.provider);
 
   if (!tokens.length && !how.length) return null;
@@ -684,10 +677,9 @@ function atBottom(feed) {
   return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= STICK_SLACK;
 }
 
-function scrollFeed(force) {
-  const feed = $("#feed");
-  if (force) state.stick = true;
+function scrollFeed() {
   if (!state.stick) return;
+  const feed = $("#feed");
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -1000,18 +992,7 @@ function parseResponseFormat(kind, raw) {
 
 // Параметры панели в терминах OpenRouter. Наши поля — `system` и `model` —
 // параметрами не уходят и по `supported_parameters` не проверяются.
-const PROVIDER_PARAMS = [
-  "temperature",
-  "max_tokens",
-  "top_p",
-  "top_k",
-  "min_p",
-  "repetition_penalty",
-  "presence_penalty",
-  "frequency_penalty",
-  "stop",
-  "response_format",
-];
+const PROVIDER_PARAMS = [...NUMBER_FIELDS, "stop", "response_format"];
 
 // Чем заданные параметры не сойдутся с выбранной моделью. Предупреждать надо
 // **до** отправки: на каждом вызове стоит provider.require_parameters=true,
@@ -1103,14 +1084,6 @@ function sameValue(a, b) {
   return a === b;
 }
 
-// Изменила ли правка хоть что-нибудь. Сравниваются только поля панели:
-// стенограмма и занятость живут своей жизнью, и по ним «изменилось» было бы
-// правдой всегда.
-function configChanged(before, after, fields) {
-  if (!before) return true;
-  return fields.some((name) => !sameValue(before[name], after[name]));
-}
-
 // Что сейчас набрано в панели. Бросает, если поле не разобрать.
 function readPanel() {
   const patch = {
@@ -1159,13 +1132,8 @@ function renderWarnings() {
 // не послать вовсе.
 async function ensurePanelApplied() {
   if (!state.current) return true;
-  try {
-    readPanel();
-  } catch (err) {
-    state.panelDirty = true;
-    saveStatus(String(err.message || err), true);
-    return false;
-  }
+  // Неразобранное поле помечает панель грязной внутри applySettings — отсюда
+  // это видно по `panelDirty`, и отправка не состоится.
   await applySettings();
   return !state.panelDirty;
 }
@@ -1205,8 +1173,10 @@ function applySettings() {
       // Сравнивается не панель с панелью, а конфиг агента до и после:
       // сервер по дороге нормализует (пустой список стоп-строк становится
       // `null`), и панель, разошедшаяся с агентом только формой записи,
-      // изменением не является.
-      if (configChanged(before, updated, fields)) {
+      // изменением не является. Сравниваются только поля панели: стенограмма
+      // и занятость живут своей жизнью, и по ним «изменилось» было бы
+      // правдой всегда.
+      if (fields.some((name) => !sameValue(before[name], updated[name]))) {
         saveStatus("Применено — со следующего сообщения.");
       }
     } catch (err) {
@@ -1251,10 +1221,8 @@ function renderTiles() {
     // Подсказка вместо второй строки: плитка от неё не растёт, а откуда
     // взялось число, сказано словами.
     if (faded) v.title = "число прошлого обмена: последний вызов упал";
-    const row = el("div", "tile-row");
-    row.appendChild(v);
     const tile = el("div", "tile");
-    tile.append(el("div", "tile-k", label), row);
+    tile.append(el("div", "tile-k", label), v);
     box.appendChild(tile);
   });
 }

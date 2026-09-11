@@ -636,8 +636,8 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
      подпись переставала говорить, что стоит в плитке. */
   overflow-wrap: anywhere;
 }
-.tile-row { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; }
 .tile-v {
+  margin-top: 3px;
   font-size: 18px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
