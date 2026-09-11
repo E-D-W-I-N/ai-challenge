@@ -69,7 +69,7 @@ function icon(name) {
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
   const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  path.setAttribute("d", ICONS[name] || "");
+  path.setAttribute("d", ICONS[name]);
   svg.appendChild(path);
   return svg;
 }
@@ -211,7 +211,7 @@ function renderMarkdown(text) {
 async function api(path, options) {
   const res = await fetch(path, options);
   if (!res.ok) throw new Error(await detail(res));
-  return res.status === 204 ? null : res.json();
+  return res.json();
 }
 
 async function detail(res) {
@@ -511,10 +511,9 @@ function atBottom(feed) {
   return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= STICK_SLACK;
 }
 
-function scrollFeed(force) {
-  const feed = $("#feed");
-  if (force) state.stick = true;
+function scrollFeed() {
   if (!state.stick) return;
+  const feed = $("#feed");
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -584,7 +583,7 @@ async function exchange(path, body, questionText) {
   if (state.applying) await state.applying;
   if (!(await ensurePanelApplied())) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
-    return false;
+    return;
   }
   // Текст забираем из поля только теперь: до этой строки отправка могла
   // не состояться.
@@ -872,14 +871,7 @@ function paramWarnings(model, settings, extraBody, baseModel) {
   }
 
   const cap = model.temperature_cap;
-  if (
-    model.temperature_capped &&
-    settings.temperature !== null &&
-    settings.temperature !== undefined &&
-    cap !== null &&
-    cap !== undefined &&
-    settings.temperature > cap
-  ) {
+  if (model.temperature_capped && cap != null && settings.temperature > cap) {
     warnings.push(
       `«${model.id}» обрезает temperature на ${cap.toFixed(1)}: ` +
         `на ${settings.temperature} ` +
@@ -979,13 +971,8 @@ function renderWarnings() {
 // не послать вовсе.
 async function ensurePanelApplied() {
   if (!state.current) return true;
-  try {
-    readPanel();
-  } catch (err) {
-    state.panelDirty = true;
-    saveStatus(String(err.message || err), true);
-    return false;
-  }
+  // Разбор и его ошибка живут в `applySettings`: поле, которое не прочитать,
+  // оставляет `panelDirty`, а по нему и видно, что правка не доехала.
   await applySettings();
   return !state.panelDirty;
 }
