@@ -45,7 +45,7 @@ def check(name):
     def wrap(fn):
         def run():
             _stub.reset()
-            REGISTRY.kill_all()
+            _reset_registry()
             try:
                 detail = fn() or ""
                 RESULTS.append((name, True, detail))
@@ -61,6 +61,14 @@ def check(name):
         return run
 
     return wrap
+
+
+def _reset_registry() -> None:
+    """Гасит живых и стирает базу перед каждой проверкой: процесс один,
+    а состояние друг от друга проверки наследовать не должны."""
+    for agent_id in list(REGISTRY._agents):
+        REGISTRY._unload(agent_id)
+    REGISTRY.store.clear()
 
 
 async def drain(agen) -> list[dict]:
@@ -344,6 +352,13 @@ def check_panel_reaches_request():
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "третий"})
         bare = _stub.CALLS[-1]
 
+        # Ноль — это заданный ноль, а не «не задано»: с require_parameters
+        # отправить 0 и не отправить параметр — два разных списка провайдеров.
+        client.patch(f"/api/agents/{agent_id}", json={"temperature": 0, "top_p": 0})
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четвёртый"})
+        zero = _stub.CALLS[-1]["payload"]
+        assert zero["temperature"] == 0.0 and zero["top_p"] == 0.0, zero
+
         # Кривой тип — 400 с текстом, а не 500 и не молчаливая отправка.
         assert client.patch(f"/api/agents/{agent_id}", json={"top_k": 0.5}).status_code == 400
         assert client.patch(f"/api/agents/{agent_id}", json={"stop": "СТОП"}).status_code == 400
@@ -354,6 +369,18 @@ def check_panel_reaches_request():
         )
         # Менять можно только то, что в панели видно.
         assert client.patch(f"/api/agents/{agent_id}", json={"note": "х"}).status_code == 400
+        # Пустое имя дало бы пустую строку в списке слева, пустой текст —
+        # пустую реплику в истории, а лента в теле значила бы, что историю
+        # диктует браузер, а не агент.
+        assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
+        assert client.post(
+            f"/api/agents/{agent_id}/messages", json={"text": " "}
+        ).status_code == 400
+        with_feed = client.post(
+            f"/api/agents/{agent_id}/messages",
+            json={"text": "привет", "messages": [{"role": "user", "content": "привет"}]},
+        )
+        assert with_feed.status_code == 400 and "только text" in with_feed.json()["detail"], with_feed.text
 
     sent, payload = call["messages"], call["payload"]
     assert sent[0] == {"role": "system", "content": "НОВЫЙ ПРОМПТ"}, sent[0]
@@ -509,6 +536,188 @@ def check_config_survives_by_construction():
         f"{len(probes)} полей конфига и история из {messages + 1} реплик пережили "
         "переоткрытие файла, схема сходится с кодом"
     )
+
+
+@check("чат поднимается из строки, которую писали не мы: чужое поле, битый JSON")
+def check_foreign_row():
+    """Строку в базе мог записать сервер другой версии — или правка руками.
+    Подъём чата обязан пережить и незнакомый ключ в конфиге, и пропавшую
+    модель, и битый JSON в колонке: уронить чтение — значит потерять
+    сохранённый диалог, а он единственное, ради чего день делался.
+    """
+    from app.agent import Agent
+
+    path = _temp_db("foreign")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="чужой", model="stub/m", system="СИС", top_k=7), store=store)
+    agent.remember("user", "меня зовут Нина")
+    agent.remember("assistant", "привет", metrics={"provider": "stub"})
+    chat = agent.id
+
+    # 1) Конфиг с полями, которых в этой версии нет: незнакомое отбрасывается
+    #    молча, знакомое доезжает.
+    with store.tx() as conn:
+        conn.execute(
+            "UPDATE sessions SET config = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "label": "чужой",
+                        "model": "stub/m",
+                        "system": "СИС",
+                        "top_k": 7,
+                        "history_limit": 4,
+                        "seed_messages": [{"role": "user", "content": "чужое"}],
+                    },
+                    ensure_ascii=False,
+                ),
+                chat,
+            ),
+        )
+    revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=chat, store=store)
+    assert revived.spec.model == "stub/m" and revived.spec.top_k == 7, revived.spec
+    assert revived.spec.system == "СИС", revived.spec.system
+    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет"], revived.history
+
+    # 2) Конфиг без модели: чат всё равно виден и открывается — в нём лежит
+    #    переписка, а модель пользователь выберет заново.
+    with store.tx() as conn:
+        conn.execute("UPDATE sessions SET config = ? WHERE id = ?", ('{"label": "без модели"}', chat))
+    registry = AgentRegistry(max_agents=10, store=store)
+    entries = registry.catalogue()
+    assert [e["id"] for e in entries] == [chat], entries
+    assert entries[0]["model"], "чат без модели исчез бы из списка слева"
+    bare = registry.require(chat)
+    assert [t.content for t in bare.history] == ["меня зовут Нина", "привет"], bare.history
+
+    # 3) Битый JSON: конфиг падает на пустой, метрики — на «их нет»,
+    #    а не роняют чтение целиком.
+    with store.tx() as conn:
+        conn.execute("UPDATE sessions SET config = 'не json' WHERE id = ?", (chat,))
+        conn.execute("UPDATE messages SET metrics = '{битое' WHERE session_id = ?", (chat,))
+    store.close()
+
+    again = Store(path).init()
+    try:
+        assert again.load_session(chat)["config"] == {}, "битый конфиг не упал на пустой"
+        assert [m["metrics"] for m in again.load_messages(chat)] == [None, None], (
+            "битые метрики не упали на «их нет»"
+        )
+        second = AgentRegistry(max_agents=10, store=again)
+        assert len(second.require(chat).history) == 2, "битая строка уронила подъём чата"
+    finally:
+        again.close()
+    return "чужое поле отброшено, чат без модели открылся, битый JSON не уронил чтение"
+
+
+@check("два столбца времени: заведение не сдвигается правкой, свежесть — сдвигается записью")
+def check_session_timestamps():
+    """Каждый столбец держит свой порядок: `created_at` — список слева
+    (он по заведению), `updated_at` — `/сессии` в консоли (там свежие сверху).
+
+    Оба теряются молча. `save_session` зовётся на каждую правку панели и
+    не вправе двигать `created_at`, иначе переименованный чат прыгнет в конец
+    списка. `save_history` обязан двигать `updated_at`, иначе разговор
+    не поднимает чат наверх и список свежести замирает навсегда. И подъём
+    чата из базы — тоже не заведение: открытый после перезапуска чат не должен
+    уезжать в конец.
+    """
+    from app.agent import Agent, Turn
+
+    path = _temp_db("stamps")
+    store = Store(path).init()
+    older = {"model": "stub/m", "label": "старший"}
+    store.save_session("ag_00001", label="старший", config=older, created_at=100.0)
+    time.sleep(0.01)
+    store.save_session("ag_00002", label="младший", config={"model": "stub/m"}, created_at=200.0)
+
+    # Правка конфига живого чата: имя новое, время заведения прежнее.
+    time.sleep(0.01)
+    store.save_session("ag_00001", label="переименован", config=older, created_at=100.0)
+    saved = store.load_session("ag_00001")
+    assert saved["label"] == "переименован", saved["label"]
+    assert saved["created_at"] == 100.0, (
+        f"правка сдвинула время заведения на {saved['created_at']} — "
+        "переименованный чат уедет в конец списка слева"
+    )
+    assert [row["id"] for row in store.list_sessions()] == ["ag_00001", "ag_00002"]
+
+    # А теперь в младшем говорят: разговор обязан поднять его наверх.
+    time.sleep(0.01)
+    store.save_history(
+        "ag_00002", [Turn(role="user", content="привет"), Turn(role="assistant", content="и тебе")]
+    )
+    order = [row["id"] for row in store.list_sessions()]
+    assert order == ["ag_00002", "ag_00001"], (
+        f"список свежести {order}: запись истории не сдвинула updated_at "
+        "или порядок сортировки перевёрнут"
+    )
+    assert [row["history_len"] for row in store.list_sessions()] == [2, 0]
+
+    # Подъём чата из базы — не заведение заново.
+    lifted = Agent(AgentSpec(label="старший", model="stub/m"), agent_id="ag_00001", store=store)
+    assert lifted.created_at == 100.0, (
+        f"поднятый чат получил новое время заведения ({lifted.created_at}) — "
+        "после перезапуска он уедет в конец списка слева"
+    )
+    assert store.load_session("ag_00001")["created_at"] == 100.0, "подъём переписал created_at"
+    store.close()
+    return "правка не трогает created_at, подъём — тоже; запись истории двигает updated_at"
+
+
+@check("рассуждение видно в ленте, но не уходит ни в базу, ни обратно в модель")
+def check_reasoning_and_transcript():
+    """Стенограмма — то, из чего клиент рисует ленту и плитки: после каждого
+    обмена он перечитывает агента и перерисовывает всё заново, а не полагается
+    на дорисованное по дороге. Поэтому её формат — часть поведения: поле,
+    пропавшее из реплики, — это молча переставшая рисоваться карточка.
+
+    Рассуждение в ленте есть, а в базе и в следующем запросе — нет: в контекст
+    оно не возвращается, а места занимает больше самого ответа.
+    """
+    _stub.install(reply="итоговый ответ", reasoning="я подумал про панду")
+    with TestClient(main.app) as client:
+        chat = new_agent(client)
+        client.post(f"/api/agents/{chat}/messages", json={"text": "вопрос"})
+        body = client.get(f"/api/agents/{chat}").json()
+
+    transcript = body["transcript"]
+    assert [t["role"] for t in transcript] == ["user", "assistant"], transcript
+    for turn in transcript:
+        for field in ("role", "content", "error", "reasoning", "metrics"):
+            assert field in turn, f"в реплике нет поля {field}: {turn}"
+    answer = transcript[-1]
+    assert answer["content"] == "итоговый ответ" and answer["error"] is None, answer
+    assert answer["reasoning"] == "я подумал про панду", answer
+    assert answer["metrics"] and answer["metrics"]["provider"] == "stub", answer["metrics"]
+    # По `history_len` клиент обновляет строку списка, не перечитывая ленту.
+    assert body["history_len"] == len(transcript), (body["history_len"], len(transcript))
+
+    # В базе рассуждения нет — ни колонкой, ни текстом.
+    store = REGISTRY.store
+    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(messages)")}
+    assert "reasoning" not in columns, "рассуждению в базе не место: в контекст оно не входит"
+    blob = " ".join(str(v) for row in store.conn.execute("SELECT * FROM messages") for v in row)
+    assert "панду" not in blob, "рассуждение осело в базе"
+
+    # И обратно в модель не уезжает: в контексте только ответ.
+    _stub.reset()
+    _stub.install(reply="второй ответ")
+    with TestClient(main.app) as client:
+        client.post(f"/api/agents/{chat}/messages", json={"text": "ещё"})
+    sent = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
+    assert "панду" not in sent, f"рассуждение вернулось в контекст: {sent}"
+    assert "итоговый ответ" in sent, sent
+
+    # Оборванный ответ помечен, и ошибка доезжает до ленты.
+    with TestClient(main.app) as client:
+        broken = new_agent(client)
+        hurt = REGISTRY.require(broken)
+        hurt.remember("user", "вопрос")
+        hurt.remember("assistant", "огрыз", error="оборвалось")
+        failed = client.get(f"/api/agents/{broken}").json()["transcript"][-1]
+    assert failed["error"] == "оборвалось", failed
+    return f"{len(transcript)} реплики со всеми полями; рассуждения нет ни в базе, ни в промпте"
 
 
 @check("изоляция чатов: у сообщений есть session_id, ленты не сливаются")
@@ -676,10 +885,10 @@ def check_eviction_keeps_session():
         made = []
         first_object = None
         for i in range(10):
-            agent = registry.create(
-                AgentSpec(label=f"чат {i}", model="stub/m", temperature=i / 10),
-                context_length=128_000,
-            )
+            agent = registry.create_many(
+                [AgentSpec(label=f"чат {i}", model="stub/m", temperature=i / 10)],
+                context_lengths={"stub/m": 128_000},
+            )[0]
             asyncio.run(drain(agent.ask(f"вопрос {i}")))
             made.append(agent.id)
             first_object = first_object or agent
@@ -838,7 +1047,7 @@ def check_ids_come_from_db():
     return f"{taken} остался за соседом, свежий получил {mine.id}; имена — {first}, {third}"
 
 
-@check("транзакция берёт блокировку сразу; занятая база — внятный 503")
+@check("транзакция берёт блокировку сразу и откатывается целиком; занятая база — 503")
 def check_tx_locks_immediately():
     """`BEGIN IMMEDIATE`, а не голый `BEGIN`.
 
@@ -854,9 +1063,39 @@ def check_tx_locks_immediately():
 
     И то, ради чего блокировка нужна: не дождавшийся своей очереди получает
     внятный 503 с объяснением, а не голый 500, и записи после себя
-    не оставляет.
+    не оставляет — ни на записи, ни на чтении.
     """
     from app.store import _busy
+
+    # Обещание «половины обмена в базе не бывает» держит не `save_history`,
+    # а откат: упала транзакция — в файле не должно остаться ни строки чата,
+    # ни половины реплик. И база после отката обязана остаться рабочей:
+    # незакрытая транзакция валит следующую запись на «transaction within
+    # a transaction».
+    class Boom(RuntimeError):
+        pass
+
+    rolled = Store(_temp_db("rollback")).init()
+    try:
+        with rolled.tx() as conn:
+            conn.execute(
+                "INSERT INTO sessions (id, label, created_at, updated_at) "
+                "VALUES ('ag_00777', 'половина', 1, 1)"
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, seq, role, content, at) "
+                "VALUES ('ag_00777', 0, 'user', 'вопрос без ответа', 1)"
+            )
+            raise Boom
+    except Boom:
+        pass
+    assert rolled.load_session("ag_00777") is None, "строка недописанной транзакции осталась"
+    assert _rows(rolled, "ag_00777") == [], "реплики недописанной транзакции остались"
+    rolled.save_session("ag_00778", label="после отката", config={}, created_at=1.0)
+    assert rolled.load_session("ag_00778")["label"] == "после отката", (
+        "после отката база не пишет — транзакция осталась открытой"
+    )
+    rolled.close()
 
     path = _temp_db("immediate")
     store = Store(path).init()
@@ -919,7 +1158,32 @@ def check_tx_locks_immediately():
         assert reopened.list_sessions() == [], reopened.list_sessions()
     finally:
         reopened.close()
-    return "открытая транзакция видна второму писателю сразу; занятая база даёт 503"
+
+    # Чтение обязано объясниться так же. Под WAL читатель писателя не ждёт,
+    # но эксклюзивную блокировку соседа переждать не может — и там, где
+    # `reading()` перестанет переводить ошибку, наружу поедет голый 500.
+    locked = _temp_db("busy-read")
+    Store(locked).init().close()
+    keeper = sqlite3.connect(str(locked), isolation_level=None)
+    keeper.execute("PRAGMA busy_timeout=0")
+    keeper.execute("PRAGMA locking_mode=EXCLUSIVE")
+    keeper.execute("BEGIN IMMEDIATE")
+    keeper.execute("INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_00001', 1, 1)")
+    try:
+        on_read = None
+        try:
+            Store(locked).list_sessions()
+        except StoreBusyError as exc:
+            on_read = exc
+        assert on_read is not None, "чтение занятой базы упало голым sqlite3"
+        assert "занята другим процессом" in str(on_read), str(on_read)
+    finally:
+        keeper.execute("ROLLBACK")
+        keeper.close()
+    return (
+        "упавшая транзакция не оставила ни строки; открытая видна второму "
+        "писателю сразу; занятая база даёт 503 и на записи, и на чтении"
+    )
 
 
 # --- Сквозное: ключ, сеть, клиент ---------------------------------------------

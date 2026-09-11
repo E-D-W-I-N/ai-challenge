@@ -75,10 +75,6 @@ async def index() -> FileResponse:
 # --- вспомогательное ----------------------------------------------------------
 
 
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-
 async def _context_lengths() -> dict[str, int]:
     """Длины контекста по моделям. Каталог недоступен — просто не покажем заполнение."""
     try:
@@ -125,7 +121,7 @@ async def _pump(
                 continue
             if event is done:
                 break
-            yield _sse(event)
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     finally:
         if not task.done():
             task.cancel()

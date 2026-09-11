@@ -483,6 +483,102 @@ async function routeChecks() {
     check("после смены модели предупреждение появляется", text.length > 0, text);
     check("и говорит человеческими словами, без имён полей конфига",
       /поставщик/i.test(text) && !/provider|extra_body|order|404/.test(text), text);
+
+    // Второй повод: параметр, которого модель не заявляет. На каждом вызове
+    // стоит provider.require_parameters, и такой параметр выкашивает
+    // провайдеров — вместо ответа придёт невнятная ошибка.
+    $("#f-model").value = "строгая/модель";
+    $("#f-top_k").value = "40";
+    $("#f-top_k").dispatchEvent(new Evt("change"));
+    await settle(40);
+    const unsupported = $("#model-warn").textContent;
+    check("про незаявленный моделью параметр панель предупреждает отдельно",
+      /top_k/.test(unsupported) && /строгая\/модель/.test(unsupported), unsupported);
+    check("и это второе предупреждение, а не замена первому",
+      $("#model-warn").children.length === 2, String($("#model-warn").children.length));
+
+    // Третий: температуру модель заявляет и всё равно обрезает на 1.0.
+    $("#f-temperature").value = "1.2";
+    $("#f-temperature").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("про обрезанную температуру предупреждает, хотя параметр заявлен",
+      /1\.0/.test($("#model-warn").textContent) &&
+        $("#model-warn").children.length === 3,
+      $("#model-warn").textContent);
+
+    // Заявленное молчит: пугать тем, чего не будет, хуже, чем молчать.
+    $("#f-temperature").value = "0.5";
+    $("#f-top_k").value = "";
+    $("#f-top_k").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("заявленные параметры молчат",
+      $("#model-warn").children.length === 1, $("#model-warn").textContent);
+  }
+
+  // ── узкое окно: борта становятся ящиками поверх ленты ──
+  //
+  // Целый режим интерфейса, который стенд раньше не исполнял ни разу:
+  // `matchMedia` в нём был прибит к `matches: false`. Утверждения —
+  // про то, что видно на экране, а не про внутренние флаги.
+  {
+    const { client, $, settle, Evt, document } = freshClient({ narrow: true });
+    client.init();
+    await settle(40);
+    const app = $("#app");
+    const openDrawer = (which) => {
+      document.getElementById("restore-" + which).dispatchEvent(new Evt("click"));
+    };
+    const esc = () => document.body.dispatchEvent(new Evt("keydown", { key: "Escape" }));
+
+    check("на узком окне оба борта свёрнуты сразу",
+      app.classList.contains("no-sidebar") && app.classList.contains("no-panel"),
+      app.className);
+    check("и на экране осталось, чем их вернуть",
+      Boolean(document.getElementById("restore-sidebar")) &&
+        Boolean(document.getElementById("restore-panel")),
+      "кнопок разворота нет");
+
+    openDrawer("sidebar");
+    await settle(10);
+    check("кнопка возвращает список, и под ящиком появляется затемнение",
+      !app.classList.contains("no-sidebar") && Boolean($(".backdrop")), app.className);
+
+    openDrawer("panel");
+    await settle(10);
+    check("ящики не соседствуют: открыли настройки — список закрылся",
+      app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
+
+    // Escape поверх диалога подтверждения важнее ящиков.
+    openDrawer("sidebar");
+    await settle(10);
+    $("#agent-list").querySelectorAll(".mini")[1].dispatchEvent(new Evt("click"));
+    check("удаление спрашивает подтверждение", Boolean($(".confirm")), "диалога нет");
+    esc();
+    await settle(10);
+    check("Escape поверх диалога гасит диалог, а открытый ящик оставляет",
+      !$(".confirm") && !app.classList.contains("no-sidebar"), app.className);
+
+    esc();
+    await settle(10);
+    check("а следующий Escape закрывает ящик и убирает затемнение",
+      app.classList.contains("no-sidebar") && !$(".backdrop"), app.className);
+  }
+
+  // ── широкое окно: Escape борта не трогает ──
+  {
+    const { client, $, settle, Evt, document } = freshClient();
+    client.init();
+    await settle(30);
+    const app = $("#app");
+    check("на широком окне борта открыты", 
+      !app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
+    document.body.dispatchEvent(new Evt("keydown", { key: "Escape" }));
+    await settle(10);
+    check("и Escape их не закрывает: ящиков здесь нет",
+      !app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
   }
 
   // ── где оказывается лента ──

@@ -92,10 +92,6 @@ class Turn:
         возвращается ответ, а не путь к нему."""
         return {"role": self.role, "content": self.content}
 
-    def as_dict(self) -> dict:
-        """Реплика для стенограммы — все поля, а не перечисленные руками."""
-        return asdict(self)
-
 
 @dataclass
 class Exchange:
@@ -295,9 +291,10 @@ class Agent:
         self.persist()
 
     def transcript(self) -> list[dict]:
-        """Ровно реплики диалога. Системного промпта здесь нет: он конфиг,
-        а не реплика, и виден в панели полем `system`."""
-        return [turn.as_dict() for turn in self.history]
+        """Ровно реплики диалога, все поля каждой: по ним клиент рисует ленту
+        и плитки. Системного промпта здесь нет: он конфиг, а не реплика,
+        и виден в панели полем `system`."""
+        return [asdict(turn) for turn in self.history]
 
     def as_dict(self, *, with_transcript: bool = False) -> dict:
         data = spec_as_dict(
@@ -314,7 +311,7 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
-    async def ask(self, user_text: str, *, commit: bool = True) -> AsyncIterator[dict]:
+    async def ask(self, user_text: str) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
         События: `start`, `reasoning`, `delta`, `metrics`, `error`, `done`.
@@ -388,7 +385,7 @@ class Agent:
             except asyncio.CancelledError:
                 # Клиент ушёл: частичный ответ всё равно записываем — он уже
                 # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                self._commit(user_text, text, "вызов прерван", commit, reasoning, final_metrics)
+                self._commit(user_text, text, "вызов прерван", reasoning, final_metrics)
                 raise
             except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                 failure = f"{type(exc).__name__}: {exc}"
@@ -397,7 +394,7 @@ class Agent:
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            committed = self._commit(user_text, text, failure, commit, reasoning, final_metrics)
+            committed = self._commit(user_text, text, failure, reasoning, final_metrics)
 
             done: dict = {
                 "type": "done",
@@ -419,12 +416,11 @@ class Agent:
         user_text: str,
         answer: str,
         failure: str | None,
-        commit: bool,
         reasoning: str = "",
         metrics: dict | None = None,
     ) -> bool:
         """Пишет обмен в историю. Возвращает False, если писать было нечего."""
-        if not commit or not answer.strip():
+        if not answer.strip():
             return False
 
         # Вопрос и ответ ложатся в базу парой, одной транзакцией: иначе,

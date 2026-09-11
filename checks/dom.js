@@ -438,6 +438,17 @@ function buildServer(options) {
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
+      // Модель, которая заявляет о себе всё: по ней панель считает, чего
+      // она не потянет. Температуру она заявляет и всё равно обрезает
+      // на 1.0 — ловушка, по `supported_parameters` не видная.
+      {
+        id: "строгая/модель",
+        supported_parameters: ["temperature", "max_tokens"],
+        temperature_capped: true,
+        temperature_cap: 1.0,
+        prompt_price_per_m: 0,
+        completion_price_per_m: 0,
+      },
     ],
   };
 
@@ -576,7 +587,12 @@ function boot(html, options) {
   const store = {};
 
   globalThis.document = document;
-  globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
+  // Ширину окна задаёт проверка: на узком борта становятся ящиками поверх
+  // ленты, и это целый режим интерфейса. С прибитым `matches: false` он
+  // не исполнялся бы ни разу.
+  globalThis.window = {
+    matchMedia: () => ({ matches: Boolean(options && options.narrow), addEventListener() {} }),
+  };
   globalThis.localStorage = {
     getItem: (k) => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },
