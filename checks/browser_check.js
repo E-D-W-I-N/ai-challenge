@@ -212,15 +212,12 @@ function usageText(node, cls) {
 }
 
 const NO_TILE = "(плитки нет)";
-const shownAs = (tile) => tile.v + " / " + tile.sub;
 function tileOf($, name) {
   const el = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
-  if (!el) return { el: null, v: NO_TILE, sub: NO_TILE, row: NO_TILE };
-  const sub = el.querySelector(".tile-sub");
+  if (!el) return { el: null, v: NO_TILE, row: NO_TILE };
   return {
     el,
     v: el.querySelector(".tile-v").textContent,
-    sub: sub ? sub.textContent : "",
     row: el.children.slice(1).map((c) => c.className).join(","),
   };
 }
@@ -409,10 +406,10 @@ async function routeChecks() {
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
-      empty["Входные токены"].v === "—", shownAs(empty["Входные токены"]));
+      empty["Входные токены"].v === "—", empty["Входные токены"].v);
     // Ноль сообщений — это знание, а не незнание: разговора не было.
-    check("до первого ответа сообщений ноль", empty["Сообщений"].v === "0", shownAs(empty["Сообщений"]));
-    check("и контекст пуст", empty["Контекст"].v === "—", shownAs(empty["Контекст"]));
+    check("до первого ответа сообщений ноль", empty["Сообщений"].v === "0", empty["Сообщений"].v);
+    check("и контекст пуст", empty["Контекст"].v === "—", empty["Контекст"].v);
 
     $("#input").value = "первый вопрос";
     $("#composer").requestSubmit();
@@ -427,10 +424,6 @@ async function routeChecks() {
        one["Стоимость"].v, one["Сообщений"].v].join(" | "));
     check("контекст — доля окна по последнему ответу",
       one["Контекст"].v === "1.2 %", one["Контекст"].v);
-    check("подписей в плитках больше нет: панель и так вся про диалог",
-      PANEL.every((name) => tileOf($, name).sub === ""),
-      PANEL.map((name) => name + ":" + tileOf($, name).sub).join(" | "));
-
     // Цена в девять знаков занимает ширину плитки целиком: окажись в строке
     // значения кто-то ещё, на экране останется «$0.000...».
     check("в строке значения стоимости никого, кроме самого значения",

@@ -226,10 +226,10 @@ def _label_field(payload: dict) -> str:
     return label.strip()
 
 
-def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
+def _parse_spec(payload: dict, where: str) -> AgentSpec:
     """Конфиг агента из JSON. Все ошибки — 400 с текстом, а не 500."""
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail=f"{where[:-1] or 'агент'}: должен быть объектом")
+        raise HTTPException(status_code=400, detail=f"{where[:-1]}: должен быть объектом")
 
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),

@@ -31,7 +31,7 @@
 .venv/bin/python checks/spawn_100.py      # сто агентов в одном процессе
 .venv/bin/python checks/restart.py        # два процесса подряд на одном файле базы
 .venv/bin/python checks/two_processes.py  # одновременные писатели: id не пересекаются
-node checks/browser_check.js              # клиент под node, 116 утверждений
+node checks/browser_check.js              # клиент под node, 115 утверждений
 ```
 
 ## Что нельзя сломать
