@@ -12,7 +12,6 @@
 /opt/homebrew/bin/python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload --port 8000   # http://127.0.0.1:8000
-.venv/bin/python -m app.cli                           # то же самое без браузера
 ```
 
 ## Безопасность
@@ -47,7 +46,7 @@ node checks/browser_check.js            # клиент под node, 220 утве
 
 ## Про проверки
 
-Бьют по поведению, а не по исходнику — кроме одной: «выпиленное осталось выпиленным»
-(`checks/run_checks.py:316`) грепает исходники по таблице `GONE`, и здесь она законна.
-Новых мета-проверок не заводить. Греп по клиенту — не проверка клиента: `browser_check.js`
-исполняет настоящий `app/static/app.js` под node на стенде `checks/dom.js`.
+Бьют по поведению, а не по исходнику — кроме таблицы `GONE` (`checks/run_checks.py`),
+стерегущей грепом выпиленные слова; новых мета-проверок сверх неё не заводить. Греп по
+клиенту — не проверка клиента: `browser_check.js` исполняет настоящий `app/static/app.js`
+под node на стенде `checks/dom.js`.
