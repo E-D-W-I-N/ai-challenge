@@ -199,7 +199,18 @@ def check_cli():
     assert "привет из консоли" in out.getvalue(), out.getvalue()
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
-    return "ответ напечатан, история записана, агент в реестре"
+
+    # Команды диалога печатают то, что у агента есть: /история и /агенты.
+    import contextlib
+
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        cli._print_history(agent)
+        cli._print_agents()
+    shown = printed.getvalue()
+    assert "как дела?" in shown and "привет из консоли" in shown, shown
+    assert agent.id in shown and agent.spec.label in shown, shown
+    return "ответ напечатан, история записана и показана, агент в реестре"
 
 
 @check("список чатов: пустой старт, порядок создания, имена, переименование, удаление")
@@ -216,6 +227,11 @@ def check_chat_list():
         assert client.get("/api/agents").json()["agents"] == []
 
         made = [client.post("/api/agents", json={}).json()["agents"][0] for _ in range(4)]
+        # Кнопка «Новый чат» отдаёт чистый чат: промпт пишет пользователь,
+        # и пустой `system` обязан пропасть из тела запроса целиком, а не
+        # уехать в модель пустым системным сообщением.
+        assert all(a["system"] == "" for a in made), [a["system"] for a in made]
+
         listed = client.get("/api/agents").json()["agents"]
         assert [a["id"] for a in listed] == [a["id"] for a in made], (
             [a["label"] for a in listed], [a["label"] for a in made]
@@ -238,6 +254,7 @@ def check_chat_list():
         # Разговор в старом чате не поднимает его наверх: список не по свежести,
         # а первое сообщение не переименовывает чат — автоимени нет.
         client.post(f"/api/agents/{made[0]['id']}/messages", json={"text": "расскажи про кэш"})
+        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
         talked = [a["id"] for a in client.get("/api/agents").json()["agents"]]
         assert talked == after + [fresh["id"]], talked
         assert client.get(f"/api/agents/{made[0]['id']}").json()["label"] == made[0]["label"]
@@ -297,7 +314,7 @@ def check_whole_history():
     long_chat = agent_module.Agent(AgentSpec(label="длинный", model="stub/model", system="СИС"))
     for i in range(500):
         long_chat.remember("user", f"реплика {i}")
-    prompt = long_chat.build_prompt("последний вопрос")
+    prompt = long_chat.build_prompt("последний вопрос", spec=long_chat.spec)
     assert len(prompt) == 502, len(prompt)
     assert prompt[1]["content"] == "реплика 0", prompt[1]
     return f"{len(sent)} сообщений в промпте после {turns} обменов, 500 реплик хранятся целиком"
@@ -1048,6 +1065,9 @@ def check_client():
     assert ".feed > * { flex: 0 0 auto; }" in css, "элементы ленты сжимаются"
     feed = css[css.index(".feed {") : css.index(".feed > *")]
     assert "min-height: 0" in feed and "overflow-y: auto" in feed, feed
+    assert "scroll-behavior: smooth" not in feed, (
+        "плавная прокрутка ленты дёргает её на каждом куске ответа"
+    )
     assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
 
     node = shutil.which("node")

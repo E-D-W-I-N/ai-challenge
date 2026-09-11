@@ -63,6 +63,7 @@ has("подпись ссылки на месте", "[док](https://example.com
 // ── разметка разбирается ──
 
 has("заголовок", "# Заголовок", "<h1>Заголовок</h1>");
+has("уровень заголовка считается по решёткам", "### Третий", "<h3>Третий</h3>");
 has("жирный", "**важно**", "<strong>важно</strong>");
 has("курсив", "*косо*", "<em>косо</em>");
 has("inline-код", "вот `x = 1` тут", "<code>x = 1</code>");
@@ -189,6 +190,8 @@ check("открытый диалог важнее ящиков", escapeAction(tr
 check("без диалога Escape закрывает ящики узкого окна", escapeAction(false, true, 1) === "drawers",
   escapeAction(false, true, 1));
 check("на широком окне Escape не трогает борта", escapeAction(false, false, 2) === null);
+check("закрывать нечего — Escape ничего не делает", escapeAction(false, true, 0) === null,
+  escapeAction(false, true, 0));
 
 // ── стоп-строки и формат ответа из панели ──
 
@@ -214,6 +217,12 @@ check("свой JSON пустым не отправляется", parseResponseF
   let broke = false;
   try { parseResponseFormat("custom", "{не json"); } catch (e) { broke = /не JSON/.test(e.message); }
   check("кривой JSON даёт понятную ошибку, а не уезжает провайдеру", broke);
+}
+{
+  // Массив уехал бы в PATCH и вернулся серверным 400 вместо понятного текста.
+  let broke = false;
+  try { parseResponseFormat("custom", "[1,2]"); } catch (e) { broke = /объект/.test(e.message); }
+  check("массив вместо объекта тоже ошибка", broke);
 }
 
 // ── маршрут целиком: правка в панели → отправка → тело запроса ──

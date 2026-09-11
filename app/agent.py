@@ -125,16 +125,13 @@ class Agent:
 
     # --- история -------------------------------------------------------------
 
-    def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
+    def build_prompt(self, user_text: str, *, spec: AgentSpec) -> list[dict]:
         """Системный промпт + вся история + вопрос этого хода.
 
         История уезжает целиком: чат помнит начало разговора, сколько бы он
-        ни длился. Конфиг читается каждый раз, поэтому правка в панели видна
-        со следующего сообщения; `spec` передаёт обмен — он собирает промпт
-        и тело запроса из одного слепка.
+        ни длился. Конфиг приносит обмен слепком — из него собираются и промпт,
+        и тело запроса, поэтому правка в панели видна со следующего сообщения.
         """
-        spec = spec if spec is not None else self.spec
-
         messages: list[dict] = []
         if spec.system:
             messages.append({"role": "system", "content": spec.system})
@@ -161,8 +158,6 @@ class Agent:
     def transcript(self) -> list[dict]:
         """Ровно реплики диалога. Системного промпта здесь нет: он конфиг,
         а не реплика, и виден в панели полем `system`."""
-        # Все поля реплики, а не перечисленные руками: иначе новое поле
-        # появилось бы в `Turn`, а до ленты не доехало.
         return [asdict(turn) for turn in self.history]
 
     def as_dict(self, *, with_transcript: bool = False) -> dict:

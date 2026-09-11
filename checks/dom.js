@@ -590,4 +590,4 @@ function boot(html, options) {
 // Дать очереди микрозадач и таймерам добежать: клиент асинхронный насквозь.
 const settle = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
-module.exports = { boot, settle, Evt, El };
+module.exports = { boot, settle, Evt };

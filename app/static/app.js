@@ -583,7 +583,7 @@ async function exchange(path, body, questionText) {
   if (state.applying) await state.applying;
   if (!(await ensurePanelApplied())) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
-    return false;
+    return;
   }
   // Текст забираем из поля только теперь: до этой строки отправка могла
   // не состояться.
@@ -871,7 +871,7 @@ function paramWarnings(model, settings, extraBody, baseModel) {
   }
 
   const cap = model.temperature_cap;
-  if (model.temperature_capped && settings.temperature > cap) {
+  if (model.temperature_capped && cap != null && settings.temperature > cap) {
     warnings.push(
       `«${model.id}» обрезает temperature на ${cap.toFixed(1)}: ` +
         `на ${settings.temperature} ` +

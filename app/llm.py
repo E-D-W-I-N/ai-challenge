@@ -226,7 +226,7 @@ async def stream_completion(
         **attribution_headers(),
     }
 
-    metrics = Metrics(model=session.model, context_length=context_length)
+    metrics = Metrics(model=session.model, context_length=context_length or None)
     speed = _SpeedTracker()
     started = time.monotonic()
     text_parts: list[str] = []

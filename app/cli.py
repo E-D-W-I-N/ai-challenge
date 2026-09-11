@@ -80,7 +80,8 @@ async def ask(agent: Agent, text: str, out=sys.stdout) -> str:
     return answer
 
 
-def _print_history(agent: Agent, out=sys.stdout) -> None:
+def _print_history(agent: Agent) -> None:
+    out = sys.stdout
     if not agent.history:
         out.write("[история пуста]\n")
         return
@@ -89,13 +90,15 @@ def _print_history(agent: Agent, out=sys.stdout) -> None:
         out.write(f"{turn.role}{mark}: {turn.content}\n")
 
 
-def _print_agents(out=sys.stdout) -> None:
+def _print_agents() -> None:
+    out = sys.stdout
     out.write(f"живых агентов: {len(REGISTRY)} (потолок {REGISTRY.max_agents})\n")
     for agent in REGISTRY.list():
         out.write(f"  {agent.id}  {agent.spec.label}  {agent.spec.model}  реплик {len(agent.history)}\n")
 
 
-async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
+async def repl(agent: Agent, *, once: bool = False) -> int:
+    out = sys.stdout
     out.write(f"агент {agent.id} · {agent.spec.model}\n")
     if not has_key():
         out.write("[нет ключа] OPENROUTER_API_KEY не найден — вызова не будет.\n")
@@ -118,14 +121,14 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
         if text in ("/выход", "/exit", "/quit"):
             return 0
         if text in ("/история", "/history"):
-            _print_history(agent, out)
+            _print_history(agent)
             continue
         if text in ("/забыть", "/forget"):
             agent.forget()
             out.write("[история очищена]\n")
             continue
         if text in ("/агенты", "/agents"):
-            _print_agents(out)
+            _print_agents()
             continue
 
         try:
