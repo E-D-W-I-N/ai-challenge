@@ -656,6 +656,9 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   white-space: nowrap;
 }
 .tile-v.small { font-size: 13px; font-weight: 550; }
+/* Число осталось от прошлого обмена: последний упал и своих чисел не принёс.
+   Размер тот же — плитка не растёт и не прыгает, меняется только цвет. */
+.tile-v.past { color: var(--muted); }
 
 /* ── подтверждение ── */
 .confirm {

@@ -21,6 +21,7 @@ const state = {
   stick: true,         // лента примотана к низу — доматывать новые ответы
   baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
   contextStale: false, // модель сменили — прежняя доля окна к новой не относится
+  contextPast: false,  // доля окна осталась от прошлого обмена: последний упал
   statusTimer: null,   // таймер, гасящий строку состояния
 };
 
@@ -127,20 +128,82 @@ function totalField(name) {
 // расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
 // на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
 // плитку после каждого ответа, навсегда.
+function has(value) {
+  return value !== null && value !== undefined;
+}
+
+// Метрики упавшего обмена приходят с пустыми числами: заполнены `error`,
+// `model` и время, а `prompt_tokens`, `total_tokens`, `cost_usd`
+// и `context_fill_pct` — `null`. Класть такой набор поверх прежнего значило бы
+// гасить плитки ровно в тот момент, когда числа нужнее всего: на записи видно
+// ошибку переполнения, а сколько контекста было занято — уже нет.
+//
+// Поэтому набор не заменяется, а **сливается по полям**: новое число
+// побеждает, пустое поле оставляет прежнее. Если провайдер в ошибке всё же
+// назвал часть чисел, показаны будут они, а остальное — прежнее.
+function mergeMetrics(held, fresh) {
+  if (!fresh) return held;
+  if (!held) return { ...fresh };
+  const out = { ...held };
+  Object.keys(fresh).forEach((name) => {
+    if (has(fresh[name])) out[name] = fresh[name];
+  });
+  return out;
+}
+
 // Метрики нового ответа. Пометку «модель сменили» снимает **только** эта
 // функция: с новыми метриками приходит и свежая доля окна, и разбросать
 // снятие по веткам потока значило бы получить путь, на котором плитка
 // осталась бы погашенной навсегда.
+//
+// Снимает её теперь **пришедшая доля окна**, а не сам факт вызова: после
+// слияния пустые метрики упавшего обмена несут прежний процент, и снятие
+// «по любым метрикам» выпустило бы на экран долю окна прошлой модели.
 function keepMetrics(metrics) {
-  state.lastMetrics = metrics;
+  state.lastMetrics = mergeMetrics(state.lastMetrics, metrics);
+  if (metrics && has(metrics.context_fill_pct)) {
+    state.contextStale = false;
+    state.contextPast = false;
+  } else if (metrics && metrics.error) {
+    // Обмен упал, а число на экране осталось прежним — плитка об этом скажет.
+    state.contextPast = !!(state.lastMetrics && has(state.lastMetrics.context_fill_pct));
+  }
+}
+
+// Последние известные числа **этого** чата: свёртка метрик его ответов теми же
+// правилами, что и в потоке. Открытие чата состояние не сливает, а заменяет:
+// иначе числа соседнего чата протекли бы в тот, который открыли следом.
+function knownMetrics(agent) {
+  let held = null;
+  (agent.transcript || []).forEach((turn) => {
+    if (turn.role === "assistant" && turn.metrics) held = mergeMetrics(held, turn.metrics);
+  });
+  return held;
+}
+
+function resetMetrics(agent) {
+  state.lastMetrics = knownMetrics(agent);
   state.contextStale = false;
+  const last = lastAnswerMetrics(agent);
+  state.contextPast = !!(
+    state.lastMetrics &&
+    has(state.lastMetrics.context_fill_pct) &&
+    !(last && has(last.context_fill_pct))
+  );
 }
 
 function contextFill() {
   if (state.contextStale) return null;
   const m = state.lastMetrics;
-  if (!m || m.context_fill_pct === null || m.context_fill_pct === undefined) return null;
+  if (!m || !has(m.context_fill_pct)) return null;
   return m.context_fill_pct;
+}
+
+// Показанное число относится не к последнему обмену, а к прошлому: последний
+// упал и своих чисел не принёс. Плитку это не удлиняет — значение остаётся
+// на месте, приглушается цветом и объясняется подсказкой.
+function contextIsPast() {
+  return state.contextPast && contextFill() !== null;
 }
 
 // ─────────────────────────── markdown ─────────────────────────
@@ -437,8 +500,9 @@ async function openAgent(agentId) {
   // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
   // читатель выключил бы доматывание сразу для всех чатов.
   state.stick = true;
-  // Чат открыт заново: доля окна относится к той модели, что у него сейчас.
-  keepMetrics(lastAnswerMetrics(agent));
+  // Чат открыт заново: доля окна относится к той модели, что у него сейчас,
+  // а числа — только его собственные.
+  resetMetrics(agent);
   renderList();
   renderFeed(agent);
   fillPanel(agent);
@@ -809,7 +873,10 @@ async function exchange(path, body, questionText) {
             break;
           case "error":
             failure = e.message;
-            if (e.metrics) keepMetrics(e.metrics);
+            // Перерисовка здесь не лишняя: метрики упавшего обмена меняют
+            // показанное (пометкой «из прошлого обмена», а на частичных
+            // числах — и значением), а `done` после ошибки приходит не всегда.
+            if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
             break;
           case "done":
             if (e.text) answer = e.text;
@@ -1246,13 +1313,13 @@ const TILES = [
   // полем, а не внутри сумм: у чата с молчащим usage сумм нет вовсе, а ответы
   // в нём были.
   ["Сообщений", () => fmt.tokens(state.current ? state.current.exchanges : null)],
-  ["Контекст", () => fmt.pct(contextFill())],
+  ["Контекст", () => fmt.pct(contextFill()), false, contextIsPast],
 ];
 
 function renderTiles() {
   const box = $("#tiles");
   box.innerHTML = "";
-  TILES.forEach(([label, value, small]) => {
+  TILES.forEach(([label, value, small, past]) => {
     const tile = document.createElement("div");
     tile.className = "tile";
     const k = document.createElement("div");
@@ -1263,8 +1330,11 @@ function renderTiles() {
     const v = document.createElement("div");
     // Значению отдана вся ширина плитки: подписей рядом больше нет, и цене
     // в девять знаков ничего не мешает быть видной целиком.
-    v.className = "tile-v" + (small ? " small" : "");
+    v.className = "tile-v" + (small ? " small" : "") + (past && past() ? " past" : "");
     v.textContent = value();
+    // Подсказка вместо второй строки: плитка от неё не растёт, а откуда
+    // взялось число, сказано словами.
+    if (past && past()) v.title = "число прошлого обмена: последний вызов упал";
     row.appendChild(v);
     tile.append(k, row);
     box.appendChild(tile);
