@@ -1,9 +1,10 @@
-"""Все проверки Дней 6 и 7 — без сети, без ключа, без живых вызовов к LLM.
+"""Ядро проверок Дней 6, 7 и 8 — без сети, без ключа, без живых вызовов к LLM.
 
     .venv/bin/python checks/run_checks.py
 
-Отдельные скрипты (`spawn_100.py`, `restart.py`, `two_processes.py`)
-запускаются отсюда же.
+Каждая проверка стережёт одно обещание продукта: пункт задания одного из трёх
+дней или сквозное свойство. Отдельные скрипты (`spawn_100.py`, `restart.py`,
+`two_processes.py`) запускаются отсюда же.
 """
 
 from __future__ import annotations
@@ -13,11 +14,8 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
-import tempfile
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,19 +29,15 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
-from app.llm import SAMPLING_FIELDS, Metrics  # noqa: E402
+from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec  # noqa: E402
-from app.store import Store, StoreBusyError  # noqa: E402
+from app.store import Store  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
 CHECKS: list = []
-"""Проверки в порядке объявления. Наполняет декоратор `check`.
-
-Списка руками нет намеренно: он дублировал объявления, и забыть в нём
-строчку значило тихо не запустить проверку.
-"""
+"""Проверки в порядке объявления. Наполняет декоратор `check`."""
 
 
 def check(name):
@@ -86,443 +80,90 @@ def read(path: str) -> str:
     return open(os.path.join(ROOT, path), encoding="utf-8").read()
 
 
-# --- 1. главный критерий дня --------------------------------------------------
+def _temp_db(name: str) -> str:
+    """Свежий файл базы под одну проверку. Каталога заранее нет — его создаёт Store."""
+    import tempfile
+
+    return os.path.join(tempfile.mkdtemp(prefix=f"check-{name}-"), "nested", "agents.db")
 
 
-@check("спавн ста агентов с разными конфигами в одном процессе")
-def check_spawn_100():
+def _script(name: str, expected: str, line: int) -> str:
+    """Отдельный скрипт-проверка: он поднимает свои процессы сам."""
     result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "checks", "spawn_100.py")],
+        [sys.executable, os.path.join(ROOT, "checks", name)],
         capture_output=True,
         text=True,
         cwd=ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "ОК: сто агентов" in result.stdout, result.stdout
-    return result.stdout.strip().splitlines()[1]
+    assert expected in result.stdout, result.stdout
+    return result.stdout.strip().splitlines()[line]
 
 
-@check("на чистом старте список чатов пуст")
-def check_empty_start():
-    """Чаты заводит пользователь: ни заготовок, ни чата «по умолчанию».
-    Пустой список — это работа клиента, и его половина в browser_check.js."""
-    with TestClient(main.app) as client:
-        assert client.get("/api/agents").json()["agents"] == []
-        agent = client.post("/api/agents", json={}).json()["agents"][0]
-        assert client.delete(f"/api/agents/{agent['id']}").status_code == 200
-        assert client.get("/api/agents").json()["agents"] == []
-    return "до первого чата список пуст и становится пустым снова"
+# --- День 6: агент как отдельная сущность, сто агентов в одном процессе -------
 
 
-@check("список чатов идёт в порядке создания, новый — последним")
-def check_list_order():
-    """Порядок списка слева не стерёг никто.
-
-    Развернул сортировку `catalogue()` наоборот — все проверки остались
-    зелёными, хотя список слева перевернулся бы целиком. Порядок здесь
-    видимое поведение: чаты нумеруются возрастающе, и «Новый чат 7» выше
-    «Новый чат 3» — это не тот список, который завёл пользователь.
-
-    Отдельно про день памяти: порядок обязан пережить перезапуск, а список
-    строится по базе, где строки лежат свежими сверху. Значит сортировка
-    в `catalogue()` — не украшение, а единственное, что держит порядок.
-    """
-    with TestClient(main.app) as client:
-        made = [client.post("/api/agents", json={}).json()["agents"][0] for _ in range(4)]
-        listed = client.get("/api/agents").json()["agents"]
-        assert [a["id"] for a in listed] == [a["id"] for a in made], (
-            [a["label"] for a in listed], [a["label"] for a in made]
-        )
-
-        # Удаление из середины порядок остальных не трогает.
-        client.delete(f"/api/agents/{made[1]['id']}")
-        after = [a["id"] for a in client.get("/api/agents").json()["agents"]]
-        assert after == [made[0]["id"], made[2]["id"], made[3]["id"]], after
-
-        # Разговор в старом чате не поднимает его наверх: список не по свежести.
-        _stub.install(reply="ок")
-        client.post(f"/api/agents/{made[0]['id']}/messages", json={"text": "?"})
-        talked = [a["id"] for a in client.get("/api/agents").json()["agents"]]
-        assert talked == after, talked
-
-        # А новый встаёт последним.
-        fresh = client.post("/api/agents", json={}).json()["agents"][0]
-        tail = [a["id"] for a in client.get("/api/agents").json()["agents"]]
-        assert tail[-1] == fresh["id"], tail
-
-    # И тот же порядок после настоящего переоткрытия файла базы.
-    path = _temp_db("order")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        _restart(store)
-        with TestClient(main.app) as client:
-            born = [client.post("/api/agents", json={}).json()["agents"][0]["id"] for _ in range(4)]
-            client.post(f"/api/agents/{born[0]}/messages", json={"text": "?"})
-        store.close()
-        again = Store(path).init()
-        _restart(again)
-        revived = [a["id"] for a in main._listing()["agents"]]
-    finally:
-        main.REGISTRY = saved_registry
-        again.close()
-    assert revived == born, (revived, born)
-    return "порядок создания держится при удалении, разговоре и переоткрытии файла"
+@check("спавн ста агентов с разными конфигами в одном процессе")
+def check_spawn_100():
+    return _script("spawn_100.py", "ОК: сто агентов", 1)
 
 
-@check("у свежего чата нет системного промпта, и в теле его нет вовсе")
-def check_new_chat_is_blank():
-    """Смотрим не на поле в ответе ручки, а на то, что ушло в модель: пустой
-    `system` обязан пропасть из промпта целиком. Пустая строка в роли `system` —
-    это не «промпта нет», это заданный пустой промпт."""
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        fresh = client.post("/api/agents", json={}).json()["agents"][0]
-        assert fresh["system"] == "", f"свежий чат несёт промпт: {fresh['system']!r}"
-        full = client.get(f"/api/agents/{fresh['id']}").json()
-        assert full["transcript"] == [], full["transcript"]
+@check("конфиг агента копируется вглубь: сто агентов не делят один extra_body")
+def check_spec_deep_copy():
+    from app.registry import AgentRegistry
 
-        client.post(f"/api/agents/{fresh['id']}/messages", json={"text": "вопрос"})
-        sent = _stub.CALLS[-1]["messages"]
-        assert [m["role"] for m in sent] == ["user"], sent
-        assert not any(m["role"] == "system" for m in sent), sent
-
-        # А заданный руками — доезжает: пустота здесь не запрет, а умолчание.
-        client.patch(f"/api/agents/{fresh['id']}", json={"system": "МОЙ ПРОМПТ"})
-        _stub.reset()
-        client.post(f"/api/agents/{fresh['id']}/messages", json={"text": "ещё"})
-        after = _stub.CALLS[-1]["messages"]
-        assert after[0] == {"role": "system", "content": "МОЙ ПРОМПТ"}, after[0]
-    return "свежий чат пуст, промпт появляется только заданный руками"
-
-
-# --- выпиленное осталось выпиленным ------------------------------------------
-
-# Слово и чем оно было. Одна таблица вместо пяти проверок, обходивших файлы
-# в поисках одних и тех же слов.
-#
-# Скоупа у правила нет намеренно. Он и был источником бед: в Дне 6 слияние
-# шести проверок в таблицу потеряло три правила ровно тем, что сузило скоуп,
-# и потеря прошла зелёной. Поэтому правило смотрит **во все файлы под
-# контролем версий**, а сузить его можно только записью в ONLY — с областью
-# и причиной. Забытая запись делает правило шире, а не уже.
-#
-# Списка расширений здесь тоже нет: он был и сужался молча. Двоичные читаются
-# байтами и декодируются с заменой — пропустить файл из-за кодировки значит
-# сузить обход. Поиск регистронезависимый: «прогон» и «судья» жили в клиенте
-# текстом для пользователя, а он пишется с большой буквы.
-
-# Единственный файл, которому запретные слова положены: он их и запрещает.
-SELF = "checks/run_checks.py"
-
-# Сузить правило можно только здесь, областью-префиксом пути и причиной.
-# Сужение обязано быть оправданным: слово должно законно встречаться
-# за пределами области — иначе это выключенное правило, ждущее, когда слово
-# вернётся, и проверка это скажет.
-#
-# «children» вне реестра — свойство DOM-узла. «колонк» и «памяти» вне клиента —
-# колонка таблицы SQLite и память между запусками: в `app/store.py` и README
-# это их основное значение.
-ONLY = {
-    "children": ("app/registry.py", "вне реестра это свойство DOM-узла"),
-    "колонк": ("app/static/", "вне клиента это колонка таблицы SQLite"),
-    "памяти": ("app/static/", "вне клиента это память между запусками и память процесса"),
-}
-
-# Растяжка: сужения заморожены вместе с областями. Это не доказательство —
-# проверку, которая стережёт саму себя, написать нельзя, — а требование
-# сделать ослабление явным: тронуть придётся и эту строку, а она затем
-# и стоит, чтобы в дифф попало «я ослабляю проверку».
-NARROWED = (
-    ("children", "app/registry.py"),
-    ("колонк", "app/static/"),
-    ("памяти", "app/static/"),
-)
-
-SHOWCASE_CAPTIONS = (
-    "Единственное отличие",
-    "База пары",
-    "ступень",
-    "Панель экспертов",
-)
-"""Подписи выпиленной витрины сценариев — те, что объясняли интерфейс сам себе.
-
-Стерегутся дважды и по-разному, потому что вернуться могут двумя путями.
-Таблица `GONE` ищет их в исходниках: так ловится подпись, вернувшаяся
-в разметку или в клиент, — она не попадёт ни в один ответ ручки. Обход тела
-ответа в `check_removed_endpoints` ищет их в том, что реально уехало наружу:
-так ловится фраза, которой в файлах буквально нет — собранная по дороге или
-приехавшая из конфига. Ни одна из двух проверок не покрывает случай другой.
-"""
-
-GONE = [
-    # заготовки дней 1–5: файл описаний, поднятие на старте, черновик
-    *[(f"День {n}", "заготовки дней 1–5") for n in range(1, 6)],
-    ("PRESET_CHATS", "заготовки дней 1–5"),
-    ("bootstrap_chats", "заготовки дней 1–5"),
-    ("draft", "черновик с подставленным вопросом"),
-    # сценарии: прогон, судья, зависимости, серии
-    ("Scenario", "сценарии"),
-    ("judge", "модель-судья"),
-    ("depends_on", "зависимости сценариев"),
-    ("repeats", "серии прогонов"),
-    ("прогон", "сценарии"),
-    ("судья", "модель-судья"),
-    ("колонк", "витрина сценариев"),
-    # родительские связи жили ради субагентов прогона
-    ("parent_id", "каскад субагентов"),
-    ("kill_children", "каскад субагентов"),
-    ("children", "каскад субагентов"),
-    # витрина: группы, пояснения, кнопка очистки, автоимя
-    ("list-group", "группы чатов"),
-    ("state.groups", "группы чатов"),
-    ("note", "пояснения из описаний сценариев"),
-    ("Очистить все", "кнопка «Очистить все чаты»"),
-    ("clear-all", "кнопка «Очистить все чаты»"),
-    ("clearAll", "кнопка «Очистить все чаты»"),
-    ("/api/agents/reset", "ручка очистки"),
-    ("maybeAutoName", "автоимя по первому сообщению"),
-    ("chatTitle", "автоимя по первому сообщению"),
-    ("autoname", "автоимя по первому сообщению"),
-    ("карандаш", "подпись, объясняющая интерфейс сам себе"),
-    # заготовка диалога: поле конфига и колонка базы, снятые этой веткой
-    ("seed_messages", "заготовка диалога"),
-    ("starting_prompt", "заготовка диалога"),
-    # рельс справа от ленты: полоса точек по числу сообщений
-    ("rail", "рельс с точками справа от ленты"),
-    # управление контекстом: оно станет заданием Дня 9 и вернётся осознанно
-    ("history_limit", "окно памяти в конфиге агента"),
-    ("history-limit", "ключ CLI, задававший окно памяти"),
-    ("MAX_STORED_MESSAGES", "потолок хранимых реплик"),
-    ("окно памяти", "поле панели «Окно памяти, сообщений»"),
-    # Подстрока склонение не берёт: правило выше не поймало «ноль в окне
-    # памяти» в подсказке панели — она пережила выпиливание и разъехала
-    # клиент с Днём 7. Поэтому в клиенте запрещено само слово: там ему
-    # взяться неоткуда, пока управление контекстом не вернётся Днём 9.
-    ("памяти", "разговоры про окно памяти в панели, в любом падеже"),
-    # витрина сценариев объясняла себя подписями — их не должно быть в коде
-    *[(caption, "пояснение витрины") for caption in SHOWCASE_CAPTIONS],
-]
-
-# Имя клиента-референса: он был инструментом разработки, а не частью продукта,
-# и не должен встречаться нигде — ни в коде, ни в именах файлов, ни в двоичных.
-REFERENCE_NAME = "o" + "mlx"
-
-# Файлы, которых не должно быть вовсе.
-GONE_FILES = ("day.py", "checks/_daysrc.py", "app/commands.py")
-
-
-def _tracked() -> list[str]:
-    names = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
-    ).stdout.split()
-    return [n for n in names if os.path.isfile(os.path.join(ROOT, n))]
-
-
-def _read_any(name: str) -> str:
-    """Содержимое файла под ROOT. Двоичное — с заменой: пропустить файл
-    из-за кодировки значит сузить обход, только через исключение."""
-    with open(os.path.join(ROOT, name), "rb") as handle:
-        return handle.read().decode("utf-8", "replace")
-
-
-def _files_for(word: str, tracked: list[str]) -> list[str]:
-    """Где действует правило: всё под контролем версий, кроме самой проверки.
-
-    Или файлы под областью из ONLY, если правило сужено.
-    """
-    scope, _ = ONLY.get(word.lower(), (None, ""))
-    files = [n for n in tracked if n != SELF and (scope is None or n.startswith(scope))]
-    assert files, f"правилу «{word}» не осталось ни одного файла"
-    return files
-
-
-def _found(word: str, body: str) -> bool:
-    """Регистр не спасает: слово есть, как бы его ни написали."""
-    return word.lower() in body.lower()
-
-
-@check("выпиленное осталось выпиленным: ни слова в исходниках")
-def check_nothing_left_behind():
-    """Печатает **все** совпадения разом, а не первое: раньше пять проверок
-    падали по одной с понятным именем, и от слияния диагностика не должна
-    стать хуже.
-
-    Перед обходом — самопроверка. Потерянное правило молчит ровно так же,
-    как соблюдённое: каждое правило обязано доказать, что вообще способно
-    сработать, а каждая оговорка — что она рабочая, а не прикрывает
-    настоящий след.
-    """
-    tracked = _tracked()
-    body_of = {n: _read_any(n) for n in tracked}
-
-    assert SELF in tracked, f"{SELF} не под контролем версий — поблажка про себя не сработает"
-    words = {w.lower() for w, _ in GONE}
-    assert len(words) == len(GONE), "в таблице повторяются слова"
-
-    # 0. Обход покрывает всё, что под контролем версий. Считать слепые файлы
-    #    от того же списка, который вернул `_tracked()`, мало: так видны
-    #    сужения ниже него, но не он сам. Поэтому сверяемся со свежим
-    #    `git ls-files`, взятым здесь и мимо всех помощников.
-    listed = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
-    ).stdout.split()
-    assert listed, "git ls-files не вернул ничего — сверять обход не с чем"
-    on_disk = [n for n in listed if os.path.isfile(os.path.join(ROOT, n))]
-    dropped = sorted(set(on_disk) - set(tracked))
-    assert not dropped, (
-        f"из обхода выпали файлы под контролем версий: {', '.join(dropped)} — "
-        "список подрезан в самом `_tracked()`"
+    shared = AgentSpec(
+        label="общий",
+        model="stub/model",
+        stop=["\n"],
+        response_format={"type": "json_object"},
+        extra_body={"provider": {"allow_fallbacks": False}},
     )
+    registry = AgentRegistry(max_agents=100)
+    first, second = registry.create_many([shared, shared])
 
-    # Не-UTF-8 обход обязан прочитать, а не уронить: иначе двоичный файл
-    # выпадет из него молча. Проверяем настоящим чтением, а не верой
-    # в аргумент "replace"; имя абсолютное, поэтому ROOT из `_read` отпадает
-    # и в репозитории ничего не появляется.
-    with tempfile.NamedTemporaryFile(suffix=".bin") as probe:
-        probe.write(b"\xff\xfe\x00" + "хвост".encode("utf-8"))
-        probe.flush()
-        assert _read_any(probe.name).endswith("хвост"), "обход падает на не-UTF-8"
+    assert first.spec.extra_body is not shared.extra_body
+    assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
+    assert first.spec.extra_body is not second.spec.extra_body
+    assert first.spec.stop is not shared.stop
+    assert first.spec.response_format is not shared.response_format
 
-    wide = [w for w, _ in GONE if w.lower() not in ONLY]
-    assert wide, "сужены все правила до одного — обходить стало нечего"
-    for word in wide:
-        seen = set(_files_for(word, tracked))
-        blind = [n for n in tracked if n != SELF and n not in seen]
-        assert not blind, (
-            f"правило «{word}» не смотрит в {', '.join(sorted(blind))} — "
-            "обход сузился; несуженное правило обязано видеть всё под контролем версий"
-        )
-
-    # 1. Правило срабатывает на своём же слове, в любом регистре.
-    for word, what in GONE:
-        _files_for(word, tracked)
-        for probe in (word, word.upper(), word.lower(), f"// хвост {word.title()} хвост"):
-            assert _found(word, probe), (
-                f"правило «{word}» ({what}) не сработало бы даже на {probe!r} — "
-                "оно ничего не стережёт"
-            )
-    assert _found(REFERENCE_NAME, REFERENCE_NAME.upper()), "правило про референс не сработает"
-
-    # 2. Сужений ровно столько, сколько заявлено, и все они про живые правила.
-    narrowed_now = tuple(sorted((w, scope) for w, (scope, _) in ONLY.items()))
-    assert narrowed_now == tuple(sorted(NARROWED)), (
-        f"сужения изменились: было {sorted(NARROWED)}, стало {list(narrowed_now)}. "
-        "Сужение правила ослабляет проверку — если это осознанно, поправьте NARROWED"
-    )
-    stale = [w for w in ONLY if w not in words]
-    assert not stale, f"скоуп есть, а правила нет: {', '.join(stale)}"
-
-    # 3. Каждое сужение оправдано. Область нужна затем, что слово законно
-    #    встречается ЗА её пределами; если не встречается — сужение
-    #    бессмысленно, и это выключенное правило, ждущее, когда слово вернётся.
-    pointless = []
-    for word, (scope, why) in ONLY.items():
-        inside = [n for n in tracked if n.startswith(scope)]
-        assert inside, f"область «{word}» не покрывает ни одного файла: {scope}"
-        outside = [
-            n for n in tracked
-            if n != SELF and not n.startswith(scope) and _found(word, body_of[n])
-        ]
-        if not outside:
-            pointless.append(f"«{word}» ({why}) за пределами {scope} не встречается")
-    assert not pointless, (
-        "сужение ничем не оправдано, снимите его — иначе оно молча прикроет "
-        "настоящий след:\n  " + "\n  ".join(pointless)
-    )
-
-    # 4. Сам обход.
-    hits = []
-    for word, what in GONE:
-        for name in _files_for(word, tracked):
-            if _found(word, body_of[name]):
-                hits.append(f"{name}: «{word}» ({what})")
-
-    # Референс — по всем файлам разом, включая имена, двоичные и сам файл
-    # проверки: имя собрано из кусков и буквально в нём не встречается.
-    for name in tracked:
-        if REFERENCE_NAME in name.lower():
-            hits.append(f"{name}: имя референса в имени файла")
-        elif _found(REFERENCE_NAME, body_of[name]):
-            hits.append(f"{name}: имя референса в содержимом")
-
-    for path in GONE_FILES:
-        assert not os.path.exists(os.path.join(ROOT, path)), f"{path} жив"
-
-    assert not hits, f"осталось {len(hits)} упоминаний:\n  " + "\n  ".join(hits)
-    return (
-        f"{len(GONE) + 1} правил по {len(tracked)} файлам под контролем версий, "
-        f"регистр не спасает, сужено {len(ONLY)} — ни одного совпадения"
-    )
+    first.spec.extra_body["provider"]["order"] = ["only-me"]
+    first.spec.stop.append("ДРУГОЕ")
+    first.spec.response_format["type"] = "json_schema"
+    assert "order" not in shared.extra_body["provider"], shared.extra_body
+    assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
+    assert shared.stop == ["\n"], shared.stop
+    assert shared.response_format == {"type": "json_object"}, shared.response_format
+    assert second.spec.stop == ["\n"], second.spec.stop
+    return "правка у одного агента не задела ни общий конфиг, ни соседа"
 
 
-@check("ручек выпиленных механик нет, и мёртвых полей наружу тоже")
-def check_removed_endpoints():
-    """Поведенческая половина: ручки отвечают 404, а поля не торчат наружу."""
-    with TestClient(main.app) as client:
-        for path in ("/api/scenarios", "/api/run/0"):
-            assert client.get(path).status_code == 404, path
-        assert client.post("/api/scenarios/0/agents").status_code == 404
-        # 405 — путь совпал с GET /api/agents/{id}: ручки reset всё равно нет.
-        assert client.post("/api/agents/reset").status_code in (404, 405), "ручка reset жива"
+@check("агент живёт без веб-слоя: CLI говорит с ним напрямую")
+def check_cli():
+    _stub.install(reply="привет из консоли")
+    import io
 
-        agent = client.post("/api/agents", json={}).json()["agents"][0]
-        for gone in (
-            "parent_id", "group", "note", "origin", "draft", "children", "seed",
-            "history_limit",
-        ):
-            assert gone not in agent, f"наружу торчит мёртвое поле {gone}"
+    from app import cli
 
-        # Окно памяти ушло и из ручки правки: панель такого поля не показывает,
-        # а PATCH принимает ровно то, что в панели есть.
-        assert client.patch(
-            f"/api/agents/{agent['id']}", json={"history_limit": 4}
-        ).status_code == 400, "PATCH всё ещё принимает history_limit"
+    args = cli._parse_args(["--model", "stub/m", "--label", "консоль"])
+    agent = cli.build_agent(args)
+    out = io.StringIO()
+    answer = asyncio.run(cli.ask(agent, "как дела?", out))
+    assert answer == "привет из консоли", answer
+    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
+    assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
+    return "ответ напечатан, история записана, агент в реестре"
 
-        # Каскад субагентов — ещё и поведением, не только словом в исходнике:
-        # греп по `children` сужен до реестра, и упоминание в комментарии
-        # ловит, а поле, выставленное из кода, — нет.
-        for owner, name in ((REGISTRY, "реестр"), (REGISTRY.require(agent["id"]), "агент")):
-            for attr in ("children", "parent", "parent_id", "kill_children", "seed_messages"):
-                assert not hasattr(owner, attr), f"у {name} снова есть {attr}"
 
-        assert "groups" not in client.get("/api/agents").json(), "групп в ответе быть не должно"
-
-        # Подписи витрины — по тому, что реально уехало наружу, а не по тому,
-        # что написано в файлах. Фраза может не встречаться в исходнике вовсе:
-        # достаточно собрать её по дороге, и греп по коду промолчит. Смотрим
-        # оба ответа, куда попадает `Agent.as_dict`, и служебный.
-        agent.update(
-            client.patch(f"/api/agents/{agent['id']}", json={"label": "чат"}).json()
-        )
-        bodies = {
-            "GET /api/agents": client.get("/api/agents").text,
-            "GET /api/agents/{id}": client.get(f"/api/agents/{agent['id']}").text,
-            "GET /api/health": client.get("/api/health").text,
-        }
-    for where, body in bodies.items():
-        for caption in SHOWCASE_CAPTIONS:
-            assert caption.lower() not in body.lower(), (
-                f"{where}: наружу уехало пояснение витрины «{caption}»"
-            )
-    return (
-        f"четыре ручки отдают 404/405, мёртвых полей нет, "
-        f"{len(SHOWCASE_CAPTIONS)} подписей витрины нет в теле {len(bodies)} ответов"
-    )
+# --- История: помнится и уезжает в модель целиком ------------------------------
 
 
 @check("в модель уезжает вся история: ни хвоста, ни отсечки по росту")
 def check_whole_history_goes_to_model():
-    """На месте выпиленного окна памяти.
-
-    Прежняя проверка стерегла обрезку: окно `history_limit` резало хвост,
-    а `MAX_STORED_MESSAGES` — само хранилище. Обрезки больше нет, и стеречь
-    надо ровно обратное: что в промпт попадают **все** реплики и что рост
-    истории ничего из неё не выбрасывает.
-
-    Пороги взяты заведомо выше прежних отсечек — 20 сообщений в окне
-    по умолчанию и 400 хранимых: вернись любая из них, здесь станет красно.
-    """
+    """Управление контекстом — задание Дня 9; здесь обрезки нет вовсе.
+    Пороги выше прежних отсечек (20 в окне, 400 хранимых): вернись любая
+    из них — станет красно."""
     _stub.install(reply=lambda m, i: f"ответ {i}")
 
     # 1. Живой маршрут: 25 обменов — больше прежнего окна по умолчанию.
@@ -587,133 +228,7 @@ def check_parallel():
     return f"коды {codes}, в истории 2 реплики, вызов к модели один"
 
 
-@check("несостоявшийся обмен: история не тронута, вопрос возвращён клиенту")
-def check_rollback():
-    _stub.install(fail=True)
-
-    async def scenario():
-        agent = REGISTRY.create(AgentSpec(label="падение", model="stub/model"))
-        return agent, await drain(agent.ask("вопрос, который не доедет"))
-
-    agent, events = asyncio.run(scenario())
-    done = [e for e in events if e["type"] == "done"][0]
-    assert agent.history == [], agent.history
-    assert done["committed"] is False, done
-    assert done["question"] == "вопрос, который не доедет", done
-
-    async def partial():
-        agent = REGISTRY.create(AgentSpec(label="частичный", model="stub/model"))
-
-        async def half(session, *, prompt_override=None, context_length=None):
-            yield {"type": "delta", "text": "полов", "metrics": {"error": None}}
-            yield {"type": "error", "message": "оборвалось", "metrics": {"error": "оборвалось"}}
-
-        agent_module.stream_completion = half
-        await drain(agent.ask("вопрос"))
-        return agent
-
-    agent = asyncio.run(partial())
-    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
-    assert agent.history[1].content == "полов", agent.history[1].content
-    assert agent.history[1].error == "оборвалось", agent.history[1].error
-    return "ответа нет → история пуста и вопрос вернулся; частичный → помечен ошибкой"
-
-
-@check("обрыв клиента гасит вызов и снимает бронь")
-def check_disconnect():
-    _stub.install(reply="а" * 400, chunks=40, delay=0.02)
-
-    class Gone:
-        """Клиент, которого не стало на N-м опросе."""
-
-        def __init__(self, after: int) -> None:
-            self.after = after
-            self.polls = 0
-
-        async def is_disconnected(self) -> bool:
-            self.polls += 1
-            return self.polls > self.after
-
-    async def scenario(after: int):
-        agent = REGISTRY.create(AgentSpec(label="обрыв", model="stub/model"))
-        agent.reserve()
-        frames = [
-            frame
-            async for frame in main._pump(
-                lambda: main._chat_events(agent, "вопрос"), Gone(after), agent.release
-            )
-        ]
-        await asyncio.sleep(0.1)
-        return agent, frames
-
-    agent, frames = asyncio.run(scenario(3))
-    assert _stub.ACTIVE["closed"] == 1, _stub.ACTIVE
-    assert _stub.ACTIVE["now"] == 0, _stub.ACTIVE
-    assert agent.busy is False, "бронь должна сниматься и на обрыве"
-
-    # Разрыв до первого события: генератор не запускался вовсе, а бронь всё
-    # равно обязана сняться — иначе агент навсегда останется занятым.
-    _stub.reset()
-    _stub.install(reply="б" * 200, chunks=20, delay=0.02)
-    early, early_frames = asyncio.run(scenario(0))
-    assert early_frames == [], early_frames
-    assert early.busy is False, "бронь залипла на разрыве до первого события"
-    return f"поток закрыт после {len(frames)} кадров, стрим погашен, бронь снята"
-
-
-# --- 5. новые параметры -------------------------------------------------------
-
-NEW_PARAMS = {
-    "top_p": 0.9,
-    "top_k": 40,
-    "min_p": 0.05,
-    "repetition_penalty": 1.1,
-    "presence_penalty": 0.5,
-    "frequency_penalty": 0.25,
-}
-
-
-@check("новые параметры доезжают до тела запроса, а незаданные — нет")
-def check_new_params():
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        bare = new_agent(client)
-        client.post(f"/api/agents/{bare}/messages", json={"text": "привет"})
-        empty_payload = _stub.CALLS[-1]["payload"]
-        for name in ("temperature", "max_tokens", *NEW_PARAMS):
-            assert name not in empty_payload, f"{name} уехал в тело, хотя задан не был"
-
-        full = new_agent(client, temperature=0.4, max_tokens=100, **NEW_PARAMS)
-        client.post(f"/api/agents/{full}/messages", json={"text": "привет"})
-        payload = _stub.CALLS[-1]["payload"]
-        for name, value in NEW_PARAMS.items():
-            assert payload.get(name) == value, (name, payload.get(name))
-
-        # Ноль — это заданный ноль, а не «не задано».
-        zero = new_agent(client, presence_penalty=0.0, temperature=0.0)
-        client.post(f"/api/agents/{zero}/messages", json={"text": "привет"})
-        payload = _stub.CALLS[-1]["payload"]
-        assert payload["presence_penalty"] == 0.0, payload
-        assert payload["temperature"] == 0.0, payload
-
-        # PATCH с null снимает параметр: он перестаёт уходить вовсе.
-        client.patch(f"/api/agents/{full}", json={"top_k": None, "min_p": None})
-        client.post(f"/api/agents/{full}/messages", json={"text": "ещё"})
-        payload = _stub.CALLS[-1]["payload"]
-        assert "top_k" not in payload and "min_p" not in payload, payload
-        assert payload["top_p"] == 0.9, payload
-
-        # Кривой тип — 400 с текстом, а не 500 и не молчаливая отправка.
-        assert client.patch(f"/api/agents/{full}", json={"top_k": 0.5}).status_code == 400
-        assert client.patch(f"/api/agents/{full}", json={"top_p": "быстро"}).status_code == 400
-
-        # true — не число. В Python True это int, и без отдельной проверки
-        # «temperature: true» уехало бы к провайдеру единицей.
-        for bad in ({"temperature": True}, {"max_tokens": True}):
-            assert client.patch(f"/api/agents/{full}", json=bad).status_code == 400, bad
-            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
-            assert born.status_code == 400, (bad, born.text)
-    return "шесть новых параметров едут, незаданные отсутствуют, ноль отличим от пустоты"
+# --- Панель и тело запроса ----------------------------------------------------
 
 
 # Каждое поле панели вместе с тем, во что оно должно превратиться в теле
@@ -733,15 +248,21 @@ PANEL_FIELDS = {
 }
 
 
-@check("правка в панели применяется к следующему сообщению, а не к следующему чату")
-def check_panel_applies_next_message():
-    """Проверяем не ответ ручки, а то, что реально ушло в модель: и промпт,
-    и каждое поле панели."""
+@check("сообщение уходит с тем конфигом, что показан в панели")
+def check_panel_reaches_request():
+    """Смотрим не ответ ручки, а то, что реально ушло в модель: и промпт,
+    и каждое поле панели. Три состояния поля: не задано — в теле его нет
+    вовсе; задано — уехало ровно им; снято — исчезло снова. Клиентская
+    половина — в `checks/browser_check.js`, исполнением `app.js`."""
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         agent_id = new_agent(client, model="старая/модель", system="СТАРЫЙ ПРОМПТ")
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
-        assert _stub.CALLS[-1]["messages"][0]["content"] == "СТАРЫЙ ПРОМПТ"
+        first = _stub.CALLS[-1]
+        assert first["messages"][0]["content"] == "СТАРЫЙ ПРОМПТ", first["messages"][0]
+        for name in PANEL_FIELDS:
+            if name != "model":
+                assert name not in first["payload"], f"{name} уехал в тело, хотя задан не был"
 
         patched = client.patch(
             f"/api/agents/{agent_id}",
@@ -751,209 +272,53 @@ def check_panel_applies_next_message():
 
         _stub.reset()
         client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
+        call = _stub.CALLS[-1]
 
-    call = _stub.CALLS[-1]
+        # Снятое поле исчезает из тела целиком, а не уезжает пустым.
+        client.patch(
+            f"/api/agents/{agent_id}",
+            json={"system": None, "top_k": None, "stop": None},
+        )
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "третий"})
+        bare = _stub.CALLS[-1]
+
+        # Кривой тип — 400 с текстом, а не 500 и не молчаливая отправка.
+        assert client.patch(f"/api/agents/{agent_id}", json={"top_k": 0.5}).status_code == 400
+        assert client.patch(f"/api/agents/{agent_id}", json={"stop": "СТОП"}).status_code == 400
+        # true — не число: в Python True это int, и без отдельной проверки
+        # «temperature: true» уехало бы к провайдеру единицей.
+        assert client.patch(f"/api/agents/{agent_id}", json={"temperature": True}).status_code == 400
+
     sent, payload = call["messages"], call["payload"]
-    assert sent[0]["role"] == "system", sent
-    assert sent[0]["content"] == "НОВЫЙ ПРОМПТ", sent[0]["content"]
+    assert sent[0] == {"role": "system", "content": "НОВЫЙ ПРОМПТ"}, sent[0]
     assert call["model"] == "новая/модель", call["model"]
     for name, value in PANEL_FIELDS.items():
         if name == "model":
             continue
         assert payload.get(name) == value, (name, payload.get(name), value)
-    # Новый промпт встал на место старого, а прошлый обмен из истории никуда
-    # не делся: правка панели меняет конфиг, а не переписку.
+    # Правка панели меняет конфиг, а не переписку: прошлый обмен на месте.
     assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"], sent
     assert sent[1]["content"] == "первый", sent[1]
-    return "промпт, модель и все параметры уехали новыми, история на месте"
+
+    assert not any(m["role"] == "system" for m in bare["messages"]), bare["messages"]
+    assert "top_k" not in bare["payload"] and "stop" not in bare["payload"], bare["payload"]
+    assert bare["payload"]["top_p"] == 0.11, bare["payload"]
+    return "промпт, модель и все параметры уехали новыми; снятые исчезли, история цела"
 
 
-@check("правка панели во время генерации не теряется")
-def check_patch_during_generation():
-    """Запрет был не нужен: обмен снимает слепок конфига в начале, поэтому
-    правка панели текущий ответ исказить не может. А стоил дорого: 409 приходил
-    ровно тогда, когда правку и хочется внести, и терялся навсегда."""
+@check("тело каждого вызова: require_parameters, сжатие выключено, usage запрошен")
+def check_call_body_invariants():
+    """Три правила, без которых день не состоится:
 
-    async def scenario():
-        from httpx import ASGITransport, AsyncClient
+    - `provider.require_parameters` — без него OpenRouter вправе увести запрос
+      к провайдеру, который молча проигнорирует temperature или stop;
+    - выключенное `context-compression` — иначе на окнах 8k и меньше провайдер
+      сам обрезает промпт посередине: ошибки нет, а середина разговора ушла;
+    - `usage: {include: true}` — без него точных чисел не пришлёт никто,
+      и День 8 остался бы без единого токена.
 
-        _stub.install(reply="д" * 400, chunks=40, delay=0.02)
-        transport = ASGITransport(app=main.app)
-        async with AsyncClient(transport=transport, base_url="http://bench") as client:
-            created = await client.post(
-                "/api/agents",
-                json={"agent": {"model": "stub/model", "label": "п", "system": "СТАРЫЙ ПРОМПТ"}},
-            )
-            agent_id = created.json()["agents"][0]["id"]
-
-            generating = asyncio.create_task(
-                client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
-            )
-            await asyncio.sleep(0.15)
-            patched = await client.patch(
-                f"/api/agents/{agent_id}",
-                json={"system": "НОВЫЙ ПРОМПТ", "temperature": 0.9},
-            )
-            await generating
-            current = list(_stub.CALLS)
-
-            _stub.reset()
-            _stub.install(reply="ок")
-            await client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
-            return patched, current, list(_stub.CALLS)
-
-    patched, current, following = asyncio.run(scenario())
-
-    assert patched.status_code == 200, f"правку во время генерации отвергли: {patched.text}"
-
-    # Текущий ответ правка не задела: тело запроса снято слепком на старте.
-    assert [m["content"] for m in current[0]["messages"] if m["role"] == "system"] == [
-        "СТАРЫЙ ПРОМПТ"
-    ], current[0]["messages"]
-    assert "temperature" not in current[0]["payload"], current[0]["payload"]
-
-    # А следующее сообщение ушло уже новым.
-    assert [m["content"] for m in following[0]["messages"] if m["role"] == "system"] == [
-        "НОВЫЙ ПРОМПТ"
-    ], following[0]["messages"]
-    assert following[0]["payload"]["temperature"] == 0.9, following[0]["payload"]
-
-    # Клиентская половина — в `checks/browser_check.js`: там правка панели
-    # доезжает до тела запроса **исполнением**, а не строкой в исходнике.
-    return "PATCH во время генерации принят, текущий ответ цел, следующий — новый"
-
-
-@check("обмен идёт целиком на одном конфиге: смешанного запроса не бывает")
-def check_config_snapshot():
-    """Конфиг читается в двух точках, а не в одной.
-
-    Промпт собирает `build_prompt`, тело — `build_payload`, и между ними
-    стоит `yield` события `start`. Правка, попавшая туда, дала бы смешанный
-    запрос: новую модель со старым системным промптом. Сейчас через этот
-    `yield` никто не приостанавливается, но держится это на устройстве
-    доставки событий, а не на самом обмене.
-
-    Шагаем генератор руками — `__anext__` останавливает его ровно в окне —
-    и правим конфиг оттуда: со слепком в запрос уезжает один конфиг целиком.
-    """
-    _stub.install(reply="ок")
-
-    async def scenario():
-        agent = REGISTRY.create(
-            AgentSpec(
-                label="слепок",
-                model="старая/модель",
-                system="СТАРЫЙ ПРОМПТ",
-                temperature=0.1,
-                max_tokens=100,
-            )
-        )
-        stream = agent.ask("вопрос")
-        start = await stream.__anext__()
-
-        # Промпт уже собран, тело ещё нет — то самое окно.
-        agent.spec.model = "новая/модель"
-        agent.spec.system = "НОВЫЙ ПРОМПТ"
-        agent.spec.temperature = 0.9
-        agent.spec.max_tokens = 999
-
-        async for _ in stream:
-            pass
-        return agent, start
-
-    agent, start = asyncio.run(scenario())
-    assert start["type"] == "start", start
-
-    call = _stub.CALLS[0]
-    systems = [m["content"] for m in call["messages"] if m["role"] == "system"]
-    assert systems == ["СТАРЫЙ ПРОМПТ"], systems
-    assert call["payload"]["model"] == "старая/модель", call["payload"]["model"]
-    assert call["payload"]["temperature"] == 0.1, call["payload"]
-    assert call["payload"]["max_tokens"] == 100, call["payload"]
-    # Промпт в событии start — тот же, что уехал в модель.
-    assert start["resolved_messages"] == call["messages"], (start["resolved_messages"], call["messages"])
-
-    # А следующий обмен идёт уже целиком на новом конфиге.
-    _stub.reset()
-    _stub.install(reply="ок")
-    asyncio.run(drain(agent.ask("второй")))
-    call = _stub.CALLS[0]
-    assert call["payload"]["model"] == "новая/модель", call["payload"]["model"]
-    assert [m["content"] for m in call["messages"] if m["role"] == "system"] == ["НОВЫЙ ПРОМПТ"]
-    assert call["payload"]["temperature"] == 0.9, call["payload"]
-
-    source = read("app/agent.py")
-    assert "copy_spec(self.spec)" in source, "обмен собирает запрос из живого конфига"
-    return "правка в окне между промптом и телом не смешала конфиги"
-
-
-@check("системный промпт не фиксируется при создании: в модель едет нынешний")
-def check_system_prompt_single_home():
-    """Корень жалобы «сменил промпт — уезжает старый».
-
-    Раньше промпт мог приехать двумя путями: полем `system` и системным
-    сообщением внутри `messages`. Второй дом фиксировал текст в момент
-    создания агента: панель правила `spec.system`, а в модель уезжала копия
-    из заготовки. Дома теперь физически один — поля `messages` у конфига
-    больше нет, — и нарушить это нечем.
-
-    Но само поведение, ради которого дом делали одним, проверять надо
-    по-прежнему: промпт читается из конфига **на каждом обращении**,
-    а не запоминается при создании. И переживает перезапуск: после
-    переоткрытия файла в модель обязан ехать тот же текст.
-    """
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, system="ИСХОДНЫЙ")
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "первый"})
-        assert _stub.CALLS[-1]["messages"][0] == {"role": "system", "content": "ИСХОДНЫЙ"}
-
-        client.patch(f"/api/agents/{agent_id}", json={"system": "ПРАВЛЕНЫЙ"})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
-        sent = _stub.CALLS[-1]["messages"]
-        systems = [m["content"] for m in sent if m["role"] == "system"]
-        assert systems == ["ПРАВЛЕНЫЙ"], systems
-        assert "ИСХОДНЫЙ" not in " ".join(m["content"] for m in sent), sent
-
-        # И ещё раз, третьим сообщением: промпт не «применяется однажды».
-        client.patch(f"/api/agents/{agent_id}", json={"system": "ТРЕТИЙ"})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "третий"})
-        assert _stub.CALLS[-1]["messages"][0]["content"] == "ТРЕТИЙ", _stub.CALLS[-1]["messages"][0]
-
-        # Снятый промпт исчезает из тела целиком: пустая строка в роли
-        # `system` — это не «промпта нет», это заданный пустой промпт.
-        client.patch(f"/api/agents/{agent_id}", json={"system": None})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четвёртый"})
-        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
-
-    # Второго дома нет по построению: конфиг агента его не описывает,
-    # а ручка создания не принимает.
-    assert not hasattr(AgentSpec("л", "m"), "messages"), "у конфига снова есть messages"
-    with TestClient(main.app) as client:
-        extra = client.post(
-            "/api/agents",
-            json={"agent": {"model": "stub/m", "messages": [{"role": "system", "content": "х"}]}},
-        )
-        assert extra.status_code == 200, extra.text
-        created = extra.json()["agents"][0]
-        assert created["system"] == "", f"messages протекли в промпт: {created['system']}"
-        client.post(f"/api/agents/{created['id']}/messages", json={"text": "?"})
-        assert not any(m["role"] == "system" for m in _stub.CALLS[-1]["messages"]), _stub.CALLS[-1]
-    return "промпт читается из конфига на каждом обращении; второго дома нет"
-
-
-@check("provider.require_parameters стоит на каждом вызове")
-def check_require_parameters():
-    """Стерёг его только текст предупреждения в панели, а не тело запроса.
-
-    Убрал `require_parameters` из `build_payload` — ни одна проверка не
-    покраснела, хотя это правило, на котором держится весь смысл панели:
-    без него OpenRouter вправе увести запрос к провайдеру, который молча
-    проигнорирует temperature или stop, и стенд покажет неправду.
-
-    Проверяется на всех путях: обычное сообщение, перегенерация, чат
-    с закреплённым поставщиком и чат без единого заданного параметра.
-    """
+    По телу запроса на всех путях: сообщение, перегенерация, чат
+    с параметрами и чат со своим `extra_body`."""
     _stub.install(reply="ок")
     with TestClient(main.app) as client:
         bare = new_agent(client)
@@ -963,504 +328,43 @@ def check_require_parameters():
         loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
         client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
 
-        # Закреплённый поставщик дополняет provider, а не затирает его:
-        # extra_body мержится поверх, и require_parameters обязан уцелеть.
-        pinned = new_agent(client, extra_body={"provider": {"order": ["openai"]}})
-        client.post(f"/api/agents/{pinned}/messages", json={"text": "три"})
+        # Свой поставщик и свой плагин дописываются рядом, а не вместо наших:
+        # иначе выключенное сжатие исчезало бы молча, от соседства ключей.
+        mine = new_agent(
+            client,
+            extra_body={"provider": {"order": ["openai"]}, "plugins": [{"id": "web"}]},
+        )
+        client.post(f"/api/agents/{mine}/messages", json={"text": "три"})
 
     assert len(_stub.CALLS) == 4, len(_stub.CALLS)
     for call in _stub.CALLS:
-        provider = call["payload"].get("provider")
+        payload = call["payload"]
+        provider = payload.get("provider")
         assert provider and provider.get("require_parameters") is True, (
-            f"вызов ушёл без provider.require_parameters: {call['payload'].get('provider')!r}"
+            f"вызов ушёл без provider.require_parameters: {provider!r}"
         )
-    assert _stub.CALLS[-1]["payload"]["provider"]["order"] == ["openai"], _stub.CALLS[-1]["payload"]
+        assert {"id": "context-compression", "enabled": False} in (payload.get("plugins") or []), (
+            f"вызов ушёл со сжатием контекста на усмотрение провайдера: {payload.get('plugins')!r}"
+        )
+        assert payload.get("usage") == {"include": True}, (
+            f"вызов ушёл без просьбы о usage: {payload.get('usage')!r}"
+        )
+    last = _stub.CALLS[-1]["payload"]
+    assert last["provider"]["order"] == ["openai"], last["provider"]
+    assert last["plugins"][-1] == {"id": "web"}, last["plugins"]
 
-    # И то же самое напрямую, без веб-слоя: правило живёт в build_payload,
-    # а не в ручке, поэтому CLI и любой другой вызывающий получают его тоже.
+    # И то же самое напрямую, без веб-слоя: правила живут в build_payload,
+    # а не в ручке, поэтому CLI и любой другой вызывающий получают их тоже.
     from app.llm import build_payload
 
     payload = build_payload(AgentSpec(label="без веба", model="stub/m"))
     assert payload["provider"]["require_parameters"] is True, payload["provider"]
-    return "4 вызова через ручки и один напрямую — все с require_parameters"
-
-
-@check("сжатие контекста выключено на каждом вызове")
-def check_context_compression_off():
-    """Заказчик не смог показать переполнение: ошибки не было вовсе.
-
-    OpenRouter на всех эндпоинтах с окном 8k и меньше по умолчанию включает
-    плагин `context-compression` (стратегия middle-out): не влезший промпт
-    он молча обрезает посередине и отправляет остаток. Запрос проходит,
-    ответ приходит, ошибки нет — а середина разговора потеряна. День 7
-    добивался, чтобы история не терялась, и терял её тут же, на провайдере.
-
-    Стережётся по телу запроса, как `require_parameters`: те же четыре пути
-    через ручки плюс прямой вызов `build_payload`.
-    """
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        bare = new_agent(client)
-        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
-        client.post(f"/api/agents/{bare}/regenerate")
-
-        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
-        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
-
-        # Свой плагин в extra_body дописывается рядом, а не вместо нашего.
-        extra = new_agent(client, extra_body={"plugins": [{"id": "web"}]})
-        client.post(f"/api/agents/{extra}/messages", json={"text": "три"})
-
-    assert len(_stub.CALLS) == 4, len(_stub.CALLS)
-    for call in _stub.CALLS:
-        plugins = call["payload"].get("plugins")
-        assert {"id": "context-compression", "enabled": False} in (plugins or []), (
-            f"вызов ушёл со сжатием контекста на усмотрение провайдера: {plugins!r}"
-        )
-    assert _stub.CALLS[-1]["payload"]["plugins"][-1] == {"id": "web"}, _stub.CALLS[-1]["payload"]
-
-    from app.llm import build_payload
-
-    payload = build_payload(AgentSpec(label="без веба", model="stub/m"))
     assert payload["plugins"] == [{"id": "context-compression", "enabled": False}], payload
-    return "4 вызова через ручки и один напрямую — все с выключенным сжатием"
-
-
-@check("usage у OpenRouter запрашивается на каждом вызове")
-def check_usage_is_asked_for():
-    """Дыра, найденная мутацией: выкинь `"usage": {"include": true}` из тела —
-    и ни одна проверка не покраснеет, хотя день остался бы без единого числа.
-
-    Заглушка усадьбу чисел выдумывает сама и потому слепа к этому полю: точные
-    `prompt_tokens`, `completion_tokens` и `cost` присылает OpenRouter, и только
-    если его об этом попросили. Стережём по телу запроса — теми же путями, что
-    и выключенное сжатие.
-    """
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        bare = new_agent(client)
-        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
-        client.post(f"/api/agents/{bare}/regenerate")
-        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
-        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
-
-    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
-    for call in _stub.CALLS:
-        assert call["payload"].get("usage") == {"include": True}, (
-            f"вызов ушёл без просьбы о usage: {call['payload'].get('usage')!r}"
-        )
-
-    from app.llm import build_payload
-
-    payload = build_payload(AgentSpec(label="прямой", model="stub/m"))
     assert payload["usage"] == {"include": True}, payload
-    return "3 вызова через ручки и один напрямую — все просят usage"
+    return "4 вызова через ручки и один напрямую — все три правила на каждом"
 
 
-@check("свой plugins в extra_body мержится по id, а не затирает наш")
-def check_extra_body_plugins_merge():
-    """Развилка `extra_body`: он мержится поверх тела, и `plugins` целиком
-    заменял бы наш список — выключенное сжатие исчезало бы молча, от одного
-    лишь соседства ключей.
-
-    Выбранное поведение — как у `provider`, только по `id` элемента:
-
-    - чужие плагины дописываются рядом, наш выключенный уцелевает;
-    - названный пользователем тот же `id` побеждает: включить сжатие обратно
-      можно, но только написав это своей рукой. Молчаливого затирания нет
-      ни в ту, ни в другую сторону.
-    """
-    from app.llm import build_payload
-
-    def plugins(extra):
-        return build_payload(AgentSpec(label="п", model="stub/m", extra_body=extra))["plugins"]
-
-    ours = {"id": "context-compression", "enabled": False}
-
-    # Чужой плагин не сбивает наш.
-    assert plugins({"plugins": [{"id": "web", "max_results": 3}]}) == [
-        ours,
-        {"id": "web", "max_results": 3},
-    ], plugins({"plugins": [{"id": "web", "max_results": 3}]})
-
-    # Осознанное включение сжатия обратно — побеждает пользователь, и запись
-    # в теле ровно одна: два `context-compression` подряд — это не настройка.
-    back_on = plugins({"plugins": [{"id": "context-compression", "enabled": True}]})
-    assert back_on == [{"id": "context-compression", "enabled": True}], back_on
-
-    # Пустой список плагинов у пользователя наш плагин не снимает: «ничего
-    # своего не добавляю» — это не «верни провайдеру сжатие на усмотрение».
-    assert plugins({"plugins": []}) == [ours], plugins({"plugins": []})
-
-    # И остальной extra_body от этого не меняется.
-    mixed = build_payload(
-        AgentSpec(
-            label="п",
-            model="stub/m",
-            extra_body={"plugins": [{"id": "web"}], "provider": {"order": ["openai"]}, "seed": 7},
-        )
-    )
-    assert mixed["provider"] == {"require_parameters": True, "order": ["openai"]}, mixed["provider"]
-    assert mixed["seed"] == 7, mixed
-    assert mixed["plugins"] == [ours, {"id": "web"}], mixed["plugins"]
-    return "чужой плагин дописан, свой context-compression побеждает, пустой список не снимает"
-
-
-@check("stop и response_format правятся из панели и доезжают до тела запроса")
-def check_stop_and_format():
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "раз"})
-        payload = _stub.CALLS[-1]["payload"]
-        assert "stop" not in payload and "response_format" not in payload, payload
-
-        client.patch(
-            f"/api/agents/{agent_id}",
-            json={"stop": ["КОНЕЦ", "СТОП"], "response_format": {"type": "json_object"}},
-        )
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "два"})
-        payload = _stub.CALLS[-1]["payload"]
-        assert payload["stop"] == ["КОНЕЦ", "СТОП"], payload["stop"]
-        assert payload["response_format"] == {"type": "json_object"}, payload["response_format"]
-
-        # Пустое значение снимает параметр: он перестаёт уходить вовсе.
-        client.patch(f"/api/agents/{agent_id}", json={"stop": None, "response_format": None})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "три"})
-        payload = _stub.CALLS[-1]["payload"]
-        assert "stop" not in payload and "response_format" not in payload, payload
-
-        # Пустые строки в списке — не стоп-строки.
-        client.patch(f"/api/agents/{agent_id}", json={"stop": ["", "  "]})
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "четыре"})
-        assert "stop" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"]
-
-        assert client.patch(f"/api/agents/{agent_id}", json={"stop": "СТОП"}).status_code == 400
-        assert (
-            client.patch(f"/api/agents/{agent_id}", json={"response_format": "json"}).status_code
-            == 400
-        )
-
-    return "оба параметра задаются, снимаются и не уходят пустыми"
-
-
-@check("создание и правка разбирают конфиг одинаково")
-def check_create_and_patch_agree():
-    """Дефект аудита: POST и PATCH расходились на пустых стоп-строках.
-
-    POST сохранял ["", "  ", "КОНЕЦ"] как есть, PATCH выбрасывал пустые.
-    Пустая стоп-строка не косметика: она остановила бы генерацию сразу,
-    а с provider.require_parameters ещё и сузила бы список провайдеров.
-    Ни одна проверка расхождения не ловила — обе ручки разбирали поля
-    двумя независимыми кусками кода.
-
-    Правильное поведение — то, которое было у PATCH и которого ждёт панель:
-    поле стоп-строк построчное, и лишний перевод строки не параметр.
-    `readStopLines` в клиенте делает ровно это.
-
-    Проверяется не «PATCH чистит», а **согласие двух ручек**: любое поле,
-    заданное при создании и той же правкой, обязано дать один конфиг.
-    """
-    cases = [
-        {"stop": ["", "  ", "КОНЕЦ", " СТОП "]},
-        {"stop": ["", "   "]},
-        {"system": None},
-        {"response_format": {"type": "json_object"}},
-        {"temperature": 0.0, "top_p": 0, "max_tokens": 7},
-    ]
-    watched = ("stop", "system", "response_format", *SAMPLING_FIELDS)
-    with TestClient(main.app) as client:
-        for case in cases:
-            created = client.post("/api/agents", json={"agent": {"model": "stub/model", **case}})
-            assert created.status_code == 200, created.text
-            born = created.json()["agents"][0]
-
-            blank_id = new_agent(client)
-            patched = client.patch(f"/api/agents/{blank_id}", json=case)
-            assert patched.status_code == 200, patched.text
-            grown = patched.json()
-
-            for field in watched:
-                assert born[field] == grown[field], (
-                    f"{case}: поле {field} после создания {born[field]!r}, "
-                    f"после правки {grown[field]!r} — ручки разбирают его по-разному"
-                )
-
-        # Согласие в отказах тоже: кривой тип обе ручки обязаны отвергнуть.
-        for bad in ({"stop": "СТОП"}, {"top_k": 0.5}, {"max_tokens": 0}):
-            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
-            grown = client.patch(f"/api/agents/{new_agent(client)}", json=bad)
-            assert born.status_code == 400 and grown.status_code == 400, (
-                bad, born.status_code, grown.status_code
-            )
-
-    # И то, ради чего чистка нужна: пустая стоп-строка не уезжает в модель.
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, stop=["", "  ", "КОНЕЦ"])
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
-        assert _stub.CALLS[-1]["payload"]["stop"] == ["КОНЕЦ"], _stub.CALLS[-1]["payload"]
-    return f"{len(cases)} конфигов и 3 отказа: создание и правка сходятся"
-
-
-@check("любое поле конфига переживает переоткрытие файла, включая ещё не придуманные")
-def check_config_survives_by_construction():
-    """Дыра аудита: `_migrate` можно было удалить, не уронив ни одной проверки.
-
-    Значит схему базы не стерёг никто: колонку можно было потерять молча,
-    а «конфиг едет одним JSON-полем, поэтому новое поле сохраняется само»
-    было обещанием без сторожа.
-
-    Список полей здесь **выводится** из `AgentSpec`, а не перечисляется:
-    перечисленный отстал бы от датакласса ровно тогда, когда поле добавили
-    и забыли — то есть в единственном случае, ради которого проверка нужна.
-    Значения подбираются по типу поля, тоже без ручного списка.
-    """
-    from dataclasses import fields as spec_fields
-
-    from app.agent import Agent
-
-    # Значение, отличное от умолчания, для каждого поля конфига.
-    probes: dict = {}
-    for f in spec_fields(AgentSpec):
-        kind = str(f.type)
-        if f.name == "model":
-            probes[f.name] = "проверка/модель"
-        elif "list[str]" in kind:
-            probes[f.name] = [f"СТОП-{f.name}"]
-        elif "str" in kind:
-            probes[f.name] = f"текст-{f.name}"
-        elif "int" in kind:
-            probes[f.name] = 7
-        elif "float" in kind:
-            probes[f.name] = 0.25
-        elif "dict" in kind:
-            probes[f.name] = {"метка": f.name}
-        else:
-            raise AssertionError(f"поле {f.name}: {f.type} — тип неизвестен, подберите значение")
-    assert len(probes) == len(spec_fields(AgentSpec)), probes
-
-    path = _temp_db("schema-roundtrip")
-    store = Store(path).init()
-    spec = AgentSpec(**probes)
-    agent = Agent(spec, store=store)
-    agent.remember("user", "вопрос")
-    agent.remember("assistant", "ответ", metrics={"provider": "stub"})
-    agent_id = agent.id
-    store.close()
-
-    # Настоящее переоткрытие файла, а не тот же объект в памяти.
-    again = Store(path).init()
-    try:
-        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
-        lost = {
-            f.name: (probes[f.name], getattr(revived.spec, f.name))
-            for f in spec_fields(AgentSpec)
-            if getattr(revived.spec, f.name) != probes[f.name]
-        }
-        assert not lost, f"поля конфига не пережили переоткрытие файла: {lost}"
-        assert [t.content for t in revived.history] == ["вопрос", "ответ"], revived.history
-        assert revived.history[1].metrics == {"provider": "stub"}, revived.history[1].metrics
-
-        # Колонки схемы и колонки, которые читает код, — один набор.
-        # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,
-        # либо её кто-то пишет мимо `_session_row`.
-        in_db = {r["name"] for r in again.conn.execute("PRAGMA table_info(sessions)")}
-        row = again.load_session(agent_id)
-        expected = set(row) | {"updated_at"}
-        assert in_db == expected, f"схема и код разошлись: в базе {in_db}, код читает {expected}"
-    finally:
-        again.close()
-    return f"{len(probes)} полей конфига пережили переоткрытие файла, схема сходится с кодом"
-
-
-@check("мимо redact() записать нельзя: пути записи выводятся из класса")
-def check_every_write_path_redacts():
-    """Дыра аудита: явные `redact()` в `save_session`/`save_history` можно было
-    убрать, не уронив ничего.
-
-    И правильно — несущий слой не они, а `_Writer`: транзакция отдаёт обёртку,
-    и чистится любой строковый параметр. Но само это свойство никто не стерёг:
-    `check_no_key_in_db` ходит теми путями записи, которые знает, а новый путь
-    мимо транзакции прошёл бы зелёным.
-
-    Поэтому список путей здесь **выводится** из класса `Store`: всякий метод,
-    в теле которого есть INSERT/UPDATE/DELETE/REPLACE, обязан идти через
-    `tx()`, а не через голое соединение. Перечисленный список пропустил бы
-    ровно тот метод, который забыли в него внести.
-    """
-    import inspect
-
-    import app.store as store_module
-
-    # Слова целиком, а не подстроки: `updated_at` — это не UPDATE, и по
-    # подстроке в список путей записи попадал весь `list_sessions`.
-    mutating = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE)\b")
-    checked = []
-    for name, fn in inspect.getmembers(Store, inspect.isfunction):
-        body = inspect.getsource(fn)
-        if not mutating.search(body.upper()):
-            continue
-        checked.append(name)
-        if name == "init":
-            continue  # схему заводит executescript, параметров у него нет
-        for bypass in ("self.conn.execute", "self._conn.execute", "self.reading("):
-            assert bypass not in body, (
-                f"Store.{name} пишет через {bypass} — мимо `_Writer`, а значит "
-                "мимо redact(). Писать можно только внутри tx()"
-            )
-    assert len(checked) >= 5, f"путей записи нашлось всего {checked} — обход сузился"
-
-    # Транзакция отдаёт обёртку, а не соединение: иначе обещание держалось бы
-    # на внимательности автора каждого метода.
-    store = Store(store_module.MEMORY).init()
-    key = "sk-or-v1-" + "e" * 64
-    saved_key = os.environ.get("OPENROUTER_API_KEY")
-    os.environ["OPENROUTER_API_KEY"] = key
-    try:
-        with store.tx() as conn:
-            assert not isinstance(conn, sqlite3.Connection), (
-                "tx() отдаёт голое соединение — redact() перестал быть по построению"
-            )
-            # Все три формы параметров, какие принимает обёртка.
-            conn.execute(
-                "INSERT INTO sessions (id, label, config, created_at, updated_at) "
-                "VALUES (?, ?, ?, 0, 0)",
-                (f"ag_{key}", key, key),
-            )
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES (:k, :v)", {"k": "т", "v": key}
-            )
-            conn.executemany(
-                "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
-                [("s", 0, "user", key), ("s", 1, "assistant", key)],
-            )
-        leaked = []
-        for table in ("sessions", "messages", "meta"):
-            for row in store.conn.execute(f"SELECT * FROM {table}"):
-                for column in row.keys():
-                    if isinstance(row[column], str) and key in row[column]:
-                        leaked.append(f"{table}.{column}")
-        assert not leaked, f"ключ уехал в базу через tx(): {sorted(set(leaked))}"
-    finally:
-        if saved_key is None:
-            os.environ.pop("OPENROUTER_API_KEY", None)
-        else:
-            os.environ["OPENROUTER_API_KEY"] = saved_key
-        store.close()
-    return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
-
-
-@check("панель правит живого агента: модель, промпт, имя")
-def check_patch_panel():
-    _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, model="stub/old", system="старый")
-        patched = client.patch(
-            f"/api/agents/{agent_id}",
-            json={
-                "model": "stub/new",
-                "system": "новый промпт",
-                "label": "Переименован",
-            },
-        )
-        assert patched.status_code == 200, patched.text
-        body = patched.json()
-        assert body["model"] == "stub/new" and body["label"] == "Переименован"
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"})
-        assert client.patch(f"/api/agents/{agent_id}", json={"note": "х"}).status_code == 400
-
-    call = _stub.CALLS[-1]
-    assert call["model"] == "stub/new", call["model"]
-    assert call["messages"][0]["content"] == "новый промпт", call["messages"][0]
-    return "PATCH меняет модель, промпт и имя; чужие поля не принимаются"
-
-
-# --- 6. лента: рассуждение и перегенерация ------------------------------------
-
-
-@check("стенограмма — это ровно диалог, и в ней есть всё, что рисует клиент")
-def check_transcript_shape():
-    """Формат стенограммы не стерёг никто: поля можно было убрать молча.
-
-    Так и вышло — удаление seed-реплик из `transcript()` и поля
-    `seed_messages` из ответа ручки не уронило ни одной из 65 проверок.
-    Клиент рисует ленту **из ответа ручки**, а не из того, что дорисовал
-    по дороге: после каждого обмена он перечитывает агента и перерисовывает
-    всё заново. Значит контракт стенограммы — часть поведения, и он такой:
-    в ней ровно реплики диалога, по одной на ход, в порядке разговора,
-    и у каждой есть поля, которые клиент читает.
-    """
-    _stub.install(reply="ответ", reasoning="я подумал")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, system="СИСТЕМА")
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-        body = client.get(f"/api/agents/{agent_id}").json()
-
-    transcript = body["transcript"]
-    # Ровно диалог: системный промпт — это конфиг, а не реплика разговора,
-    # и в ленте ему делать нечего. Он виден в панели, полем `system`.
-    assert [t["role"] for t in transcript] == ["user", "assistant"], transcript
-    assert body["system"] == "СИСТЕМА", body["system"]
-    assert transcript[0]["content"] == "вопрос", transcript[0]
-    assert transcript[1]["content"] == "ответ", transcript[1]
-    assert "seed_messages" not in body, "наружу вернулась заготовка"
-
-    # Поля, которые читает клиент. Убрать любое молча нельзя: карточка
-    # перестанет показывать то, что показывала, а ошибку — вовсе проглотит.
-    for turn in transcript:
-        for field in ("role", "content", "error", "reasoning", "metrics"):
-            assert field in turn, f"в реплике нет поля {field}: {turn}"
-    answer = transcript[1]
-    assert answer["reasoning"] == "я подумал", answer
-    assert answer["error"] is None, answer
-    assert answer["metrics"] and answer["metrics"]["provider"] == "stub", answer["metrics"]
-
-    # Длина стенограммы и history_len — про одно и то же: клиент по второму
-    # обновляет строку списка, не перечитывая ленту.
-    assert body["history_len"] == len(transcript), (body["history_len"], len(transcript))
-
-    # Оборванный ответ помечен ошибкой, и она доезжает до стенограммы.
-    _stub.install(fail=True)
-    with TestClient(main.app) as client:
-        broken = new_agent(client)
-        agent = REGISTRY.require(broken)
-        agent.remember("user", "вопрос")
-        agent.remember("assistant", "огрыз", error="оборвалось")
-        failed = client.get(f"/api/agents/{broken}").json()["transcript"][-1]
-    assert failed["error"] == "оборвалось", failed
-    return f"{len(transcript)} реплики, поля на месте, ошибка доезжает"
-
-
-@check("рассуждение приезжает отдельным событием и в ответ не входит")
-def check_reasoning():
-    _stub.install(reply="итоговый ответ", reasoning="я подумал вот так")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        events = sse(client.post(f"/api/agents/{agent_id}/messages", json={"text": "привет"}).text)
-        transcript = client.get(f"/api/agents/{agent_id}").json()["transcript"]
-
-    names = [e["event"] for e in events]
-    assert "reasoning" in names, names
-    thought = next(e for e in events if e["event"] == "reasoning")
-    assert thought["text"] == "я подумал вот так", thought
-    done = next(e for e in events if e["event"] == "done")
-    assert done["reasoning"] == "я подумал вот так", done
-    assert done["text"] == "итоговый ответ", done
-
-    answer = transcript[-1]
-    assert answer["reasoning"] == "я подумал вот так", answer
-    assert answer["content"] == "итоговый ответ", answer
-
-    # Обратно в модель рассуждение не уходит: в контексте только ответ.
-    _stub.reset()
-    _stub.install(reply="второй ответ")
-    with TestClient(main.app) as client:
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "ещё"})
-    sent = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
-    assert "я подумал вот так" not in sent, sent
-    assert "итоговый ответ" in sent, sent
-    return "reasoning виден в потоке и в стенограмме, в контекст не возвращается"
+# --- День 8: подсчёт токенов --------------------------------------------------
 
 
 class _FakeResponse:
@@ -1506,294 +410,468 @@ def _sse_chunks(*payloads) -> list[str]:
     return [f"data: {json.dumps(p, ensure_ascii=False)}" for p in payloads] + ["data: [DONE]"]
 
 
-@check("время до первого токена честное и на думающей модели")
-def check_first_token():
-    """`ttft_ms` стоит на первом токене **ответа**, `first_token_ms` — на первом
-    токене вообще.
-
-    На думающей модели это разные моменты: `ttft_ms` наступает, когда модель
-    домыслила, и показывать его значило бы записать всё размышление
-    в «модель молчала».
-
-    Проверяется **настоящий** `stream_completion`, а не заглушка: заглушка
-    сочиняет метрики целиком, и утверждение о них говорило бы только о ней
-    самой. Здесь подменён транспорт — HTTP-ответ отдаётся строками SSE, между
-    рассуждением и ответом стоит настоящая пауза, — а разбор, тайминги
-    и usage считает `app/llm.py`.
-
-    Клиентская половина — в `checks/browser_check.js`, блоком «первый токен
-    честный и виден под ответом»: там настоящий `app.js` рисует строку под
-    ответом, у которого `first_token_ms` и `ttft_ms` разошлись. Раньше вместо
-    неё здесь стоял греп по исходнику на строку «Первый токен, с» — он
-    не стерёг ничего: подпись можно было оставить, а число подменить на
-    `ttft_ms`, и греп остался бы зелёным.
-    """
+def _parsed_metrics(lines, **kwargs) -> dict:
+    """Гоняет настоящий `stream_completion` на подменённом транспорте: метрики
+    заглушки говорили бы только о самой заглушке."""
     import app.llm as llm
 
-    lines = _sse_chunks(
-        {"provider": "стенд", "choices": [{"delta": {"reasoning": "думаю"}}]},
-        {"choices": [{"delta": {"content": "ответ"}, "finish_reason": "stop"}]},
-        {
-            "usage": {
-                "prompt_tokens": 140,
-                "completion_tokens": 60,
-                "total_tokens": 200,
-                "completion_tokens_details": {"reasoning_tokens": 40},
-                "cost": 0.000123456789,
-            }
-        },
-    )
+    gap = kwargs.pop("gap", None)
     saved_client, saved_key = llm.shared_client, llm.api_key
-    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines, gap_after=0))
+    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines, gap_after=gap))
     llm.api_key = lambda: "sk-or-проверочный"
     try:
-        spec = AgentSpec(label="думающая", model="stub/thinking")
-        events = asyncio.run(
-            drain(llm.stream_completion(spec, prompt_override=[], context_length=1000))
-        )
+        spec = AgentSpec(label="разбор", model="stub/thinking")
+        events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[], **kwargs)))
     finally:
         llm.shared_client, llm.api_key = saved_client, saved_key
+    return next(e for e in events if e["type"] == "done")["metrics"]
 
-    metrics = next(e for e in events if e["type"] == "done")["metrics"]
-    assert metrics["first_token_ms"] is not None, metrics
-    # Рассуждение пришло раньше ответа — значит и первый токен раньше TTFT.
-    # Равенство здесь так же плохо, как отсутствие: оно значит, что размышление
-    # записали в молчание.
-    assert metrics["first_token_ms"] < metrics["ttft_ms"], metrics
 
-    # Тем же разбором приезжает и usage последнего чанка — то, из чего день
-    # собирает и строку под ответом, и итог чата.
+@check("входные, выходные и всего — числа провайдера, разобранные сервером")
+def check_usage_parsed_by_server():
+    """Главные числа дня приезжают последним чанком OpenRouter, и разбирает
+    их `app/llm.py`. Заодно честное время до первого токена: `ttft_ms` стоит
+    на первом токене **ответа**, `first_token_ms` — на первом вообще, и на
+    думающей модели это разные моменты."""
+    metrics = _parsed_metrics(
+        _sse_chunks(
+            {"provider": "стенд", "choices": [{"delta": {"reasoning": "думаю"}}]},
+            {"choices": [{"delta": {"content": "ответ"}, "finish_reason": "stop"}]},
+            {
+                "usage": {
+                    "prompt_tokens": 140,
+                    "completion_tokens": 60,
+                    "total_tokens": 200,
+                    "completion_tokens_details": {"reasoning_tokens": 40},
+                    "cost": 0.000123456789,
+                }
+            },
+        ),
+        gap=0,
+        context_length=1000,
+    )
     assert metrics["prompt_tokens"] == 140, metrics
     assert metrics["completion_tokens"] == 60, metrics
     assert metrics["total_tokens"] == 200, metrics
+    # Рассуждение провайдер кладёт ВНУТРЬ выхода и называет отдельно.
     assert metrics["reasoning_tokens"] == 40, metrics
     assert metrics["cost_usd"] == 0.00012346, metrics
     assert metrics["provider"] == "стенд" and metrics["finish_reason"] == "stop", metrics
-    # Контекст считает сервер: 200 из 1000 — двадцать процентов.
-    assert metrics["context_fill_pct"] == 20.0, metrics
-    return (
-        f"первый токен {metrics['first_token_ms']:.1f} мс раньше "
-        f"ttft {metrics['ttft_ms']:.1f} мс, usage разобран настоящим llm.py"
+    # Рассуждение пришло раньше ответа — значит и первый токен раньше TTFT.
+    # Равенство здесь так же плохо, как отсутствие: оно значит, что
+    # размышление записали в молчание.
+    assert metrics["first_token_ms"] is not None, metrics
+    assert metrics["first_token_ms"] < metrics["ttft_ms"], metrics
+
+    # Сумму провайдер вправе не называть. Тогда её досчитывает сервер — один
+    # раз, до записи в историю: добор в браузере дал бы на одном экране два
+    # разных «всего» — сумму под ответом и другую сумму в плитке.
+    quiet = _parsed_metrics(
+        _sse_chunks(
+            {"choices": [{"delta": {"content": "ответ"}}]},
+            {"usage": {"prompt_tokens": 80, "completion_tokens": 40}},
+        )
     )
+    assert quiet["total_tokens"] == 120, quiet
 
-
-@check("провайдер смолчал о сумме — её досчитывает сервер, а не браузер")
-def check_total_tokens_filled_in():
-    """`total_tokens` в usage не обязателен, и без него «всего» брать неоткуда.
-
-    Досчитывать его в браузере нельзя: итог чата считается по `total_tokens`
-    реплик, и добор на клиенте дал бы на одном экране два разных «всего» —
-    сумму под ответом и другую сумму в плитке. Поэтому сумма появляется один
-    раз, до записи в историю, и дальше её все видят одинаково.
-    """
+    # А из одной половины сумма не выдумывается: «всего» остаётся неизвестным.
     import app.llm as llm
 
-    lines = _sse_chunks(
-        {"choices": [{"delta": {"content": "ответ"}}]},
-        {"usage": {"prompt_tokens": 80, "completion_tokens": 40}},
-    )
-    saved_client, saved_key = llm.shared_client, llm.api_key
-    llm.shared_client = lambda: _FakeClient(_FakeResponse(lines))
-    llm.api_key = lambda: "sk-or-проверочный"
-    try:
-        spec = AgentSpec(label="молчун", model="stub/quiet")
-        events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[])))
-    finally:
-        llm.shared_client, llm.api_key = saved_client, saved_key
-
-    metrics = next(e for e in events if e["type"] == "done")["metrics"]
-    assert metrics["total_tokens"] == 120, metrics
-
-    # Названа только одна часть — досчитывать нечего, и выдумывать сумму
-    # из половины нельзя: «всего» остаётся неизвестным, то есть прочерком.
     half = Metrics()
     llm._apply_usage(half, {"prompt_tokens": 80})
     assert half.total_tokens is None, half
-    return "80 + 40 = 120 названы сервером; из одной половины сумма не выдумывается"
+    return (
+        f"вход 140, выход 60 (из них 40 рассуждение), всего 200; "
+        f"первый токен {metrics['first_token_ms']:.1f} мс раньше ttft {metrics['ttft_ms']:.1f} мс"
+    )
 
 
-@check("перегенерация заменяет последний ответ, а не добавляет второй")
-def check_regenerate():
-    _stub.install(reply=lambda m, i: f"ответ {i}")
+def _usage(prompt, completion, total, cost):
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cost_usd": cost,
+    }
+
+
+@check("сводка по чату — сумма слагаемых, а не выдуманное число")
+def check_usage_summary_sums():
+    """У каждого ответа свой usage: с одинаковыми числами сумма сошлась бы
+    и при сложении, и при `100 * len(history)`, и при возврате последней
+    метрики трижды."""
+    plan = [
+        _usage(11, 5, 16, 0.000011),
+        _usage(120, 40, 160, 0.000120),
+        _usage(1300, 7, 1307, 0.001300),
+    ]
+    _stub.install(usage=lambda i: plan[i])
     with TestClient(main.app) as client:
         agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-        before = client.get(f"/api/agents/{agent_id}").json()["transcript"]
-        again = client.post(f"/api/agents/{agent_id}/regenerate")
-        assert again.status_code == 200, again.text
-        after = client.get(f"/api/agents/{agent_id}").json()["transcript"]
+        for i in range(3):
+            client.post(f"/api/agents/{agent_id}/messages", json={"text": f"вопрос {i}"})
+        body = client.get(f"/api/agents/{agent_id}").json()
 
-    assert len(before) == len(after) == 2, (len(before), len(after))
-    assert [t["role"] for t in after] == ["user", "assistant"], after
-    assert after[0]["content"] == "вопрос", after[0]
-    assert after[1]["content"] != before[1]["content"], "ответ должен быть новым"
-    # Второй вызов видел тот же контекст, что и первый: пара снята до вызова.
-    assert _stub.CALLS[0]["messages"] == _stub.CALLS[1]["messages"], _stub.CALLS[1]["messages"]
+    total = body["usage_total"]
+    assert total is not None, "сводки нет вовсе"
+    assert total["prompt_tokens"] == 11 + 120 + 1300, total
+    assert total["completion_tokens"] == 5 + 40 + 7, total
+    assert total["total_tokens"] == 16 + 160 + 1307, total
+    assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
+    assert body["exchanges"] == 3, body["exchanges"]
 
+    # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
+    # и клиент рисует по ним строку под каждым ответом.
+    answers = [t for t in body["transcript"] if t["role"] == "assistant"]
+    assert [a["metrics"]["total_tokens"] for a in answers] == [16, 160, 1307], answers
+
+    # Перегенерация обмен заменяет, а не добавляет: сумма не удваивается.
+    _stub.install(reply="снова", usage=lambda i: _usage(1000, 100, 1100, 0.001))
     with TestClient(main.app) as client:
-        empty = new_agent(client)
-        assert client.post(f"/api/agents/{empty}/regenerate").status_code == 409
-    return "после перегенерации в истории по-прежнему один вопрос и один ответ"
+        client.post(f"/api/agents/{agent_id}/regenerate")
+        after = client.get(f"/api/agents/{agent_id}").json()
+    assert after["exchanges"] == 3, after["exchanges"]
+    assert after["usage_total"]["total_tokens"] == 16 + 160 + 1100, after["usage_total"]
+    return (
+        f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
+        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
+    )
 
 
-@check("неудачная перегенерация возвращает и вопрос, и прошлый ответ")
-def check_regenerate_failure():
-    """Пара снимается с истории до вызова, и её надо вернуть, если ответа нет.
+@check("реплики без чисел пропускаются, а не считаются нулём")
+def check_usage_summary_skips_unknown():
+    """Ноль и «неизвестно» — разные вещи, и на экране выглядят по-разному.
+    Провайдер вправе смолчать о цене (или о токенах вовсе): такая реплика
+    в сумму не входит ни слагаемым, ни нулём, а чат, где чисел не принёс
+    никто, даёт `None` — прочерк, а не «0 токенов»."""
+    from app.agent import Agent
 
-    Сценарий короткий и сам напрашивается: у агента закреплён провайдер
-    через provider.order, смена модели роняет вызов, и «перегенерировать»
-    уносило и вопрос, и уже полученный ответ. Восстановить их было нечем —
-    историю хранит сервер.
-    """
-    _stub.install(reply="живой ответ")
+    spec = AgentSpec(label="тихий", model="stub/model")
+    quiet = Agent(spec)
+    quiet.remember("user", "вопрос")
+    quiet.remember("assistant", "ответ", metrics=None)
+    quiet.remember("user", "ещё")
+    quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
+    assert quiet.usage_summary() is None, quiet.usage_summary()
+    assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
+    # Сумм нет, а разговор был: плитка «Сообщений» считает ответы, а не слагаемые.
+    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
+
+    mixed = Agent(spec)
+    mixed.remember("user", "вопрос")
+    mixed.remember("assistant", "ответ", metrics=_usage(100, 10, 110, None))
+    mixed.remember("user", "ещё")
+    mixed.remember("assistant", "ответ", metrics=None)
+    mixed.remember("user", "и ещё")
+    mixed.remember("assistant", "ответ", metrics=_usage(200, 20, 220, 0.0002))
+    total = mixed.usage_summary()
+    assert total["prompt_tokens"] == 300, total
+    assert total["total_tokens"] == 330, total
+    # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
+    assert total["cost_usd"] == 0.0002, total
+    assert mixed.exchanges() == 3, mixed.exchanges()
+
+    # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
+    sneaky = Agent(spec)
+    sneaky.remember("user", "вопрос", metrics=_usage(999, 999, 999, 9.0))
+    assert sneaky.usage_summary() is None, sneaky.usage_summary()
+    return "ответ без чисел пропущен, чат без чисел даёт None, вопросы не считаются"
+
+
+# --- День 7: память переживает перезапуск, чаты изолированы -------------------
+
+
+@check("сводка по чату переживает перезапуск: числа те же из файла базы")
+def check_usage_summary_survives_restart():
+    """Сводка выводится из `messages.metrics`, а не хранится колонкой. Значит
+    доказательство — настоящее переоткрытие файла: жила бы сумма в памяти
+    процесса, после перезапуска она обнулилась бы."""
+    from app.agent import Agent
+
+    path = _temp_db("usage-restart")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="память", model="stub/model"), store=store)
+    agent.remember("user", "вопрос")
+    agent.remember("assistant", "ответ", metrics=_usage(70, 30, 100, 0.00007))
+    agent.remember("user", "ещё")
+    agent.remember("assistant", "ответ", metrics=_usage(230, 90, 320, 0.00023))
+    before = agent.usage_summary()
+    agent_id = agent.id
+    store.close()
+
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        after = revived.usage_summary()
+    finally:
+        again.close()
+
+    assert before == after, (before, after)
+    assert after["total_tokens"] == 420, after
+    assert revived.exchanges() == 2, revived.exchanges()
+    return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
+
+
+@check("диалог продолжается в новом процессе программы")
+def check_restart_process():
+    return _script("restart.py", "ОК: диалог продолжился", 2)
+
+
+@check("два процесса на одной базе: id не пересекаются, чужой диалог цел")
+def check_two_processes():
+    return _script("two_processes.py", "ОК: два процесса", -3)
+
+
+@check("любое поле конфига и вся история переживают переоткрытие файла")
+def check_config_survives_by_construction():
+    """Список полей **выводится** из `AgentSpec`, а не перечисляется:
+    перечисленный отстал бы от датакласса ровно тогда, когда поле добавили
+    и забыли — в единственном случае, ради которого проверка нужна. История
+    длиннее прежних отсечек: вернись любая при записи или при подъёме —
+    станет красно."""
+    from dataclasses import fields as spec_fields
+
+    from app.agent import Agent
+
+    # Значение, отличное от умолчания, для каждого поля конфига.
+    probes: dict = {}
+    for f in spec_fields(AgentSpec):
+        kind = str(f.type)
+        if f.name == "model":
+            probes[f.name] = "проверка/модель"
+        elif "list[str]" in kind:
+            probes[f.name] = [f"СТОП-{f.name}"]
+        elif "str" in kind:
+            probes[f.name] = f"текст-{f.name}"
+        elif "int" in kind:
+            probes[f.name] = 7
+        elif "float" in kind:
+            probes[f.name] = 0.25
+        elif "dict" in kind:
+            probes[f.name] = {"метка": f.name}
+        else:
+            raise AssertionError(f"поле {f.name}: {f.type} — тип неизвестен, подберите значение")
+    assert len(probes) == len(spec_fields(AgentSpec)), probes
+
+    messages = 500
+    path = _temp_db("schema-roundtrip")
+    store = Store(path).init()
+    spec = AgentSpec(**probes)
+    agent = Agent(spec, store=store)
+    for i in range(messages):
+        agent.remember("user" if i % 2 == 0 else "assistant", f"реплика {i}", persist=False)
+    agent.remember("assistant", "ответ", metrics={"provider": "stub"})
+    agent.persist()
+    agent_id = agent.id
+    store.close()
+
+    # Настоящее переоткрытие файла, а не тот же объект в памяти.
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        lost = {
+            f.name: (probes[f.name], getattr(revived.spec, f.name))
+            for f in spec_fields(AgentSpec)
+            if getattr(revived.spec, f.name) != probes[f.name]
+        }
+        assert not lost, f"поля конфига не пережили переоткрытие файла: {lost}"
+
+        assert len(revived.history) == messages + 1, f"из базы поднялось {len(revived.history)}"
+        assert revived.history[0].content == "реплика 0", "у поднятого чата отъели начало"
+        assert revived.history[-1].metrics == {"provider": "stub"}, revived.history[-1].metrics
+        # И это же целиком уезжает в модель: восстановленная история — обычная.
+        prompt = revived.build_prompt("новый вопрос")
+        assert len(prompt) == 1 + messages + 1 + 1, len(prompt)
+        assert prompt[1]["content"] == "реплика 0", prompt[1]
+
+        # Колонки схемы и колонки, которые читает код, — один набор.
+        # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,
+        # либо её кто-то пишет мимо `_session_row`.
+        in_db = {r["name"] for r in again.conn.execute("PRAGMA table_info(sessions)")}
+        row = again.load_session(agent_id)
+        expected = set(row) | {"updated_at"}
+        assert in_db == expected, f"схема и код разошлись: в базе {in_db}, код читает {expected}"
+    finally:
+        again.close()
+    return (
+        f"{len(probes)} полей конфига и история из {messages + 1} реплик пережили "
+        "переоткрытие файла, схема сходится с кодом"
+    )
+
+
+@check("изоляция чатов: у сообщений есть session_id, ленты не сливаются")
+def check_session_isolation():
+    _stub.install(reply=lambda m, i: f"ответ{i}")
     with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "мой вопрос"})
+        first = new_agent(client, label="чат 1")
+        second = new_agent(client, label="чат 2")
+        client.post(f"/api/agents/{first}/messages", json={"text": "меня зовут Нина"})
+        _stub.reset()
+        client.post(f"/api/agents/{second}/messages", json={"text": "как меня зовут?"})
 
-        def history():
-            body = client.get(f"/api/agents/{agent_id}").json()["transcript"]
-            return [(t["role"], t["content"]) for t in body]
+    asked = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
+    assert "Нина" not in asked, f"вторая сессия видит чужую историю: {asked}"
 
-        before = history()
-        assert before == [("user", "мой вопрос"), ("assistant", "живой ответ")], before
+    store = REGISTRY.store
+    assert [r[2] for r in store.message_rows(first)] == ["меня зовут Нина", "ответ0"]
+    assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"]
 
-        # Вызов падает целиком, не отдав ни одного токена, — как HTTP 402.
-        _stub.install(fail=True)
-        response = client.post(f"/api/agents/{agent_id}/regenerate")
-        assert response.status_code == 200, response.text
-        events = sse(response.text)
-        after = history()
+    # И тот же путь, которым лента поднимается после перезапуска: выборка
+    # обязана быть по `session_id`. Условие, которое его не сужает, даёт
+    # каждому чату все строки базы — ленты сливаются в одну, и заметно это
+    # только после перезапуска.
+    assert [m["content"] for m in store.load_messages(first)] == ["меня зовут Нина", "ответ0"], (
+        store.load_messages(first)
+    )
+    assert [m["content"] for m in store.load_messages(second)] == ["как меня зовут?", "ответ0"], (
+        store.load_messages(second)
+    )
 
-    done = next(e for e in events if e["event"] == "done")
-    assert done["committed"] is False, done
-    assert done["restored"] is True, done
-    assert after == before, f"история должна остаться прежней, а стала {after}"
-
-    # Частичный ответ — другое дело: он записан, и возвращать старое поверх
-    # нельзя, иначе в ленте окажется два ответа на один вопрос.
-    async def partial():
-        agent = REGISTRY.create(AgentSpec(label="частичная", model="stub/model"))
-        agent.remember("user", "вопрос")
-        agent.remember("assistant", "старый ответ")
-
-        async def half(session, *, prompt_override=None, context_length=None):
-            yield {"type": "delta", "text": "новый огрыз", "metrics": {"error": None}}
-            yield {"type": "error", "message": "оборвалось", "metrics": {"error": "оборвалось"}}
-
-        agent_module.stream_completion = half
-        taken = agent.take_last_exchange()
-        await drain(main._regenerate_events(agent, taken))
-        return agent
-
-    agent = asyncio.run(partial())
-    pairs = [(t.role, t.content) for t in agent.history]
-    assert pairs == [("user", "вопрос"), ("assistant", "новый огрыз")], pairs
-    return "провал вернул пару на место, частичный ответ её заменил"
+    # Схема не даёт записать реплику без сессии: ключ составной, и это
+    # единственная защита от «все чаты в одной ленте» после перезапуска.
+    keys = [row[1] for row in store.conn.execute("PRAGMA table_info(messages)") if row[5]]
+    assert keys == ["session_id", "seq"], keys
+    indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(messages)")}
+    assert "messages_by_session" in indexes, indexes
+    return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
 
 
-@check("обрыв до первого события не теряет снятую перегенерацией пару")
-def check_regenerate_disconnect():
-    """Дыра того же класса, что залипшая бронь, и закрыта тем же приёмом.
+@check("seq без дыр: откат и укорачивание пересчитывают номера от нуля")
+def check_seq_renumbered():
+    """Номера строк — не отделка хранения: по ним история поднимается в том же
+    порядке (`ORDER BY seq`), и дыра или сдвиг значат, что `save_history`
+    дописывает хвост вместо того, чтобы переписать историю целиком. А хвост
+    после отката оставил бы в базе ответ, которого в истории уже нет.
 
-    `take_last_exchange` вызывается в обработчике, до `_stream`, а возврат
-    жил только внутри генератора событий. Если клиент отвалился до первого
-    опроса, генератор отменяется, не начав выполняться, и его `finally`
-    не срабатывает никогда — пара уходила вместе с вопросом.
+    Вторая половина — про то, что записывать нечего: несостоявшийся обмен
+    не оставляет вопроса без ответа. Мутациями проверено, что без этой
+    проверки молча проходят все три поломки: `seq = i * 2`,
+    `enumerate(turns, start=5)` и запись вопроса при пустом ответе.
     """
-    _stub.install(reply="новый ответ", chunks=10, delay=0.02)
+    from app.agent import Agent, Turn
 
-    class Gone:
-        """Клиента уже нет к моменту первого опроса."""
+    path = _temp_db("seq")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="seq", model="stub/m"), store=store)
 
-        async def is_disconnected(self) -> bool:
-            return True
+    # 1) Ответа не случилось — в базе не появилось ничего, даже вопроса.
+    _stub.install(fail=True)
+    asyncio.run(drain(agent.ask("вопрос, на который не ответили")))
+    assert store.message_rows(agent.id) == [], store.message_rows(agent.id)
 
-    async def scenario():
-        agent = REGISTRY.create(AgentSpec(label="обрыв", model="stub/model"))
-        agent.remember("user", "мой вопрос")
-        agent.remember("assistant", "живой ответ")
-        agent.reserve()
-        taken = agent.take_last_exchange()
-        assert taken is not None
-        assert agent.history == [], "пара обязана сняться до вызова"
-        frames = [
-            frame
-            async for frame in main._pump(
-                lambda: main._regenerate_events(agent, taken),
-                Gone(),
-                # Ровно то, что вешает на поток сама ручка перегенерации.
-                main._restore_and_release(agent, taken),
-            )
-        ]
-        await asyncio.sleep(0.05)
-        return agent, frames
-
-    agent, frames = asyncio.run(scenario())
-    assert frames == [], frames
-    pairs = [(t.role, t.content) for t in agent.history]
-    assert pairs == [("user", "мой вопрос"), ("assistant", "живой ответ")], pairs
-    assert agent.busy is False, "бронь должна сниматься и здесь"
-    assert not _stub.CALLS, "до модели дело дойти не должно было"
-    return "0 кадров, пара на месте, бронь снята"
-
-
-# --- 7. чаты: имена, удаление, отсутствие «очистить всё» ----------------------
-
-
-@check("имена по умолчанию нумеруются, автоимени нет")
-def check_numbered_names():
+    # 2) Обычные обмены: номера идут подряд и от нуля.
     _stub.install(reply="ок")
-    with TestClient(main.app) as client:
-        first = client.post("/api/agents", json={}).json()["agents"][0]
-        second = client.post("/api/agents", json={}).json()["agents"][0]
-        assert first["label"] != second["label"], (first["label"], second["label"])
-        import re as _re
+    for i in range(3):
+        asyncio.run(drain(agent.ask(f"вопрос {i}")))
+    seqs = [row[0] for row in store.message_rows(agent.id)]
+    assert seqs == list(range(6)), f"номера пошли с дырами или со сдвигом: {seqs}"
 
-        for agent in (first, second):
-            assert _re.fullmatch(r"Новый чат \d+", agent["label"]), agent["label"]
-        numbers = [int(a["label"].split()[-1]) for a in (first, second)]
-        assert numbers[1] == numbers[0] + 1, numbers
+    # 3) Укорачивание истории — так выглядит откат обмена и перегенерация.
+    agent.history = agent.history[-2:]
+    agent.persist()
+    rows = store.message_rows(agent.id)
+    assert [r[0] for r in rows] == [0, 1], f"после укорачивания номера не от нуля: {rows}"
+    assert [r[2] for r in rows] == ["вопрос 2", "ок"], rows
 
-        # Номер удалённого чата второй раз не выдаётся: двух «Новых чатов N»
-        # одновременно быть не должно.
-        client.delete(f"/api/agents/{second['id']}")
-        third = client.post("/api/agents", json={}).json()["agents"][0]
-        assert third["label"] != second["label"], third["label"]
-        assert int(third["label"].split()[-1]) > numbers[1], third["label"]
-
-        # Первое сообщение имя не меняет — автоимени больше нет.
-        client.post(f"/api/agents/{first['id']}/messages", json={"text": "расскажи про кэш"})
-        again = client.get(f"/api/agents/{first['id']}").json()
-        assert again["label"] == first["label"], again["label"]
-
-        live = [a["label"] for a in client.get("/api/agents").json()["agents"]]
-        assert len(live) == len(set(live)), "имена по умолчанию не должны повторяться"
-
-    return f"{first['label']}, {second['label']}, после удаления — {third['label']}"
+    # 4) Длинный чат пишется целиком: ни отсечки, ни дыр в нумерации.
+    long_chat = 500
+    agent.history = [Turn(role="user", content=f"т{i}") for i in range(long_chat)]
+    agent.persist()
+    rows = store.message_rows(agent.id)
+    assert len(rows) == long_chat, f"историю подрезали при записи: {len(rows)}"
+    assert [r[0] for r in rows] == list(range(long_chat)), "номера пошли с дырами"
+    assert rows[0][2] == "т0", rows[0]
+    store.close()
+    return f"нет ответа — нет записи; seq = 0..{long_chat - 1} подряд после укорачивания"
 
 
-@check("переименование и удаление живут в списке слева")
-def check_list_actions():
-    """Серверная половина: PATCH меняет имя, пустое имя отвергается, DELETE убирает.
+@check("транзакция берёт блокировку сразу; занятая база — внятный 503")
+def check_tx_locks_immediately():
+    """`BEGIN IMMEDIATE`, а не голый `BEGIN` — и это тот самый блокирующий баг:
+    второй `uvicorn` на той же базе молча уничтожал чужой чат.
 
-    Клиентская половина — в `checks/browser_check.js`, блоком «переименование
-    чата в списке слева»: клик по кнопке, Enter, Escape, потеря фокуса,
-    пустое имя. Раньше она была грепом по исходнику («в app.js есть строка
-    function startRename»), то есть описывала реализацию: переименование
-    ломалось, не тронув ни одной из тех строк, и греп оставался зелёным, —
-    а переименовать `startRename` во что угодно роняло проверку, ничего
-    не сломав.
+    Отложенная транзакция берёт блокировку на первой записи. Начавшись
+    с чтения, при повышении до записи она получает SQLITE_BUSY **мимо**
+    `busy_timeout`: ретрая нет, и второй процесс получает ошибку вместо
+    очереди. `two_processes.py` этого не ловит — там все пути записи
+    начинаются с записи.
+
+    Проверяется наблюдаемым: пока транзакция открыта и не сделала ни одного
+    запроса, второй писатель обязан её видеть. Соединение берём с нулевым
+    таймаутом — ждать нечего, нужен сам факт блокировки.
+
+    И то, ради чего блокировка нужна: дождавшийся своей очереди ждёт молча,
+    а не дождавшийся получает внятный 503 с объяснением, а не голый 500.
     """
-    assert 'id="f-label"' not in read("app/static/index.html"), "имя всё ещё правится в панели"
+    import sqlite3
 
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, label="Было")
-        renamed = client.patch(f"/api/agents/{agent_id}", json={"label": "Стало"})
-        assert renamed.status_code == 200 and renamed.json()["label"] == "Стало"
-        assert client.patch(f"/api/agents/{agent_id}", json={"label": "  "}).status_code == 400
-        assert client.delete(f"/api/agents/{agent_id}").status_code == 200
-        assert client.get(f"/api/agents/{agent_id}").status_code == 404
-    return "PATCH меняет имя, пустое отвергается, DELETE убирает; поля имени в панели нет"
+    from app.store import StoreBusyError, _busy
+
+    path = _temp_db("immediate")
+    store = Store(path).init()
+    entered = None
+    try:
+        with store.tx():
+            # Ни одного запроса внутри транзакции ещё не было.
+            rival = sqlite3.connect(path, timeout=0)
+            try:
+                rival.execute("BEGIN IMMEDIATE")
+                entered = True
+            except sqlite3.OperationalError as exc:
+                entered = False
+                reason = str(exc).lower()
+                assert "locked" in reason or "busy" in reason, exc
+            finally:
+                rival.close()
+        assert entered is False, (
+            "второй писатель вошёл в базу, пока транзакция открыта: значит она "
+            "отложенная. Отложенная берёт блокировку только на первой записи, "
+            "и повышение из чтения в запись даёт SQLITE_BUSY мимо busy_timeout"
+        )
+    finally:
+        store.close()
+
+    # «database is locked» — ситуация штатная и переводится в текст; «no such
+    # table» — баг схемы, и подменять его успокаивающим текстом нельзя.
+    translated = _busy(sqlite3.OperationalError("database is locked"), path)
+    assert isinstance(translated, StoreBusyError), type(translated)
+    assert "занята другим процессом" in str(translated), translated
+    assert "повторите" in str(translated), translated
+    assert _busy(sqlite3.OperationalError("no such table: sessions"), path) is None
+
+    # И то же самое наружу: 503 с объяснением, а запись, которая не прошла,
+    # не оставила после себя половины чата.
+    busy_path = _temp_db("busy")
+    waiting = Store(busy_path).init()
+    blocker = sqlite3.connect(busy_path, isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_99999', 1, 1)")
+    waiting.conn.execute("PRAGMA busy_timeout=50")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            saved_store = main.REGISTRY.store
+            main.REGISTRY.store = waiting
+            try:
+                response = client.post("/api/agents", json={"agent": {"model": "stub/m"}})
+            finally:
+                main.REGISTRY.store = saved_store
+        assert response.status_code == 503, (response.status_code, response.text)
+        assert "занята другим процессом" in response.json()["detail"], response.text
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        waiting.close()
+
+    reopened = Store(busy_path).init()
+    try:
+        assert reopened.list_sessions() == [], reopened.list_sessions()
+    finally:
+        reopened.close()
+    return "открытая транзакция видна второму писателю сразу; занятая база даёт 503"
+
+
+# --- Сквозное: ключ, сеть, клиент ---------------------------------------------
 
 
 @check("ключа нет ни в интерфейсе, ни в отдаваемых наружу данных")
@@ -1823,990 +901,6 @@ def check_no_key_leak():
     for body in bodies:
         assert "sk-or-v1" not in body, "ключ утёк в ответ ручки"
     return "в клиенте про ключ ни слова, ручки его не отдают"
-
-
-@check("каталог отдаёт данные, по которым панель предупреждает о параметрах")
-def check_catalog_capabilities():
-    """Отбор моделей в чате не нужен, а вот данные о них — нужны.
-
-    С `provider.require_parameters=true` параметр, которого модель не
-    заявляет, выкашивает провайдеров, и вместо ответа приходит невнятная
-    ошибка. Предупредить об этом заранее можно только по каталогу.
-    """
-    import app.catalog as catalog
-
-    plain = catalog._normalize(
-        {
-            "id": "openai/gpt-4o-mini",
-            "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
-            "supported_parameters": ["temperature", "max_tokens", "stop"],
-            "context_length": 128000,
-        }
-    )
-    assert plain["supported_parameters"] == ["temperature", "max_tokens", "stop"], plain
-    assert plain["is_free"] is False and plain["temperature_capped"] is False, plain
-    assert plain["temperature_cap"] is None, plain
-
-    # Ловушка, ради которой мало одного supported_parameters: температуру
-    # семейство заявляет, а на 1.2 всё равно отвечает 400.
-    capped = catalog._normalize(
-        {
-            "id": "anthropic/claude-sonnet-4",
-            "pricing": {"prompt": "0.000003", "completion": "0.000015"},
-            "supported_parameters": ["temperature", "max_tokens"],
-        }
-    )
-    assert "temperature" in capped["supported_parameters"], capped
-    assert capped["temperature_capped"] is True, capped
-    assert capped["temperature_cap"] == catalog.TEMPERATURE_CAP, capped
-
-    free = catalog._normalize(
-        {"id": "x/y:free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 8000}
-    )
-    assert free["is_free"] is True, free
-
-    # Отбор при этом не вернулся: чат показывает каталог целиком.
-    assert not hasattr(catalog, "filter_models"), "фильтры каталога вернулись"
-
-    async def catalog_stub():
-        return [plain, capped, free]
-
-    _stub.install(reply="ок")
-    saved = catalog.fetch_models
-    catalog.fetch_models = catalog_stub
-    try:
-        with TestClient(main.app) as client:
-            models = client.get("/api/models").json()["models"]
-            assert len(models) == 3, "каталог отдаётся целиком, включая :free"
-            assert all("supported_parameters" in m for m in models), models[0]
-            assert any(m["temperature_capped"] for m in models), models
-
-            # Длина контекста из каталога доезжает до агента и до метрик —
-            # по ней плитка «Контекст» показывает заполнение. Стерёг её
-            # только сам каталог: `context_length` можно было не передать
-            # ни при создании, ни при смене модели, и всё оставалось зелёным.
-            agent_id = new_agent(client, model=plain["id"])
-            assert REGISTRY.require(agent_id).context_length == 128000
-            events = sse(
-                client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"}).text
-            )
-            done = next(e for e in events if e["event"] == "done")
-            assert done["metrics"]["context_length"] == 128000, done["metrics"]
-
-            client.patch(f"/api/agents/{agent_id}", json={"model": free["id"]})
-            assert REGISTRY.require(agent_id).context_length == 8000, "смена модели не обновила"
-    finally:
-        catalog.fetch_models = saved
-    return "три поля на месте, отбор не вернулся, длина контекста доезжает до метрик"
-
-
-@check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
-def check_no_cdn():
-    html = read("app/static/index.html")
-    css = read("app/static/style.css")
-    js = read("app/static/app.js")
-    for name, src in (("index.html", html), ("style.css", css), ("app.js", js)):
-        for pattern in ("http://", "https://", "//cdn", "@import", "url("):
-            for hit in re.findall(re.escape(pattern) + r"[^\s\"'()]*", src):
-                # Единственное допустимое вхождение — пространство имён SVG:
-                # это идентификатор, по нему браузер никуда не ходит.
-                assert hit.startswith("http://www.w3.org/2000/svg"), f"{name}: {hit}"
-    assert "@font-face" not in css, "свои шрифты тоже не подключаем"
-    assert html.count("<script") == 1 and 'src="/static/app.js"' in html
-    assert html.count("<link") == 1 and 'href="/static/style.css"' in html
-    return "в статике только относительные пути и w3.org-неймспейс SVG"
-
-
-@check("лента прокручивается, а не сжимает карточки; композер закреплён")
-def check_feed_scrolls():
-    """Карточки сплющивались в полоску вместо прокрутки.
-
-    Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
-    У карточки к тому же `overflow: hidden`, из-за чего её автоматический
-    минимальный размер равен нулю — сжаться она может до полосы. Прошлая
-    правка (`min-height: 0` у колонки чата) закрепила композер, но сжатие
-    шло по другой причине и осталось.
-    """
-    css = read("app/static/style.css")
-    block = css[css.index(".chat {") : css.index(".feed {")]
-    for rule in ("min-height: 0", "overflow: hidden", "flex-direction: column"):
-        assert rule in block, f"у .chat нет правила {rule}"
-    # `min-height: 0` переехало с обёртки на саму ленту: обёртка была нужна
-    # только рельсу и ушла вместе с ним, а без этого правила колонка не даёт
-    # ленте сжаться — она растягивает чат и уносит композер за нижний край.
-    feed_block = css[css.index(".feed {") : css.index(".feed > *")]
-    assert "min-height: 0" in feed_block, "у .feed нет min-height: 0"
-    assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
-    assert "overflow-y: auto" in feed_block, "лента должна прокручиваться"
-
-    # Главное: элементам ленты запрещено сжиматься.
-    assert ".feed > * { flex: 0 0 auto; }" in css, "элементы ленты всё ещё сжимаются"
-    assert "scroll-behavior: smooth" not in feed_block, (
-        "плавная прокрутка ленты дёргает её на каждом куске ответа"
-    )
-    return "элементы ленты не сжимаются, лента прокручивается, композер закреплён"
-
-
-@check("клиент: разбор markdown и раскладка проверены настоящими вызовами")
-def check_browser():
-    """Клиентский код исполняется под node: payload на входе, утверждения
-    про выход. Греп по исходнику прошёл бы и если экранирование переедет
-    **после** разбора — то есть самая опасная поверхность демо была бы
-    прикрыта пустышкой."""
-    node = shutil.which("node")
-    assert node, (
-        "нужен node, чтобы исполнить клиентский код: разбор markdown "
-        "проверяется настоящими вызовами, а не чтением исходника"
-    )
-    result = subprocess.run(
-        [node, os.path.join(ROOT, "checks", "browser_check.js")],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout.strip()
-
-
-# --- 9. реестр и инфраструктура -----------------------------------------------
-
-
-@check("конфиг агента копируется вглубь: сто агентов не делят один extra_body")
-def check_spec_deep_copy():
-    from app.registry import AgentRegistry
-
-    shared = AgentSpec(
-        label="общий",
-        model="stub/model",
-        stop=["\n"],
-        response_format={"type": "json_object"},
-        extra_body={"provider": {"allow_fallbacks": False}},
-    )
-    registry = AgentRegistry(max_agents=100)
-    first, second = registry.create_many([shared, shared])
-
-    assert first.spec.extra_body is not shared.extra_body
-    assert first.spec.extra_body["provider"] is not shared.extra_body["provider"]
-    assert first.spec.extra_body is not second.spec.extra_body
-    assert first.spec.stop is not shared.stop
-    assert first.spec.response_format is not shared.response_format
-
-    first.spec.extra_body["provider"]["order"] = ["only-me"]
-    first.spec.stop.append("ДРУГОЕ")
-    first.spec.response_format["type"] = "json_schema"
-    assert "order" not in shared.extra_body["provider"], shared.extra_body
-    assert "order" not in second.spec.extra_body["provider"], second.spec.extra_body
-    assert shared.stop == ["\n"], shared.stop
-    assert shared.response_format == {"type": "json_object"}, shared.response_format
-    assert second.spec.stop == ["\n"], second.spec.stop
-    return "правка у одного агента не задела ни общий конфиг, ни соседа"
-
-
-@check("вытеснение по потолку берёт самых старых простаивающих и щадит занятых")
-def check_eviction():
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=5)
-    old = registry.create_many([AgentSpec(label=f"старый {i}", model="stub/m") for i in range(3)])
-    fresh = registry.create_many([AgentSpec(label=f"свежий {i}", model="stub/m") for i in range(2)])
-    for agent in fresh:
-        agent.last_used_at += 100
-    registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(3)])
-
-    assert len(registry) == 5, len(registry)
-    assert all(registry.get(a.id) is None for a in old), "старые должны быть вытеснены"
-    assert all(registry.get(a.id) is not None for a in fresh), "свежие вытесняться не должны"
-    assert registry.evicted == 3, registry.evicted
-
-    busy = AgentRegistry(max_agents=2)
-    held = busy.create(AgentSpec(label="занят", model="stub/m"))
-    held.reserve()
-    busy.create_many([AgentSpec(label=f"н {i}", model="stub/m") for i in range(3)])
-    assert busy.get(held.id) is not None, "занятого вытеснять нельзя"
-    held.release()
-
-    # Сам потолок настраивается из окружения — и это не стерёг никто:
-    # выбрось чтение AGENT_MAX_LIVE, и набор остался бы зелёным.
-    from app.registry import DEFAULT_MAX_AGENTS
-
-    os.environ["AGENT_MAX_LIVE"] = "7"
-    try:
-        assert AgentRegistry().max_agents == 7, AgentRegistry().max_agents
-    finally:
-        os.environ.pop("AGENT_MAX_LIVE")
-    assert AgentRegistry().max_agents == DEFAULT_MAX_AGENTS
-    return "вытеснены три самых старых, свежие и занятый на месте, AGENT_MAX_LIVE читается"
-
-
-@check("потолок пачки при спавне")
-def check_batch_limit():
-    with TestClient(main.app) as client:
-        too_many = client.post(
-            "/api/agents",
-            json={"agents": [{"model": "stub/m"} for _ in range(main.MAX_SPAWN_BATCH + 1)]},
-        )
-        assert too_many.status_code == 400, too_many.status_code
-        assert str(main.MAX_SPAWN_BATCH) in too_many.json()["detail"], too_many.text
-        batch = client.post("/api/agents", json={"agents": [{"model": "stub/m"}] * 3})
-        assert batch.status_code == 200, batch.text
-    return f"пачка больше {main.MAX_SPAWN_BATCH} → 400"
-
-
-@check("общий httpx-клиент и семафор на процесс")
-def check_shared_client():
-    import app.llm as llm
-
-    async def scenario():
-        first = llm.shared_client()
-        assert first is llm.shared_client(), "клиент должен быть один на процесс"
-        assert llm.call_slots() is llm.call_slots()
-        await llm.aclose()
-        assert llm.shared_client() is not first, "после закрытия создаётся новый"
-        await llm.aclose()
-
-    asyncio.run(scenario())
-
-    os.environ["LLM_MAX_CONCURRENCY"] = "3"
-    try:
-        assert llm.max_concurrency() == 3, llm.max_concurrency()
-    finally:
-        os.environ.pop("LLM_MAX_CONCURRENCY")
-    assert llm.max_concurrency() == llm.DEFAULT_MAX_CONCURRENCY
-    assert read("app/llm.py").count("httpx.AsyncClient(") == 1, "клиент создаётся в одном месте"
-    return "клиент один, семафор один, LLM_MAX_CONCURRENCY читается"
-
-
-@check("клиент шлёт только текст: лента в теле запроса запрещена")
-def check_no_feed():
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        bad = client.post(
-            f"/api/agents/{agent_id}/messages",
-            json={"text": "привет", "messages": [{"role": "user", "content": "привет"}]},
-        )
-        assert bad.status_code == 400, bad.text
-        assert "только text" in bad.json()["detail"], bad.text
-        assert client.post(f"/api/agents/{agent_id}/messages", json={"text": " "}).status_code == 400
-    return "лишние поля в теле → 400, пустой текст тоже"
-
-
-@check("«Стоп» гасит генерацию: частичный ответ записан и помечен")
-def check_cancel():
-    """Кнопку «Стоп» не стерёг никто: ручка cancel, флаг `cancelled` и текст
-    «генерация отменена» можно было выкинуть целиком, не уронив ни одной
-    проверки. Между тем это единственный способ не платить за ответ,
-    который уже не нужен."""
-    _stub.install(reply="а" * 200, chunks=20, delay=0.02)
-
-    async def scenario():
-        from httpx import ASGITransport, AsyncClient
-
-        transport = ASGITransport(app=main.app)
-        async with AsyncClient(transport=transport, base_url="http://bench") as client:
-            created = await client.post(
-                "/api/agents", json={"agent": {"model": "stub/model", "label": "стоп"}}
-            )
-            agent_id = created.json()["agents"][0]["id"]
-            talking = asyncio.create_task(
-                client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-            )
-            await asyncio.sleep(0.1)
-            stopped = await client.post(f"/api/agents/{agent_id}/cancel")
-            return stopped, await talking, REGISTRY.require(agent_id)
-
-    stopped, response, agent = asyncio.run(scenario())
-    assert stopped.status_code == 200, stopped.text
-    assert stopped.json()["was_busy"] is True, stopped.text
-
-    done = next(e for e in sse(response.text) if e["event"] == "done")
-    assert done["cancelled"] is True, done
-    assert done["error"] == "генерация отменена", done
-
-    # Оборванный ответ всё равно часть диалога: он уже оплачен, и следующий
-    # вопрос должен видеть, чем кончилось.
-    roles = [t.role for t in agent.history]
-    assert roles == ["user", "assistant"], roles
-    answer = agent.history[-1]
-    assert answer.error == "генерация отменена", answer.error
-    assert 0 < len(answer.content) < 200, len(answer.content)
-    return f"стрим оборван на {len(answer.content)} символах, ответ помечен отменой"
-
-
-@check("без ключа сообщение не уходит: 503 вместо вызова к модели")
-def check_no_key():
-    """Стенд без .env — обычное состояние свежего клона. Проверка была только
-    на то, что ключ не утекает; на то, что его отсутствие останавливает вызов,
-    не было никакой: сними `_require_key`, и набор остался бы зелёным."""
-    _stub.install(reply="ок")
-    saved = main.has_key
-    main.has_key = lambda: False
-    try:
-        with TestClient(main.app) as client:
-            agent_id = new_agent(client)
-            blocked = client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
-            repeated = client.post(f"/api/agents/{agent_id}/regenerate")
-            listing = client.get("/api/agents").json()
-            agent = REGISTRY.require(agent_id)
-    finally:
-        main.has_key = saved
-
-    assert blocked.status_code == 503, blocked.text
-    assert repeated.status_code == 503, repeated.text
-    assert listing["has_key"] is False, listing
-    assert not _stub.CALLS, f"до модели дошло {len(_stub.CALLS)} вызовов"
-    assert agent.busy is False, "бронь не должна залипнуть на отказе"
-    return "оба пути отдают 503, вызова нет, бронь не взята"
-
-
-@check("ключ и заголовки атрибуции: окружение сильнее .env")
-def check_env_reading():
-    """В app/config.py не смотрела ни одна проверка: выбрось чтение .env или
-    заголовки атрибуции — всё осталось бы зелёным. Ключ при этом живёт
-    ровно там, и «стенд не настроен» отличается от «ключ есть» только этим
-    файлом. Настоящий .env не трогаем: читаем из временного каталога."""
-    import pathlib
-    import tempfile
-
-    import app.config as config
-
-    names = ("OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_SITE_NAME")
-    before = {name: os.environ.get(name) for name in names}
-    saved_root = config.ROOT
-    try:
-        for name in names:
-            os.environ.pop(name, None)
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, ".env"), "w", encoding="utf-8") as handle:
-                handle.write(
-                    "# комментарий\n\n"
-                    'OPENROUTER_API_KEY="из-файла"\n'
-                    "OPENROUTER_SITE_URL = http://стенд\n"
-                    "мусор без равенства\n"
-                )
-            config.ROOT = pathlib.Path(tmp)
-            config._load_dotenv()
-            assert config.api_key() == "из-файла", config.api_key()
-            assert os.environ["OPENROUTER_SITE_URL"] == "http://стенд"
-
-            # Переменная окружения сильнее файла: иначе стенд не смог бы
-            # подставить свой ключ, не переписав .env пользователя.
-            os.environ["OPENROUTER_API_KEY"] = "из-окружения"
-            config._load_dotenv()
-            assert config.api_key() == "из-окружения", config.api_key()
-
-        headers = config.attribution_headers()
-        assert headers == {"HTTP-Referer": "http://стенд"}, headers
-        os.environ["OPENROUTER_SITE_NAME"] = "стенд"
-        assert config.attribution_headers()["X-Title"] == "стенд"
-
-        # Пустой ключ — это отсутствие ключа, а не ключ из пробелов.
-        os.environ["OPENROUTER_API_KEY"] = "   "
-        assert config.api_key() is None and config.has_key() is False
-    finally:
-        config.ROOT = saved_root
-        for name, value in before.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-    return ".env читается, окружение сильнее файла, заголовки едут только заданные"
-
-
-@check("CLI говорит с агентом без веб-слоя")
-def check_cli():
-    _stub.install(reply="привет из консоли")
-    import io
-
-    from app import cli
-
-    args = cli._parse_args(["--model", "stub/m", "--label", "консоль"])
-    agent = cli.build_agent(args)
-    out = io.StringIO()
-    answer = asyncio.run(cli.ask(agent, "как дела?", out))
-    assert answer == "привет из консоли", answer
-    assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
-    assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
-    return "ответ напечатан, история записана, агент в реестре"
-
-
-
-# --- 12. День 7: память между запусками ---------------------------------------
-
-
-def _temp_db(name: str) -> str:
-    """Свежий файл базы под одну проверку. Каталога заранее нет — его создаёт Store."""
-    import tempfile
-
-    return os.path.join(tempfile.mkdtemp(prefix=f"check-{name}-"), "nested", "agents.db")
-
-
-def _meta(store, key: str):
-    """Значение счётчика прямо из таблицы `meta`.
-
-    Читаем схему, а не зовём метод: в приложении `meta` нужна одному счётчику,
-    и заводить в `Store` публичный геттер ради проверки — тот самый код,
-    который существует только для тестов.
-    """
-    row = store.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row is not None else None
-
-
-class _Turn:
-    """Минимальная реплика: хранилищу от неё нужны эти поля, и только они."""
-
-    def __init__(self, role, content, error=None, metrics=None, at=1.0):
-        self.role, self.content, self.error = role, content, error
-        self.metrics, self.at = metrics, at
-
-
-@check("настоящий перезапуск: файл базы закрыт и открыт заново")
-def check_store_reopen():
-    path = _temp_db("reopen")
-    assert not os.path.isdir(os.path.dirname(path)), "каталога быть не должно — его создаёт init()"
-
-    first = Store(path).init()
-    first.save_session(
-        "ag_00042",
-        label="Нина",
-        config={"model": "stub/m", "max_tokens": 7, "top_p": 0.9},
-        created_at=100.0,
-        context_length=128_000,
-    )
-    first.save_history(
-        "ag_00042", [_Turn("user", "меня зовут Нина"), _Turn("assistant", "привет, Нина")]
-    )
-    first.close()
-
-    # Новый объект на том же файле — это и есть перезапуск, а не «тот же
-    # объект в памяти»: соединение закрыто, кеш sqlite ушёл вместе с ним.
-    second = Store(path).init()
-    saved = second.load_session("ag_00042")
-    assert saved is not None, "чат не пережил закрытие файла"
-    assert saved["config"]["max_tokens"] == 7 and saved["config"]["top_p"] == 0.9
-    assert saved["created_at"] == 100.0 and saved["context_length"] == 128_000
-    rows = second.message_rows("ag_00042")
-    assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
-    assert second.max_agent_seq() == 42, second.max_agent_seq()
-
-    # Время реплики — дыра, найденная мутацией: колонка `at` писалась и читалась,
-    # но никто не сверял, то же ли число вернулось. Подставь при чтении ноль —
-    # и набор оставался зелёным, а «когда это было» терялось при перезапуске.
-    restored = second.load_messages("ag_00042")
-    assert [m["at"] for m in restored] == [1.0, 1.0], [m["at"] for m in restored]
-    second.close()
-    return f"каталог создан init(), после переоткрытия {len(rows)} реплики, конфиг и время на месте"
-
-
-@check("диалог продолжается в новом процессе программы")
-def check_restart_process():
-    result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "checks", "restart.py")],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "ОК: диалог продолжился" in result.stdout, result.stdout
-    return result.stdout.strip().splitlines()[2]
-
-
-@check("два процесса на одной базе: id не пересекаются, чужой диалог цел")
-def check_two_processes():
-    result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "checks", "two_processes.py")],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "ОК: два процесса" in result.stdout, result.stdout
-    return result.stdout.strip().splitlines()[-3]
-
-
-@check("восстановление истории — в конструкторе агента, а не отдельным вызовом")
-def check_restore_in_constructor():
-    from app.agent import Agent
-
-    path = _temp_db("ctor")
-    store = Store(path).init()
-    spec = AgentSpec(label="ctor", model="stub/m", system="СИС")
-
-    born = Agent(spec, store=store)
-    born.remember("user", "меня зовут Нина")
-    born.remember("assistant", "привет, Нина")
-    store.close()
-
-    # Тот же id, новый объект, новое открытие файла — история обязана приехать
-    # сама, без единого дополнительного вызова.
-    again = Store(path).init()
-    revived = Agent(spec, agent_id=born.id, store=again)
-    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет, Нина"]
-    # Время реплики — дыра, найденная мутацией: колонка `at` писалась и читалась,
-    # но подставь при подъёме ноль — и набор оставался зелёным. Сверяем с тем,
-    # что записали: «когда это было» перезапуск терять не вправе.
-    assert [t.at for t in revived.history] == [t.at for t in born.history], (
-        [t.at for t in revived.history],
-        [t.at for t in born.history],
-    )
-
-    _stub.install(reply="ок")
-    asyncio.run(drain(revived.ask("как меня зовут?")))
-    sent = [m["content"] for m in _stub.CALLS[0]["messages"]]
-    assert sent == ["СИС", "меня зовут Нина", "привет, Нина", "как меня зовут?"], sent
-    again.close()
-    return "агент поднят конструктором: реплики из базы уехали в следующий запрос"
-
-
-@check("изоляция сессий: у сообщений есть session_id, ленты не сливаются")
-def check_session_isolation():
-    _stub.install(reply=lambda m, i: f"ответ{i}")
-    with TestClient(main.app) as client:
-        first = new_agent(client, label="чат 1")
-        second = new_agent(client, label="чат 2")
-        client.post(f"/api/agents/{first}/messages", json={"text": "меня зовут Нина"})
-        _stub.reset()
-        client.post(f"/api/agents/{second}/messages", json={"text": "как меня зовут?"})
-
-    asked = " ".join(m["content"] for m in _stub.CALLS[0]["messages"])
-    assert "Нина" not in asked, f"вторая сессия видит чужую историю: {asked}"
-
-    store = REGISTRY.store
-    assert [r[2] for r in store.message_rows(first)] == ["меня зовут Нина", "ответ0"]
-    assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"]
-
-    # Схема не даёт записать реплику без сессии: ключ составной, и это
-    # единственная защита от «все чаты в одной ленте» после перезапуска.
-    keys = [row[1] for row in store.conn.execute("PRAGMA table_info(messages)") if row[5]]
-    assert keys == ["session_id", "seq"], keys
-    indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(messages)")}
-    assert "messages_by_session" in indexes, indexes
-    return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
-
-
-@check("порядковые номера без дыр: откат и укорачивание пересчитывают seq от нуля")
-def check_seq_renumbered():
-    from app.agent import Agent
-
-    path = _temp_db("seq")
-    store = Store(path).init()
-    agent = Agent(AgentSpec(label="seq", model="stub/m"), store=store)
-
-    # 1) Несостоявшийся обмен: в базе не должно появиться вопроса без ответа.
-    _stub.install(fail=True)
-    asyncio.run(drain(agent.ask("вопрос, на который не ответили")))
-    assert store.message_rows(agent.id) == [], store.message_rows(agent.id)
-
-    # 2) Обычные обмены и укорачивание истории.
-    _stub.reset()
-    _stub.install(reply="ок")
-    for i in range(3):
-        asyncio.run(drain(agent.ask(f"вопрос {i}")))
-    assert [row[0] for row in store.message_rows(agent.id)] == list(range(6))
-
-    agent.history = agent.history[-2:]  # так выглядит история после отката обмена
-    agent.persist()
-    seqs = [row[0] for row in store.message_rows(agent.id)]
-    assert seqs == [0, 1], f"после укорачивания номера должны идти от нуля: {seqs}"
-
-    # 3) Потолка хранимого больше нет, и это половина, которую стеречь надо
-    #    теперь: длинная история пишется в базу целиком, без отсечки.
-    long_history = 500
-    agent.history = [_Turn("user", f"т{i}") for i in range(long_history)]
-    agent.persist()
-    rows = store.message_rows(agent.id)
-    assert len(rows) == long_history, f"историю подрезали при записи: {len(rows)}"
-    assert [r[0] for r in rows] == list(range(long_history)), "номера пошли с дырами"
-    assert rows[0][2] == "т0", rows[0]
-    store.close()
-    return f"нет ответа — нет записи; seq = 0..N; {long_history} реплик записаны целиком"
-
-
-@check("длинный чат поднимается из базы целиком: ни отсечки, ни потерянного начала")
-def check_long_chat_survives_restart():
-    """Половина выпиленного окна, которая живёт в слое памяти.
-
-    Окна и потолка хранимого больше нет — значит история идёт целиком и в базу,
-    и обратно, и оттуда в модель. Порог заведомо выше прежних отсечек (20
-    сообщений в окне, 400 хранимых): вернись любая из них при записи или
-    при восстановлении — здесь станет красно.
-
-    Проверяется настоящим переоткрытием файла, а не тем же объектом в памяти:
-    обрезка при чтении из базы выглядела бы точно так же, как её отсутствие,
-    если смотреть на объект, который ничего не перечитывал.
-    """
-    from app.agent import Agent
-
-    path = _temp_db("long-chat")
-    store = Store(path).init()
-    messages = 500
-    agent = Agent(AgentSpec(label="долгий", model="stub/m", system="СИС"), store=store)
-    for i in range(messages):
-        role = "user" if i % 2 == 0 else "assistant"
-        agent.remember(role, f"реплика {i}", persist=False)
-    agent.persist()
-    agent_id = agent.id
-    store.close()
-
-    again = Store(path).init()
-    try:
-        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
-        assert len(revived.history) == messages, f"из базы поднялось {len(revived.history)}"
-        assert revived.history[0].content == "реплика 0", "у поднятого чата отъели начало"
-        assert revived.history[-1].content == f"реплика {messages - 1}", revived.history[-1]
-
-        # И это же целиком уезжает в модель: восстановленная история — обычная.
-        prompt = revived.build_prompt("новый вопрос")
-        assert len(prompt) == 1 + messages + 1, len(prompt)
-        assert prompt[1]["content"] == "реплика 0", prompt[1]
-    finally:
-        again.close()
-    return f"{messages} реплик записаны, подняты из файла и уехали в промпт целиком"
-
-
-@check("частичный ответ пишется в базу с пометкой ошибки, парой с вопросом")
-def check_partial_persisted():
-    from app.agent import Agent
-
-    path = _temp_db("partial")
-    store = Store(path).init()
-    agent = Agent(AgentSpec(label="partial", model="stub/m"), store=store)
-
-    async def broken(session, *, prompt_override=None, context_length=None):
-        yield {"type": "delta", "text": "начал отвеч", "metrics": None}
-        raise RuntimeError("провод оборвался")
-
-    agent_module.stream_completion = broken
-    asyncio.run(drain(agent.ask("вопрос")))
-    store.close()
-
-    reopened = Store(path).init()
-    rows = reopened.message_rows(agent.id)
-    assert [(r[0], r[1]) for r in rows] == [(0, "user"), (1, "assistant")], rows
-    errors = [
-        row["error"]
-        for row in reopened.conn.execute(
-            "SELECT error FROM messages WHERE session_id = ? ORDER BY seq", (agent.id,)
-        )
-    ]
-    assert errors[0] is None and errors[1], errors
-    reopened.close()
-    return "после обрыва в базе пара реплик, у ответа проставлена ошибка"
-
-
-@check("рассуждение в базу не пишется, метрики пишутся")
-def check_reasoning_not_stored():
-    _stub.install(reply="ответ", reasoning="я думаю про панду")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-
-    store = REGISTRY.store
-    columns = {row[1] for row in store.conn.execute("PRAGMA table_info(messages)")}
-    assert "reasoning" not in columns, "рассуждению в базе не место: в контекст оно не входит"
-    blob = " ".join(str(v) for row in store.conn.execute("SELECT * FROM messages") for v in row)
-    assert "панду" not in blob, "рассуждение осело в базе"
-
-    stored = store.load_messages(agent_id)
-    assert stored[-1]["metrics"], "метрики ответа должны пережить перезапуск: по ним плитки"
-    assert stored[-1]["metrics"]["provider"] == "stub", stored[-1]["metrics"]
-
-    with TestClient(main.app) as client:
-        full = client.get(f"/api/agents/{agent_id}").json()
-    assert full["transcript"][-1]["reasoning"] == "я думаю про панду", full["transcript"][-1]
-    return "колонки reasoning в базе нет, метрики сохранены"
-
-
-@check("неудачная перегенерация: в базе ровно исходная пара, без дублей и дыр")
-def check_regenerate_failure_db():
-    _stub.install(reply="первый ответ")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "мой вопрос"})
-        before = REGISTRY.store.message_rows(agent_id)
-        assert before == [(0, "user", "мой вопрос"), (1, "assistant", "первый ответ")], before
-
-        _stub.install(fail=True)
-        response = client.post(f"/api/agents/{agent_id}/regenerate")
-        assert response.status_code == 200, response.text
-        done = next(e for e in sse(response.text) if e["event"] == "done")
-        assert done.get("restored") is True, done
-
-    after = REGISTRY.store.message_rows(agent_id)
-    assert after == before, f"после неудачной перегенерации база разошлась: {after}"
-
-    _stub.install(reply="второй ответ")
-    with TestClient(main.app) as client:
-        client.post(f"/api/agents/{agent_id}/regenerate")
-    replaced = REGISTRY.store.message_rows(agent_id)
-    assert replaced == [(0, "user", "мой вопрос"), (1, "assistant", "второй ответ")], replaced
-    return "неудача возвращает исходную пару, удача заменяет ответ — в обоих случаях seq 0,1"
-
-
-def _restart(store):
-    """Новый реестр на том же файле — так выглядит перезапуск процесса."""
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=1000, store=store)
-    main.REGISTRY = registry
-    return registry
-
-
-@check("нумерация имён переживает перезапуск: занятый номер второй раз не выдаётся")
-def check_numbering_survives_restart():
-    """Счётчик имён обязан жить в базе, а не в процессе.
-
-    Проверяется это не только поведением — в одном процессе счётчик в памяти
-    рестарт бы «пережил» сам собой, и проверка ничего бы не поймала, — а тем,
-    где лежит число: после каждой выдачи оно должно стоять в `meta`. Реальный
-    второй процесс на той же базе разбирает `checks/two_processes.py`.
-    """
-    path = _temp_db("numbers")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        _restart(store)
-        with TestClient(main.app) as client:
-            first = client.post("/api/agents", json={}).json()["agents"][0]["label"]
-            second = client.post("/api/agents", json={}).json()["agents"][0]["label"]
-        assert _meta(store, main.CHAT_NUMBER_KEY) == "2", (
-            "номер выдан не базой: после перезапуска счётчик начнётся заново "
-            f"и выдаст занятое имя (в meta {_meta(store, main.CHAT_NUMBER_KEY)!r})"
-        )
-
-        # Перезапуск процесса: счётчик в памяти начался бы с единицы заново.
-        _restart(store)
-        with TestClient(main.app) as client:
-            third = client.post("/api/agents", json={}).json()["agents"][0]["label"]
-            labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
-        assert _meta(store, main.CHAT_NUMBER_KEY) == "3", _meta(store, main.CHAT_NUMBER_KEY)
-    finally:
-        main.REGISTRY = saved_registry
-        store.close()
-
-    numbers = [int(name.split()[-1]) for name in (first, second, third)]
-    assert numbers == [1, 2, 3], numbers
-    assert len(labels) == len(set(labels)), f"имена повторились: {sorted(labels)}"
-    return f"до рестарта {first}, {second}; после — {third}, номер стоит в базе"
-
-
-@check("чаты сверх потолка реестра: все видны в списке и любой открывается")
-def check_list_beyond_cap():
-    from app.registry import AgentRegistry
-
-    _stub.install(reply="ответ")
-    path = _temp_db("beyond-cap")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        registry = AgentRegistry(max_agents=3, store=store)
-        main.REGISTRY = registry
-        made = []
-        for i in range(10):
-            agent = registry.create(AgentSpec(label=f"чат {i}", model="stub/m"))
-            asyncio.run(drain(agent.ask(f"вопрос {i}")))
-            made.append(agent.id)
-
-        assert len(registry) <= 3, f"в памяти {len(registry)} при потолке 3"
-        assert registry.evicted >= 7, registry.evicted
-
-        listing = main._listing()
-        assert [a["id"] for a in listing["agents"]] == made, listing["agents"]
-        assert listing["stored"] == 10 and listing["live"] <= 3
-        assert all(a["history_len"] == 2 for a in listing["agents"])
-
-        with TestClient(main.app) as client:
-            body = client.get(f"/api/agents/{made[0]}").json()
-        texts = [t["content"] for t in body["transcript"]]
-        assert texts == ["вопрос 0", "ответ"], texts
-    finally:
-        main.REGISTRY = saved_registry
-        store.close()
-    return "10 чатов при потолке 3: все в списке, длина истории на месте, любой открывается"
-
-
-@check("вытеснение — выгрузка, а не удаление: чат остаётся в базе")
-def check_eviction_keeps_session():
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=2, store=REGISTRY.store)
-    old = registry.create(AgentSpec(label="старый", model="stub/m"))
-    old.remember("user", "меня зовут Нина")
-    old.remember("assistant", "привет")
-    old.spec.temperature = 0.9
-    old.save_config()
-    old_id = old.id
-
-    registry.create_many([AgentSpec(label=f"новый {i}", model="stub/m") for i in range(3)])
-    assert registry.get(old_id) is None, "старый должен быть выгружен из памяти"
-    assert registry.evicted >= 1, registry.evicted
-    assert registry.store.load_session(old_id) is not None, "выгрузка не должна удалять чат"
-
-    revived = registry.require(old_id)
-    assert revived is not old, "поднят новый объект, а не тот же самый"
-    assert [t.content for t in revived.history] == ["меня зовут Нина", "привет"]
-    assert revived.spec.temperature == 0.9, revived.spec.temperature
-
-    registry.kill(revived.id)
-    assert registry.store.load_session(old_id) is None, "kill обязан стереть и строку в базе"
-    return "выгруженный чат поднялся с историей и конфигом; kill стёр его из базы"
-
-
-@check("выгруженный объект больше не пишет в сессию")
-def check_detached_does_not_clobber():
-    from app.registry import AgentRegistry
-
-    registry = AgentRegistry(max_agents=1, store=REGISTRY.store)
-    first = registry.create(AgentSpec(label="долгая", model="stub/m"))
-    first.remember("user", "вопрос 1")
-    first.remember("assistant", "ответ 1")
-
-    registry.create(AgentSpec(label="вытесняющая", model="stub/m"))
-    assert registry.get(first.id) is None, "первый должен быть выгружен"
-    assert first.detached is True and first.store is None, "выгруженный обязан отцепиться"
-
-    second = registry.require(first.id)
-    assert second is not first, "поднят тот же объект — проверка ничего не проверяет"
-    second.remember("user", "вопрос 2")
-    second.remember("assistant", "ответ 2")
-
-    first.remember("user", "мусор")
-    stored = [row[2] for row in registry.store.message_rows(first.id)]
-    assert stored == ["вопрос 1", "ответ 1", "вопрос 2", "ответ 2"], stored
-    return "выгруженный объект пишет только в память, база остаётся за поднятым"
-
-
-@check("параллельная запись: восемь чатов пишут одновременно, ничего не теряется")
-def check_parallel_writes():
-    from app.agent import Agent
-
-    path = _temp_db("parallel")
-    store = Store(path).init()
-    _stub.install(reply=lambda m, i: f"ответ-{i}", chunks=6, delay=0.002)
-
-    agents = [Agent(AgentSpec(label=f"чат {i}", model="stub/m"), store=store) for i in range(8)]
-
-    async def all_at_once():
-        await asyncio.gather(*(drain(a.ask(f"вопрос {i}")) for i, a in enumerate(agents)))
-
-    asyncio.run(all_at_once())
-    store.close()
-
-    reopened = Store(path).init()
-    for i, agent in enumerate(agents):
-        rows = reopened.message_rows(agent.id)
-        assert [r[0] for r in rows] == [0, 1], (agent.id, rows)
-        assert rows[0][2] == f"вопрос {i}", rows
-    total = reopened.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert total == 16, total
-    reopened.close()
-    return "8 чатов писали одновременно, в базе 16 реплик, порядок в каждом свой"
-
-
-@check("id выдаёт база: занятый номер не выдаётся второй раз")
-def check_id_claimed_in_store():
-    import app.agent as agent_mod
-    from app.agent import Agent
-
-    path = _temp_db("claim")
-    store = Store(path).init()
-
-    stranger = Agent(AgentSpec(label="чужой", model="stub/m"), store=store)
-    stranger.remember("user", "СЕКРЕТ соседа")
-    stranger.remember("assistant", "ответ соседа")
-    taken = stranger.id
-
-    # Откатываем счётчик ровно на этот номер: так и выглядит давно поднятый
-    # сервер, мимо которого консоль успела занять следующий id.
-    agent_mod._last_id = int(taken.removeprefix("ag_")) - 1
-    mine = Agent(AgentSpec(label="мой", model="stub/m"), store=store)
-    assert mine.id != taken, f"выдан занятый id {taken}"
-
-    assert [row[2] for row in store.message_rows(taken)] == ["СЕКРЕТ соседа", "ответ соседа"]
-    assert store.load_session(taken)["label"] == "чужой", "чужой конфиг перезаписан"
-    store.close()
-    return f"{taken} остался за соседом, свежий агент получил {mine.id}"
-
-
-@check("после перезапуска счётчик id стартует за занятыми номерами")
-def check_ids_reserved_on_start():
-    """Дыра, найденная мутацией: выкинь `reserve_ids` из реестра — и всё
-    оставалось зелёным, потому что `claim_agent_id` догоняет базу сам, ловя
-    конфликт первичного ключа.
-
-    Догоняет — но уже испортив попытку, и на каждый свежий процесс приходится
-    лишний `INSERT`, который откатится. Стережём наблюдаемое: id, который
-    процесс предложит первым, в базе свободен.
-    """
-    import app.agent as agent_mod
-    from app.registry import AgentRegistry
-
-    path = _temp_db("reserve")
-    store = Store(path).init()
-    before = agent_mod._last_id
-    try:
-        # Номера с начала: иначе занятые окажутся далеко впереди нуля, и
-        # «счётчик на нуле» случайно попадёт в свободный.
-        agent_mod._last_id = 0
-        for _ in range(5):
-            store.claim_agent_id()
-        taken = {row["id"] for row in store.list_sessions()}
-        assert len(taken) == 5, taken
-
-        # «Перезапуск»: счётчик процесса снова на нуле, база — нет.
-        agent_mod._last_id = 0
-        AgentRegistry(store=store)
-        first = agent_mod.new_agent_id()
-        assert first not in taken, (
-            f"процесс предложит занятый {first}: счётчик не догнал базу при старте"
-        )
-    finally:
-        agent_mod._last_id = max(before, agent_mod._last_id)
-        store.close()
-    return f"{len(taken)} номеров в базе, первый предложенный после старта — {first}"
-
-
-@check("недостроенный агент не оставляет пустую строку чата")
-def check_claim_rolled_back():
-    from app.agent import Agent
-
-    path = _temp_db("claim-rollback")
-    store = Store(path).init()
-    good = Agent(AgentSpec(label="живой", model="stub/m"), store=store)
-    before = store.count_sessions()
-
-    saved = store.save_session
-    store.save_session = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("бум на записи"))
-    try:
-        Agent(AgentSpec(label="недостроенный", model="stub/m"), store=store)
-        raise AssertionError("конструктор должен был упасть")
-    except RuntimeError as exc:
-        assert "бум" in str(exc), exc
-    finally:
-        store.save_session = saved
-
-    assert store.count_sessions() == before, "занятая строка не убрана"
-    assert [row["label"] for row in store.list_sessions()] == ["живой"]
-    assert store.load_session(good.id) is not None, "уборка задела чужой чат"
-    store.close()
-    return "строка, занятая под упавший конструктор, убрана; соседняя цела"
-
-
-@check("context_length переживает выгрузку и перезапуск")
-def check_context_length_restored():
-    from app.registry import AgentRegistry
-
-    path = _temp_db("ctxlen")
-    store = Store(path).init()
-    registry = AgentRegistry(max_agents=10, store=store)
-    agent = registry.create(AgentSpec(label="контекст", model="stub/m"), context_length=128_000)
-    registry._unload(agent.id)
-    assert registry.require(agent.id).context_length == 128_000
-
-    store.close()
-    reopened = Store(path).init()
-    assert reopened.load_session(agent.id)["context_length"] == 128_000
-    reopened.close()
-    return "после выгрузки и после переоткрытия файла context_fill_pct снова считается"
 
 
 @check("ключа OpenRouter в базе нет ни в одной колонке — включая ещё не придуманные")
@@ -2867,573 +961,116 @@ def check_no_key_in_db():
     return f"ключ не найден ни в одной колонке и ни в одном файле базы ({', '.join(files)})"
 
 
-@check("вырожденный ключ не режет идентификаторы: у редакции есть нижний порог")
-def check_redact_floor():
-    from app.agent import Agent
-    from app.store import MIN_SECRET_LENGTH, redact
+@check("мимо redact() записать нельзя: пути записи выводятся из класса")
+def check_every_write_path_redacts():
+    """Несущий слой чистки — не явные `redact()` в отдельных методах, а `_Writer`:
+    транзакция отдаёт обёртку, и чистится любой строковый параметр любого
+    запроса. Но само это свойство надо стеречь отдельно: `check_no_key_in_db`
+    ходит теми путями записи, которые знает, а новый путь мимо транзакции
+    прошёл бы зелёным — мутацией проверено.
 
+    Поэтому список путей здесь **выводится** из класса `Store`: всякий метод,
+    в теле которого есть INSERT/UPDATE/DELETE/REPLACE, обязан идти через
+    `tx()`, а не через голое соединение. Перечисленный список пропустил бы
+    ровно тот метод, который забыли в него внести.
+    """
+    import inspect
+    import sqlite3
+
+    import app.store as store_module
+
+    # Слова целиком, а не подстроки: `updated_at` — это не UPDATE, и по
+    # подстроке в список путей записи попадал весь `list_sessions`.
+    mutating = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE)\b")
+    checked = []
+    for name, fn in inspect.getmembers(Store, inspect.isfunction):
+        body = inspect.getsource(fn)
+        if not mutating.search(body.upper()):
+            continue
+        checked.append(name)
+        if name == "init":
+            continue  # схему заводит executescript, параметров у него нет
+        for bypass in ("self.conn.execute", "self._conn.execute", "self.reading("):
+            assert bypass not in body, (
+                f"Store.{name} пишет через {bypass} — мимо `_Writer`, а значит "
+                "мимо redact(). Писать можно только внутри tx()"
+            )
+    assert len(checked) >= 5, f"путей записи нашлось всего {checked} — обход сузился"
+
+    # Транзакция отдаёт обёртку, а не соединение: иначе обещание держалось бы
+    # на внимательности автора каждого метода.
+    store = Store(store_module.MEMORY).init()
+    key = "sk-or-v1-" + "e" * 64
     saved_key = os.environ.get("OPENROUTER_API_KEY")
-    path = _temp_db("floor")
-    store = Store(path).init()
+    os.environ["OPENROUTER_API_KEY"] = key
     try:
-        os.environ["OPENROUTER_API_KEY"] = "1"
-        assert redact("ag_00001") == "ag_00001" and redact("assistant") == "assistant"
-
-        agent = Agent(AgentSpec(label="порог", model="stub/m"), store=store)
-        agent.remember("user", "встретимся 1 числа")
-        assert [r[2] for r in store.message_rows(agent.id)] == ["встретимся 1 числа"]
-        assert store.load_session(agent.id)["label"] == "порог", "id или имя изрезаны редакцией"
-
-        real = "sk-or-v1-" + "a" * 64
-        assert len(real) >= MIN_SECRET_LENGTH
-        os.environ["OPENROUTER_API_KEY"] = real
-        agent.remember("user", f"мой ключ {real}")
-        stored = " ".join(r[2] for r in store.message_rows(agent.id))
-        assert real not in stored and "***" in stored, stored
+        with store.tx() as conn:
+            assert not isinstance(conn, sqlite3.Connection), (
+                "tx() отдаёт голое соединение — redact() перестал быть по построению"
+            )
+            # Все три формы параметров, какие принимает обёртка.
+            conn.execute(
+                "INSERT INTO sessions (id, label, config, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0)",
+                (f"ag_{key}", key, key),
+            )
+            conn.execute("INSERT INTO meta (key, value) VALUES (:k, :v)", {"k": "т", "v": key})
+            conn.executemany(
+                "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
+                [("s", 0, "user", key), ("s", 1, "assistant", key)],
+            )
+        leaked = []
+        for table in ("sessions", "messages", "meta"):
+            for row in store.conn.execute(f"SELECT * FROM {table}"):
+                for column in row.keys():
+                    if isinstance(row[column], str) and key in row[column]:
+                        leaked.append(f"{table}.{column}")
+        assert not leaked, f"ключ уехал в базу через tx(): {sorted(set(leaked))}"
     finally:
         if saved_key is None:
             os.environ.pop("OPENROUTER_API_KEY", None)
         else:
             os.environ["OPENROUTER_API_KEY"] = saved_key
         store.close()
-    return f"ключ короче {MIN_SECRET_LENGTH} символов данные не трогает, настоящий — режется"
+    return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
 
 
-@check("транзакция берёт блокировку сразу, а не при первой записи")
-def check_tx_locks_immediately():
-    """Седьмая дыра, найденная уже сверкой инвариантов после сокращения:
-    `BEGIN IMMEDIATE` не стерёг никто.
-
-    Подменил его на голый `BEGIN` — все 65 проверок остались зелёными,
-    включая `two_processes.py`. Тот его и не ловит: все пути записи там
-    начинаются с записи, а отложенная транзакция ломается на другом —
-    когда она началась с чтения и повышает блокировку до записи. Тогда
-    SQLite отвечает SQLITE_BUSY **без** ретрая по `busy_timeout`, и второй
-    процесс получает ошибку вместо очереди.
-
-    Проверяется наблюдаемым: пока транзакция открыта и не сделала ни одного
-    запроса, второй писатель обязан её видеть. Соединение берём с нулевым
-    таймаутом — ждать нам нечего, нужен сам факт блокировки.
-    """
-    path = _temp_db("immediate")
-    store = Store(path).init()
-    entered = None
-    try:
-        with store.tx():
-            # Ни одного запроса внутри транзакции ещё не было.
-            rival = sqlite3.connect(path, timeout=0)
-            try:
-                rival.execute("BEGIN IMMEDIATE")
-                entered = True
-            except sqlite3.OperationalError as exc:
-                entered = False
-                reason = str(exc).lower()
-                assert "locked" in reason or "busy" in reason, exc
-            finally:
-                rival.close()
-        assert entered is False, (
-            "второй писатель вошёл в базу, пока транзакция открыта: значит она "
-            "отложенная. Отложенная берёт блокировку только на первой записи, "
-            "и повышение из чтения в запись даёт SQLITE_BUSY мимо busy_timeout"
-        )
-
-        # И то, ради чего блокировка нужна: занятая база — это внятный 503,
-        # а не срыв записи. Транзакция, не дождавшаяся своей очереди,
-        # откатывается целиком.
-        holder = sqlite3.connect(path, timeout=0)
-        holder.execute("BEGIN IMMEDIATE")
-        try:
-            waiting = Store(path).init()
-            waiting.conn.execute(f"PRAGMA busy_timeout=50")
-            try:
-                waiting.save_session(
-                    "ag_00001", label="не пройдёт", config={"model": "m"}, created_at=0.0
-                )
-                raise AssertionError("занятая база пропустила запись")
-            except StoreBusyError as exc:
-                assert "занята" in str(exc), exc
-            waiting.close()
-        finally:
-            holder.rollback()
-            holder.close()
-    finally:
-        store.close()
-    return "открытая транзакция видна второму писателю сразу; занятая база даёт StoreBusyError"
+@check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
+def check_no_cdn():
+    html = read("app/static/index.html")
+    css = read("app/static/style.css")
+    js = read("app/static/app.js")
+    for name, src in (("index.html", html), ("style.css", css), ("app.js", js)):
+        for pattern in ("http://", "https://", "//cdn", "@import", "url("):
+            for hit in re.findall(re.escape(pattern) + r"[^\s\"'()]*", src):
+                # Единственное допустимое вхождение — пространство имён SVG:
+                # это идентификатор, по нему браузер никуда не ходит.
+                assert hit.startswith("http://www.w3.org/2000/svg"), f"{name}: {hit}"
+    assert "@font-face" not in css, "свои шрифты тоже не подключаем"
+    assert html.count("<script") == 1 and 'src="/static/app.js"' in html
+    assert html.count("<link") == 1 and 'href="/static/style.css"' in html
+    return "в статике только относительные пути и w3.org-неймспейс SVG"
 
 
-@check("занятая база — внятный 503, а не голый 500")
-def check_busy_message():
-    import sqlite3
-
-    from app.store import StoreBusyError, _busy
-
-    translated = _busy(sqlite3.OperationalError("database is locked"), "/tmp/agents.db")
-    assert isinstance(translated, StoreBusyError), type(translated)
-    text = str(translated)
-    assert "занята другим процессом" in text and "повторите" in text, text
-    assert _busy(sqlite3.OperationalError("no such table: sessions"), "/tmp/a.db") is None
-
-    path = _temp_db("busy")
-    store = Store(path).init()
-    blocker = sqlite3.connect(str(path), isolation_level=None)
-    blocker.execute("PRAGMA busy_timeout=0")
-    blocker.execute("BEGIN IMMEDIATE")
-    blocker.execute("INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_99999', 1, 1)")
-    store.conn.execute("PRAGMA busy_timeout=50")
-    try:
-        with TestClient(main.app, raise_server_exceptions=False) as client:
-            saved_store = main.REGISTRY.store
-            main.REGISTRY.store = store
-            try:
-                response = client.post("/api/agents", json={"agent": {"model": "stub/m"}})
-            finally:
-                main.REGISTRY.store = saved_store
-        assert response.status_code == 503, (response.status_code, response.text)
-        assert "занята другим процессом" in response.json()["detail"], response.text
-    finally:
-        blocker.execute("ROLLBACK")
-        blocker.close()
-        store.close()
-
-    reopened = Store(path).init()
-    assert [r["label"] for r in reopened.list_sessions()] == [], reopened.list_sessions()
-    reopened.close()
-    return "HTTP 503 с объяснением; чат, который не записали, база не завела"
-
-
-@check(".gitignore ловит базу и её WAL-файлы")
-def check_gitignore_db():
-    patterns = [
-        line.strip()
-        for line in open(os.path.join(ROOT, ".gitignore"), encoding="utf-8")
-        if line.strip() and not line.startswith("#")
-    ]
-    for needed in ("*.db", "*.db-wal", "*.db-shm"):
-        assert needed in patterns, f"{needed} не в .gitignore: база уедет в публичный репозиторий"
-
-    probe = ["data/agents.db", "data/agents.db-wal", "data/agents.db-shm", "agents.db"]
+@check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
+def check_browser():
+    """Клиентский код исполняется под node: payload на входе, утверждения
+    про выход. Греп по исходнику прошёл бы и если экранирование переедет
+    **после** разбора — то есть самая опасная поверхность демо была бы
+    прикрыта пустышкой."""
+    node = shutil.which("node")
+    assert node, (
+        "нужен node, чтобы исполнить клиентский код: разбор markdown "
+        "проверяется настоящими вызовами, а не чтением исходника"
+    )
     result = subprocess.run(
-        ["git", "check-ignore", "--no-index", *probe], capture_output=True, text=True, cwd=ROOT
+        [node, os.path.join(ROOT, "checks", "browser_check.js")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
     )
-    ignored = set(result.stdout.split())
-    assert set(probe) <= ignored, f"git не игнорирует: {sorted(set(probe) - ignored)}"
-    return "git игнорирует *.db, *.db-wal, *.db-shm и каталог data/"
-
-
-@check("CLI продолжает сохранённый чат: --session и /сессии")
-def check_cli_session():
-    import io
-
-    from app import cli
-
-    _stub.install(reply="запомнил")
-    first = cli.build_agent(cli._parse_args(["--model", "stub/m", "--label", "консоль"]))
-    asyncio.run(cli.ask(first, "меня зовут Нина", io.StringIO()))
-
-    REGISTRY._unload(first.id)
-    assert REGISTRY.get(first.id) is None
-
-    second = cli.build_agent(cli._parse_args(["--session", first.id]))
-    assert second.id == first.id and [t.content for t in second.history] == [
-        "меня зовут Нина",
-        "запомнил",
-    ], second.history
-
-    out = io.StringIO()
-    saved_stdin = sys.stdin
-    sys.stdin = io.StringIO("")
-    try:
-        asyncio.run(cli.repl(second, once=True, out=out))
-    finally:
-        sys.stdin = saved_stdin
-    assert "[продолжаем]" in out.getvalue(), out.getvalue()
-
-    listing = io.StringIO()
-    cli._print_sessions(listing)
-    assert first.id in listing.getvalue(), listing.getvalue()
-
-    try:
-        cli.build_agent(cli._parse_args(["--session", "ag_99999"]))
-        raise AssertionError("несуществующий чат должен честно падать")
-    except SystemExit:
-        pass
-    return "--session поднимает чат из базы, /сессии его показывает"
-
-
-
-
-
-@check("поднятый из базы чат отдаёт те же поля панели: повторный PATCH ничего не меняет")
-def check_panel_stable_after_restart():
-    """«Применено» не должно появляться на чате, поднятом из базы.
-
-    Клиент показывает строку, только если правка что-то изменила, — сравнивает
-    конфиг до и после `PATCH`. Значит, чат после перезапуска обязан отдавать
-    ровно те же значения: измени хоть одно поле тип по дороге через JSON,
-    и первое же сообщение показало бы «Применено» на пустом месте.
-
-    Стенд клиента этого поймать не может: у него свой сервер и своя память.
-    """
-    panel = (
-        "system",
-        "model",
-        "stop",
-        "response_format",
-        "temperature",
-        "max_tokens",
-        "top_p",
-        "top_k",
-        "min_p",
-        "repetition_penalty",
-        "presence_penalty",
-        "frequency_penalty",
-    )
-    settings = {
-        "system": "ты гид",
-        "model": "stub/model",
-        "stop": ["СТОП", "КОНЕЦ"],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-        "max_tokens": 200,
-        "top_p": 0.0,
-        "top_k": 7,
-        "min_p": 0.05,
-        "repetition_penalty": 1.1,
-        "presence_penalty": 0.2,
-        "frequency_penalty": 0.3,
-    }
-
-    path = _temp_db("panel-stable")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        _restart(store)
-        with TestClient(main.app) as client:
-            chat_id = client.post("/api/agents", json={}).json()["agents"][0]["id"]
-            saved = client.patch(f"/api/agents/{chat_id}", json=settings).json()
-        before = {name: saved[name] for name in panel}
-        assert before["top_p"] == 0.0 and before["temperature"] == 0.0, before
-
-        store.close()
-        again = Store(path).init()
-        _restart(again)
-        with TestClient(main.app) as client:
-            restored = client.get(f"/api/agents/{chat_id}").json()
-            # Панель показывает то, что пришло с сервера, и шлёт это же обратно.
-            repeated = client.patch(
-                f"/api/agents/{chat_id}", json={name: restored[name] for name in panel}
-            ).json()
-    finally:
-        main.REGISTRY = saved_registry
-        again.close()
-
-    after_load = {name: restored[name] for name in panel}
-    assert after_load == before, (
-        "поднятый из базы чат отдаёт другие значения — «Применено» вылезло бы "
-        f"на первом же сообщении: {[k for k in panel if after_load[k] != before[k]]}"
-    )
-    after_patch = {name: repeated[name] for name in panel}
-    assert after_patch == before, (
-        f"повторный PATCH что-то изменил: {[k for k in panel if after_patch[k] != before[k]]}"
-    )
-    # Типы тоже те же: список остался списком, объект — объектом.
-    assert isinstance(after_load["stop"], list) and after_load["stop"] == ["СТОП", "КОНЕЦ"]
-    assert isinstance(after_load["response_format"], dict), after_load["response_format"]
-    return f"{len(panel)} полей панели пережили переоткрытие файла без единого расхождения"
-
-
-@check("переименованный чат остаётся переименованным после перезапуска")
-def check_rename_survives_restart():
-    """Переименование — то, чем пользуются постоянно, и оно обязано пережить рестарт.
-
-    Проверяется настоящим переоткрытием файла, а не тем же объектом в памяти:
-    имя лежит и отдельной колонкой, и внутри конфига, и разойтись они не должны.
-    """
-    _stub.install(reply="ответ")
-    path = _temp_db("rename")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        _restart(store)
-        with TestClient(main.app) as client:
-            created = client.post("/api/agents", json={}).json()["agents"][0]
-            assert created["label"] == "Новый чат 1", created["label"]
-            client.post(f"/api/agents/{created['id']}/messages", json={"text": "привет"})
-            renamed = client.patch(
-                f"/api/agents/{created['id']}", json={"label": "Про Казань"}
-            )
-            assert renamed.status_code == 200 and renamed.json()["label"] == "Про Казань"
-
-        # Закрываем базу и открываем файл заново — это и есть перезапуск.
-        store.close()
-        again = Store(path).init()
-        second = _restart(again)
-        listing = main._listing()["agents"]
-    finally:
-        main.REGISTRY = saved_registry
-
-    assert [a["label"] for a in listing] == ["Про Казань"], listing
-    revived = second.require(created["id"])
-    assert revived.spec.label == "Про Казань", revived.spec.label
-    # Имя лежит и колонкой, и в конфиге: разойтись они не должны.
-    row = again.load_session(created["id"])
-    assert row["label"] == "Про Казань", row["label"]
-    assert row["config"]["label"] == "Про Казань", row["config"]["label"]
-    # Переписка при переименовании не пострадала.
-    assert [t.content for t in revived.history] == ["привет", "ответ"], revived.history
-    again.close()
-    return f"«{created['label']}» → «Про Казань» пережило переоткрытие файла"
-
-
-@check("удалили последний чат — список пуст, а строки в базе не осталось")
-def check_last_chat_deleted():
-    """Удаление — из обоих слоёв. Номера здесь не проверяются: их стережёт
-    `check_numbering_survives_restart`, и привязываться к ним второй раз
-    значит ронять эту проверку на чужой поломке."""
-    path = _temp_db("last-chat")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        _restart(store)
-        with TestClient(main.app) as client:
-            first = client.post("/api/agents", json={}).json()["agents"][0]
-            assert client.delete(f"/api/agents/{first['id']}").status_code == 200
-            assert client.get("/api/agents").json()["agents"] == [], "чат остался в списке"
-            assert store.load_session(first["id"]) is None, "строка чата осталась в базе"
-            assert store.message_rows(first["id"]) == [], "реплики удалённого чата остались"
-    finally:
-        main.REGISTRY = saved_registry
-        store.close()
-    return "после удаления список пуст, строки и реплик в базе нет"
-
-
-@check("список не обрезается: тысяча с лишним чатов видна целиком")
-def check_list_not_truncated():
-    """Обрезка была бы молчаливой, а список — единственный путь к диалогу."""
-    from app.registry import AgentRegistry
-
-    path = _temp_db("no-cap")
-    store = Store(path).init()
-    saved_registry = main.REGISTRY
-    try:
-        main.REGISTRY = AgentRegistry(max_agents=5, store=store)
-        made = 1200
-        now = time.time()
-        with store.tx():
-            for i in range(made):
-                store.save_session(
-                    f"chat_{i:05d}",
-                    label=f"чат {i}",
-                    config={"model": "stub/m", "label": f"чат {i}"},
-                    created_at=now + i,
-                )
-        entries = main._listing()["agents"]
-        assert len(entries) == made, f"в списке {len(entries)} из {made} — список обрезан"
-        far = entries[-1]
-        assert main.REGISTRY.require(far["id"]).spec.label == far["label"]
-    finally:
-        main.REGISTRY = saved_registry
-        store.close()
-    return f"{made} чатов — в списке все, любой открывается"
-
-
-# --- 13. День 8: подсчёт токенов ----------------------------------------------
-
-
-def _usage(prompt, completion, total, cost):
-    return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-        "cost_usd": cost,
-    }
-
-
-@check("сводка по чату — сумма слагаемых, а не выдуманное число")
-def check_usage_summary_sums():
-    """Главное утверждение дня: вход, выход, всего и цена по всему диалогу.
-
-    У каждого ответа свой usage: с одинаковыми числами (а заглушка до этого дня
-    отдавала всем `total_tokens=100`) сумма трёх ответов равнялась бы тремстам
-    и при правильном сложении, и при `100 * len(history)`, и при возврате
-    последней метрики трижды.
-    """
-    plan = [
-        _usage(11, 5, 16, 0.000011),
-        _usage(120, 40, 160, 0.000120),
-        _usage(1300, 7, 1307, 0.001300),
-    ]
-    _stub.install(usage=lambda i: plan[i])
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        for i in range(3):
-            client.post(f"/api/agents/{agent_id}/messages", json={"text": f"вопрос {i}"})
-        body = client.get(f"/api/agents/{agent_id}").json()
-
-    total = body["usage_total"]
-    assert total is not None, "сводки нет вовсе"
-    assert total["prompt_tokens"] == 11 + 120 + 1300, total
-    assert total["completion_tokens"] == 5 + 40 + 7, total
-    assert total["total_tokens"] == 16 + 160 + 1307, total
-    assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
-    assert body["exchanges"] == 3, body["exchanges"]
-
-    # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
-    # и клиент рисует по ним строку под каждым ответом.
-    answers = [t for t in body["transcript"] if t["role"] == "assistant"]
-    assert [a["metrics"]["total_tokens"] for a in answers] == [16, 160, 1307], answers
-    return (
-        f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
-        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
-    )
-
-
-@check("реплики без чисел пропускаются, а не считаются нулём")
-def check_usage_summary_skips_unknown():
-    """Ноль и «неизвестно» — разные вещи, и на экране они выглядят по-разному.
-
-    Провайдер вправе смолчать о цене (или о токенах вовсе): такая реплика
-    в сумму не входит ни слагаемым, ни нулём. Чат, где чисел не принёс никто,
-    даёт `None` — в интерфейсе это прочерк, а не «0 токенов».
-    """
-    from app.agent import Agent
-
-    spec = AgentSpec(label="тихий", model="stub/model")
-    quiet = Agent(spec)
-    quiet.remember("user", "вопрос")
-    quiet.remember("assistant", "ответ", metrics=None)
-    quiet.remember("user", "ещё")
-    quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
-    assert quiet.usage_summary() is None, quiet.usage_summary()
-    assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
-    # Сумм нет, а разговор был: плитка «Обменов» считает ответы, а не слагаемые,
-    # и молчащий usage не должен делать вид, что в чате пусто.
-    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
-
-    mixed = Agent(spec)
-    mixed.remember("user", "вопрос")
-    mixed.remember("assistant", "ответ", metrics=_usage(100, 10, 110, None))
-    mixed.remember("user", "ещё")
-    mixed.remember("assistant", "ответ", metrics=None)
-    mixed.remember("user", "и ещё")
-    mixed.remember("assistant", "ответ", metrics=_usage(200, 20, 220, 0.0002))
-    total = mixed.usage_summary()
-    assert total["prompt_tokens"] == 300, total
-    assert total["total_tokens"] == 330, total
-    # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
-    assert total["cost_usd"] == 0.0002, total
-    # Слагаемых два, а обменов три — и расхождение видно по самим суммам,
-    # а не по счётчику: он про то, сколько раз поговорили.
-    assert mixed.exchanges() == 3, mixed.exchanges()
-
-    # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
-    sneaky = Agent(spec)
-    sneaky.remember("user", "вопрос", metrics=_usage(999, 999, 999, 9.0))
-    assert sneaky.usage_summary() is None, sneaky.usage_summary()
-    return "ответ без чисел пропущен, чат без чисел даёт None, вопросы не считаются"
-
-
-@check("сводка по чату переживает перезапуск: числа те же из файла базы")
-def check_usage_summary_survives_restart():
-    """Сводка выводится из `messages.metrics`, а не хранится колонкой.
-
-    Значит доказательство — настоящее переоткрытие файла: если бы сумма жила
-    в памяти процесса, после перезапуска она обнулилась бы.
-    """
-    from app.agent import Agent
-
-    path = _temp_db("usage-restart")
-    store = Store(path).init()
-    agent = Agent(AgentSpec(label="память", model="stub/model"), store=store)
-    agent.remember("user", "вопрос")
-    agent.remember("assistant", "ответ", metrics=_usage(70, 30, 100, 0.00007))
-    agent.remember("user", "ещё")
-    agent.remember("assistant", "ответ", metrics=_usage(230, 90, 320, 0.00023))
-    before = agent.usage_summary()
-    agent_id = agent.id
-    store.close()
-
-    again = Store(path).init()
-    try:
-        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
-        after = revived.usage_summary()
-    finally:
-        again.close()
-
-    assert before == after, (before, after)
-    assert after["total_tokens"] == 420, after
-    assert revived.exchanges() == 2, revived.exchanges()
-    return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
-
-
-@check("перегенерация не удваивает сумму: обмен заменяется, а не добавляется")
-def check_usage_summary_regenerate():
-    plan = [_usage(100, 10, 110, 0.0001), _usage(300, 30, 330, 0.0003)]
-    _stub.install(reply=lambda m, i: f"ответ {i}", usage=lambda i: plan[i])
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-        before = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
-        client.post(f"/api/agents/{agent_id}/regenerate")
-        body = client.get(f"/api/agents/{agent_id}").json()
-        after = body["usage_total"]
-
-    assert before["total_tokens"] == 110, before
-    # Второй вызов заменил первый: в сумме числа второго, а не их сложение.
-    assert after["total_tokens"] == 330, after
-    assert after["prompt_tokens"] == 300, after
-    # И обмен в ленте остался один — перегенерация заменила карточку.
-    assert body["exchanges"] == 1, body["exchanges"]
-    return f"после перегенерации всего {after['total_tokens']}, а не {110 + 330}"
-
-
-@check("неудачный обмен в сумму не попадает")
-def check_usage_summary_ignores_failed_call():
-    """Вызов, не отдавший ни токена, в историю не пишется — значит и в сумме
-    его нет. Иначе сводка росла бы на ошибках, за которые никто не платил."""
-    _stub.install(usage=lambda i: _usage(50, 5, 55, 0.00005))
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client)
-        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
-        good = client.get(f"/api/agents/{agent_id}").json()["usage_total"]
-
-        _stub.install(fail=True, usage=lambda i: _usage(700, 70, 770, 0.0007))
-        response = client.post(f"/api/agents/{agent_id}/messages", json={"text": "второй"})
-        events = sse(response.text)
-        after = client.get(f"/api/agents/{agent_id}").json()
-
-    assert any(e["event"] == "error" for e in events), events
-    assert len(after["transcript"]) == 2, after["transcript"]
-    assert after["usage_total"] == good, (good, after["usage_total"])
-    assert after["exchanges"] == 1, after["exchanges"]
-    return "провалившийся вызов не в истории и не в сумме: всего осталось 55"
-
-
-@check("сводка не заводит колонку в базе и едет тем же путём, что длина истории")
-def check_usage_summary_has_no_column():
-    """Сводка выводится из реплик. Колонка в `sessions` была бы вторым местом,
-    где живёт та же правда, — и разъезжались бы они молча."""
-    from app.agent import spec_as_dict
-
-    path = _temp_db("usage-no-column")
-    store = Store(path).init()
-    try:
-        columns = {r["name"] for r in store.conn.execute("PRAGMA table_info(sessions)")}
-        assert not [c for c in columns if "token" in c or "usage" in c or "cost" in c], columns
-        # Тот же формат описывает и чат, которого нет в памяти: у него сводки
-        # нет, и это `None` — прочерк, а не нули.
-        listed = spec_as_dict(
-            AgentSpec(label="из базы", model="stub/m"),
-            agent_id="ag_00001",
-            history_len=4,
-            created_at=0.0,
-            last_used_at=0.0,
-        )
-        assert listed["usage_total"] is None, listed["usage_total"]
-        assert "usage_total" in listed and "exchanges" in listed, listed.keys()
-    finally:
-        store.close()
-    return f"колонок про токены в sessions нет ({len(columns)} прежних), сводка едет полем JSON"
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
 
 
 def main_() -> int:
