@@ -973,6 +973,96 @@ def check_require_parameters():
     return "4 вызова через ручки и один напрямую — все с require_parameters"
 
 
+@check("сжатие контекста выключено на каждом вызове")
+def check_context_compression_off():
+    """Заказчик не смог показать переполнение: ошибки не было вовсе.
+
+    OpenRouter на всех эндпоинтах с окном 8k и меньше по умолчанию включает
+    плагин `context-compression` (стратегия middle-out): не влезший промпт
+    он молча обрезает посередине и отправляет остаток. Запрос проходит,
+    ответ приходит, ошибки нет — а середина разговора потеряна. День 7
+    добивался, чтобы история не терялась, и терял её тут же, на провайдере.
+
+    Стережётся по телу запроса, как `require_parameters`: те же четыре пути
+    через ручки плюс прямой вызов `build_payload`.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        bare = new_agent(client)
+        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
+        client.post(f"/api/agents/{bare}/regenerate")
+
+        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
+        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
+
+        # Свой плагин в extra_body дописывается рядом, а не вместо нашего.
+        extra = new_agent(client, extra_body={"plugins": [{"id": "web"}]})
+        client.post(f"/api/agents/{extra}/messages", json={"text": "три"})
+
+    assert len(_stub.CALLS) == 4, len(_stub.CALLS)
+    for call in _stub.CALLS:
+        plugins = call["payload"].get("plugins")
+        assert {"id": "context-compression", "enabled": False} in (plugins or []), (
+            f"вызов ушёл со сжатием контекста на усмотрение провайдера: {plugins!r}"
+        )
+    assert _stub.CALLS[-1]["payload"]["plugins"][-1] == {"id": "web"}, _stub.CALLS[-1]["payload"]
+
+    from app.llm import build_payload
+
+    payload = build_payload(AgentSpec(label="без веба", model="stub/m"))
+    assert payload["plugins"] == [{"id": "context-compression", "enabled": False}], payload
+    return "4 вызова через ручки и один напрямую — все с выключенным сжатием"
+
+
+@check("свой plugins в extra_body мержится по id, а не затирает наш")
+def check_extra_body_plugins_merge():
+    """Развилка `extra_body`: он мержится поверх тела, и `plugins` целиком
+    заменял бы наш список — выключенное сжатие исчезало бы молча, от одного
+    лишь соседства ключей.
+
+    Выбранное поведение — как у `provider`, только по `id` элемента:
+
+    - чужие плагины дописываются рядом, наш выключенный уцелевает;
+    - названный пользователем тот же `id` побеждает: включить сжатие обратно
+      можно, но только написав это своей рукой. Молчаливого затирания нет
+      ни в ту, ни в другую сторону.
+    """
+    from app.llm import build_payload
+
+    def plugins(extra):
+        return build_payload(AgentSpec(label="п", model="stub/m", extra_body=extra))["plugins"]
+
+    ours = {"id": "context-compression", "enabled": False}
+
+    # Чужой плагин не сбивает наш.
+    assert plugins({"plugins": [{"id": "web", "max_results": 3}]}) == [
+        ours,
+        {"id": "web", "max_results": 3},
+    ], plugins({"plugins": [{"id": "web", "max_results": 3}]})
+
+    # Осознанное включение сжатия обратно — побеждает пользователь, и запись
+    # в теле ровно одна: два `context-compression` подряд — это не настройка.
+    back_on = plugins({"plugins": [{"id": "context-compression", "enabled": True}]})
+    assert back_on == [{"id": "context-compression", "enabled": True}], back_on
+
+    # Пустой список плагинов у пользователя наш плагин не снимает: «ничего
+    # своего не добавляю» — это не «верни провайдеру сжатие на усмотрение».
+    assert plugins({"plugins": []}) == [ours], plugins({"plugins": []})
+
+    # И остальной extra_body от этого не меняется.
+    mixed = build_payload(
+        AgentSpec(
+            label="п",
+            model="stub/m",
+            extra_body={"plugins": [{"id": "web"}], "provider": {"order": ["openai"]}, "seed": 7},
+        )
+    )
+    assert mixed["provider"] == {"require_parameters": True, "order": ["openai"]}, mixed["provider"]
+    assert mixed["seed"] == 7, mixed
+    assert mixed["plugins"] == [ours, {"id": "web"}], mixed["plugins"]
+    return "чужой плагин дописан, свой context-compression побеждает, пустой список не снимает"
+
+
 @check("stop и response_format правятся из панели и доезжают до тела запроса")
 def check_stop_and_format():
     _stub.install(reply="ок")
