@@ -75,10 +75,6 @@ async def index() -> FileResponse:
 # --- вспомогательное ----------------------------------------------------------
 
 
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-
 async def _context_lengths() -> dict[str, int]:
     """Длины контекста по моделям. Каталог недоступен — просто не покажем заполнение."""
     try:
@@ -90,8 +86,8 @@ async def _context_lengths() -> dict[str, int]:
 
 async def _pump(
     make_events: Callable[[], AsyncIterator[dict]],
-    request: Request | None,
-    on_close: Callable[[], None] | None = None,
+    request: Request,
+    on_close: Callable[[], None],
 ) -> AsyncIterator[str]:
     """Гоняет поток событий в SSE и гасит его, когда клиент ушёл: брошенная
     вкладка иначе жжёт токены.
@@ -116,7 +112,7 @@ async def _pump(
     task = asyncio.create_task(pump())
     try:
         while True:
-            if request is not None and await request.is_disconnected():
+            if await request.is_disconnected():
                 return
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -125,20 +121,19 @@ async def _pump(
                 continue
             if event is done:
                 break
-            yield _sse(event)
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     finally:
         if not task.done():
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        if on_close is not None:
-            on_close()
+        on_close()
 
 
 def _stream(
     make_events: Callable[[], AsyncIterator[dict]],
-    request: Request | None,
-    on_close: Callable[[], None] | None = None,
+    request: Request,
+    on_close: Callable[[], None],
 ):
     return StreamingResponse(
         _pump(make_events, request, on_close),

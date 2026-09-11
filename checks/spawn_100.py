@@ -74,7 +74,7 @@ def main() -> int:
     # Конфиги действительно разные и не ссылаются на один объект.
     assert agents[0].spec is not specs[0], "агент обязан держать копию конфига"
     assert agents[0].history is not agents[1].history, "история у каждого своя"
-    assert registry.get(agents[7].id) is agents[7]
+    assert registry.require(agents[7].id) is agents[7]
     print(f"[1] реестр: {N} агентов за {direct_ms:.1f} мс, живых {len(registry)}")
 
     # 2) Та же сотня — одним HTTP-запросом. Именно это показывают организатору.

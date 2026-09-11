@@ -38,6 +38,15 @@ GATE_TIMEOUT = 30.0
 чем висеть вечно, если родитель умер."""
 
 
+def _texts(store, session_id: str) -> list[str]:
+    """Реплики чата как они лежат в базе, по порядку."""
+    with store.reading() as conn:
+        rows = conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? ORDER BY seq", (session_id,)
+        ).fetchall()
+    return [row["content"] for row in rows]
+
+
 def _wait_for(path: str) -> None:
     deadline = time.monotonic() + GATE_TIMEOUT
     while not os.path.exists(path):
@@ -152,7 +161,7 @@ def main() -> int:
     survived = store.load_session(second["session"])
     assert survived is not None, "сессия второго процесса исчезла из базы"
     assert survived["label"] == "B-консоль", survived["label"]
-    texts = [row[2] for row in store.message_rows(second["session"])]
+    texts = _texts(store, second["session"])
     assert any("СЕКРЕТ_B" in t for t in texts), f"реплики второго процесса стёрты: {texts}"
     print(f"[3] сессия B цела: label={survived['label']}, реплик {len(texts)}")
 
@@ -190,7 +199,7 @@ def main() -> int:
             found = [
                 session_id
                 for session_id in made
-                if any(secret == row[2] for row in store2.message_rows(session_id))
+                if secret in _texts(store2, session_id)
             ]
             assert len(found) == 1, f"{secret} найден в {len(found)} сессиях вместо одной"
     print(

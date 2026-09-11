@@ -56,8 +56,8 @@ class AgentRegistry:
     def __len__(self) -> int:
         return len(self._agents)
 
-    def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
-        return self.create_many([spec], context_lengths={spec.model: context_length})[0]
+    def create(self, spec: AgentSpec) -> Agent:
+        return self.create_many([spec])[0]
 
     def create_many(
         self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
@@ -131,9 +131,6 @@ class AgentRegistry:
         return entries
 
 
-    def get(self, agent_id: str) -> Agent | None:
-        return self._agents.get(agent_id)
-
     def require(self, agent_id: str) -> Agent:
         """Агент по id: живой из памяти, иначе поднятый из базы. Нет и там —
         значит, чат удалили."""
@@ -166,17 +163,6 @@ class AgentRegistry:
         # Сессией владеет тот объект, что лежит в реестре (см. Agent.detach).
         agent.detach()
         return True
-
-    def kill_all(self, *, purge: bool = True) -> list[str]:
-        """Гасит всех живых. purge — заодно стереть базу (нужно только проверкам)."""
-        killed = list(self._agents)
-        for agent in self._agents.values():
-            agent.cancel()
-            agent.detach()
-        self._agents.clear()
-        if purge:
-            self.store.clear()
-        return killed
 
     def _make_room(self, need: int) -> None:
         """Освобождает место, вытесняя самых старых простаивающих.

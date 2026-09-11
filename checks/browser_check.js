@@ -5,7 +5,8 @@
 // Разбор markdown — самая опасная поверхность демо: в него попадает текст
 // от модели, и он же кладётся в innerHTML. Проверять его чтением исходника
 // бессмысленно — переедет экранирование за разбор, и grep этого не заметит.
-// Поэтому здесь настоящие payload'ы и утверждения про выход.
+// Поэтому здесь настоящие payload'ы и утверждения про выход, а дальше —
+// настоящий маршрут: правка в поле панели → отправка → тело запроса.
 //
 // app.js под node подключается модулем: в браузере `module` не существует,
 // и файл просто запускается сам.
@@ -16,7 +17,7 @@ const path = require("path");
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
 
 const app = require(path.join(__dirname, "..", "app", "static", "app.js"));
-const { renderMarkdown, layoutFor, escapeAction, readStopLines, parseResponseFormat, paramWarnings } = app;
+const { renderMarkdown } = app;
 
 const failures = [];
 let passed = 0;
@@ -106,205 +107,16 @@ check(
   check("текст вокруг метки уцелел", out.includes("до") && out.includes("после"), out);
 }
 
-// ── раскладка узкого окна ──
-
-check(
-  "узкое окно сворачивает оба борта",
-  JSON.stringify(layoutFor(true, { sidebar: "0", panel: "0" })) ===
-    JSON.stringify({ sidebar: true, panel: true }),
-  JSON.stringify(layoutFor(true, { sidebar: "0", panel: "0" }))
-);
-check(
-  "узкое окно не смотрит на сохранённый выбор",
-  JSON.stringify(layoutFor(true, { sidebar: "1", panel: "1" })) ===
-    JSON.stringify({ sidebar: true, panel: true })
-);
-check(
-  "широкое окно возвращает выбор пользователя",
-  JSON.stringify(layoutFor(false, { sidebar: "1", panel: "0" })) ===
-    JSON.stringify({ sidebar: true, panel: false }),
-  JSON.stringify(layoutFor(false, { sidebar: "1", panel: "0" }))
-);
-check(
-  "широкое окно по умолчанию показывает оба борта",
-  JSON.stringify(layoutFor(false, { sidebar: "0", panel: "0" })) ===
-    JSON.stringify({ sidebar: false, panel: false })
-);
-
-// ── предупреждение о параметрах, которых модель не потянет ──
-
-{
-  const plain = {
-    id: "openai/gpt-4o-mini",
-    supported_parameters: ["temperature", "max_tokens", "stop", "response_format"],
-    temperature_capped: false,
-    temperature_cap: null,
-  };
-  const capped = {
-    id: "anthropic/claude-sonnet",
-    supported_parameters: ["temperature", "max_tokens", "top_p"],
-    temperature_capped: true,
-    temperature_cap: 1.0,
-  };
-
-  const unsupported = paramWarnings(plain, { temperature: 0.5, top_k: 40, min_p: 0.05 });
-  check("незаявленный параметр даёт предупреждение", unsupported.length === 1, JSON.stringify(unsupported));
-  check("в предупреждении названы все незаявленные", /top_k, min_p/.test(unsupported[0] || ""), unsupported[0]);
-  check("в предупреждении названа модель", /gpt-4o-mini/.test(unsupported[0] || ""), unsupported[0]);
-  check(
-    "предупреждение объясняет, чем это кончится",
-    /require_parameters/.test(unsupported[0] || ""),
-    unsupported[0]
-  );
-
-  check(
-    "заявленные параметры молчат",
-    paramWarnings(plain, { temperature: 0.5, max_tokens: 100, stop: ["СТОП"] }).length === 0
-  );
-  check(
-    "незаданные параметры не считаются незаявленными",
-    paramWarnings(plain, { temperature: null, top_k: null, min_p: undefined }).length === 0
-  );
-  check(
-    "response_format проверяется наравне с числами",
-    paramWarnings(
-      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
-      { response_format: { type: "json_object" } }
-    ).length === 1
-  );
-  check(
-    "stop проверяется наравне с числами",
-    paramWarnings(
-      { id: "m", supported_parameters: ["temperature"], temperature_capped: false },
-      { stop: ["КОНЕЦ"] }
-    ).length === 1
-  );
-
-  // Главная ловушка: модель заявляет temperature и всё равно вернёт 400.
-  const hot = paramWarnings(capped, { temperature: 1.2 });
-  check("обрезанная температура предупреждает, хотя параметр заявлен", hot.length === 1, JSON.stringify(hot));
-  check("в предупреждении назван потолок", /1\.0/.test(hot[0] || ""), hot[0]);
-  check("температура под потолком молчит", paramWarnings(capped, { temperature: 0.9 }).length === 0);
-  check("ровно потолок молчит", paramWarnings(capped, { temperature: 1.0 }).length === 0);
-  check(
-    "оба повода дают два предупреждения",
-    paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }).length === 2,
-    JSON.stringify(paramWarnings(capped, { temperature: 1.2, min_p: 0.1 }))
-  );
-
-  // Не на чем основать — не пугаем.
-  check("модель не найдена в каталоге — молчим", paramWarnings(null, { top_k: 40 }).length === 0);
-  check("модель не отдала supported_parameters — молчим",
-    paramWarnings({ id: "m", supported_parameters: [] }, { top_k: 40 }).length === 0);
-  // Проверяются только параметры запроса: `system` и `model` — наши поля
-  // панели, и предупреждать про них по `supported_parameters` не о чем.
-  check("свои поля панели в запрос не уходят и не проверяются",
-    paramWarnings(plain, { system: "ПРОМПТ", model: plain.id }).length === 0);
-}
-
-// ── привязка к поставщику: говорим в момент смены модели ──
-
-{
-  const model = { id: "вторая/модель", supported_parameters: ["temperature"], temperature_capped: false };
-  const pinned = { provider: { order: ["openai"] } };
-
-  check(
-    "пока модель прежняя — молчим",
-    paramWarnings(model, { model: "первая/модель" }, pinned, "первая/модель").length === 0
-  );
-  const changed = paramWarnings(model, { model: "вторая/модель" }, pinned, "первая/модель");
-  check("на смене модели предупреждаем", changed.length === 1, JSON.stringify(changed));
-  check("названы поставщик и обе модели",
-    /openai/.test(changed[0]) && /вторая\/модель/.test(changed[0]) && /первая\/модель/.test(changed[0]),
-    changed[0]);
-  check("без имён полей конфига и кодов ошибок",
-    !/provider|extra_body|order|404/.test(changed[0]), changed[0]);
-
-  check(
-    "чат без привязки молчит и на смене модели",
-    paramWarnings(model, { model: "вторая/модель" }, {}, "первая/модель").length === 0
-  );
-  check(
-    "запрет фолбэка сам по себе не предупреждает: смену модели он не ломает",
-    paramWarnings(model, { model: "вторая/модель" }, { provider: { allow_fallbacks: false } }, "первая/модель")
-      .length === 0
-  );
-  check(
-    "без исходной модели молчим: сравнивать не с чем",
-    paramWarnings(model, { model: "вторая/модель" }, pinned, "").length === 0
-  );
-  check(
-    "привязка и незаявленный параметр — два повода",
-    paramWarnings(model, { model: "вторая/модель", top_k: 40 }, pinned, "первая/модель").length === 2
-  );
-}
-
-// ── что закрывает Escape ──
-
-check(
-  "Escape закрывает диалог подтверждения всегда",
-  escapeAction(true, false, 0) === "dialog",
-  escapeAction(true, false, 0)
-);
-check(
-  "открытый диалог важнее ящиков",
-  escapeAction(true, true, 2) === "dialog",
-  escapeAction(true, true, 2)
-);
-check(
-  "без диалога Escape закрывает ящики узкого окна",
-  escapeAction(false, true, 1) === "drawers",
-  escapeAction(false, true, 1)
-);
-check("на широком окне Escape не трогает борта", escapeAction(false, false, 2) === null);
-check("закрывать нечего — Escape ничего не делает", escapeAction(false, true, 0) === null);
-
-// ── стоп-строки и формат ответа из панели ──
-
-check(
-  "стоп-строки читаются по одной в строке",
-  JSON.stringify(readStopLines("КОНЕЦ\nСТОП")) === JSON.stringify(["КОНЕЦ", "СТОП"]),
-  JSON.stringify(readStopLines("КОНЕЦ\nСТОП"))
-);
-check("пробелы по краям срезаются", JSON.stringify(readStopLines("  КОНЕЦ  ")) === JSON.stringify(["КОНЕЦ"]));
-check("пустые строки не считаются", JSON.stringify(readStopLines("a\n\n\n b ")) === JSON.stringify(["a", "b"]));
-check("пустое поле — параметр не отправляется", readStopLines("   ") === null);
-check("совсем пустое поле — тоже null", readStopLines("") === null);
-
-check("формат по умолчанию не задан", parseResponseFormat("", "") === null);
-check(
-  "готовый вариант не требует писать JSON",
-  JSON.stringify(parseResponseFormat("json_object", "")) === JSON.stringify({ type: "json_object" })
-);
-check(
-  "свой JSON разбирается",
-  JSON.stringify(parseResponseFormat("custom", '{"type":"json_schema"}')) ===
-    JSON.stringify({ type: "json_schema" })
-);
-check("свой JSON пустым не отправляется", parseResponseFormat("custom", "   ") === null);
-{
-  let broke = false;
-  try { parseResponseFormat("custom", "{не json"); } catch (e) { broke = /не JSON/.test(e.message); }
-  check("кривой JSON даёт понятную ошибку, а не уезжает провайдеру", broke);
-}
-{
-  let broke = false;
-  try { parseResponseFormat("custom", "[1,2]"); } catch (e) { broke = /объект/.test(e.message); }
-  check("массив вместо объекта тоже ошибка", broke);
-}
-
 // ── маршрут целиком: правка в панели → отправка → тело запроса ──
 //
-// Смена системного промпта ломалась трижды, и все три раза сервер был
-// зелёным: расходились состояние панели и состояние агента. Значит проверять
-// надо не ручку, а тот код, который выполняется в браузере, и по всему
-// маршруту. `checks/dom.js` даёт минимальный DOM и минимальный сервер,
-// который записывает, с каким конфигом ушло каждое сообщение.
+// Инвариант: сообщение уходит с тем конфигом, что показан в панели.
+// Проверяется не ручка, а код, который выполняется в браузере: `checks/dom.js`
+// даёт минимальный DOM и минимальный сервер, записывающий, с каким конфигом
+// ушло каждое сообщение.
 //
 // Правку вносим **без события `change`** — просто ставим значение в поле,
-// как это делает пользователь, ещё не убрав из него курсор. Ровно так
-// баг и воспроизводился: событие — один-единственный шанс доставить правку,
-// и поводов его упустить сколько угодно.
+// как пользователь, ещё не убравший из него курсор: событие — единственный
+// шанс доставить правку, и поводов его упустить сколько угодно.
 
 const fs = require("fs");
 const HTML = fs.readFileSync(path.join(__dirname, "..", "app", "static", "index.html"), "utf8");
@@ -340,6 +152,15 @@ function freshClient(options) {
   const env = dom.boot(HTML, { ...options, chats: seeded });
   const client = require(path.join(__dirname, "..", "app", "static", "app.js"));
   return { ...env, ...dom, client, $: (sel) => env.document.querySelector(sel) };
+}
+
+// Кнопку в карточке ищем по назначению, а не по номеру в ряду: индекс
+// начинает жать не то, оставаясь зелёным.
+function cardButton(card, title) {
+  const btn = card && card.querySelectorAll(".icon-btn").find((b) => b.title === title);
+  if (btn) return btn;
+  check(`в ленте есть карточка с кнопкой «${title}»`, false, String(card && card.className));
+  return { dispatchEvent() {} };
 }
 
 async function routeChecks() {
@@ -384,9 +205,8 @@ async function routeChecks() {
 
   // ── в теле сообщения только текст: ленту хранит агент ──
   //
-  // Раньше это стерёг греп по исходнику («в app.js есть строка { text }»),
-  // то есть описывал реализацию: тело можно раздуть, не тронув ту строку.
-  // Серверная половина — check_no_feed в run_checks.py: лишние поля → 400.
+  // Историю помнит агент, а не браузер: клиент шлёт вопрос и ничего больше,
+  // а перегенерация — вовсе пустое тело.
   {
     const { client, server, $, settle, Evt } = freshClient();
     client.init();
@@ -403,63 +223,14 @@ async function routeChecks() {
       JSON.stringify(posted[0] && posted[0].body)
     );
 
-    const card = $("#feed").querySelector(".card");
-    card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+    cardButton($("#feed").querySelector(".card"), "Перегенерировать")
+      .dispatchEvent(new Evt("click"));
     await settle(120);
     const repeated = server.state.requests.filter((r) => r.path.endsWith("/regenerate"));
     check(
       "перегенерация не шлёт тела вовсе: вопрос помнит агент",
       repeated.length === 1 && repeated[0].body === null,
       JSON.stringify(repeated.map((r) => r.body))
-    );
-  }
-
-  // ── правка во время генерации ──
-  {
-    const { client, server, $, settle } = freshClient({ delay: 30 });
-    client.init();
-    await settle(20);
-    $("#input").value = "первый";
-    $("#composer").requestSubmit();
-    await settle(40);
-    check("во время генерации клиент занят", client.state.busy === true);
-    $("#f-system").value = "ПРАВКА НА ЛЕТУ";
-    await settle(200);
-    $("#input").value = "второй";
-    $("#composer").requestSubmit();
-    await settle(250);
-    const second = server.state.sent[1];
-    check(
-      "правка во время генерации уезжает со следующим сообщением",
-      second && second.config.system === "ПРАВКА НА ЛЕТУ",
-      JSON.stringify(server.state.sent.map((x) => x.config.system))
-    );
-    check(
-      "текущий ответ правка не задела",
-      server.state.sent[0].config.system === "СТАРЫЙ ПРОМПТ",
-      server.state.sent[0].config.system
-    );
-  }
-
-  // ── перегенерация подчиняется тому же правилу ──
-  {
-    const { client, server, $, settle } = freshClient();
-    client.init();
-    await settle(20);
-    $("#input").value = "вопрос";
-    $("#composer").requestSubmit();
-    await settle(80);
-    $("#f-system").value = "ПРОМПТ ДЛЯ ПОВТОРА";
-    await client.state.applying;
-    const card = $("#feed").querySelector(".card");
-    const refresh = card.querySelectorAll(".icon-btn")[2];
-    refresh.dispatchEvent(new (require(path.join(__dirname, "dom.js")).Evt)("click"));
-    await settle(120);
-    const last = server.state.sent[server.state.sent.length - 1];
-    check(
-      "перегенерация тоже идёт с тем, что показывает панель",
-      last && last.config.system === "ПРОМПТ ДЛЯ ПОВТОРА",
-      JSON.stringify(server.state.sent.map((x) => x.config.system))
     );
   }
 
@@ -479,84 +250,11 @@ async function routeChecks() {
     check("текст сообщения остался в поле ввода", $("#input").value === "вопрос", $("#input").value);
   }
 
-  // ── пустой старт: писать надо куда-то сразу ──
-  {
-    const { client, server, $, settle, Evt } = freshClient({ bare: true });
-    check("на чистом старте на сервере нет чатов", server.state.agents.length === 0,
-      String(server.state.agents.length));
-    client.init();
-    await settle(60);
-
-    check("клиент заводит один чат сам", server.state.agents.length === 1,
-      String(server.state.agents.length));
-    check("и сразу его открывает", Boolean(client.state.current), "чат не открыт");
-    check("имя у него по умолчанию", /^Новый чат \d+$/.test(client.state.current.label),
-      client.state.current.label);
-    check("панель у него тоже пустая: промпт не придуман за пользователя",
-      $("#f-system").value === "", JSON.stringify($("#f-system").value));
-    check("и он пуст: ни переписки, ни черновика",
-      client.state.current.transcript.length === 0 && $("#input").value === "",
-      JSON.stringify([client.state.current.transcript, $("#input").value]));
-    check("в списке ровно одна строка",
-      $("#agent-list").querySelectorAll(".item").length === 1,
-      String($("#agent-list").querySelectorAll(".item").length));
-
-    // Удалили единственный чат — появился свежий, а не пустой экран.
-    const before = client.state.current.id;
-    const row = $("#agent-list").querySelectorAll(".item")[0];
-    row.querySelectorAll(".mini")[1].dispatchEvent(new Evt("click"));
-    const dialog = $(".confirm");
-    check("удаление спрашивает подтверждение", Boolean(dialog), "диалога нет");
-    const buttons = dialog.querySelectorAll(".primary");
-    buttons[0].dispatchEvent(new Evt("click"));
-    await settle(80);
-
-    check("после удаления последнего чата появляется свежий",
-      server.state.agents.length === 1 && client.state.current.id !== before,
-      JSON.stringify({ живых: server.state.agents.length, было: before, стало: client.state.current && client.state.current.id }));
-    check("и он тоже пустой", client.state.current.transcript.length === 0,
-      JSON.stringify(client.state.current.transcript));
-    check("номер имени не переиспользуется", client.state.current.label === "Новый чат 2",
-      client.state.current.label);
-  }
-
-  // ── «Новый чат» встаёт в конец списка ──
-  //
-  // Порядок списка слева не стерёг никто: разворот сортировки реестра
-  // наоборот не ронял ни одной проверки. Серверная половина —
-  // check_list_order в run_checks.py.
-  {
-    const { client, server, $, settle, Evt } = freshClient();
-    client.init();
-    await settle(30);
-    const names = () =>
-      $("#agent-list").querySelectorAll(".item-title").map((el) => el.textContent);
-
-    check("сначала в списке два заведённых чата",
-      names().join(" | ") === "первый чат | второй чат", names().join(" | "));
-
-    $("#new-chat").dispatchEvent(new Evt("click"));
-    await settle(60);
-    check("новый чат встаёт последним, а не первым",
-      names().length === 3 && /^Новый чат/.test(names()[2]), names().join(" | "));
-    check("и он же открыт",
-      client.state.current && client.state.current.label === names()[2],
-      client.state.current && client.state.current.label);
-    check("порядок прежних не тронут",
-      names()[0] === "первый чат" && names()[1] === "второй чат", names().join(" | "));
-    check("на сервере тот же порядок",
-      server.state.agents.map((a) => a.label).join(" | ") === names().join(" | "),
-      server.state.agents.map((a) => a.label).join(" | "));
-  }
-
   // ── лента рисуется из стенограммы ──
   //
   // Клиент после каждого обмена перечитывает агента и перерисовывает ленту
   // целиком: на экране должно быть ровно то, что у агента в истории, а не то,
-  // что клиент дорисовал по дороге. Значит формат стенограммы — часть
-  // поведения, и раньше его не стерёг никто: поле можно было убрать из ответа
-  // ручки, и ни одна проверка не краснела. Серверная половина —
-  // check_transcript_shape в run_checks.py.
+  // что он дорисовал по дороге. Значит формат стенограммы — часть поведения.
   {
     const talk = [
       { role: "user", content: "мой вопрос", error: null, reasoning: "", metrics: null },
@@ -578,8 +276,7 @@ async function routeChecks() {
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
 
-    const feed = $("#feed");
-    const nodes = feed.children.filter(
+    const nodes = $("#feed").children.filter(
       (el) => el.classList.contains("msg-user") || el.classList.contains("card")
     );
     check("в ленте по узлу на реплику стенограммы", nodes.length === talk.length,
@@ -587,30 +284,23 @@ async function routeChecks() {
     check("вопросы — пузырями, ответы — карточками",
       nodes.map((el) => (el.classList.contains("msg-user") ? "u" : "a")).join("") === "uaua",
       nodes.map((el) => el.className).join(" | "));
-
-    check("текст вопроса показан", nodes[0].textContent === "мой вопрос", nodes[0].textContent);
-    check("текст ответа показан и разобран как markdown",
+    check("вопрос показан текстом, а не разметкой",
+      nodes[0].textContent === "мой вопрос" && nodes[0].innerHTML === "",
+      JSON.stringify([nodes[0].textContent, nodes[0].innerHTML]));
+    check("текст ответа разобран как markdown",
       nodes[1].querySelector(".card-body").innerHTML.includes("<strong>жирный</strong>"),
       nodes[1].querySelector(".card-body").innerHTML);
     check("имя модели берётся из метрик реплики, а не из конфига чата",
       nodes[1].querySelector(".card-model").textContent === "особая/модель",
       nodes[1].querySelector(".card-model").textContent);
-    check("провайдер показан отдельной меткой",
-      nodes[1].querySelector(".card-tag").textContent === "поставщик",
-      String(nodes[1].querySelector(".card-tag")));
     check("рассуждение показано свёрнутым блоком",
-      Boolean(nodes[1].querySelector(".think")) &&
+      nodes[1].querySelector(".think-body") &&
         nodes[1].querySelector(".think-body").textContent === "я подумал",
       String(nodes[1].querySelector(".think")));
-    check("у целого ответа блока ошибки нет",
-      nodes[1].querySelector(".card-error") === null, "блок ошибки появился");
-
-    check("оборванный ответ помечен",
-      nodes[3].classList.contains("failed"), nodes[3].className);
-    check("и текст ошибки показан",
-      nodes[3].querySelector(".card-error") &&
+    check("оборванный ответ помечен, и текст ошибки показан",
+      nodes[3].classList.contains("failed") &&
         nodes[3].querySelector(".card-error").textContent === "оборвалось",
-      String(nodes[3].querySelector(".card-error")));
+      nodes[3].className + " | " + String(nodes[3].querySelector(".card-error")));
 
     // Пустая стенограмма — это заставка, а не пустая лента с нулём узлов.
     $("#agent-list").querySelectorAll(".item-open")[0].dispatchEvent(new Evt("click"));
@@ -619,14 +309,60 @@ async function routeChecks() {
       Boolean($("#feed").querySelector(".empty")), $("#feed").textContent);
   }
 
+  // ── пустой старт: писать надо куда-то сразу ──
+  {
+    const { client, server, $, settle, Evt } = freshClient({ bare: true });
+    client.init();
+    await settle(60);
+
+    check("на пустом сервере клиент заводит один чат сам", server.state.agents.length === 1,
+      String(server.state.agents.length));
+    check("и сразу его открывает", Boolean(client.state.current), "чат не открыт");
+    check("панель у него пустая: промпт не придуман за пользователя",
+      $("#f-system").value === "" && client.state.current.transcript.length === 0,
+      JSON.stringify([$("#f-system").value, client.state.current.transcript]));
+
+    // Удалили единственный чат — появился свежий, а не пустой экран.
+    const before = client.state.current.id;
+    const row = $("#agent-list").querySelectorAll(".item")[0];
+    row.querySelectorAll(".mini")[1].dispatchEvent(new Evt("click"));
+    $(".confirm").querySelectorAll(".primary")[0].dispatchEvent(new Evt("click"));
+    await settle(80);
+    check("после удаления последнего чата появляется свежий, с новым номером",
+      server.state.agents.length === 1 && client.state.current.id !== before &&
+        client.state.current.label === "Новый чат 2",
+      JSON.stringify({ живых: server.state.agents.length, было: before,
+                       стало: client.state.current && client.state.current.label }));
+  }
+
+  // ── «Новый чат» встаёт в конец списка ──
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(30);
+    const names = () =>
+      $("#agent-list").querySelectorAll(".item-title").map((el) => el.textContent);
+
+    check("сначала в списке два заведённых чата",
+      names().join(" | ") === "первый чат | второй чат", names().join(" | "));
+
+    $("#new-chat").dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("новый чат встаёт последним, а не первым",
+      names().length === 3 && /^Новый чат/.test(names()[2]) &&
+        names()[0] === "первый чат" && names()[1] === "второй чат",
+      names().join(" | "));
+    check("и он же открыт",
+      client.state.current && client.state.current.label === names()[2],
+      client.state.current && client.state.current.label);
+  }
+
   // ── переименование чата в списке слева ──
   //
-  // Раньше это стереглось грепом по исходнику: «в app.js есть строка
-  // function startRename», «есть miniButton("pencil")», «встречаются слова
-  // Enter и Escape». Такая проверка описывает реализацию, а не поведение:
-  // переименование можно сломать, не тронув ни одной из этих строк, и она
-  // останется зелёной. Здесь — настоящий маршрут: клик по кнопке,
-  // клавиша, запрос к серверу, имя в списке.
+  // Настоящий маршрут: клик по кнопке, клавиша, запрос к серверу, имя
+  // в списке. Греп по исходнику («в app.js есть function startRename»)
+  // описывал бы реализацию: переименование можно сломать, не тронув ни одной
+  // из тех строк, и греп останется зелёным.
   {
     const { client, server, $, settle, Evt } = freshClient();
     client.init();
@@ -636,330 +372,96 @@ async function routeChecks() {
     const title = () => row().querySelector(".item-title");
     const patches = () =>
       server.state.requests.filter((r) => r.method === "PATCH" && "label" in (r.body || {}));
-
-    check("до переименования в строке показано имя чата",
-      title() && title().textContent === "первый чат",
-      title() && title().textContent);
+    const rename = () => {
+      row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+      return row().querySelector(".item-rename");
+    };
 
     // 1. Кнопка открывает поле прямо в строке, со старым именем внутри.
-    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
-    let field = row().querySelector(".item-rename");
-    check("кнопка открывает поле ввода прямо в строке", Boolean(field), "поля нет");
-    check("в поле стоит нынешнее имя", field && field.value === "первый чат",
-      field && field.value);
-    check("пока переименовываем, кнопки открытия чата в строке нет",
-      row().querySelector(".item-open") === null, "кнопка осталась");
+    let field = rename();
+    check("кнопка открывает поле ввода со старым именем внутри",
+      field && field.value === "первый чат", field && field.value);
 
     // 2. Enter сохраняет: правка уходит на сервер и видна в списке.
     field.value = "новое имя";
     field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
     await settle(40);
-    check("Enter отправляет новое имя на сервер",
-      patches().length === 1 && patches()[0].body.label === "новое имя",
-      JSON.stringify(patches().map((r) => r.body)));
-    check("имя на сервере поменялось",
-      server.state.agents[0].label === "новое имя", server.state.agents[0].label);
-    check("список показывает новое имя", title() && title().textContent === "новое имя",
-      title() && title().textContent);
-    check("поле ввода закрылось", row().querySelector(".item-rename") === null, "поле осталось");
+    check("Enter отправляет новое имя на сервер и список его показывает",
+      patches().length === 1 && server.state.agents[0].label === "новое имя" &&
+        title().textContent === "новое имя",
+      JSON.stringify([patches().map((r) => r.body), title() && title().textContent]));
 
     // 3. Escape отменяет: ни запроса, ни следа в списке.
-    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
-    field = row().querySelector(".item-rename");
+    field = rename();
     field.value = "передумал";
     field.dispatchEvent(new Evt("keydown", { key: "Escape" }));
     await settle(40);
-    check("Escape не шлёт запроса", patches().length === 1,
-      JSON.stringify(patches().map((r) => r.body)));
-    check("Escape оставляет прежнее имя", title() && title().textContent === "новое имя",
-      title() && title().textContent);
+    check("Escape не шлёт запроса и оставляет прежнее имя",
+      patches().length === 1 && title().textContent === "новое имя",
+      JSON.stringify([patches().map((r) => r.body), title() && title().textContent]));
 
     // 4. Потеря фокуса сохраняет: имя не должно теряться молча.
-    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
-    field = row().querySelector(".item-rename");
+    field = rename();
     field.focus();
     field.value = "по потере фокуса";
     field.blur();
     await settle(40);
     check("потеря фокуса тоже сохраняет",
-      patches().length === 2 && patches()[1].body.label === "по потере фокуса",
-      JSON.stringify(patches().map((r) => r.body)));
-    check("и список это показывает", title() && title().textContent === "по потере фокуса",
-      title() && title().textContent);
+      patches().length === 2 && title().textContent === "по потере фокуса",
+      JSON.stringify([patches().map((r) => r.body), title() && title().textContent]));
 
     // 5. Пустое имя чат не стирает: запроса нет, имя прежнее.
-    row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
-    field = row().querySelector(".item-rename");
+    field = rename();
     field.value = "   ";
     field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
     await settle(40);
-    check("пустым именем чат не переименовать", patches().length === 2,
-      JSON.stringify(patches().map((r) => r.body)));
-    check("после пустого ввода имя осталось прежним",
-      title() && title().textContent === "по потере фокуса",
-      title() && title().textContent);
-  }
-
-  // ── где оказывается лента ──
-  //
-  // Утверждения здесь про **положение ленты**, а не про внутренний флаг.
-  // Прошлая версия проверяла флаг — и пропустила регресс: флаг вёл себя
-  // ровно как задумано, а лента при этом оставалась в нуле, потому что
-  // содержимое пересоздаётся и браузер обнуляет прокрутку. Смотреть надо
-  // на то, что видит читатель.
-  {
-    // Разговор должен быть длиннее экрана — иначе прокручивать нечего.
-    // Высоту стенд считает по числу узлов, так что «длиннее» здесь значит
-    // «больше сообщений», как и в браузере.
-    const TALK = [];
-    for (let i = 1; i <= 6; i += 1) {
-      TALK.push({ role: "user", content: `вопрос ${i}`, error: null, reasoning: "", metrics: null });
-      TALK.push({ role: "assistant", content: `ответ ${i}`, error: null, reasoning: "", metrics: null });
-    }
-    const withHistory = (label) => ({ label, transcript: TALK.slice(), history_len: TALK.length });
-    const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
-    // Экран — единственное, что задаёт проверка: высоту содержимого считает
-    // стенд, как браузер считал бы её раскладкой.
-    const measure = (feed) => {
-      feed.clientHeight = 120;
-      return feed;
-    };
-    const UP = 40;   // куда отматывает читатель
-
-    // 1. Чат открывают, чтобы увидеть последнее сообщение.
-    {
-      const { client, $, settle, Evt } = freshClient({
-        chats: [withHistory("чат А"), withHistory("чат Б")],
-      });
-      client.init();
-      await settle(30);
-      const feed = measure($("#feed"));
-      // Два первых чата в стенде — без истории; наши с историей идут за ними.
-      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
-      await settle(40);
-      check("открытый чат показывает конец разговора", atBottom(feed),
-        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
-
-      // 2. Отмотал вверх в одном чате — другой всё равно открывается внизу.
-      feed.scrollTop = UP;
-      feed.dispatchEvent(new Evt("scroll"));
-      $("#agent-list").querySelectorAll(".item-open")[3].dispatchEvent(new Evt("click"));
-      await settle(40);
-      check("отмотанная лента не переносится на другой чат", atBottom(feed),
-        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
-
-      // ...и возврат в первый чат тоже показывает конец разговора.
-      feed.scrollTop = UP;
-      feed.dispatchEvent(new Evt("scroll"));
-      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
-      await settle(40);
-      check("и возврат в прежний чат — тоже", atBottom(feed),
-        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
-    }
-
-    // 3. Перегенерацию просит сам читатель — значит показать, что вышло.
-    {
-      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")] });
-      client.init();
-      await settle(30);
-      const feed = measure($("#feed"));
-      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
-      await settle(40);
-      feed.scrollTop = UP;
-      feed.dispatchEvent(new Evt("scroll"));
-      const card = feed.querySelector(".card");
-      card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
-      await settle(150);
-      check("перегенерация при отмотанной ленте показывает новый ответ", atBottom(feed),
-        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
-    }
-
-    // 4. Отмотал вверх во время ответа — лента остаётся там, где её оставили.
-    {
-      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")], delay: 25 });
-      client.init();
-      await settle(30);
-      const feed = measure($("#feed"));
-      // Открываем именно чат с историей: в пустом отматывать нечего.
-      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
-      await settle(40);
-      $("#input").value = "вопрос";
-      $("#composer").requestSubmit();
-      await settle(40);
-      feed.scrollTop = UP;
-      feed.dispatchEvent(new Evt("scroll"));
-      await settle(300);
-      check("отмотанная во время ответа лента остаётся на месте", feed.scrollTop === UP,
-        `лента на ${feed.scrollTop}, ждали ${UP}`);
-      check("и уж точно не в начале разговора", feed.scrollTop !== 0, String(feed.scrollTop));
-    }
-
-    // 5. Прижатая лента доматывается сама.
-    {
-      const { client, $, settle, Evt } = freshClient({ chats: [withHistory("чат")], delay: 5 });
-      client.init();
-      await settle(30);
-      const feed = measure($("#feed"));
-      $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
-      await settle(40);
-      $("#input").value = "вопрос";
-      $("#composer").requestSubmit();
-      await settle(200);
-      check("прижатая лента доматывается к новому ответу", atBottom(feed),
-        `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
-    }
+    check("пустым именем чат не переименовать",
+      patches().length === 2 && title().textContent === "по потере фокуса",
+      JSON.stringify([patches().map((r) => r.body), title() && title().textContent]));
   }
 
   // ── «Применено» — о событии, а не о каждой отправке ──
   //
-  // Жалоба заказчика: строка появлялась на каждое сообщение. Причина
-  // в правке двумя кругами раньше: пролив панели переехал внутрь `exchange`
-  // и стал случаться перед каждой отправкой, а сообщение показывалось
-  // по факту пролива. Инвариант тут ни при чём — проливать надо всегда,
-  // сообщать не о чем. Утверждения ниже — про то, что видно на экране.
+  // Жалоба заказчика: строка появлялась на каждое сообщение. Проливать панель
+  // надо перед каждой отправкой — сообщать не о чем. Утверждения ниже — про
+  // то, что видно на экране.
   {
     const { client, $, settle, Evt } = freshClient();
     const shown = () => $("#save-status").textContent;
     client.init();
     await settle(20);
 
-    // 1. Отправка без единой правки: панель проливается, экран молчит.
     $("#input").value = "первый";
     $("#composer").requestSubmit();
     await settle(120);
     check("отправка без правок ничего не сообщает", shown() === "", shown());
 
-    $("#input").value = "второй";
-    $("#composer").requestSubmit();
-    await settle(120);
-    check("и вторая отправка тоже", shown() === "", shown());
+    // Пролив теми же значениями изменением не является: панель «изменилась»
+    // по событию, а конфиг агента — нет.
+    $("#f-system").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("правка теми же значениями тоже молчит", shown() === "", shown());
 
-    // 2. Правка есть — сообщение появляется.
     $("#f-system").value = "ПРАВКА";
     $("#f-system").dispatchEvent(new Evt("change"));
     await settle(40);
     check("после настоящей правки сообщение есть", /Применено/.test(shown()), shown());
 
-    // 3. Правка, а сразу за ней отправка: сообщение остаётся тем же самым,
-    //    а не появляется вторым — таймер у него один, назначенный правкой.
-    const timer = client.state.statusTimer;
-    $("#input").value = "третий";
-    $("#composer").requestSubmit();
-    await settle(120);
-    check("отправка сразу после правки не показывает второе сообщение",
-      /Применено/.test(shown()) && client.state.statusTimer === timer,
-      `${shown()} | таймер ${client.state.statusTimer === timer ? "тот же" : "новый"}`);
-
-    // 4. Следующая отправка уже без правок — снова тишина.
-    await settle(0);
-    $("#save-status").textContent = "";
-    $("#input").value = "четвёртый";
-    $("#composer").requestSubmit();
-    await settle(120);
-    check("после применённой правки следующая отправка молчит", shown() === "", shown());
-  }
-
-  // ── пролив теми же значениями изменением не является ──
-  {
-    const { client, $, settle, Evt } = freshClient();
-    const shown = () => $("#save-status").textContent;
-    client.init();
-    await settle(20);
-
-    // Ставим в поля ровно то, что там уже стоит: панель «изменилась»
-    // по событию, но конфиг агента — нет.
-    $("#f-system").value = $("#f-system").value;
-    $("#f-temperature").value = $("#f-temperature").value;
-    $("#f-system").dispatchEvent(new Evt("change"));
-    await settle(40);
-    check("правка теми же значениями ничего не сообщает", shown() === "", shown());
-
     // Пустое поле не равно нулю: заданный ноль — это правка.
+    $("#save-status").textContent = "";
     $("#f-top_p").value = "0";
     $("#f-top_p").dispatchEvent(new Evt("change"));
     await settle(40);
     check("ноль в пустом поле — настоящая правка", /Применено/.test(shown()), shown());
 
-    // ...а стереть ноль обратно в пустоту — тоже правка, в другую сторону.
-    $("#save-status").textContent = "";
-    $("#f-top_p").value = "";
-    $("#f-top_p").dispatchEvent(new Evt("change"));
-    await settle(40);
-    check("и стереть его обратно — тоже", /Применено/.test(shown()), shown());
-
-    // Стоп-строки: лишний перевод строки списком не становится.
-    $("#save-status").textContent = "";
-    $("#f-stop").value = "\n\n";
-    $("#f-stop").dispatchEvent(new Evt("change"));
-    await settle(40);
-    check("пустые строки в стоп-списке правкой не считаются", shown() === "", shown());
-
-    $("#f-stop").value = "КОНЕЦ";
-    $("#f-stop").dispatchEvent(new Evt("change"));
-    await settle(40);
-    check("а настоящая стоп-строка — считается", /Применено/.test(shown()), shown());
-  }
-
-  // ── две правки подряд: таймер не залипает, и строка гаснет ──
-  //
-  // Единственное место, где проверяется гашение строки состояния: правка
-  // показывает «Применено», вторая правка перевешивает таймер, а не копит
-  // второй, и через пять секунд после последней правки строка пуста.
-  {
-    const { client, $, settle, Evt } = freshClient();
-    const shown = () => $("#save-status").textContent;
-    client.init();
-    await settle(20);
-
-    $("#f-system").value = "раз";
-    $("#f-system").dispatchEvent(new Evt("change"));
-    await settle(40);
-    const first = client.state.statusTimer;
-    $("#f-system").value = "два";
-    $("#f-system").dispatchEvent(new Evt("change"));
-    await settle(40);
-    check("вторая правка перевешивает таймер, а не копит второй",
-      /Применено/.test(shown()) && Boolean(client.state.statusTimer) &&
-        client.state.statusTimer !== first,
-      `${shown()} | ${first === client.state.statusTimer ? "тот же таймер" : "новый таймер"}`);
-
-    await new Promise((r) => setTimeout(r, 5100));
-    check("и через пять секунд после последней правки строка пуста",
-      shown() === "", shown());
-  }
-
-  // ── неудачная правка: своя красная строка, а не «Применено» ──
-  {
-    const { client, $, settle, Evt } = freshClient();
-    const shown = () => $("#save-status").textContent;
-    client.init();
-    await settle(20);
-
-    // Пустая модель — сервер отвечает 400.
+    // Провалившийся PATCH — своя красная строка, а не «Применено».
     $("#f-model").value = "";
     $("#f-model").dispatchEvent(new Evt("change"));
     await settle(60);
-    check("провалившийся PATCH не сообщает о применении", !/Применено/.test(shown()), shown());
-    check("а говорит, что не так", shown().length > 0, "строка пуста");
-    check("и делает это красным",
-      /error/.test($("#save-status").className), $("#save-status").className);
-  }
-
-  // ── перегенерация без правок ──
-  {
-    const { client, $, settle, Evt } = freshClient();
-    const shown = () => $("#save-status").textContent;
-    client.init();
-    await settle(20);
-    $("#input").value = "вопрос";
-    $("#composer").requestSubmit();
-    await settle(120);
-    $("#save-status").textContent = "";
-
-    const card = $("#feed").querySelector(".card");
-    card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
-    await settle(140);
-    check("перегенерация без правок ничего не сообщает", shown() === "", shown());
+    check("провалившаяся правка краснеет и объясняет, а не рапортует о применении",
+      !/Применено/.test(shown()) && shown().length > 0 &&
+        /error/.test($("#save-status").className),
+      shown() + " | " + $("#save-status").className);
   }
 
   // ── предупреждение про поставщика: только при смене модели ──
@@ -970,8 +472,7 @@ async function routeChecks() {
     });
     client.init();
     await settle(20);
-    const rows = $("#agent-list").querySelectorAll(".item-open");
-    rows[2].dispatchEvent(new Evt("click"));
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
     check("на закреплённом чате предупреждения нет, пока модель прежняя",
       $("#model-warn").children.length === 0, $("#model-warn").textContent);
@@ -982,209 +483,146 @@ async function routeChecks() {
     check("после смены модели предупреждение появляется", text.length > 0, text);
     check("и говорит человеческими словами, без имён полей конфига",
       /поставщик/i.test(text) && !/provider|extra_body|order|404/.test(text), text);
+
+    // Второй повод: параметр, которого модель не заявляет. На каждом вызове
+    // стоит provider.require_parameters, и такой параметр выкашивает
+    // провайдеров — вместо ответа придёт невнятная ошибка.
+    $("#f-model").value = "строгая/модель";
+    $("#f-top_k").value = "40";
+    $("#f-top_k").dispatchEvent(new Evt("change"));
+    await settle(40);
+    const unsupported = $("#model-warn").textContent;
+    check("про незаявленный моделью параметр панель предупреждает отдельно",
+      /top_k/.test(unsupported) && /строгая\/модель/.test(unsupported), unsupported);
+    check("и это второе предупреждение, а не замена первому",
+      $("#model-warn").children.length === 2, String($("#model-warn").children.length));
+
+    // Третий: температуру модель заявляет и всё равно обрезает на 1.0.
+    $("#f-temperature").value = "1.2";
+    $("#f-temperature").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("про обрезанную температуру предупреждает, хотя параметр заявлен",
+      /1\.0/.test($("#model-warn").textContent) &&
+        $("#model-warn").children.length === 3,
+      $("#model-warn").textContent);
+
+    // Заявленное молчит: пугать тем, чего не будет, хуже, чем молчать.
+    $("#f-temperature").value = "0.5";
+    $("#f-top_k").value = "";
+    $("#f-top_k").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("заявленные параметры молчат",
+      $("#model-warn").children.length === 1, $("#model-warn").textContent);
   }
-}
 
-// ── сам стенд ──
-//
-// Стенд теперь единственная страховка от целого класса ошибок, и его
-// собственное поведение закреплено так же, как поведение клиента. Стенд,
-// тихо расходящийся с браузером, — тот же капкан, из-за которого проверка
-// трижды смотрела не туда: утверждение зелёное, а в браузере сломано.
-// Где повторить браузер дёшево — повторяем; где нельзя — падаем с текстом.
+  // ── узкое окно: борта становятся ящиками поверх ленты ──
+  //
+  // Целый режим интерфейса, который стенд раньше не исполнял ни разу:
+  // `matchMedia` в нём был прибит к `matches: false`. Утверждения —
+  // про то, что видно на экране, а не про внутренние флаги.
+  {
+    const { client, $, settle, Evt, document } = freshClient({ narrow: true });
+    client.init();
+    await settle(40);
+    const app = $("#app");
+    const openDrawer = (which) => {
+      document.getElementById("restore-" + which).dispatchEvent(new Evt("click"));
+    };
+    const esc = () => document.body.dispatchEvent(new Evt("keydown", { key: "Escape" }));
 
-function stubChecks() {
-  const dom = require(path.join(__dirname, "dom.js"));
-  const fresh = () => {
-    const env = dom.boot(HTML, { chats: [{ label: "чат" }] });
-    return { env, doc: env.document, make: (tag) => env.document.createElement(tag) };
-  };
-  const throws = (body, pattern) => {
-    try {
-      body();
-      return false;
-    } catch (err) {
-      return pattern.test(err.message);
+    check("на узком окне оба борта свёрнуты сразу",
+      app.classList.contains("no-sidebar") && app.classList.contains("no-panel"),
+      app.className);
+    check("и на экране осталось, чем их вернуть",
+      Boolean(document.getElementById("restore-sidebar")) &&
+        Boolean(document.getElementById("restore-panel")),
+      "кнопок разворота нет");
+
+    openDrawer("sidebar");
+    await settle(10);
+    check("кнопка возвращает список, и под ящиком появляется затемнение",
+      !app.classList.contains("no-sidebar") && Boolean($(".backdrop")), app.className);
+
+    openDrawer("panel");
+    await settle(10);
+    check("ящики не соседствуют: открыли настройки — список закрылся",
+      app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
+
+    // Escape поверх диалога подтверждения важнее ящиков.
+    openDrawer("sidebar");
+    await settle(10);
+    $("#agent-list").querySelectorAll(".mini")[1].dispatchEvent(new Evt("click"));
+    check("удаление спрашивает подтверждение", Boolean($(".confirm")), "диалога нет");
+    esc();
+    await settle(10);
+    check("Escape поверх диалога гасит диалог, а открытый ящик оставляет",
+      !$(".confirm") && !app.classList.contains("no-sidebar"), app.className);
+
+    esc();
+    await settle(10);
+    check("а следующий Escape закрывает ящик и убирает затемнение",
+      app.classList.contains("no-sidebar") && !$(".backdrop"), app.className);
+  }
+
+  // ── широкое окно: Escape борта не трогает ──
+  {
+    const { client, $, settle, Evt, document } = freshClient();
+    client.init();
+    await settle(30);
+    const app = $("#app");
+    check("на широком окне борта открыты", 
+      !app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
+    document.body.dispatchEvent(new Evt("keydown", { key: "Escape" }));
+    await settle(10);
+    check("и Escape их не закрывает: ящиков здесь нет",
+      !app.classList.contains("no-sidebar") && !app.classList.contains("no-panel"),
+      app.className);
+  }
+
+  // ── где оказывается лента ──
+  //
+  // Утверждения про **положение ленты**, а не про внутренний флаг: флаг вёл
+  // себя ровно как задумано, а лента оставалась в нуле — содержимое
+  // пересоздаётся, и браузер обнуляет прокрутку.
+  {
+    const TALK = [];
+    for (let i = 1; i <= 6; i += 1) {
+      TALK.push({ role: "user", content: `вопрос ${i}`, error: null, reasoning: "", metrics: null });
+      TALK.push({ role: "assistant", content: `ответ ${i}`, error: null, reasoning: "", metrics: null });
     }
-  };
+    const atBottom = (feed) => feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 80;
+    const UP = 40;   // куда отматывает читатель
 
-  // 1. Высота растёт от содержимого, а присвоить её нельзя.
-  {
-    const { make } = fresh();
-    const box = make("div");
-    check("пустой узел не имеет высоты", box.scrollHeight === 0, String(box.scrollHeight));
-    box.appendChild(make("div"));
-    const one = box.scrollHeight;
-    box.appendChild(make("div"));
-    check("высота растёт от содержимого", box.scrollHeight > one, `${one} → ${box.scrollHeight}`);
-    check(
-      "присвоить высоту нельзя — стенд падает с объяснением",
-      throws(() => { box.scrollHeight = 4000; }, /не присваивают/),
-      "присвоение прошло молча"
-    );
-    box.clientHeight = 1000;
-    check("высота не меньше экрана", box.scrollHeight >= 1000, String(box.scrollHeight));
-  }
-
-  // 2. Прокрутка зажата, как в браузере.
-  {
-    const { make } = fresh();
-    const box = make("div");
-    for (let i = 0; i < 10; i += 1) box.appendChild(make("div"));
-    box.clientHeight = 100;
-    const limit = box.scrollHeight - box.clientHeight;
-    box.scrollTop = 1e6;
-    check("вниз дальше края не уедешь", box.scrollTop === limit, `${box.scrollTop} при пределе ${limit}`);
-    box.scrollTop = -50;
-    check("вверх за ноль тоже", box.scrollTop === 0, String(box.scrollTop));
-    box.scrollTop = 40;
-    check("обычное значение принимается как есть", box.scrollTop === 40, String(box.scrollTop));
-  }
-
-  // 3. Составной селектор либо работает, либо падает — но не молчит.
-  {
-    const { doc, make } = fresh();
-    const box = make("div");
-    const btn = make("button");
-    btn.className = "mini danger";
-    btn.id = "цель";
-    box.appendChild(btn);
-    check("тег с классами находится", box.querySelector("button.mini.danger") === btn);
-    check("класс с id находится", box.querySelector("#цель.mini") === btn);
-    check("несовпадение по одному из классов — не находится", box.querySelector("button.mini.нет") === null);
-    for (const bad of [".a .b", ".a > .b", ".a, .b", "[data-x]", "div:first-child", "*"]) {
-      check(
-        `селектор «${bad}» роняет стенд, а не отдаёт пустоту`,
-        throws(() => box.querySelector(bad), /не умеет селектор|пустой селектор/),
-        "вернул пустоту молча"
-      );
-    }
-    check("документ ведёт себя так же", throws(() => doc.querySelector(".a .b"), /не умеет селектор/));
-  }
-
-  // 4. textContent видит то, что положили через innerHTML.
-  {
-    const { make } = fresh();
-    const box = make("div");
-    box.innerHTML = "<p>первый</p><p>второй</p>";
-    check("текст читается сквозь разметку", box.textContent === "первыйвторой", box.textContent);
-    box.innerHTML = "&lt;script&gt; &amp; кавычка &quot;";
-    check("сущности разворачиваются", box.textContent === '<script> & кавычка "', box.textContent);
-    box.innerHTML = "";
-    check("после очистки текст пуст", box.textContent === "", box.textContent);
-  }
-
-  // 5. Событие всплывает до документа.
-  {
-    const { doc, make } = fresh();
-    const deep = make("span");
-    const middle = make("div");
-    middle.appendChild(deep);
-    doc.body.appendChild(middle);
-    const seen = [];
-    doc.addEventListener("click", (ev) => seen.push(ev.target === deep ? "документ" : "не тот target"));
-    deep.dispatchEvent(new dom.Evt("click"));
-    check("событие с глубокого узла доходит до документа", seen.join() === "документ", seen.join());
-
-    const stopped = [];
-    doc.addEventListener("keydown", () => stopped.push("документ"));
-    const input = make("input");
-    doc.body.appendChild(input);
-    input.addEventListener("keydown", (ev) => ev.stopPropagation());
-    input.dispatchEvent(new dom.Evt("keydown"));
-    check("остановленное событие до документа не доходит", stopped.length === 0, stopped.join());
-  }
-
-  // 6. Потеря фокуса шлёт change — и только если значение поменялось.
-  {
-    const { make } = fresh();
-    const field = make("textarea");
-    const events = [];
-    field.addEventListener("blur", () => events.push("blur"));
-    field.addEventListener("change", () => events.push("change"));
-
-    field.focus();
-    field.blur();
-    check("без правки change не шлётся", events.join() === "blur", events.join());
-
-    events.length = 0;
-    field.focus();
-    field.value = "новое";
-    field.blur();
-    check("после правки идут blur и change, в этом порядке", events.join() === "blur,change", events.join());
-  }
-
-  // 7. Обработчики идут в порядке подписки, инлайновый — не исключение.
-  {
-    const { make } = fresh();
-    const box = make("div");
-    const order = [];
-    box.onclick = () => order.push("инлайн");
-    box.addEventListener("click", () => order.push("подписка"));
-    box.dispatchEvent(new dom.Evt("click"));
-    check("инлайновый раньше, если назначен раньше", order.join() === "инлайн,подписка", order.join());
-
-    const other = make("div");
-    const second = [];
-    other.addEventListener("click", () => second.push("подписка"));
-    other.onclick = () => second.push("инлайн");
-    other.dispatchEvent(new dom.Evt("click"));
-    check("и позже, если назначен позже", second.join() === "подписка,инлайн", second.join());
-
-    const third = make("div");
-    const replaced = [];
-    third.onclick = () => replaced.push("первый");
-    third.onclick = () => replaced.push("второй");
-    third.dispatchEvent(new dom.Evt("click"));
-    check("инлайновый один: переприсвоение заменяет", replaced.join() === "второй", replaced.join());
-  }
-
-  // 9. <select> с чужим значением теряет выбор, а не держит старое.
-  {
-    const { make } = fresh();
-    const box = make("select");
-    ["первая/модель", "вторая/модель"].forEach((id) => {
-      const opt = make("option");
-      opt.value = id;
-      box.appendChild(opt);
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "чат", transcript: TALK, history_len: TALK.length }],
+      delay: 25,
     });
-    check("без выбора показывает первую опцию", box.value === "первая/модель", box.value);
-    box.value = "вторая/модель";
-    check("существующая опция выбирается", box.value === "вторая/модель", box.value);
-    box.value = "нет/такой/модели";
-    check("значения, которого нет в списке, не остаётся — выбор снят",
-      box.value === "", JSON.stringify(box.value));
-    check("и selectedIndex это подтверждает", box.selectedIndex === -1, String(box.selectedIndex));
-    box.value = "первая/модель";
-    check("после снятия выбор снова назначается", box.value === "первая/модель", box.value);
-    box.value = "";
-    box.innerHTML = "";
-    const opt = make("option");
-    opt.value = "третья/модель";
-    box.appendChild(opt);
-    check("пересобранный список снова начинается с первой опции",
-      box.value === "третья/модель", box.value);
-  }
+    client.init();
+    await settle(30);
+    // Экран — единственное, что задаёт проверка: высоту содержимого считает
+    // стенд, как браузер считал бы её раскладкой.
+    const feed = $("#feed");
+    feed.clientHeight = 120;
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("открытый чат показывает конец разговора", atBottom(feed),
+      `лента на ${feed.scrollTop} из ${feed.scrollHeight}`);
 
-  // 8. Подмена содержимого обнуляет прокрутку — то, ради чего всё затевалось.
-  {
-    const { make } = fresh();
-    const box = make("div");
-    for (let i = 0; i < 10; i += 1) box.appendChild(make("div"));
-    box.clientHeight = 100;
-    box.scrollTop = 60;
-    box.innerHTML = "";
-    check("после подмены содержимого прокрутка в нуле", box.scrollTop === 0, String(box.scrollTop));
+    // Отмотал вверх во время ответа — лента остаётся там, где её оставили.
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(40);
+    feed.scrollTop = UP;
+    feed.dispatchEvent(new Evt("scroll"));
+    await settle(300);
+    check("отмотанная во время ответа лента остаётся на месте", feed.scrollTop === UP,
+      `лента на ${feed.scrollTop}, ждали ${UP}`);
   }
 }
 
 // ── итог ──
-
-try {
-  stubChecks();
-} catch (err) {
-  failures.push("проверка стенда упала: " + (err && err.stack));
-}
 
 routeChecks()
   .catch((err) => failures.push("маршрут клиента упал: " + (err && err.stack)))

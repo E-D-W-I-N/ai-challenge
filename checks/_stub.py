@@ -17,13 +17,9 @@ CALLS: list[dict] = []
 обязаны смотреть на то самое тело, которое ушло бы в OpenRouter.
 """
 
-ACTIVE = {"now": 0, "peak": 0, "closed": 0}
-"""Сколько стримов открыто прямо сейчас, максимум и сколько закрыто досрочно."""
-
 
 def reset() -> None:
     CALLS.clear()
-    ACTIVE.update(now=0, peak=0, closed=0)
 
 
 def _default_reply(messages: list[dict], index: int) -> str:
@@ -88,33 +84,21 @@ def make(
             context_length=context_length,
         ).as_dict()
 
-        ACTIVE["now"] += 1
-        ACTIVE["peak"] = max(ACTIVE["peak"], ACTIVE["now"])
-        finished = False
-        try:
-            if fail:
-                metrics = {**metrics, "error": "HTTP 402: заглушка", "finish_reason": None}
-                yield {"type": "error", "message": "HTTP 402: заглушка", "metrics": metrics}
-                finished = True
-                return
+        if fail:
+            metrics = {**metrics, "error": "HTTP 402: заглушка", "finish_reason": None}
+            yield {"type": "error", "message": "HTTP 402: заглушка", "metrics": metrics}
+            return
 
-            if reasoning:
-                yield {"type": "reasoning", "text": reasoning, "metrics": metrics}
+        if reasoning:
+            yield {"type": "reasoning", "text": reasoning, "metrics": metrics}
 
-            size = max(1, len(text) // max(1, chunks))
-            for start in range(0, len(text), size):
-                if delay:
-                    await asyncio.sleep(delay)
-                yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
-            yield {"type": "metrics", "metrics": metrics}
-            yield {"type": "done", "text": text, "reasoning": reasoning, "metrics": metrics}
-            finished = True
-        finally:
-            ACTIVE["now"] -= 1
-            if not finished:
-                # Генератор закрыли на середине: именно так выглядит погашенный
-                # вызов, когда клиент ушёл со страницы.
-                ACTIVE["closed"] += 1
+        size = max(1, len(text) // max(1, chunks))
+        for start in range(0, len(text), size):
+            if delay:
+                await asyncio.sleep(delay)
+            yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
+        yield {"type": "metrics", "metrics": metrics}
+        yield {"type": "done", "text": text, "reasoning": reasoning, "metrics": metrics}
 
     return fake_stream_completion
 
