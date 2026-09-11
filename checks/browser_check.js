@@ -491,6 +491,61 @@ async function routeChecks() {
     );
   }
 
+  // ── разметка из ответа не становится разметкой страницы — на самой карточке ──
+  //
+  // Дыра, найденная мутацией: экранирование стерегли только прямые вызовы
+  // `renderMarkdown`. Сними его на месте вызова — допиши `.replace(/&lt;/g, "<")`
+  // в `answerCard` — и весь набор оставался зелёным. Здесь утверждение о том,
+  // что оказалось в ленте, а не о том, что вернула функция.
+  //
+  // Заодно стережётся `el()`: он ставит текст через `textContent`, а не через
+  // `innerHTML`, — и это тоже можно было поменять, не уронив ничего. В стенде
+  // разница видна: у узла, набранного текстом, `innerHTML` пуст, а `textContent`
+  // отдаёт написанное целиком; у набранного разметкой — наоборот.
+  {
+    const EVIL = '<img src=x onerror="alert(1)">';
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{
+        label: EVIL,
+        history_len: 2,
+        transcript: [
+          { role: "user", content: EVIL, error: null, reasoning: "", metrics: null },
+          { role: "assistant", content: EVIL, error: null, reasoning: "", metrics: null },
+        ],
+      }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const body = $("#feed").querySelector(".card-body");
+    check(
+      "в теле ответа тега из ответа модели нет",
+      body && !body.innerHTML.includes("<img"),
+      body && body.innerHTML
+    );
+    check(
+      "в теле ответа тег остался текстом",
+      body && body.innerHTML.includes("&lt;img"),
+      body && body.innerHTML
+    );
+
+    const bubble = $("#feed").querySelector(".msg-user");
+    check(
+      "вопрос показан текстом, а не разметкой",
+      bubble && bubble.textContent === EVIL && bubble.innerHTML === "",
+      bubble && JSON.stringify([bubble.textContent, bubble.innerHTML])
+    );
+
+    const title = $("#agent-list").querySelectorAll(".item-title")[2];
+    check(
+      "имя чата в списке показано текстом, а не разметкой",
+      title && title.textContent === EVIL && title.innerHTML === "",
+      title && JSON.stringify([title.textContent, title.innerHTML])
+    );
+  }
+
   // ── правка во время генерации ──
   {
     const { client, server, $, settle } = freshClient({ delay: 30 });

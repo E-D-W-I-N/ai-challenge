@@ -1025,6 +1025,37 @@ def check_context_compression_off():
     return "4 вызова через ручки и один напрямую — все с выключенным сжатием"
 
 
+@check("usage у OpenRouter запрашивается на каждом вызове")
+def check_usage_is_asked_for():
+    """Дыра, найденная мутацией: выкинь `"usage": {"include": true}` из тела —
+    и ни одна проверка не покраснеет, хотя день остался бы без единого числа.
+
+    Заглушка усадьбу чисел выдумывает сама и потому слепа к этому полю: точные
+    `prompt_tokens`, `completion_tokens` и `cost` присылает OpenRouter, и только
+    если его об этом попросили. Стережём по телу запроса — теми же путями, что
+    и выключенное сжатие.
+    """
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        bare = new_agent(client)
+        client.post(f"/api/agents/{bare}/messages", json={"text": "раз"})
+        client.post(f"/api/agents/{bare}/regenerate")
+        loaded = new_agent(client, temperature=0.7, stop=["СТОП"])
+        client.post(f"/api/agents/{loaded}/messages", json={"text": "два"})
+
+    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
+    for call in _stub.CALLS:
+        assert call["payload"].get("usage") == {"include": True}, (
+            f"вызов ушёл без просьбы о usage: {call['payload'].get('usage')!r}"
+        )
+
+    from app.llm import build_payload
+
+    payload = build_payload(AgentSpec(label="прямой", model="stub/m"))
+    assert payload["usage"] == {"include": True}, payload
+    return "3 вызова через ручки и один напрямую — все просят usage"
+
+
 @check("свой plugins в extra_body мержится по id, а не затирает наш")
 def check_extra_body_plugins_merge():
     """Развилка `extra_body`: он мержится поверх тела, и `plugins` целиком
@@ -2255,8 +2286,14 @@ def check_store_reopen():
     rows = second.message_rows("ag_00042")
     assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
     assert second.max_agent_seq() == 42, second.max_agent_seq()
+
+    # Время реплики — дыра, найденная мутацией: колонка `at` писалась и читалась,
+    # но никто не сверял, то же ли число вернулось. Подставь при чтении ноль —
+    # и набор оставался зелёным, а «когда это было» терялось при перезапуске.
+    restored = second.load_messages("ag_00042")
+    assert [m["at"] for m in restored] == [1.0, 1.0], [m["at"] for m in restored]
     second.close()
-    return f"каталог создан init(), после переоткрытия {len(rows)} реплики и конфиг на месте"
+    return f"каталог создан init(), после переоткрытия {len(rows)} реплики, конфиг и время на месте"
 
 
 @check("диалог продолжается в новом процессе программы")
@@ -2303,6 +2340,13 @@ def check_restore_in_constructor():
     again = Store(path).init()
     revived = Agent(spec, agent_id=born.id, store=again)
     assert [t.content for t in revived.history] == ["меня зовут Нина", "привет, Нина"]
+    # Время реплики — дыра, найденная мутацией: колонка `at` писалась и читалась,
+    # но подставь при подъёме ноль — и набор оставался зелёным. Сверяем с тем,
+    # что записали: «когда это было» перезапуск терять не вправе.
+    assert [t.at for t in revived.history] == [t.at for t in born.history], (
+        [t.at for t in revived.history],
+        [t.at for t in born.history],
+    )
 
     _stub.install(reply="ок")
     asyncio.run(drain(revived.ask("как меня зовут?")))
@@ -2680,6 +2724,44 @@ def check_id_claimed_in_store():
     assert store.load_session(taken)["label"] == "чужой", "чужой конфиг перезаписан"
     store.close()
     return f"{taken} остался за соседом, свежий агент получил {mine.id}"
+
+
+@check("после перезапуска счётчик id стартует за занятыми номерами")
+def check_ids_reserved_on_start():
+    """Дыра, найденная мутацией: выкинь `reserve_ids` из реестра — и всё
+    оставалось зелёным, потому что `claim_agent_id` догоняет базу сам, ловя
+    конфликт первичного ключа.
+
+    Догоняет — но уже испортив попытку, и на каждый свежий процесс приходится
+    лишний `INSERT`, который откатится. Стережём наблюдаемое: id, который
+    процесс предложит первым, в базе свободен.
+    """
+    import app.agent as agent_mod
+    from app.registry import AgentRegistry
+
+    path = _temp_db("reserve")
+    store = Store(path).init()
+    before = agent_mod._last_id
+    try:
+        # Номера с начала: иначе занятые окажутся далеко впереди нуля, и
+        # «счётчик на нуле» случайно попадёт в свободный.
+        agent_mod._last_id = 0
+        for _ in range(5):
+            store.claim_agent_id()
+        taken = {row["id"] for row in store.list_sessions()}
+        assert len(taken) == 5, taken
+
+        # «Перезапуск»: счётчик процесса снова на нуле, база — нет.
+        agent_mod._last_id = 0
+        AgentRegistry(store=store)
+        first = agent_mod.new_agent_id()
+        assert first not in taken, (
+            f"процесс предложит занятый {first}: счётчик не догнал базу при старте"
+        )
+    finally:
+        agent_mod._last_id = max(before, agent_mod._last_id)
+        store.close()
+    return f"{len(taken)} номеров в базе, первый предложенный после старта — {first}"
 
 
 @check("недостроенный агент не оставляет пустую строку чата")
