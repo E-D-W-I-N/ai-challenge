@@ -625,7 +625,7 @@ async function routeChecks() {
   // function startRename», «есть miniButton("pencil")», «встречаются слова
   // Enter и Escape». Такая проверка описывает реализацию, а не поведение:
   // переименование можно сломать, не тронув ни одной из этих строк, и она
-  // останется зелёной. Здесь — настоящий маршрут: клик по карандашу,
+  // останется зелёной. Здесь — настоящий маршрут: клик по кнопке,
   // клавиша, запрос к серверу, имя в списке.
   {
     const { client, server, $, settle, Evt } = freshClient();
@@ -641,10 +641,10 @@ async function routeChecks() {
       title() && title().textContent === "первый чат",
       title() && title().textContent);
 
-    // 1. Карандаш открывает поле прямо в строке, со старым именем внутри.
+    // 1. Кнопка открывает поле прямо в строке, со старым именем внутри.
     row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
     let field = row().querySelector(".item-rename");
-    check("карандаш открывает поле ввода прямо в строке", Boolean(field), "поля нет");
+    check("кнопка открывает поле ввода прямо в строке", Boolean(field), "поля нет");
     check("в поле стоит нынешнее имя", field && field.value === "первый чат",
       field && field.value);
     check("пока переименовываем, кнопки открытия чата в строке нет",
