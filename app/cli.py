@@ -140,7 +140,6 @@ def _print_agents(out=sys.stdout) -> None:
 
 
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
-    """Цикл «вопрос — ответ». Возвращает код возврата процесса."""
     out.write(f"агент {agent.id} · {agent.spec.model}\n")
     if agent.history:
         # Ради этой строки день и делался: процесс новый, разговор старый.

@@ -4,8 +4,7 @@
 // только id открытого чата и шлёт новый текст.
 //
 // Из сети не тянется ничего — ни шрифтов, ни библиотек, ни иконок: репозиторий
-// публичный и обязан работать без интернета. Иконки — inline SVG ниже,
-// markdown разбирается своими силами в renderMarkdown().
+// публичный и обязан работать без интернета.
 
 const state = {
   agents: [],          // всё, что вернул GET /api/agents
@@ -15,7 +14,6 @@ const state = {
   busy: false,
   abort: null,         // AbortController активного потока
   lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
-  tab: "model",
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
   stick: true,         // лента примотана к низу — доматывать новые ответы
@@ -35,8 +33,8 @@ const STATUS_FADE_MS = 5000;
 
 // ─────────────────────────── иконки ───────────────────────────
 
-// Минимальный набор, нарисованный путями: CDN нам недоступен, а картинки
-// в кадре нужны — по ним читается, что делает кнопка.
+// Нарисованы путями: CDN нам недоступен, а по картинке читается, что делает
+// кнопка.
 const ICONS = {
   panelLeft: "M3 3h18v18H3zM9 3v18",
   panelRight: "M3 3h18v18H3zM15 3v18",
@@ -54,6 +52,15 @@ const ICONS = {
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
 };
 
+// Узел одной строкой: тег, класс, текст. Текст ставится через textContent,
+// а не innerHTML, — разметкой страницы он стать не может.
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
 function icon(name) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -68,12 +75,10 @@ function icon(name) {
   return svg;
 }
 
-// Кнопка с иконкой. `className` разводит два размера: крупные кнопки шапок
-// и мелкие в строке списка.
+// `className` разводит два размера: крупные кнопки шапок и мелкие в списке.
 function iconButton(name, title, onClick, className = "icon-btn") {
-  const btn = document.createElement("button");
+  const btn = el("button", className);
   btn.type = "button";
-  btn.className = className;
   btn.title = title;
   btn.setAttribute("aria-label", title);
   btn.appendChild(icon(name));
@@ -213,9 +218,8 @@ function contextIsPast() {
 // не может стать разметкой страницы.
 function escapeHtml(text) {
   return String(text)
-    // Меткой inline-кода служит \u0000, и если модель пришлёт его в тексте,
-    // разбор подставил бы на его место чужой кусок. В рендере такому символу
-    // делать нечего — выбрасываем до всего остального.
+    // Меткой inline-кода служит \u0000: пришли модель его в тексте, разбор
+    // подставил бы на его место чужой кусок. Выбрасываем до всего остального.
     .replace(/\u0000/g, "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -224,7 +228,7 @@ function escapeHtml(text) {
 }
 
 // Метка, которой на время разбора подменяется inline-код: внутри кода
-// разметка не разбирается, а в тексте от модели такого символа не бывает.
+// разметка не разбирается.
 const CODE_MARK = "\u0000";
 
 function inlineMarkdown(text) {
@@ -374,9 +378,8 @@ async function loadAgents(selectId) {
   const data = await api("/api/agents");
   state.agents = data.agents;
   state.hasKey = data.has_key;
-  // Пустой список — это пустой экран, в который нечего написать. Заводим
-  // чистый чат сами: список начинается пустым, и удалить последний чат
-  // тоже можно, а писать пользователю надо куда-то сразу.
+  // Пустой список — это пустой экран, в который нечего написать: список
+  // начинается пустым, и удалить последний чат тоже можно.
   if (!state.agents.length) {
     const created = await api("/api/agents", json("POST", {}));
     state.agents = created.agents;
@@ -391,38 +394,29 @@ async function loadAgents(selectId) {
 function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
-  // Список плоский: все чаты равны, никаких групп и разделов.
   state.agents.forEach((agent) => box.appendChild(listItem(agent)));
 }
 
 function listItem(agent) {
-  const row = document.createElement("div");
   const active = state.current && agent.id === state.current.id;
-  row.className = "item" + (active ? " active" : "");
+  const row = el("div", "item" + (active ? " active" : ""));
 
-  const open = document.createElement("button");
+  const open = el("button", "item-open");
   open.type = "button";
-  open.className = "item-open";
-  const ico = document.createElement("span");
-  ico.className = "item-icon";
+  const ico = el("span", "item-icon");
   ico.appendChild(icon("chat"));
-  const title = document.createElement("span");
-  title.className = "item-title";
-  title.textContent = agent.label;
-  open.append(ico, title);
+  open.append(ico, el("span", "item-title", agent.label));
   open.title = agent.label + "\n" + agent.model;
   open.onclick = () => openAgent(agent.id);
-  row.appendChild(open);
 
-  const actions = document.createElement("div");
-  actions.className = "item-actions";
+  const actions = el("div", "item-actions");
   actions.append(
     iconButton("pencil", "Переименовать",
       (ev) => { ev.stopPropagation(); startRename(row, agent); }, "mini"),
     iconButton("trash", "Удалить чат",
       (ev) => { ev.stopPropagation(); askDelete(agent); }, "mini danger")
   );
-  row.appendChild(actions);
+  row.append(open, actions);
   return row;
 }
 
@@ -430,8 +424,7 @@ function listItem(agent) {
 // потеря фокуса — тоже сохраняет, чтобы имя не терялось молча.
 function startRename(row, agent) {
   const open = row.querySelector(".item-open");
-  const input = document.createElement("input");
-  input.className = "item-rename";
+  const input = el("input", "item-rename");
   input.value = agent.label;
   row.replaceChild(input, open);
   row.classList.add("renaming");
@@ -496,9 +489,8 @@ async function openAgent(agentId) {
   }
   state.current = agent;
   state.panelDirty = false;
-  // Чат открывают, чтобы увидеть последнее сообщение. Отмотанная лента
-  // прошлого чата к новому отношения не имеет: иначе, отмотав один раз,
-  // читатель выключил бы доматывание сразу для всех чатов.
+  // Чат открывают, чтобы увидеть последнее сообщение: отмотанная лента
+  // прошлого чата к новому отношения не имеет.
   state.stick = true;
   // Чат открыт заново: доля окна относится к той модели, что у него сейчас,
   // а числа — только его собственные.
@@ -529,20 +521,17 @@ function renderFeed(agent) {
   const feed = $("#feed");
   // Подмена содержимого обнуляет прокрутку, поэтому положение после
   // перерисовки задаётся здесь явно и всегда: либо низ, либо то место,
-  // где читатель остановился. Оставить на усмотрение браузера нельзя —
-  // он оставит ноль, то есть выбросит читателя в начало разговора.
+  // где читатель остановился. Иначе браузер выбросит его в начало разговора.
   const keep = state.stick ? null : feed.scrollTop;
   feed.innerHTML = "";
 
   const turns = agent.transcript;
   if (!turns.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    const h = document.createElement("h2");
-    h.textContent = agent.label;
-    const p = document.createElement("p");
-    p.textContent = "Напишите сообщение — историю разговора хранит сервер, а не браузер.";
-    empty.append(h, p);
+    const empty = el("div", "empty");
+    empty.append(
+      el("h2", "", agent.label),
+      el("p", "", "Напишите сообщение — историю разговора хранит сервер, а не браузер.")
+    );
     feed.appendChild(empty);
     feed.scrollTop = 0;
     return;
@@ -555,36 +544,25 @@ function renderFeed(agent) {
 }
 
 function userBubble(text) {
-  const el = document.createElement("div");
-  el.className = "msg-user";
-  el.textContent = text;
-  return el;
+  return el("div", "msg-user", text);
 }
 
-// Шапка карточки ответа: иконка и имя модели. Одна на готовый ответ и на
-// карточку, в которую ещё стримят. Провайдер стоит не здесь, а строкой под
-// ответом, рядом со скоростью: это всё про то, как прошёл этот обмен, и жить
-// оно должно в одном месте, а не в двух.
+// Шапка карточки: одна на готовый ответ и на тот, в который ещё стримят.
+// Провайдер стоит не здесь, а строкой под ответом, рядом со скоростью: всё
+// про то, как прошёл обмен, живёт в одном месте, а не в двух.
 function cardHead(modelName) {
-  const head = document.createElement("header");
-  head.className = "card-head";
-  const ico = document.createElement("span");
-  ico.className = "card-icon";
+  const head = el("header", "card-head");
+  const ico = el("span", "card-icon");
   ico.appendChild(icon("bot"));
-  const name = document.createElement("span");
-  name.className = "card-model";
-  name.textContent = modelName;
-  head.append(ico, name);
+  head.append(ico, el("span", "card-model", modelName));
   return head;
 }
 
 function answerCard(agent, turn) {
-  const card = document.createElement("article");
-  card.className = "card" + (turn.error ? " failed" : "");
+  const card = el("article", "card" + (turn.error ? " failed" : ""));
   const head = cardHead((turn.metrics && turn.metrics.model) || agent.model);
 
-  const actions = document.createElement("div");
-  actions.className = "card-actions";
+  const actions = el("div", "card-actions");
   actions.append(
     // Кнопки «метрики этого ответа» здесь больше нет: числа обмена написаны
     // под ним самим, а перекладывать их в плитки значило бы показывать
@@ -598,20 +576,14 @@ function answerCard(agent, turn) {
 
   if (turn.reasoning) card.appendChild(thinkingBlock(turn.reasoning));
 
-  const body = document.createElement("div");
-  body.className = "card-body md";
+  const body = el("div", "card-body md");
   body.innerHTML = renderMarkdown(turn.content);
   card.appendChild(body);
 
   const usage = usageLine(turn);
   if (usage) card.appendChild(usage);
 
-  if (turn.error) {
-    const err = document.createElement("div");
-    err.className = "card-error";
-    err.textContent = turn.error;
-    card.appendChild(err);
-  }
+  if (turn.error) card.appendChild(el("div", "card-error", turn.error));
   return card;
 }
 
@@ -666,35 +638,20 @@ function usageLine(turn) {
   if (m.provider) how.push(m.provider);
 
   if (!tokens.length && !how.length) return null;
-  const box = document.createElement("div");
-  box.className = "card-usage";
-  if (tokens.length) box.appendChild(usageRow("usage-tokens", tokens));
-  if (how.length) box.appendChild(usageRow("usage-how", how));
+  const box = el("div", "card-usage");
+  if (tokens.length) box.appendChild(el("div", "usage-tokens", tokens.join(" · ")));
+  if (how.length) box.appendChild(el("div", "usage-how", how.join(" · ")));
   return box;
 }
 
-function usageRow(className, parts) {
-  const row = document.createElement("div");
-  row.className = className;
-  row.textContent = parts.join(" · ");
-  return row;
-}
-
 function thinkingBlock(text) {
-  const el = document.createElement("details");
-  el.className = "think";
+  const box = el("details", "think");
   const summary = document.createElement("summary");
-  const ico = document.createElement("span");
-  ico.className = "card-icon";
+  const ico = el("span", "card-icon");
   ico.appendChild(icon("clock"));
-  const label = document.createElement("span");
-  label.textContent = "Рассуждение";
-  summary.append(ico, label);
-  const body = document.createElement("div");
-  body.className = "think-body";
-  body.textContent = text;
-  el.append(summary, body);
-  return el;
+  summary.append(ico, el("span", "", "Рассуждение"));
+  box.append(summary, el("div", "think-body", text));
+  return box;
 }
 
 function showRaw(card, turn) {
@@ -796,41 +753,35 @@ async function exchange(path, body, questionText) {
   const agent = state.current;
 
   // Инвариант живёт здесь, а не у вызывающих: через `exchange` проходит
-  // всякая отправка, и третий путь к нему не сможет его обойти. Держать
-  // свойство дисциплиной двух вызывающих — значит ждать, пока появится
-  // третий и молча откроет дыру заново.
+  // всякая отправка, и третий путь к нему не сможет его обойти.
   if (state.applying) await state.applying;
   if (!(await ensurePanelApplied())) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
     return false;
   }
   // Текст забираем из поля только теперь: до этой строки отправка могла
-  // не состояться, и стирать написанное было бы не за что.
+  // не состояться.
   if (questionText !== null) {
     const input = $("#input");
     input.value = "";
     autoGrow(input);
   }
 
-  // Обмен затевает сам читатель — и своим сообщением, и повтором ответа:
-  // ленту к низу, чтобы увидеть, что из этого вышло.
+  // Обмен затевает сам читатель: ленту к низу, чтобы увидеть, что вышло.
   state.stick = true;
   if (questionText !== null) {
     if (feed.querySelector(".empty")) feed.innerHTML = "";
     feed.appendChild(userBubble(questionText));
   } else {
     // Перегенерация заменяет последний ответ: карточку убираем с экрана,
-    // а на сервере пара «вопрос — ответ» снимается с истории тем же запросом.
+    // а на сервере пара снимается с истории тем же запросом.
     const cards = feed.querySelectorAll(".card");
     if (cards.length) cards[cards.length - 1].remove();
   }
 
-  const card = document.createElement("article");
-  card.className = "card busy";
-  const head = cardHead(agent.model);
-  const bodyEl = document.createElement("div");
-  bodyEl.className = "card-body md";
-  card.append(head, bodyEl);
+  const card = el("article", "card busy");
+  const bodyEl = el("div", "card-body md");
+  card.append(cardHead(agent.model), bodyEl);
   feed.appendChild(card);
   scrollFeed();
 
@@ -899,10 +850,7 @@ async function exchange(path, body, questionText) {
 
   if (failure) {
     card.classList.add("failed");
-    const err = document.createElement("div");
-    err.className = "card-error";
-    err.textContent = failure;
-    card.appendChild(err);
+    card.appendChild(el("div", "card-error", failure));
     hint(failure, true);
     if (!answer && questionText !== null) {
       // Обмена не было: агент вопрос не запомнил, и в ленте его быть не должно.
@@ -953,15 +901,14 @@ function fillPanel(agent) {
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
   fillResponseFormat(agent.response_format);
-  // Модель ставим сразу, не дожидаясь каталога: пока он едет, поле иначе
-  // пустое, а панель — источник правды, и её пустоту нельзя пролить в агента.
+  // Модель ставим сразу, не дожидаясь каталога: панель — источник правды,
+  // и её пустоту нельзя пролить в агента.
   setModelOptions([{ id: agent.model }], agent.model);
   state.baseModel = agent.model;
   fillModels(agent.model).then(renderWarnings);
   saveStatus("");
 }
 
-// Формат ответа: частый случай выбирается из списка, редкий пишется JSON.
 function fillResponseFormat(value) {
   const kind = $("#f-response_format_kind");
   const custom = $("#f-response_format");
@@ -989,12 +936,11 @@ function setModelOptions(models, current) {
   const select = $("#f-model");
   select.innerHTML = "";
   models.forEach((m) => {
-    const opt = document.createElement("option");
-    opt.value = m.id;
     const price = m.prompt_price_per_m
       ? "  ·  $" + m.prompt_price_per_m + " / $" + m.completion_price_per_m + " за 1M"
       : "";
-    opt.textContent = m.id + price;
+    const opt = el("option", "", m.id + price);
+    opt.value = m.id;
     if (m.id === current) opt.selected = true;
     select.appendChild(opt);
   });
@@ -1014,8 +960,7 @@ async function fillModels(current) {
   setModelOptions(options, current);
 }
 
-// Пустое поле значит «не отправлять параметр» — сервер получает null и
-// перестаёт класть параметр в тело запроса к OpenRouter.
+// Пустое поле значит «не отправлять параметр»: сервер получает null.
 function readNumber(name) {
   const raw = ($("#f-" + name).value || "").trim();
   if (!raw) return null;
@@ -1024,9 +969,8 @@ function readNumber(name) {
   return value;
 }
 
-// Стоп-строки: по одной в строке. Пустые строки и пробелы по краям
-// выбрасываются, пустое поле значит «не отправлять параметр».
-// Отдельной функцией без DOM — разбор проверяется без браузера.
+// Стоп-строки: по одной в строке, пустые не в счёт. Отдельной функцией
+// без DOM — разбор проверяется без браузера.
 function readStopLines(text) {
   const lines = String(text || "")
     .split("\n")
@@ -1054,9 +998,8 @@ function parseResponseFormat(kind, raw) {
   return parsed;
 }
 
-// Параметры панели в терминах OpenRouter: имена совпадают один в один.
-// Наши поля — `system` и `model` — в тело запроса параметрами не уходят
-// и по `supported_parameters` не проверяются.
+// Параметры панели в терминах OpenRouter. Наши поля — `system` и `model` —
+// параметрами не уходят и по `supported_parameters` не проверяются.
 const PROVIDER_PARAMS = [
   "temperature",
   "max_tokens",
@@ -1070,19 +1013,16 @@ const PROVIDER_PARAMS = [
   "response_format",
 ];
 
-// Чем заданные параметры не сойдутся с выбранной моделью. Отдельной функцией
-// без DOM — решение проверяется без браузера.
-//
-// Предупреждать надо **до** отправки: на каждом вызове стоит
-// provider.require_parameters=true, и параметр, которого модель не заявляет,
-// выкашивает провайдеров. Вместо ответа приходит невнятная ошибка, и по ней
-// не понять, что виноват один переключатель в панели.
+// Чем заданные параметры не сойдутся с выбранной моделью. Предупреждать надо
+// **до** отправки: на каждом вызове стоит provider.require_parameters=true,
+// и параметр, которого модель не заявляет, выкашивает провайдеров — вместо
+// ответа придёт ошибка, по которой не понять, что виноват один переключатель.
+// Отдельной функцией без DOM — решение проверяется без браузера.
 function paramWarnings(model, settings, extraBody, baseModel) {
   const warnings = [];
 
-  // Часть чатов привязана к одному поставщику модели, и другая модель
-  // у него, скорее всего, не обслуживается — ответ не придёт. Говорим об
-  // этом ровно в тот момент, когда модель действительно меняют: постоянная
+  // Чат, привязанный к одному поставщику, на чужой модели ответа не получит.
+  // Говорим об этом ровно в тот момент, когда модель меняют: постоянная
   // надпись про настройку, которой не видно, только сбивает с толку.
   const pinned = ((extraBody || {}).provider || {}).order;
   if (Array.isArray(pinned) && pinned.length && baseModel && settings.model !== baseModel) {
@@ -1094,8 +1034,7 @@ function paramWarnings(model, settings, extraBody, baseModel) {
   }
 
   // Каталог не загрузился или модель в нём не нашлась — про параметры молчим:
-  // пугать предупреждением, которого не на чем основать, хуже, чем не
-  // предупредить.
+  // пугать предупреждением, которого не на чем основать, хуже.
   if (!model) return warnings;
 
   const declared = model.supported_parameters || [];
@@ -1130,9 +1069,8 @@ function paramWarnings(model, settings, extraBody, baseModel) {
   return warnings;
 }
 
-// Строка состояния под панелью гаснет сама: «Применено» — сообщение
-// о событии, а не постоянная подпись, и висеть всё время ей незачем.
-// Ошибка не гаснет: её надо прочитать и исправить.
+// Строка состояния гаснет сама: «Применено» — сообщение о событии, а не
+// постоянная подпись. Ошибка не гаснет: её надо прочитать и исправить.
 function saveStatus(text, isError) {
   const el = $("#save-status");
   el.className = "save-status" + (isError ? " error" : "");
@@ -1146,15 +1084,9 @@ function saveStatus(text, isError) {
   }, STATUS_FADE_MS);
 }
 
-// Одинаковы ли два значения конфига. Не `==` и не `JSON.stringify`:
-// у полей панели разные типы, и каждый врёт по-своему.
-//
-// `null` — это «параметр не отправлять», и он не равен ни нулю, ни пустой
-// строке: `provider.require_parameters` включён, и заданный `top_p: 0`
-// сужает список провайдеров, а незаданный — нет. `==` их бы уравнял.
-// Стоп-строки — список, формат ответа — объект; их сравнивают поэлементно,
-// а не по ссылке. Порядок ключей в объекте от провайдера не гарантирован,
-// поэтому `JSON.stringify` тоже не годится.
+// Одинаковы ли два значения конфига. Не `==`: `null` — это «параметр
+// не отправлять», и он не равен ни нулю, ни пустой строке, а `==` их уравнял бы.
+// Не `JSON.stringify`: порядок ключей в объекте от провайдера не гарантирован.
 function sameValue(a, b) {
   const empty = (v) => v === null || v === undefined;
   if (empty(a) || empty(b)) return empty(a) && empty(b);
@@ -1172,8 +1104,8 @@ function sameValue(a, b) {
 }
 
 // Изменила ли правка хоть что-нибудь. Сравниваются только поля панели:
-// в ответе ручки едет ещё и то, что живёт своей жизнью, — стенограмма,
-// длина истории, занятость, — и по ним «изменилось» было бы правдой всегда.
+// стенограмма и занятость живут своей жизнью, и по ним «изменилось» было бы
+// правдой всегда.
 function configChanged(before, after, fields) {
   if (!before) return true;
   return fields.some((name) => !sameValue(before[name], after[name]));
@@ -1212,11 +1144,7 @@ function renderWarnings() {
     warnings = [];   // поле не разобрать — про это скажет строка состояния
   }
   box.innerHTML = "";
-  warnings.forEach((text) => {
-    const line = document.createElement("p");
-    line.textContent = text;
-    box.appendChild(line);
-  });
+  warnings.forEach((text) => box.appendChild(el("p", "", text)));
   box.classList.toggle("hidden", !warnings.length);
   // Открыта вкладка «Агент» — про предупреждение всё равно должно быть видно.
   tab.classList.toggle("has-warn", warnings.length > 0);
@@ -1225,13 +1153,10 @@ function renderWarnings() {
 // Инвариант чата: **сообщение уходит только тогда, когда конфиг агента
 // равен тому, что показывает панель**. Держать его на событии `change`
 // нельзя: у события ровно один шанс выстрелить, а поводов его упустить
-// сколько угодно — значение поставили из кода, поле не потеряло фокус,
-// вкладку спрятали.
-//
-// Поэтому событие оставлено только ради отзывчивости, а истина проверяется
-// в единственном месте, которое обойти нельзя, — прямо перед отправкой.
-// Панель проливается в агента, и если пролить не вышло, сообщение не уходит:
-// показать на экране одно, а послать другое хуже, чем не послать.
+// сколько угодно — значение поставили из кода, поле не потеряло фокус.
+// Поэтому событие оставлено ради отзывчивости, а истина проверяется прямо
+// перед отправкой: показать на экране одно, а послать другое хуже, чем
+// не послать вовсе.
 async function ensurePanelApplied() {
   if (!state.current) return true;
   try {
@@ -1261,8 +1186,7 @@ function applySettings() {
 
   const id = state.current.id;
   // Слепок до правки: пролив идёт перед каждой отправкой, и без сравнения
-  // «Применено» появлялось бы на каждое сообщение, даже когда пользователь
-  // ничего не трогал.
+  // «Применено» появлялось бы на каждое сообщение.
   const before = { ...state.current };
   const fields = Object.keys(patch);
   state.applying = (async () => {
@@ -1320,23 +1244,17 @@ function renderTiles() {
   const box = $("#tiles");
   box.innerHTML = "";
   TILES.forEach(([label, value, small, past]) => {
-    const tile = document.createElement("div");
-    tile.className = "tile";
-    const k = document.createElement("div");
-    k.className = "tile-k";
-    k.textContent = label;
-    const row = document.createElement("div");
-    row.className = "tile-row";
-    const v = document.createElement("div");
     // Значению отдана вся ширина плитки: подписей рядом больше нет, и цене
     // в девять знаков ничего не мешает быть видной целиком.
-    v.className = "tile-v" + (small ? " small" : "") + (past && past() ? " past" : "");
-    v.textContent = value();
+    const faded = Boolean(past && past());
+    const v = el("div", "tile-v" + (small ? " small" : "") + (faded ? " past" : ""), value());
     // Подсказка вместо второй строки: плитка от неё не растёт, а откуда
     // взялось число, сказано словами.
-    if (past && past()) v.title = "число прошлого обмена: последний вызов упал";
+    if (faded) v.title = "число прошлого обмена: последний вызов упал";
+    const row = el("div", "tile-row");
     row.appendChild(v);
-    tile.append(k, row);
+    const tile = el("div", "tile");
+    tile.append(el("div", "tile-k", label), row);
     box.appendChild(tile);
   });
 }
@@ -1359,21 +1277,15 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   const btn = $("#theme-toggle");
   btn.innerHTML = "";
-  const ico = document.createElement("span");
-  ico.className = "foot-icon";
+  const ico = el("span", "foot-icon");
   ico.appendChild(icon(theme === "dark" ? "sun" : "moon"));
-  const label = document.createElement("span");
-  label.className = "foot-label";
-  label.textContent = theme === "dark" ? "Светлая тема" : "Тёмная тема";
-  btn.append(ico, label);
+  btn.append(ico, el("span", "foot-label", theme === "dark" ? "Светлая тема" : "Тёмная тема"));
 }
 
-// Узкое окно: сайдбар и панель превращаются в ящики поверх ленты. Оба
-// свёрнуты по умолчанию — иначе от чата остаётся полоска посередине.
 const NARROW = window.matchMedia("(max-width: 940px)");
 
-// Свёрнутые сайдбар и панель оставляют на экране кнопку разворота: иначе
-// вернуть их было бы нечем.
+// Свёрнутый борт оставляет на экране кнопку разворота: иначе вернуть его
+// было бы нечем.
 function applyCollapsed(which, collapsed) {
   $("#app").classList.toggle(which === "sidebar" ? "no-sidebar" : "no-panel", collapsed);
   const id = which === "sidebar" ? "restore-sidebar" : "restore-panel";
@@ -1426,14 +1338,13 @@ function syncBackdrop() {
     return;
   }
   if (existing) return;
-  const backdrop = document.createElement("div");
-  backdrop.className = "backdrop";
+  const backdrop = el("div", "backdrop");
   backdrop.onclick = closeDrawers;
   document.body.appendChild(backdrop);
 }
 
-// Какие борта должны быть свёрнуты при данной ширине. Вынесено отдельной
-// функцией без DOM: решение проверяется без браузера, в checks/browser_check.js.
+// Какие борта свёрнуты при данной ширине. Отдельной функцией без DOM —
+// решение проверяется без браузера.
 function layoutFor(narrow, stored) {
   // На узком окне борта — ящики поверх ленты, и оба закрыты: иначе от чата
   // остаётся полоска посередине.
@@ -1454,8 +1365,7 @@ function applyWidth() {
 
 // ─────────────────── новый чат и подтверждения ────────────────
 
-// Что должен закрыть Escape. Диалог подтверждения всегда важнее ящиков:
-// он поверх всего, и пока он открыт, Escape относится к нему.
+// Что должен закрыть Escape: диалог подтверждения всегда важнее ящиков.
 // Отдельной функцией без DOM — решение проверяется без браузера.
 function escapeAction(hasDialog, narrow, openDrawerCount) {
   if (hasDialog) return "dialog";
@@ -1464,40 +1374,29 @@ function escapeAction(hasDialog, narrow, openDrawerCount) {
 }
 
 function confirmBox(title, text, confirmLabel, onYes) {
-  const wrap = document.createElement("div");
-  wrap.className = "confirm";
-  const box = document.createElement("div");
-  box.className = "confirm-box";
-  const h = document.createElement("h3");
-  h.textContent = title;
-  const p = document.createElement("p");
-  p.textContent = text;
-  const row = document.createElement("div");
-  row.className = "confirm-row";
+  const wrap = el("div", "confirm");
+  const box = el("div", "confirm-box");
+  const row = el("div", "confirm-row");
 
   const close = () => {
     document.removeEventListener("keydown", onKey);
     wrap.remove();
   };
-  // Escape закрывает диалог всегда, а не только на узком окне: это
-  // подтверждение необратимого действия, и выйти из него надо уметь
-  // не глядя. Обработчик снимается вместе с диалогом.
+  // Escape закрывает диалог всегда, а не только на узком окне: выйти
+  // из подтверждения необратимого действия надо уметь не глядя.
   const onKey = (ev) => {
     if (ev.key === "Escape") close();
   };
   document.addEventListener("keydown", onKey);
 
-  const no = document.createElement("button");
+  const no = el("button", "", "Отмена");
   no.type = "button";
-  no.textContent = "Отмена";
   no.onclick = close;
-  const yes = document.createElement("button");
+  const yes = el("button", "primary", confirmLabel);
   yes.type = "button";
-  yes.className = "primary";
-  yes.textContent = confirmLabel;
   yes.onclick = () => { close(); onYes(); };
   row.append(no, yes);
-  box.append(h, p, row);
+  box.append(el("h3", "", title), el("p", "", text), row);
   wrap.appendChild(box);
   wrap.onclick = (ev) => { if (ev.target === wrap) close(); };
   document.body.appendChild(wrap);
@@ -1550,10 +1449,10 @@ function init() {
 
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.onclick = () => {
-      state.tab = tab.dataset.tab;
+      const which = tab.dataset.tab;
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      $("#tab-model").classList.toggle("hidden", state.tab !== "model");
-      $("#tab-agent").classList.toggle("hidden", state.tab !== "agent");
+      $("#tab-model").classList.toggle("hidden", which !== "model");
+      $("#tab-agent").classList.toggle("hidden", which !== "agent");
     };
   });
 
@@ -1576,9 +1475,7 @@ function init() {
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
 
-// В браузере файл просто запускается. Под node его подключают проверки:
-// checks/browser_check.js гоняет разбор markdown и решение о раскладке
-// настоящими вызовами, а не grep'ом по исходнику.
+// В браузере файл просто запускается, под node его подключают проверки.
 if (typeof module === "undefined") {
   init();
 } else {
@@ -1586,15 +1483,11 @@ if (typeof module === "undefined") {
     init,
     state,
     renderMarkdown,
-    escapeHtml,
-    inlineMarkdown,
     layoutFor,
     escapeAction,
     readStopLines,
     parseResponseFormat,
     paramWarnings,
-    sameValue,
-    configChanged,
     fmt,
   };
 }

@@ -459,6 +459,38 @@ async function routeChecks() {
     );
   }
 
+  // ── в теле сообщения только текст: ленту хранит агент ──
+  //
+  // Раньше это стерёг греп по исходнику («в app.js есть строка { text }»),
+  // то есть описывал реализацию: тело можно раздуть, не тронув ту строку.
+  // Серверная половина — check_no_feed в run_checks.py: лишние поля → 400.
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(20);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+
+    const posted = server.state.requests.filter((r) => r.path.endsWith("/messages"));
+    check("сообщение ушло одним POST", posted.length === 1, String(posted.length));
+    check(
+      "в теле сообщения нет ничего, кроме text",
+      posted[0] && JSON.stringify(Object.keys(posted[0].body || {})) === '["text"]',
+      JSON.stringify(posted[0] && posted[0].body)
+    );
+
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Перегенерировать").dispatchEvent(new Evt("click"));
+    await settle(120);
+    const repeated = server.state.requests.filter((r) => r.path.endsWith("/regenerate"));
+    check(
+      "перегенерация не шлёт тела вовсе: вопрос помнит агент",
+      repeated.length === 1 && repeated[0].body === null,
+      JSON.stringify(repeated.map((r) => r.body))
+    );
+  }
+
   // ── правка во время генерации ──
   {
     const { client, server, $, settle } = freshClient({ delay: 30 });
@@ -688,7 +720,7 @@ async function routeChecks() {
   // function startRename», «есть miniButton("pencil")», «встречаются слова
   // Enter и Escape». Такая проверка описывает реализацию, а не поведение:
   // переименование можно сломать, не тронув ни одной из этих строк, и она
-  // останется зелёной. Здесь — настоящий маршрут: клик по карандашу,
+  // останется зелёной. Здесь — настоящий маршрут: клик по кнопке,
   // клавиша, запрос к серверу, имя в списке.
   {
     const { client, server, $, settle, Evt } = freshClient();
@@ -704,10 +736,10 @@ async function routeChecks() {
       title() && title().textContent === "первый чат",
       title() && title().textContent);
 
-    // 1. Карандаш открывает поле прямо в строке, со старым именем внутри.
+    // 1. Кнопка открывает поле прямо в строке, со старым именем внутри.
     row().querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
     let field = row().querySelector(".item-rename");
-    check("карандаш открывает поле ввода прямо в строке", Boolean(field), "поля нет");
+    check("кнопка открывает поле ввода прямо в строке", Boolean(field), "поля нет");
     check("в поле стоит нынешнее имя", field && field.value === "первый чат",
       field && field.value);
     check("пока переименовываем, кнопки открытия чата в строке нет",

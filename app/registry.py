@@ -1,4 +1,5 @@
-"""Реестр чатов: живые агенты в памяти, все чаты — в базе.
+"""Реестр чатов: словарь id → Agent поверх хранилища, один на процесс.
+Живые агенты — в памяти, все чаты — в базе.
 
 `create_many` кладёт в обычный словарь сто объектов `Agent`: ни потоков,
 ни подпроцессов, ни сети — спавн бесплатен и мгновенен.
@@ -42,8 +43,6 @@ class UnknownAgentError(KeyError):
 
 
 class AgentRegistry:
-    """Словарь id → Agent поверх хранилища чатов. Один на процесс."""
-
     def __init__(self, max_agents: int | None = None, store: Store | None = None) -> None:
         self._agents: dict[str, Agent] = {}
         self.max_agents = max_agents if max_agents is not None else _max_agents()
@@ -59,16 +58,8 @@ class AgentRegistry:
     def __len__(self) -> int:
         return len(self._agents)
 
-    def __contains__(self, agent_id: object) -> bool:
-        return agent_id in self._agents
-
-    # --- создание ------------------------------------------------------------
-
     def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
-        self._make_room(1)
-        agent = Agent(spec, context_length=context_length, store=self.store)
-        self._agents[agent.id] = agent
-        return agent
+        return self.create_many([spec], context_lengths={spec.model: context_length})[0]
 
     def create_many(
         self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
@@ -76,21 +67,20 @@ class AgentRegistry:
         """Пачка агентов одним вызовом — сто конфигов, сто объектов, один процесс."""
         specs = list(specs)
         self._make_room(len(specs))
-        agents = []
         # Сто чатов — одна транзакция, а не сто: спавн обязан остаться
         # мгновенным и после появления базы.
-        with self.store.bulk():
-            for spec in specs:
-                agent = Agent(
+        with self.store.tx():
+            agents = [
+                Agent(
                     spec,
                     context_length=(context_lengths or {}).get(spec.model),
                     store=self.store,
                 )
-                self._agents[agent.id] = agent
-                agents.append(agent)
+                for spec in specs
+            ]
+        for agent in agents:
+            self._agents[agent.id] = agent
         return agents
-
-    # --- восстановление из базы ----------------------------------------------
 
     def load(self, session_id: str) -> Agent | None:
         """Поднимает сохранённый чат в память. Живой возвращается как есть:
@@ -142,8 +132,6 @@ class AgentRegistry:
         entries.sort(key=lambda entry: entry["created_at"])
         return entries
 
-    # --- чтение --------------------------------------------------------------
-
     def get(self, agent_id: str) -> Agent | None:
         return self._agents.get(agent_id)
 
@@ -158,8 +146,6 @@ class AgentRegistry:
     def list(self) -> list[Agent]:
         """Все агенты, в порядке создания."""
         return sorted(self._agents.values(), key=lambda a: a.created_at)
-
-    # --- удаление ------------------------------------------------------------
 
     def kill(self, agent_id: str) -> bool:
         """Удаляет чат из обоих слоёв. False — его нигде нет.
@@ -193,8 +179,6 @@ class AgentRegistry:
             self.store.clear()
         return killed
 
-    # --- вытеснение ----------------------------------------------------------
-
     def _make_room(self, need: int) -> None:
         """Освобождает место, вытесняя самых старых простаивающих.
 
@@ -226,4 +210,3 @@ def _spec_from_row(saved: dict) -> AgentSpec:
 
 
 REGISTRY = AgentRegistry()
-"""Реестр процесса. Один инстанс — внутри него сколько угодно агентов."""
