@@ -716,6 +716,17 @@ def check_session_isolation():
     assert [r[2] for r in store.message_rows(first)] == ["меня зовут Нина", "ответ0"]
     assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"]
 
+    # И тот же путь, которым лента поднимается после перезапуска: выборка
+    # обязана быть по `session_id`. Условие, которое его не сужает, даёт
+    # каждому чату все строки базы — ленты сливаются в одну, и заметно это
+    # только после перезапуска.
+    assert [m["content"] for m in store.load_messages(first)] == ["меня зовут Нина", "ответ0"], (
+        store.load_messages(first)
+    )
+    assert [m["content"] for m in store.load_messages(second)] == ["как меня зовут?", "ответ0"], (
+        store.load_messages(second)
+    )
+
     # Схема не даёт записать реплику без сессии: ключ составной, и это
     # единственная защита от «все чаты в одной ленте» после перезапуска.
     keys = [row[1] for row in store.conn.execute("PRAGMA table_info(messages)") if row[5]]
@@ -723,6 +734,141 @@ def check_session_isolation():
     indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(messages)")}
     assert "messages_by_session" in indexes, indexes
     return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
+
+
+@check("seq без дыр: откат и укорачивание пересчитывают номера от нуля")
+def check_seq_renumbered():
+    """Номера строк — не отделка хранения: по ним история поднимается в том же
+    порядке (`ORDER BY seq`), и дыра или сдвиг значат, что `save_history`
+    дописывает хвост вместо того, чтобы переписать историю целиком. А хвост
+    после отката оставил бы в базе ответ, которого в истории уже нет.
+
+    Вторая половина — про то, что записывать нечего: несостоявшийся обмен
+    не оставляет вопроса без ответа. Мутациями проверено, что без этой
+    проверки молча проходят все три поломки: `seq = i * 2`,
+    `enumerate(turns, start=5)` и запись вопроса при пустом ответе.
+    """
+    from app.agent import Agent, Turn
+
+    path = _temp_db("seq")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="seq", model="stub/m"), store=store)
+
+    # 1) Ответа не случилось — в базе не появилось ничего, даже вопроса.
+    _stub.install(fail=True)
+    asyncio.run(drain(agent.ask("вопрос, на который не ответили")))
+    assert store.message_rows(agent.id) == [], store.message_rows(agent.id)
+
+    # 2) Обычные обмены: номера идут подряд и от нуля.
+    _stub.install(reply="ок")
+    for i in range(3):
+        asyncio.run(drain(agent.ask(f"вопрос {i}")))
+    seqs = [row[0] for row in store.message_rows(agent.id)]
+    assert seqs == list(range(6)), f"номера пошли с дырами или со сдвигом: {seqs}"
+
+    # 3) Укорачивание истории — так выглядит откат обмена и перегенерация.
+    agent.history = agent.history[-2:]
+    agent.persist()
+    rows = store.message_rows(agent.id)
+    assert [r[0] for r in rows] == [0, 1], f"после укорачивания номера не от нуля: {rows}"
+    assert [r[2] for r in rows] == ["вопрос 2", "ок"], rows
+
+    # 4) Длинный чат пишется целиком: ни отсечки, ни дыр в нумерации.
+    long_chat = 500
+    agent.history = [Turn(role="user", content=f"т{i}") for i in range(long_chat)]
+    agent.persist()
+    rows = store.message_rows(agent.id)
+    assert len(rows) == long_chat, f"историю подрезали при записи: {len(rows)}"
+    assert [r[0] for r in rows] == list(range(long_chat)), "номера пошли с дырами"
+    assert rows[0][2] == "т0", rows[0]
+    store.close()
+    return f"нет ответа — нет записи; seq = 0..{long_chat - 1} подряд после укорачивания"
+
+
+@check("транзакция берёт блокировку сразу; занятая база — внятный 503")
+def check_tx_locks_immediately():
+    """`BEGIN IMMEDIATE`, а не голый `BEGIN` — и это тот самый блокирующий баг:
+    второй `uvicorn` на той же базе молча уничтожал чужой чат.
+
+    Отложенная транзакция берёт блокировку на первой записи. Начавшись
+    с чтения, при повышении до записи она получает SQLITE_BUSY **мимо**
+    `busy_timeout`: ретрая нет, и второй процесс получает ошибку вместо
+    очереди. `two_processes.py` этого не ловит — там все пути записи
+    начинаются с записи.
+
+    Проверяется наблюдаемым: пока транзакция открыта и не сделала ни одного
+    запроса, второй писатель обязан её видеть. Соединение берём с нулевым
+    таймаутом — ждать нечего, нужен сам факт блокировки.
+
+    И то, ради чего блокировка нужна: дождавшийся своей очереди ждёт молча,
+    а не дождавшийся получает внятный 503 с объяснением, а не голый 500.
+    """
+    import sqlite3
+
+    from app.store import StoreBusyError, _busy
+
+    path = _temp_db("immediate")
+    store = Store(path).init()
+    entered = None
+    try:
+        with store.tx():
+            # Ни одного запроса внутри транзакции ещё не было.
+            rival = sqlite3.connect(path, timeout=0)
+            try:
+                rival.execute("BEGIN IMMEDIATE")
+                entered = True
+            except sqlite3.OperationalError as exc:
+                entered = False
+                reason = str(exc).lower()
+                assert "locked" in reason or "busy" in reason, exc
+            finally:
+                rival.close()
+        assert entered is False, (
+            "второй писатель вошёл в базу, пока транзакция открыта: значит она "
+            "отложенная. Отложенная берёт блокировку только на первой записи, "
+            "и повышение из чтения в запись даёт SQLITE_BUSY мимо busy_timeout"
+        )
+    finally:
+        store.close()
+
+    # «database is locked» — ситуация штатная и переводится в текст; «no such
+    # table» — баг схемы, и подменять его успокаивающим текстом нельзя.
+    translated = _busy(sqlite3.OperationalError("database is locked"), path)
+    assert isinstance(translated, StoreBusyError), type(translated)
+    assert "занята другим процессом" in str(translated), translated
+    assert "повторите" in str(translated), translated
+    assert _busy(sqlite3.OperationalError("no such table: sessions"), path) is None
+
+    # И то же самое наружу: 503 с объяснением, а запись, которая не прошла,
+    # не оставила после себя половины чата.
+    busy_path = _temp_db("busy")
+    waiting = Store(busy_path).init()
+    blocker = sqlite3.connect(busy_path, isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_99999', 1, 1)")
+    waiting.conn.execute("PRAGMA busy_timeout=50")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            saved_store = main.REGISTRY.store
+            main.REGISTRY.store = waiting
+            try:
+                response = client.post("/api/agents", json={"agent": {"model": "stub/m"}})
+            finally:
+                main.REGISTRY.store = saved_store
+        assert response.status_code == 503, (response.status_code, response.text)
+        assert "занята другим процессом" in response.json()["detail"], response.text
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        waiting.close()
+
+    reopened = Store(busy_path).init()
+    try:
+        assert reopened.list_sessions() == [], reopened.list_sessions()
+    finally:
+        reopened.close()
+    return "открытая транзакция видна второму писателю сразу; занятая база даёт 503"
 
 
 # --- Сквозное: ключ, сеть, клиент ---------------------------------------------
@@ -813,6 +959,80 @@ def check_no_key_in_db():
         else:
             os.environ["OPENROUTER_API_KEY"] = saved_key
     return f"ключ не найден ни в одной колонке и ни в одном файле базы ({', '.join(files)})"
+
+
+@check("мимо redact() записать нельзя: пути записи выводятся из класса")
+def check_every_write_path_redacts():
+    """Несущий слой чистки — не явные `redact()` в отдельных методах, а `_Writer`:
+    транзакция отдаёт обёртку, и чистится любой строковый параметр любого
+    запроса. Но само это свойство надо стеречь отдельно: `check_no_key_in_db`
+    ходит теми путями записи, которые знает, а новый путь мимо транзакции
+    прошёл бы зелёным — мутацией проверено.
+
+    Поэтому список путей здесь **выводится** из класса `Store`: всякий метод,
+    в теле которого есть INSERT/UPDATE/DELETE/REPLACE, обязан идти через
+    `tx()`, а не через голое соединение. Перечисленный список пропустил бы
+    ровно тот метод, который забыли в него внести.
+    """
+    import inspect
+    import sqlite3
+
+    import app.store as store_module
+
+    # Слова целиком, а не подстроки: `updated_at` — это не UPDATE, и по
+    # подстроке в список путей записи попадал весь `list_sessions`.
+    mutating = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE)\b")
+    checked = []
+    for name, fn in inspect.getmembers(Store, inspect.isfunction):
+        body = inspect.getsource(fn)
+        if not mutating.search(body.upper()):
+            continue
+        checked.append(name)
+        if name == "init":
+            continue  # схему заводит executescript, параметров у него нет
+        for bypass in ("self.conn.execute", "self._conn.execute", "self.reading("):
+            assert bypass not in body, (
+                f"Store.{name} пишет через {bypass} — мимо `_Writer`, а значит "
+                "мимо redact(). Писать можно только внутри tx()"
+            )
+    assert len(checked) >= 5, f"путей записи нашлось всего {checked} — обход сузился"
+
+    # Транзакция отдаёт обёртку, а не соединение: иначе обещание держалось бы
+    # на внимательности автора каждого метода.
+    store = Store(store_module.MEMORY).init()
+    key = "sk-or-v1-" + "e" * 64
+    saved_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = key
+    try:
+        with store.tx() as conn:
+            assert not isinstance(conn, sqlite3.Connection), (
+                "tx() отдаёт голое соединение — redact() перестал быть по построению"
+            )
+            # Все три формы параметров, какие принимает обёртка.
+            conn.execute(
+                "INSERT INTO sessions (id, label, config, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0)",
+                (f"ag_{key}", key, key),
+            )
+            conn.execute("INSERT INTO meta (key, value) VALUES (:k, :v)", {"k": "т", "v": key})
+            conn.executemany(
+                "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
+                [("s", 0, "user", key), ("s", 1, "assistant", key)],
+            )
+        leaked = []
+        for table in ("sessions", "messages", "meta"):
+            for row in store.conn.execute(f"SELECT * FROM {table}"):
+                for column in row.keys():
+                    if isinstance(row[column], str) and key in row[column]:
+                        leaked.append(f"{table}.{column}")
+        assert not leaked, f"ключ уехал в базу через tx(): {sorted(set(leaked))}"
+    finally:
+        if saved_key is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+        store.close()
+    return f"{len(checked)} путей записи выведено из класса, все идут через tx()"
 
 
 @check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
