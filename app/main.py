@@ -27,7 +27,7 @@ from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
-from .schema import AgentSpec
+from .schema import CONTEXT_FIELDS, AgentSpec
 from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -153,7 +153,15 @@ MAX_SPAWN_BATCH = 250
 _INT_FIELDS = ("max_tokens", "top_k")
 _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 
-PATCHABLE = ("label", "system", "model", "stop", "response_format", *SAMPLING_FIELDS)
+PATCHABLE = (
+    "label",
+    "system",
+    "model",
+    "stop",
+    "response_format",
+    *SAMPLING_FIELDS,
+    *CONTEXT_FIELDS,
+)
 """Что панель справа вправе менять у живого чата: всё, что в ней видно,
 и ничего сверх. Имя меняют из списка слева тем же полем `label`."""
 
@@ -203,6 +211,27 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
     return values
 
 
+def _context_fields(payload: dict, where: str = "") -> dict:
+    """Окно памяти и порог сжатия: целые или null, как параметры сэмплирования.
+
+    `keep_last = null` значит «сжатия нет» и в модель уезжает вся история —
+    это не то же самое, что `keep_last = 0` («не оставлять как есть ничего»),
+    и разница обязана доезжать до агента целой.
+    """
+    values: dict = {}
+    for name in CONTEXT_FIELDS:
+        values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
+    if values["keep_last"] is not None and values["keep_last"] < 0:
+        raise HTTPException(
+            status_code=400, detail=f"{where}keep_last: целое число от нуля или null"
+        )
+    if values["compress_every"] is not None and values["compress_every"] <= 0:
+        raise HTTPException(
+            status_code=400, detail=f"{where}compress_every: целое число больше нуля или null"
+        )
+    return values
+
+
 def _text_field(payload: dict, name: str, where: str = "") -> str:
     """Строка или null. Снятое поле — пустая строка, а не None."""
     return _optional_field(payload, name, (str,), "строка или null", where) or ""
@@ -241,6 +270,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
         ),
         extra_body=_optional_field(payload, "extra_body", (dict,), "объект или null", where) or {},
         **_sampling_fields(payload, where),
+        **_context_fields(payload, where),
     )
 
 # --- жизненный цикл агентов ---------------------------------------------------
@@ -343,6 +373,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     # на слепке конфига и текущий ответ исказить не может. Действует
     # со следующего сообщения.
     sampling = _sampling_fields(payload)
+    context = _context_fields(payload)
     if "model" in payload:
         agent.spec.model = _model_field(payload)
         agent.context_length = (await _context_lengths()).get(agent.spec.model)
@@ -359,6 +390,9 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     for name in SAMPLING_FIELDS:
         if name in payload:
             setattr(agent.spec, name, sampling[name])
+    for name in CONTEXT_FIELDS:
+        if name in payload:
+            setattr(agent.spec, name, context[name])
     # Правка из панели — часть чата: без записи она не пережила бы рестарт,
     # и следующий запрос ушёл бы со старым конфигом.
     agent.save_config()

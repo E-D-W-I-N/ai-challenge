@@ -1,8 +1,9 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Три таблицы: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
-сохраняется само, а не ждёт, пока вспомнят про колонку), `messages` и `meta`
-(счётчики, общие на всю базу). Четыре свойства, за которыми стоит следить:
+Четыре таблицы: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
+(счётчики, общие на всю базу) и `summaries` (сводки начала разговора).
+Четыре свойства, за которыми стоит следить:
 
 * **`session_id` в первичном ключе сообщений**: без него два чата из базы
   читали бы одни и те же строки, и список слева слился бы в один диалог;
@@ -64,6 +65,29 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Сводки начала разговора. Отдельной таблицей, а не колонкой в `sessions`
+-- и не строкой в `messages`: `save_history` на каждой записи начинается
+-- с `DELETE FROM messages`, и сводка стиралась бы после каждого обмена.
+--
+-- Строк несколько, а не одна на чат: сворачиваний за разговор столько же,
+-- сколько раз перевалило за порог, и у каждого свои метрики. Одна строка
+-- затирала бы метрики прошлых сжатий — а без них честного счёта стоимости
+-- сжатия не будет, то есть «экономия» станет враньём.
+--
+-- Ключ зеркалит `messages`: (session_id, seq). Каскада нет, FK не объявлены —
+-- чистить руками на всех трёх путях: удаление чата, очистка базы, `forget()`.
+CREATE TABLE IF NOT EXISTS summaries (
+    session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    upto        INTEGER NOT NULL,
+    content     TEXT NOT NULL,
+    metrics     TEXT,
+    at          REAL NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS summaries_by_session ON summaries(session_id);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -351,18 +375,25 @@ class Store:
             return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def delete_session(self, session_id: str) -> bool:
-        """Стирает чат вместе с репликами, обе таблицы одной транзакцией.
-        False — его и не было."""
+        """Стирает чат вместе с репликами и сводками, все таблицы одной
+        транзакцией. False — его и не было.
+
+        Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`
+        руками — сводка удалённого разговора достанется чату с тем же id.
+        """
         with self.tx() as conn:
             cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta`. Нужно только проверкам:
-        оставленный счётчик имён отдал бы следующей номер посередине."""
+        """Стирает базу целиком, включая `meta` и сводки. Нужно только
+        проверкам: оставленный счётчик имён отдал бы следующей номер
+        посередине, а оставленная сводка — чужое начало разговора."""
         with self.tx() as conn:
             conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM meta")
 
@@ -412,6 +443,56 @@ class Store:
                 "role": r["role"],
                 "content": r["content"],
                 "error": r["error"],
+                "metrics": _loads(r["metrics"], None) if r["metrics"] else None,
+                "at": r["at"],
+            }
+            for r in rows
+        ]
+
+    # --- сводки начала разговора ---------------------------------------------
+
+    def save_summaries(self, session_id: str, summaries) -> None:
+        """Переписывает сводки чата целиком, одной транзакцией.
+
+        Дисциплина ровно как у истории (`save_history`): `DELETE` плюс
+        `INSERT` заново с номерами от нуля — `seq` не получает дыр, а
+        оборванная запись откатывается вся. Пустой список стирает сводки
+        и ничего не пишет: это и есть очистка на `forget()`.
+        """
+        rows = [
+            (
+                session_id,
+                seq,
+                int(item["upto"]),
+                item["content"],
+                _dumps(item["metrics"]) if item.get("metrics") else None,
+                item.get("at") or time.time(),
+            )
+            for seq, item in enumerate(summaries)
+        ]
+        with self.tx() as conn:
+            conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+            if rows:
+                conn.executemany(
+                    "INSERT INTO summaries (session_id, seq, upto, content, metrics, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+
+    def load_summaries(self, session_id: str) -> list[dict]:
+        """Сводки чата по порядку сворачивания. Лежат отдельно от истории,
+        поэтому перезапись истории их не трогает."""
+        with self.reading() as conn:
+            rows = conn.execute(
+                "SELECT seq, upto, content, metrics, at FROM summaries "
+                "WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "seq": r["seq"],
+                "upto": r["upto"],
+                "content": r["content"],
                 "metrics": _loads(r["metrics"], None) if r["metrics"] else None,
                 "at": r["at"],
             }
