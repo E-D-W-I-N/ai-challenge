@@ -6,8 +6,9 @@
 
 ## Среда
 
-Системный `python3` — это 3.9, на нём проверки разваливаются (8 из 22).
-Везде только `/opt/homebrew/bin/python3.11`.
+Системный `python3` — это 3.9: без зависимостей он падает сразу на
+`ModuleNotFoundError: fastapi`, а с ними часть проверок разваливается на
+отсутствии текущего event loop. Везде только `/opt/homebrew/bin/python3.11`.
 
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv
@@ -29,7 +30,7 @@
 .venv/bin/python checks/run_checks.py     # 22 проверки, включая три ниже и клиентскую
 .venv/bin/python checks/spawn_100.py      # сто агентов в одном процессе
 .venv/bin/python checks/restart.py        # два процесса подряд на одном файле базы
-.venv/bin/python checks/two_processes.py  # сервер и консоль на одной базе
+.venv/bin/python checks/two_processes.py  # одновременные писатели: id не пересекаются
 node checks/browser_check.js              # клиент под node, 98 утверждений
 ```
 
