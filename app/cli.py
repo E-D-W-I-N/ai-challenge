@@ -1,11 +1,9 @@
 """Разговор с агентом из консоли — без браузера и без запущенного сервера.
 
-Это самое короткое доказательство главного требования дня: агент самостоятелен,
-веб-слой ему не нужен. Тот же класс `Agent`, тот же `stream_completion`, та же
-история — просто вывод идёт в терминал.
+Самое короткое доказательство главного требования дня: агент самостоятелен,
+веб-слой ему не нужен. Тот же класс `Agent`, тот же `stream_completion`.
 
     .venv/bin/python -m app.cli
-    .venv/bin/python -m app.cli --model openai/gpt-4o-mini
     echo "привет" | .venv/bin/python -m app.cli --once
 
 Команды внутри диалога: /выход, /история, /забыть, /агенты.
@@ -98,7 +96,6 @@ def _print_agents(out=sys.stdout) -> None:
 
 
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
-    """Цикл «вопрос — ответ». Возвращает код возврата процесса."""
     out.write(f"агент {agent.id} · {agent.spec.model}\n")
     if not has_key():
         out.write("[нет ключа] OPENROUTER_API_KEY не найден — вызова не будет.\n")

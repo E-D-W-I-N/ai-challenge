@@ -16,7 +16,7 @@ import contextlib
 import copy
 import itertools
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
@@ -41,10 +41,8 @@ def copy_spec(spec: AgentSpec) -> AgentSpec:
 
 
 class AgentBusyError(RuntimeError):
-    """У агента уже идёт обмен. Второй параллельный запрос — ошибка, а не очередь.
-
-    Иначе две вкладки на одном агенте молча перемешали бы историю.
-    """
+    """У агента уже идёт обмен. Второй параллельный запрос — ошибка, а не очередь:
+    иначе две вкладки на одном агенте молча перемешали бы историю."""
 
 
 @dataclass
@@ -53,21 +51,19 @@ class Turn:
 
     role: str
     content: str
+
     error: str | None = None
     """Заполнен, если ответ оборвался: реплика в истории есть, но она неполная."""
 
     reasoning: str = ""
-    """Рассуждение модели: приходит отдельным полем дельты, в `content`
-    не входит и обратно в модель не уходит."""
+    """Рассуждение модели: в `content` не входит и обратно в модель не уходит."""
 
     metrics: dict | None = None
     """Метрики этого ответа: по ним рисуются плитки внизу справа."""
 
-    at: float = field(default_factory=time.time)
-
     def as_message(self) -> dict:
-        """Реплика в том виде, в каком она уходит обратно в модель: без
-        рассуждения и метрик — в контекст возвращается ответ, а не путь к нему."""
+        """Реплика в том виде, в каком она уходит в модель: в контекст
+        возвращается ответ, а не путь к нему."""
         return {"role": self.role, "content": self.content}
 
     def as_dict(self) -> dict:
@@ -86,11 +82,8 @@ class Exchange:
 
 
 class Agent:
-    """Один агент: конфиг + история + один метод обмена.
-
-    Инстанцируется дёшево и много: ни сети, ни потоков, ни подпроцессов
-    в конструкторе — только словарь полей.
-    """
+    """Один агент: конфиг + история + один метод обмена. Инстанцируется дёшево
+    и много: ни сети, ни потоков, ни подпроцессов в конструкторе."""
 
     def __init__(
         self,
@@ -99,9 +92,8 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
     ) -> None:
-        # Один и тот же spec может поднять несколько агентов — каждому нужна
-        # своя копия, иначе правка у одного задела бы всех, а день ровно
-        # про то, что у ста агентов конфиги **разные**.
+        # Свой экземпляр конфига каждому агенту: один и тот же spec может
+        # поднять сотню, и правка у одного не должна задеть остальных.
         self.spec = copy_spec(spec)
         self.id = agent_id or f"ag_{next(_ids):05d}"
         self.created_at = time.time()
@@ -116,10 +108,6 @@ class Agent:
         self._reserved = False
 
     # --- состояние -----------------------------------------------------------
-
-    @property
-    def label(self) -> str:
-        return self.spec.label
 
     @property
     def busy(self) -> bool:
@@ -145,17 +133,16 @@ class Agent:
         поток штатным `done`."""
         self._cancel.set()
 
-    # --- сборка промпта ------------------------------------------------------
+    # --- история -------------------------------------------------------------
 
     def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
         """Системный промпт + вся история + вопрос этого хода.
 
         История уезжает целиком: чат помнит начало разговора, сколько бы он
-        ни длился. Промпт берётся из конфига каждый раз, поэтому правка
-        в панели видна со следующего сообщения.
+        ни длился. Конфиг читается каждый раз, поэтому правка в панели видна
+        со следующего сообщения; `spec` передаёт обмен — он собирает промпт
+        и тело запроса из одного слепка.
         """
-        # `spec` передаёт обмен: он собирает промпт и тело запроса из одного
-        # слепка, чтобы правка панели не могла попасть между ними.
         spec = spec if spec is not None else self.spec
 
         messages: list[dict] = []
@@ -164,8 +151,6 @@ class Agent:
         messages.extend(turn.as_message() for turn in self.history)
         messages.append({"role": "user", "content": user_text})
         return messages
-
-    # --- история -------------------------------------------------------------
 
     def remember(
         self,
@@ -184,11 +169,8 @@ class Agent:
         self.history.clear()
 
     def transcript(self) -> list[dict]:
-        """Ровно реплики диалога, в порядке разговора.
-
-        Системного промпта здесь нет: он конфиг, а не реплика, и виден
-        в панели полем `system`.
-        """
+        """Ровно реплики диалога. Системного промпта здесь нет: он конфиг,
+        а не реплика, и виден в панели полем `system`."""
         return [turn.as_dict() for turn in self.history]
 
     def as_dict(self, *, with_transcript: bool = False) -> dict:
@@ -337,32 +319,21 @@ class Agent:
         return True
 
     def take_last_exchange(self) -> Exchange | None:
-        """Снимает с истории последнюю пару «вопрос — ответ» целиком.
-
-        Пара уходит до вызова: перегенерация обязана **заменить** ответ,
-        а не дописать второй, и модель должна увидеть тот же контекст.
-        Возвращается снятое целиком, а не только вопрос: если вызов не отдаст
-        ни токена, `restore` кладёт обратно и вопрос, и прежний ответ.
-        """
-        if not self.history or self.history[-1].role != "assistant":
+        """Снимает последнюю пару «вопрос — ответ»: перегенерация обязана
+        **заменить** ответ, а не дописать второй, и модель должна увидеть тот же
+        контекст. Снятое возвращается целиком — если вызов не отдаст ни токена,
+        `restore` кладёт обратно и вопрос, и прежний ответ."""
+        if [turn.role for turn in self.history[-2:]] != ["user", "assistant"]:
             return None
-        taken = [self.history.pop()]
-        if self.history and self.history[-1].role == "user":
-            taken.insert(0, self.history.pop())
-        question = taken[0].content if taken[0].role == "user" else None
-        if question is None:
-            # Ответ без вопроса переспрашивать нечем — кладём обратно.
-            self.history.extend(taken)
-            return None
-        return Exchange(question=question, turns=taken, depth=len(self.history))
+        taken = self.history[-2:]
+        del self.history[-2:]
+        return Exchange(question=taken[0].content, turns=taken, depth=len(self.history))
 
     def restore(self, exchange: Exchange) -> bool:
-        """Кладёт снятую пару обратно, если её место никто не занял.
-
-        Записался новый обмен — перегенерация удалась (или оборвалась
-        с частичным ответом, что тоже записано), и класть старое поверх
-        нельзя: в ленте было бы два ответа на один вопрос.
-        """
+        """Кладёт снятую пару обратно, если её место никто не занял. Записался
+        новый обмен — перегенерация удалась (или оборвалась с частичным ответом,
+        что тоже записано), и класть старое поверх нельзя: в ленте было бы два
+        ответа на один вопрос."""
         if len(self.history) != exchange.depth:
             return False
         self.history.extend(exchange.turns)

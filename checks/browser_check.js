@@ -382,6 +382,38 @@ async function routeChecks() {
     );
   }
 
+  // ── в теле сообщения только текст: ленту хранит агент ──
+  //
+  // Раньше это стерёг греп по исходнику («в app.js есть строка { text }»),
+  // то есть описывал реализацию: тело можно раздуть, не тронув ту строку.
+  // Серверная половина — check_no_feed в run_checks.py: лишние поля → 400.
+  {
+    const { client, server, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(20);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+
+    const posted = server.state.requests.filter((r) => r.path.endsWith("/messages"));
+    check("сообщение ушло одним POST", posted.length === 1, String(posted.length));
+    check(
+      "в теле сообщения нет ничего, кроме text",
+      posted[0] && JSON.stringify(Object.keys(posted[0].body || {})) === '["text"]',
+      JSON.stringify(posted[0] && posted[0].body)
+    );
+
+    const card = $("#feed").querySelector(".card");
+    card.querySelectorAll(".icon-btn")[2].dispatchEvent(new Evt("click"));
+    await settle(120);
+    const repeated = server.state.requests.filter((r) => r.path.endsWith("/regenerate"));
+    check(
+      "перегенерация не шлёт тела вовсе: вопрос помнит агент",
+      repeated.length === 1 && repeated[0].body === null,
+      JSON.stringify(repeated.map((r) => r.body))
+    );
+  }
+
   // ── правка во время генерации ──
   {
     const { client, server, $, settle } = freshClient({ delay: 30 });

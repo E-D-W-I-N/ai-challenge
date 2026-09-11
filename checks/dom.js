@@ -56,7 +56,6 @@ class El {
     this._value = "";
     this.title = "";
     this.disabled = false;
-    this.checked = false;
     this.selected = false;
     this._selectCleared = false;
     this.open = false;
@@ -228,9 +227,6 @@ class El {
   setAttribute(name, value) {
     this.attributes[name] = String(value);
   }
-  getAttribute(name) {
-    return this.attributes[name];
-  }
 
   matches(sel) {
     return parseSelector(sel).every((part) => {
@@ -264,11 +260,6 @@ class El {
 
   addEventListener(type, handler) {
     (this.listeners[type] = this.listeners[type] || []).push({ handler });
-  }
-  removeEventListener(type, handler) {
-    const list = this.listeners[type] || [];
-    const i = list.findIndex((entry) => entry.handler === handler);
-    if (i >= 0) list.splice(i, 1);
   }
 
   // Событие всплывает по дереву и доходит до документа: на первом держится
@@ -311,15 +302,6 @@ class El {
   select() {}
   requestSubmit() {
     this.dispatchEvent(new Evt("submit"));
-  }
-
-  // Помощники проверок, а не браузерное API.
-  click() {
-    this.dispatchEvent(new Evt("click"));
-  }
-  change(value) {
-    if (value !== undefined) this.value = value;
-    this.dispatchEvent(new Evt("change"));
   }
 }
 
@@ -381,8 +363,6 @@ function stripTags(html) {
 
 let documentRef = null;
 
-const type_of = (event) => event.type;
-
 function buildDocument(html) {
   const root = new El("html");
   root.dataset = {};
@@ -436,13 +416,8 @@ function buildDocument(html) {
     // Событие, всплывшее с элемента, и событие, посланное самому документу, —
     // одно и то же для слушателя на document.
     fire: (event) => {
-      (document.listeners[type_of(event)] || []).slice().forEach((h) => h(event));
+      (document.listeners[event.type] || []).slice().forEach((h) => h(event));
       return event;
-    },
-    dispatch: (type, extra) => {
-      const event = new Evt(type, extra);
-      if (!event.target) event.target = document;
-      return document.fire(event);
     },
   };
   documentRef = document;
@@ -459,8 +434,8 @@ function buildServer(options) {
     agents: [],
     sent: [],       // {id, text, config} — конфиг агента в момент запроса
     requests: [],   // {method, path, body}
-    reply: (options && options.reply) || "ответ модели",
-    models: (options && options.models) || [
+    reply: "ответ модели",
+    models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
     ],
@@ -590,7 +565,7 @@ function buildServer(options) {
     return { ok: false, status: 405, json: async () => ({ detail: "не тот метод" }) };
   }
 
-  return { state, fetchStub, blank, config };
+  return { state, fetchStub };
 }
 
 // ── сборка окружения ──────────────────────────────────────────────────────
@@ -601,10 +576,7 @@ function boot(html, options) {
   const store = {};
 
   globalThis.document = document;
-  globalThis.window = {
-    matchMedia: () => ({ matches: false, addEventListener() {} }),
-    document,
-  };
+  globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
   globalThis.localStorage = {
     getItem: (k) => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },
