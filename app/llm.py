@@ -1,6 +1,5 @@
-"""Стриминг OpenRouter + сбор метрик.
-
-Стриминг обязателен: без него нет ни TTFT, ни живого счётчика скорости.
+"""Стриминг OpenRouter + сбор метрик. Без стриминга нет ни TTFT,
+ни живого счётчика скорости.
 
 Общее правило для всех вызовов — provider.require_parameters = true.
 Без него OpenRouter вправе увести запрос к провайдеру, который молча
@@ -42,11 +41,7 @@ DEFAULT_MAX_CONCURRENCY = 16
 
 
 def max_concurrency() -> int:
-    """LLM_MAX_CONCURRENCY: потолок одновременных вызовов.
-
-    Спавн бесплатен, а сто одновременных стримов — это сто соединений и счёт
-    от OpenRouter. Лишние вызовы не падают, а ждут на семафоре.
-    """
+    """LLM_MAX_CONCURRENCY. Лишние вызовы не падают, а ждут на семафоре."""
     raw = os.environ.get("LLM_MAX_CONCURRENCY", "").strip()
     try:
         value = int(raw)
@@ -67,7 +62,6 @@ _semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semap
 
 
 def shared_client() -> httpx.AsyncClient:
-    """Один httpx.AsyncClient на процесс — общий пул соединений для всех агентов."""
     loop = asyncio.get_running_loop()
     client = _clients.get(loop)
     if client is None or client.is_closed:
@@ -142,11 +136,8 @@ class Metrics:
     """Поля, которые округляются по дороге наружу. Остальные едут как есть."""
 
     def as_dict(self) -> dict:
-        """Все поля метрик, а не перечисленные руками.
-
-        Список руками означал бы, что новое поле появится здесь, а наружу
-        не поедет, — и плитка будет молча показывать прочерк.
-        """
+        """Все поля, а не перечисленные руками: иначе новое поле появилось бы
+        здесь, а наружу не поехало, и плитка молча показывала бы прочерк."""
         data = asdict(self)
         for name, digits in self._ROUND.items():
             if data[name] is not None:
@@ -182,10 +173,7 @@ SAMPLING_FIELDS = (
     "presence_penalty",
     "frequency_penalty",
 )
-"""Параметры сэмплирования, которые уходят в тело запроса как есть.
-
-Порядок только ради читаемости тела: OpenRouter на него не смотрит.
-"""
+"""Параметры сэмплирования, которые уходят в тело запроса как есть."""
 
 
 NO_COMPRESSION_PLUGIN = {"id": "context-compression", "enabled": False}
@@ -214,8 +202,7 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
     """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
     контекста — на каждом вызове.
 
-    Промпт приходит снаружи: собирает его агент, из слепка конфига. Конфиг
-    ленту не хранит, и брать её здесь неоткуда.
+    Промпт приходит снаружи: собирает его агент, из слепка конфига.
     """
     payload: dict = {
         "model": session.model,
@@ -227,9 +214,8 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
         # Сжатие контекста выключено явно: см. NO_COMPRESSION_PLUGIN.
         "plugins": [dict(NO_COMPRESSION_PLUGIN)],
     }
-    # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль.
-    # Пустое поле в панели справа значит «пусть решает провайдер»; отправить
-    # 0 вместо «не отправлять» — это другой запрос, а с
+    # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль:
+    # отправить 0 вместо «не отправлять» — это другой запрос, а с
     # provider.require_parameters=true ещё и другой список провайдеров.
     for name in SAMPLING_FIELDS:
         value = getattr(session, name, None)
@@ -261,10 +247,8 @@ async def stream_completion(
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
 ) -> AsyncIterator[dict]:
-    """Отдаёт события: {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}.
-
-    Метрики обновляются по мере генерации, финальный usage приходит последним чанком.
-    """
+    """События {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}: метрики
+    обновляются по мере генерации, финальный usage приходит последним чанком."""
     key = api_key()
     if key is None:
         raise MissingKeyError(
@@ -327,8 +311,7 @@ async def stream_completion(
                         delta = choice.get("delta") or {}
 
                         # Рассуждение приходит отдельным полем дельты и в ответ
-                        # не входит: клиент рисует его свёрнутым блоком над
-                        # ответом. В счётчик токенов не идёт — его считает
+                        # не входит. В счётчик токенов не идёт — его считает
                         # usage.completion_tokens_details.reasoning_tokens,
                         # и удваивать эту цифру своей оценкой нельзя.
                         thought = delta.get("reasoning") or ""

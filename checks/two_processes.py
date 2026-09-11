@@ -61,12 +61,12 @@ def _prepare(db: str):
 
 def _talk(agent, text: str) -> None:
     """Один обмен: он и записывает историю в базу."""
-    asyncio.run(_drain(agent.ask(text)))
 
+    async def drain():
+        async for _ in agent.ask(text):
+            pass
 
-async def _drain(agen) -> None:
-    async for _ in agen:
-        pass
+    asyncio.run(drain())
 
 
 def _child_long(db: str, folder: str) -> dict:
