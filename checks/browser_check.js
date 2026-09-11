@@ -1246,6 +1246,185 @@ async function routeChecks() {
       tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
   }
 
+  // ── упавший обмен не гасит плитки: показанное остаётся показанным ──
+  //
+  // Заказчик записывает переполнение контекста, и ровно в этот момент числа
+  // нужнее всего: на записи видно ошибку, а сколько контекста было занято —
+  // уже нет. Метрики упавшего обмена приходят с пустыми числами, и прежний
+  // код клал их поверх прежних целиком.
+  {
+    const { client, $, settle } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+      fail: (index) => (index === 0 ? null : { message: "HTTP 400: maximum context length" }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("до ошибки контекст заполнен", tileOf($, "Контекст").v === "42.5 %",
+      tileOf($, "Контекст").v);
+
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("ошибка провайдера долю окна не стёрла",
+      tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
+    check("и число помечено как прошлое, не удлиняя плитку",
+      tileOf($, "Контекст").row === "tile-v past", tileOf($, "Контекст").row);
+    check("а откуда оно — сказано подсказкой",
+      /прошлого обмена/.test(tileOf($, "Контекст").el.querySelector(".tile-v").title || ""),
+      String(tileOf($, "Контекст").el.querySelector(".tile-v").title));
+    check("сводка по чату осталась серверной: упавший обмен в неё не попал",
+      tileOf($, "Всего токенов").v === "120" && tileOf($, "Сообщений").v === "1",
+      tileOf($, "Всего токенов").v + " | " + tileOf($, "Сообщений").v);
+    check("и ошибка показана в ленте",
+      /maximum context length/.test($("#composer-hint").textContent),
+      $("#composer-hint").textContent);
+  }
+
+  // ── прочерк остаётся прочерком там, где числа не было никогда ──
+  {
+    const { client, $, settle } = freshClient({
+      fail: () => ({ message: "HTTP 400: maximum context length" }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("в чате без единого ответа ошибка оставляет прочерк, а не ноль",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+    check("и приглушать в нём нечего",
+      tileOf($, "Контекст").row === "tile-v", tileOf($, "Контекст").row);
+  }
+
+  // ── показанное не протекает между чатами ──
+  {
+    const { client, $, settle, Evt } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+      fail: (index) => (index === 0 ? null : { message: "HTTP 400: maximum context length" }),
+    });
+    const open = (i) => {
+      $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    };
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("в первом чате контекст заполнен", tileOf($, "Контекст").v === "42.5 %",
+      tileOf($, "Контекст").v);
+
+    open(1);
+    await settle(40);
+    check("во втором чате прочерк, а не числа соседа",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("и ошибка в нём чужого числа не поднимает",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+
+    open(0);
+    await settle(40);
+    check("вернулись в первый — его собственное число на месте",
+      tileOf($, "Контекст").v === "42.5 %", tileOf($, "Контекст").v);
+    check("и пометки прошлого обмена на нём нет: последний ответ был удачным",
+      tileOf($, "Контекст").row === "tile-v", tileOf($, "Контекст").row);
+  }
+
+  // ── числа, которые ошибка всё же принесла, показываются свои ──
+  {
+    const { client, $, settle } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+      fail: (index) => (index === 0
+        ? null
+        : { message: "HTTP 400: maximum context length",
+            metrics: { prompt_tokens: 8200, context_fill_pct: 99.9 } }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("доля окна из ошибки победила прежнюю",
+      tileOf($, "Контекст").v === "99.9 %", tileOf($, "Контекст").v);
+    check("и прошлым обменом не помечена: число своё",
+      tileOf($, "Контекст").row === "tile-v", tileOf($, "Контекст").row);
+  }
+
+  // ── смена модели плюс ошибка: прочерк, а не доля окна прежней модели ──
+  //
+  // Слияние метрик держит прежний процент в состоянии, и снимать пометку
+  // «модель сменили» по самому факту вызова нельзя: на новой модели своего
+  // числа ещё не было ни одного, и старое к её окну не относится.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+      fail: (index) => (index === 0 ? null : { message: "HTTP 400: maximum context length" }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    $("#f-model").value = "вторая/модель";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await client.state.applying;
+    await settle(40);
+    check("смена модели гасит контекст по-прежнему",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("упавший обмен на новой модели прежнюю долю окна не воскрешает",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
+  }
+
+  // ── ветка ошибки перерисовывает плитки сама ──
+  //
+  // Она клала метрики в состояние и уходила: на экране оставалось прежнее.
+  // Поток вправе оборваться на ошибке, без кадра `done`, — и тогда обновить
+  // показанное больше некому. Смотрим на плитку **до** конца потока.
+  {
+    const { client, $, settle } = freshClient({
+      usage: () => ({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+                      cost_usd: 0.0001, context_fill_pct: 42.5 }),
+      fail: (index) => (index === 0
+        ? null
+        : { message: "HTTP 400: maximum context length", done: false }),
+      delay: 60,
+    });
+    client.init();
+    await settle(40);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(320);
+    check("первый ответ доехал", tileOf($, "Контекст").v === "42.5 %",
+      tileOf($, "Контекст").v);
+
+    $("#input").value = "перебор";
+    $("#composer").requestSubmit();
+    // Кадры: start на 60-й, error на 120-й, поток кончается на 180-й.
+    // Смотрим между ошибкой и концом потока: перерисовать успела только она.
+    await settle(150);
+    check("кадр ошибки перерисовал плитки, не дожидаясь конца потока",
+      tileOf($, "Контекст").row === "tile-v past", tileOf($, "Контекст").row);
+    check("и значение на месте", tileOf($, "Контекст").v === "42.5 %",
+      tileOf($, "Контекст").v);
+    await settle(200);
+  }
+
   // ── чисел нет — нет и строки с числами, а плитка показывает прочерк ──
   {
     const talk = [

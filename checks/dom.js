@@ -477,6 +477,13 @@ function buildServer(options) {
     // Без них кадры стрима отдавали бы `metrics: null`, плитки в стенде всегда
     // показывали бы прочерк, и проверять там было бы нечего.
     usage: (options && options.usage) || null,
+    // Упавший обмен: словарь или функция (номер обмена) → null | описание
+    // падения `{message, metrics, done}`. Настоящая ошибка провайдера приходит
+    // кадром `error`, у метрик которого **все числа пустые**, и следом — `done`
+    // с теми же метриками. Кадр `done` можно погасить (`done: false`): поток
+    // вправе оборваться на ошибке, и тогда перерисовать плитки некому, кроме
+    // самой ветки ошибки.
+    fail: (options && options.fail) || null,
     models: (options && options.models) || [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -560,6 +567,8 @@ function buildServer(options) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     const index = state.sent.length;
     state.sent.push({ id: agent.id, text, config: config(agent) });
+    const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
+    if (failed) return errorStream(agent, text, failed);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -582,6 +591,40 @@ function buildServer(options) {
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
 
+    return streamOf(frames);
+  }
+
+  // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
+  // а `usage_total` и число обменов остаются прежними, как на сервере.
+  function errorStream(agent, text, failed) {
+    const metrics = {
+      model: agent.model,
+      provider: null,
+      error: failed.message,
+      ttft_ms: null,
+      elapsed_ms: 120.5,
+      prompt_tokens: null,
+      completion_tokens: null,
+      total_tokens: null,
+      cost_usd: null,
+      context_fill_pct: null,
+      // Провайдер вправе назвать часть чисел и в ошибке — тогда они тут.
+      ...(failed.metrics || {}),
+    };
+    const frames = [
+      { event: "start", agent: agent.id },
+      { event: "error", agent: agent.id, message: failed.message, metrics },
+      ...(failed.done === false
+        ? []
+        : [{
+            event: "done", text: "", reasoning: "", metrics,
+            error: failed.message, committed: false, question: text,
+          }]),
+    ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
+    return streamOf(frames);
+  }
+
+  function streamOf(frames) {
     let i = 0;
     const pause = (options && options.delay) || 0;
     return {
