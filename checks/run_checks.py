@@ -285,6 +285,8 @@ GONE = [
     ("history-limit", "ключ CLI, задававший окно памяти"),
     ("MAX_STORED_MESSAGES", "потолок хранимых реплик"),
     ("окно памяти", "поле панели «Окно памяти, сообщений»"),
+    # рельс справа от ленты: полоса точек по числу сообщений
+    ("rail", "рельс с точками справа от ленты"),
 ]
 
 # Имя клиента-референса: он был инструментом разработки, а не частью продукта,
@@ -1499,17 +1501,20 @@ def check_feed_scrolls():
     минимальный размер равен нулю: без запрета сжатия она давится в полоску
     вместо прокрутки."""
     css = read("app/static/style.css")
-    block = css[css.index(".chat {") : css.index(".chat-body")]
+    block = css[css.index(".chat {") : css.index(".feed {")]
     for rule in ("min-height: 0", "overflow: hidden", "flex-direction: column"):
         assert rule in block, f"у .chat нет правила {rule}"
-    assert "min-height: 0" in css[css.index(".chat-body") : css.index(".feed {")]
+    # `min-height: 0` переехало с обёртки на саму ленту: обёртка была нужна
+    # только рельсу и ушла вместе с ним, а без этого правила колонка не даёт
+    # ленте сжаться — она растягивает чат и уносит композер за нижний край.
+    feed_block = css[css.index(".feed {") : css.index(".feed > *")]
+    assert "min-height: 0" in feed_block, "у .feed нет min-height: 0"
     assert ".composer { flex: 0 0 auto" in css, "композер должен быть нерастяжимым"
-    assert "overflow-y: auto" in css[css.index(".feed {") :], "лента должна прокручиваться"
+    assert "overflow-y: auto" in feed_block, "лента должна прокручиваться"
 
     # Главное: элементам ленты запрещено сжиматься.
     assert ".feed > * { flex: 0 0 auto; }" in css, "элементы ленты всё ещё сжимаются"
-    feed = css[css.index(".feed {") : css.index(".feed > *")]
-    assert "scroll-behavior: smooth" not in feed, (
+    assert "scroll-behavior: smooth" not in feed_block, (
         "плавная прокрутка ленты дёргает её на каждом куске ответа"
     )
     return "элементы ленты не сжимаются, лента прокручивается, композер закреплён"
