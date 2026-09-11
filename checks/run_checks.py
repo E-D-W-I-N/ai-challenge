@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -101,24 +102,16 @@ def check_spawn_100():
     return result.stdout.strip().splitlines()[1]
 
 
-@check("список плоский и на чистом старте пуст")
-def check_flat_list():
+@check("на чистом старте список чатов пуст")
+def check_empty_start():
+    """Чаты заводит пользователь: ни заготовок, ни чата «по умолчанию».
+    Пустой список — это работа клиента, и его половина в browser_check.js."""
     with TestClient(main.app) as client:
-        data = client.get("/api/agents").json()
-        assert "groups" not in data, "групп в ответе быть не должно"
-        assert data["agents"] == [], f"на старте чатов быть не должно: {data['agents']}"
-
-        # Чат, заведённый руками, — обычный: его правят, переименовывают,
-        # удаляют, и никакой особости у него нет.
+        assert client.get("/api/agents").json()["agents"] == []
         agent = client.post("/api/agents", json={}).json()["agents"][0]
-        for gone in ("group", "note", "origin", "draft"):
-            assert gone not in agent, f"наружу торчит поле {gone}"
-        renamed = client.patch(f"/api/agents/{agent['id']}", json={"label": "Просто чат"})
-        assert renamed.status_code == 200 and renamed.json()["label"] == "Просто чат"
         assert client.delete(f"/api/agents/{agent['id']}").status_code == 200
         assert client.get("/api/agents").json()["agents"] == []
-
-    return "на старте пусто, заведённый чат ничем не особенный"
+    return "до первого чата список пуст и становится пустым снова"
 
 
 @check("список чатов идёт в порядке создания, новый — последним")
@@ -169,7 +162,7 @@ def check_list_order():
         store.close()
         again = Store(path).init()
         _restart(again)
-        revived = [a["id"] for a in main._listing()["agents"]]
+        revived = [a["id"] for a in asyncio.run(main.list_agents())["agents"]]
     finally:
         main.REGISTRY = saved_registry
         again.close()
@@ -200,55 +193,68 @@ def check_new_chat_is_blank():
         client.post(f"/api/agents/{fresh['id']}/messages", json={"text": "ещё"})
         after = _stub.CALLS[-1]["messages"]
         assert after[0] == {"role": "system", "content": "МОЙ ПРОМПТ"}, after[0]
-
-    assert "system=" not in read("app/main.py").split("NEW_CHAT_SPEC")[1].split(")")[0], \
-        "в NEW_CHAT_SPEC вернулся системный промпт"
     return "свежий чат пуст, промпт появляется только заданный руками"
 
 
 # --- выпиленное осталось выпиленным ------------------------------------------
 
-# Слово и чем оно было. Одна таблица вместо пяти проверок, делавших одно
-# и то же: обход файлов в поисках слов удалённой механики.
+# Слово и чем оно было. Одна таблица вместо пяти проверок, обходивших файлы
+# в поисках одних и тех же слов.
 #
-# Скоупа у правила нет намеренно. Он и был источником бед: в Дне 6 слияние
-# шести проверок в таблицу потеряло три правила ровно тем, что сузило скоуп,
-# и потеря прошла зелёной. Поэтому правило смотрит **во все файлы под
-# контролем версий**, а сузить его можно только записью в ONLY — с областью
-# и причиной. Забытая запись делает правило шире, а не уже.
+# Скоупа у правила нет намеренно, и списка расширений тоже: оба были и оба
+# сужались молча — `scenario` уехал на сервер, `draft` в конфиг, а из «.py,
+# .js, .html, .css, .md» довольно было убрать `.css`, чтобы вернуть
+# `list-group` в стили зелёным. Поэтому правило смотрит **во все файлы под
+# контролем версий**, двоичные тоже, а сузить его можно только записью
+# в ONLY — с областью и причиной. Забытая запись делает правило шире, а не уже.
 #
-# Списка расширений здесь тоже нет: он был и сужался молча. Двоичные читаются
-# байтами и декодируются с заменой — пропустить файл из-за кодировки значит
-# сузить обход. Поиск регистронезависимый: «прогон» и «судья» жили в клиенте
-# текстом для пользователя, а он пишется с большой буквы.
+# Поиск регистронезависимый: «прогон» и «судья» жили в клиенте текстом
+# для пользователя, а он пишется с большой буквы.
 
 # Единственный файл, которому запретные слова положены: он их и запрещает.
+# Собирать их из кусков ("PRESET" + "_CHATS") оказалось мало: с
+# регистронезависимым поиском `autoname` находил `AutoName` в соседней строке
+# таблицы, да и приём хрупкий — достаточно раз написать слово целиком.
+# Поблажка только для слов из таблицы: имя референса собрано из кусков
+# и здесь буквально не встречается, поэтому его обход идёт по ВСЕМ файлам,
+# включая этот, — иначе в нём одном имя можно было бы спрятать.
 SELF = "checks/run_checks.py"
 
 # Сузить правило можно только здесь, областью-префиксом пути и причиной.
 # Сужение обязано быть оправданным: слово должно законно встречаться
 # за пределами области — иначе это выключенное правило, ждущее, когда слово
-# вернётся, и проверка это скажет.
+# вернётся, и проверка это скажет. Осталось два: «children» вне реестра —
+# свойство DOM-узла, «колонк» вне клиента — колонка таблицы SQLite, и в Дне 7
+# это её основное значение: в `app/store.py` и README она встречается по делу.
 #
-# «children» вне реестра — свойство DOM-узла. «карандаш» вне разметки —
-# обычное слово, которым README и проверки описывают кнопку. «колонк» вне
-# клиента — колонка таблицы SQLite, и в Дне 7 это её основное значение:
-# в `app/store.py` и README она встречается по делу.
+# «children» стережётся ещё и поведением (check_removed_endpoints): греп ловит
+# упоминание в комментарии, но не поле, выставленное из кода, а поведение —
+# наоборот.
 ONLY = {
     "children": ("app/registry.py", "вне реестра это свойство DOM-узла"),
-    "карандаш": ("app/static/index.html", "вне разметки это обычное слово"),
     "колонк": ("app/static/", "вне клиента это колонка таблицы SQLite"),
 }
 
-# Растяжка: сужения заморожены вместе с областями. Это не доказательство —
-# проверку, которая стережёт саму себя, написать нельзя, — а требование
-# сделать ослабление явным: тронуть придётся и эту строку, а она затем
-# и стоит, чтобы в дифф попало «я ослабляю проверку».
-NARROWED = (
-    ("children", "app/registry.py"),
-    ("колонк", "app/static/"),
-    ("карандаш", "app/static/index.html"),
+# Растяжка: сужения заморожены вместе с областями. Проверку, стерегущую саму
+# себя, написать нельзя — но тронуть придётся и эту строку, и в дифф попадёт
+# «я ослабляю проверку». Дублирование здесь и есть механизм.
+NARROWED = (("children", "app/registry.py"), ("колонк", "app/static/"))
+
+SHOWCASE_CAPTIONS = (
+    "Единственное отличие",
+    "База пары",
+    "ступень",
+    "Панель экспертов",
 )
+"""Подписи выпиленной витрины сценариев — те, что объясняли интерфейс сам себе.
+
+Стерегутся дважды и по-разному, потому что вернуться могут двумя путями.
+Таблица `GONE` ищет их в исходниках: так ловится подпись, вернувшаяся
+в разметку или в клиент, — она не попадёт ни в один ответ ручки. Обход тела
+ответа в `check_removed_endpoints` ищет их в том, что реально уехало наружу:
+так ловится фраза, которой в файлах буквально нет — собранная по дороге или
+приехавшая из конфига. Ни одна из двух проверок не покрывает случай другой.
+"""
 
 GONE = [
     # заготовки дней 1–5: файл описаний, поднятие на старте, черновик
@@ -290,6 +296,8 @@ GONE = [
     ("history-limit", "ключ CLI, задававший окно памяти"),
     ("MAX_STORED_MESSAGES", "потолок хранимых реплик"),
     ("окно памяти", "поле панели «Окно памяти, сообщений»"),
+    # витрина сценариев объясняла себя подписями — их не должно быть в коде
+    *[(caption, "пояснение витрины") for caption in SHOWCASE_CAPTIONS],
 ]
 
 # Имя клиента-референса: он был инструментом разработки, а не частью продукта,
@@ -308,7 +316,8 @@ def _tracked() -> list[str]:
 
 
 def _read_any(name: str) -> str:
-    """Содержимое файла. Двоичное — с заменой: пропускать файл нельзя."""
+    """Содержимое файла под ROOT. Двоичное — с заменой: пропустить файл
+    из-за кодировки значит сузить обход, только через исключение."""
     with open(os.path.join(ROOT, name), "rb") as handle:
         return handle.read().decode("utf-8", "replace")
 
@@ -331,19 +340,14 @@ def _found(word: str, body: str) -> bool:
 
 @check("выпиленное осталось выпиленным: ни слова в исходниках")
 def check_nothing_left_behind():
-    """Одна проверка вместо пяти, обходивших файлы в поисках одних и тех же слов.
-
-    Печатает **все** совпадения разом, а не первое: раньше пять проверок
+    """Печатает **все** совпадения разом, а не первое: раньше пять проверок
     падали по одной с понятным именем, и от слияния диагностика не должна
     стать хуже.
 
     Перед обходом — самопроверка. Потерянное правило молчит ровно так же,
-    как соблюдённое, поэтому зелёный прогон о потере не говорит ничего:
-    каждое правило обязано доказать, что вообще способно сработать, а каждая
-    оговорка — что она рабочая, а не прикрывает настоящий след.
-
-    Ручки выпиленных механик проверяются отдельно — тем, что они отвечают
-    404, а не тем, что слова нет в исходнике.
+    как соблюдённое: каждое правило обязано доказать, что вообще способно
+    сработать, а каждая оговорка — что она рабочая, а не прикрывает
+    настоящий след.
     """
     tracked = _tracked()
     body_of = {n: _read_any(n) for n in tracked}
@@ -354,8 +358,9 @@ def check_nothing_left_behind():
 
     # 0. Обход покрывает всё, что под контролем версий. Считать слепые файлы
     #    от того же списка, который вернул `_tracked()`, мало: так видны
-    #    сужения ниже него, но не он сам. Поэтому сверяемся со свежим
-    #    `git ls-files`, взятым здесь и мимо всех помощников.
+    #    сужения ниже него, но не он сам — отбросить `.css` прямо в `_tracked()`
+    #    проходило зелёным. Поэтому сверяемся со свежим `git ls-files`, взятым
+    #    здесь и мимо всех помощников.
     listed = subprocess.run(
         ["git", "ls-files"], capture_output=True, text=True, cwd=ROOT, check=True
     ).stdout.split()
@@ -366,6 +371,15 @@ def check_nothing_left_behind():
         f"из обхода выпали файлы под контролем версий: {', '.join(dropped)} — "
         "список подрезан в самом `_tracked()`"
     )
+
+    # Не-UTF-8 обход обязан прочитать, а не уронить: иначе двоичный файл
+    # выпадет из него молча. Проверяем настоящим чтением, а не верой
+    # в аргумент "replace"; имя абсолютное, поэтому ROOT из `_read_any` отпадает
+    # и в репозитории ничего не появляется.
+    with tempfile.NamedTemporaryFile(suffix=".bin") as probe:
+        probe.write(b"\xff\xfe\x00" + "хвост".encode("utf-8"))
+        probe.flush()
+        assert _read_any(probe.name).endswith("хвост"), "обход падает на не-UTF-8"
 
     wide = [w for w, _ in GONE if w.lower() not in ONLY]
     assert wide, "сужены все правила до одного — обходить стало нечего"
@@ -469,35 +483,32 @@ def check_removed_endpoints():
             for attr in ("children", "parent", "parent_id", "kill_children", "seed_messages"):
                 assert not hasattr(owner, attr), f"у {name} снова есть {attr}"
 
-        listing = client.get("/api/agents").json()
-        assert "groups" not in listing, "групп в ответе быть не должно"
-        body = client.get("/api/agents").text
-        for leftover in ("Единственное отличие", "База пары", "ступень", "Панель экспертов"):
-            assert leftover not in body, f"наружу уехало пояснение: {leftover}"
-    return "четыре ручки отдают 404/405, мёртвых полей в ответах и в PATCH нет"
+        assert "groups" not in client.get("/api/agents").json(), "групп в ответе быть не должно"
+
+        # Подписи витрины — по тому, что реально уехало наружу, а не по тому,
+        # что написано в файлах. Фраза может не встречаться в исходнике вовсе:
+        # достаточно собрать её по дороге, и греп по коду промолчит. Смотрим
+        # оба ответа, куда попадает `Agent.as_dict`, и служебный.
+        agent.update(
+            client.patch(f"/api/agents/{agent['id']}", json={"label": "чат"}).json()
+        )
+        bodies = {
+            "GET /api/agents": client.get("/api/agents").text,
+            "GET /api/agents/{id}": client.get(f"/api/agents/{agent['id']}").text,
+            "GET /api/health": client.get("/api/health").text,
+        }
+    for where, body in bodies.items():
+        for caption in SHOWCASE_CAPTIONS:
+            assert caption.lower() not in body.lower(), (
+                f"{where}: наружу уехало пояснение витрины «{caption}»"
+            )
+    return (
+        f"четыре ручки отдают 404/405, мёртвых полей нет, "
+        f"{len(SHOWCASE_CAPTIONS)} подписей витрины нет в теле {len(bodies)} ответов"
+    )
 
 
 # --- 4. агент: память, откат, 409, обрыв --------------------------------------
-
-
-@check("диалог помнит предыдущее: в третьем запросе виден первый вопрос")
-def check_memory():
-    _stub.install(reply=lambda m, i: f"ответ {i}")
-    with TestClient(main.app) as client:
-        agent_id = new_agent(client, system="СИСТЕМА")
-        for text in ("меня зовут Нина", "мне 33 года", "как меня зовут?"):
-            response = client.post(f"/api/agents/{agent_id}/messages", json={"text": text})
-            assert response.status_code == 200, response.text
-
-    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
-    first, second, third = (c["messages"] for c in _stub.CALLS)
-    assert [m["role"] for m in first] == ["system", "user"], first
-    roles = [m["role"] for m in third]
-    assert roles == ["system", "user", "assistant", "user", "assistant", "user"], roles
-    assert third[1]["content"] == "меня зовут Нина", third[1]
-    assert third[-1]["content"] == "как меня зовут?", third[-1]
-    assert len(second) == 4, second
-    return "3-й запрос: 6 сообщений, первый вопрос в контексте"
 
 
 @check("в модель уезжает вся история: ни хвоста, ни отсечки по росту")
@@ -526,8 +537,9 @@ def check_whole_history_goes_to_model():
 
         sent = _stub.CALLS[-1]["messages"]
         # Системный промпт + вся переписка (по две реплики на обмен) + новый вопрос.
-        assert len(sent) == 1 + 2 * (turns - 1) + 1, len(sent)
-        assert sent[0]["role"] == "system", sent[0]
+        assert [m["role"] for m in sent] == (
+            ["system"] + ["user", "assistant"] * (turns - 1) + ["user"]
+        ), [m["role"] for m in sent]
         assert sent[1]["content"] == "вопрос 0", sent[1]
         assert sent[-1]["content"] == f"вопрос {turns - 1}", sent[-1]
         assert [m["content"] for m in sent[1:-1:2]] == [f"вопрос {i}" for i in range(turns - 1)]
@@ -693,6 +705,13 @@ def check_new_params():
         # Кривой тип — 400 с текстом, а не 500 и не молчаливая отправка.
         assert client.patch(f"/api/agents/{full}", json={"top_k": 0.5}).status_code == 400
         assert client.patch(f"/api/agents/{full}", json={"top_p": "быстро"}).status_code == 400
+
+        # true — не число. В Python True это int, и без отдельной проверки
+        # «temperature: true» уехало бы к провайдеру единицей.
+        for bad in ({"temperature": True}, {"max_tokens": True}):
+            assert client.patch(f"/api/agents/{full}", json=bad).status_code == 400, bad
+            born = client.post("/api/agents", json={"agent": {"model": "stub/m", **bad}})
+            assert born.status_code == 400, (bad, born.text)
     return "шесть новых параметров едут, незаданные отсутствуют, ноль отличим от пустоты"
 
 
@@ -1000,8 +1019,6 @@ def check_stop_and_format():
             == 400
         )
 
-    html = read("app/static/index.html")
-    assert 'id="f-stop"' in html and 'id="f-response_format"' in html, "полей нет в панели"
     return "оба параметра задаются, снимаются и не уходят пустыми"
 
 
@@ -1515,7 +1532,7 @@ def check_list_actions():
     """Серверная половина: PATCH меняет имя, пустое имя отвергается, DELETE убирает.
 
     Клиентская половина — в `checks/browser_check.js`, блоком «переименование
-    чата в списке слева»: клик по карандашу, Enter, Escape, потеря фокуса,
+    чата в списке слева»: клик по кнопке, Enter, Escape, потеря фокуса,
     пустое имя. Раньше она была грепом по исходнику («в app.js есть строка
     function startRename»), то есть описывала реализацию: переименование
     ломалось, не тронув ни одной из тех строк, и греп оставался зелёным, —
@@ -1598,38 +1615,44 @@ def check_catalog_capabilities():
     assert capped["temperature_capped"] is True, capped
     assert capped["temperature_cap"] == catalog.TEMPERATURE_CAP, capped
 
-    free = catalog._normalize({"id": "x/y:free", "pricing": {"prompt": "0", "completion": "0"}})
+    free = catalog._normalize(
+        {"id": "x/y:free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 8000}
+    )
     assert free["is_free"] is True, free
 
     # Отбор при этом не вернулся: чат показывает каталог целиком.
     assert not hasattr(catalog, "filter_models"), "фильтры каталога вернулись"
-    assert "exclude_free" not in read("app/main.py"), "ручка снова отбирает модели"
 
     async def catalog_stub():
         return [plain, capped, free]
 
+    _stub.install(reply="ок")
     saved = catalog.fetch_models
     catalog.fetch_models = catalog_stub
     try:
         with TestClient(main.app) as client:
             models = client.get("/api/models").json()["models"]
+            assert len(models) == 3, "каталог отдаётся целиком, включая :free"
+            assert all("supported_parameters" in m for m in models), models[0]
+            assert any(m["temperature_capped"] for m in models), models
+
+            # Длина контекста из каталога доезжает до агента и до метрик —
+            # по ней плитка «Контекст» показывает заполнение. Стерёг её
+            # только сам каталог: `context_length` можно было не передать
+            # ни при создании, ни при смене модели, и всё оставалось зелёным.
+            agent_id = new_agent(client, model=plain["id"])
+            assert REGISTRY.require(agent_id).context_length == 128000
+            events = sse(
+                client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"}).text
+            )
+            done = next(e for e in events if e["event"] == "done")
+            assert done["metrics"]["context_length"] == 128000, done["metrics"]
+
+            client.patch(f"/api/agents/{agent_id}", json={"model": free["id"]})
+            assert REGISTRY.require(agent_id).context_length == 8000, "смена модели не обновила"
     finally:
         catalog.fetch_models = saved
-    assert len(models) == 3, "каталог отдаётся целиком, включая :free"
-    assert all("supported_parameters" in m for m in models), models[0]
-    assert any(m["temperature_capped"] for m in models), models
-
-    js = read("app/static/app.js")
-    assert "function paramWarnings" in js, "панель не считает предупреждения"
-    # Привязка к поставщику — настройка, которая ломает смену модели.
-    # Панель говорит о ней в момент смены; сам текст проверяется вызовами
-    # в checks/browser_check.js, здесь — что данные для него есть.
-    assert "extra_body" in js, "панель не смотрит на extra_body"
-    assert "baseModel" in js, "панель не помнит, с какой модели начинали"
-    for field in ("supported_parameters", "temperature_capped", "temperature_cap"):
-        assert field in js, f"клиент не смотрит на {field}"
-    assert 'id="model-warn"' in read("app/static/index.html"), "блока предупреждения нет"
-    return "три поля на месте, отбор не вернулся, панель их читает"
+    return "три поля на месте, отбор не вернулся, длина контекста доезжает до метрик"
 
 
 @check("клиент ничего не тянет из сети: ни шрифтов, ни библиотек, ни иконок")
@@ -1756,7 +1779,18 @@ def check_eviction():
     busy.create_many([AgentSpec(label=f"н {i}", model="stub/m") for i in range(3)])
     assert busy.get(held.id) is not None, "занятого вытеснять нельзя"
     held.release()
-    return "вытеснены три самых старых, свежие и занятый на месте"
+
+    # Сам потолок настраивается из окружения — и это не стерёг никто:
+    # выбрось чтение AGENT_MAX_LIVE, и набор остался бы зелёным.
+    from app.registry import DEFAULT_MAX_AGENTS
+
+    os.environ["AGENT_MAX_LIVE"] = "7"
+    try:
+        assert AgentRegistry().max_agents == 7, AgentRegistry().max_agents
+    finally:
+        os.environ.pop("AGENT_MAX_LIVE")
+    assert AgentRegistry().max_agents == DEFAULT_MAX_AGENTS
+    return "вытеснены три самых старых, свежие и занятый на месте, AGENT_MAX_LIVE читается"
 
 
 @check("потолок пачки при спавне")
@@ -1808,11 +1842,129 @@ def check_no_feed():
         assert bad.status_code == 400, bad.text
         assert "только text" in bad.json()["detail"], bad.text
         assert client.post(f"/api/agents/{agent_id}/messages", json={"text": " "}).status_code == 400
+    return "лишние поля в теле → 400, пустой текст тоже"
 
-    js = read("app/static/app.js")
-    assert "{ text }" in js, "клиент должен слать в теле только text"
-    assert "/messages" in js and "/regenerate" in js
-    return "лишние поля в теле → 400, в app.js ленты нет"
+
+@check("«Стоп» гасит генерацию: частичный ответ записан и помечен")
+def check_cancel():
+    """Кнопку «Стоп» не стерёг никто: ручка cancel, флаг `cancelled` и текст
+    «генерация отменена» можно было выкинуть целиком, не уронив ни одной
+    проверки. Между тем это единственный способ не платить за ответ,
+    который уже не нужен."""
+    _stub.install(reply="а" * 200, chunks=20, delay=0.02)
+
+    async def scenario():
+        from httpx import ASGITransport, AsyncClient
+
+        transport = ASGITransport(app=main.app)
+        async with AsyncClient(transport=transport, base_url="http://bench") as client:
+            created = await client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", "label": "стоп"}}
+            )
+            agent_id = created.json()["agents"][0]["id"]
+            talking = asyncio.create_task(
+                client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос"})
+            )
+            await asyncio.sleep(0.1)
+            stopped = await client.post(f"/api/agents/{agent_id}/cancel")
+            return stopped, await talking, REGISTRY.require(agent_id)
+
+    stopped, response, agent = asyncio.run(scenario())
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["was_busy"] is True, stopped.text
+
+    done = next(e for e in sse(response.text) if e["event"] == "done")
+    assert done["cancelled"] is True, done
+    assert done["error"] == "генерация отменена", done
+
+    # Оборванный ответ всё равно часть диалога: он уже оплачен, и следующий
+    # вопрос должен видеть, чем кончилось.
+    roles = [t.role for t in agent.history]
+    assert roles == ["user", "assistant"], roles
+    answer = agent.history[-1]
+    assert answer.error == "генерация отменена", answer.error
+    assert 0 < len(answer.content) < 200, len(answer.content)
+    return f"стрим оборван на {len(answer.content)} символах, ответ помечен отменой"
+
+
+@check("без ключа сообщение не уходит: 503 вместо вызова к модели")
+def check_no_key():
+    """Стенд без .env — обычное состояние свежего клона. Проверка была только
+    на то, что ключ не утекает; на то, что его отсутствие останавливает вызов,
+    не было никакой: сними `_require_key`, и набор остался бы зелёным."""
+    _stub.install(reply="ок")
+    saved = main.has_key
+    main.has_key = lambda: False
+    try:
+        with TestClient(main.app) as client:
+            agent_id = new_agent(client)
+            blocked = client.post(f"/api/agents/{agent_id}/messages", json={"text": "?"})
+            repeated = client.post(f"/api/agents/{agent_id}/regenerate")
+            listing = client.get("/api/agents").json()
+            agent = REGISTRY.require(agent_id)
+    finally:
+        main.has_key = saved
+
+    assert blocked.status_code == 503, blocked.text
+    assert repeated.status_code == 503, repeated.text
+    assert listing["has_key"] is False, listing
+    assert not _stub.CALLS, f"до модели дошло {len(_stub.CALLS)} вызовов"
+    assert agent.busy is False, "бронь не должна залипнуть на отказе"
+    return "оба пути отдают 503, вызова нет, бронь не взята"
+
+
+@check("ключ и заголовки атрибуции: окружение сильнее .env")
+def check_env_reading():
+    """В app/config.py не смотрела ни одна проверка: выбрось чтение .env или
+    заголовки атрибуции — всё осталось бы зелёным. Ключ при этом живёт
+    ровно там, и «стенд не настроен» отличается от «ключ есть» только этим
+    файлом. Настоящий .env не трогаем: читаем из временного каталога."""
+    import pathlib
+    import tempfile
+
+    import app.config as config
+
+    names = ("OPENROUTER_API_KEY", "OPENROUTER_SITE_URL", "OPENROUTER_SITE_NAME")
+    before = {name: os.environ.get(name) for name in names}
+    saved_root = config.ROOT
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".env"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# комментарий\n\n"
+                    'OPENROUTER_API_KEY="из-файла"\n'
+                    "OPENROUTER_SITE_URL = http://стенд\n"
+                    "мусор без равенства\n"
+                )
+            config.ROOT = pathlib.Path(tmp)
+            config._load_dotenv()
+            assert config.api_key() == "из-файла", config.api_key()
+            assert os.environ["OPENROUTER_SITE_URL"] == "http://стенд"
+
+            # Переменная окружения сильнее файла: иначе стенд не смог бы
+            # подставить свой ключ, не переписав .env пользователя.
+            os.environ["OPENROUTER_API_KEY"] = "из-окружения"
+            config._load_dotenv()
+            assert config.api_key() == "из-окружения", config.api_key()
+
+        headers = config.attribution_headers()
+        assert headers == {"HTTP-Referer": "http://стенд"}, headers
+        os.environ["OPENROUTER_SITE_NAME"] = "стенд"
+        assert config.attribution_headers()["X-Title"] == "стенд"
+
+        # Пустой ключ — это отсутствие ключа, а не ключ из пробелов.
+        os.environ["OPENROUTER_API_KEY"] = "   "
+        assert config.api_key() is None and config.has_key() is False
+    finally:
+        config.ROOT = saved_root
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return ".env читается, окружение сильнее файла, заголовки едут только заданные"
 
 
 @check("CLI говорит с агентом без веб-слоя")
@@ -1871,13 +2023,25 @@ def check_store_reopen():
     first.save_session(
         "ag_00042",
         label="Нина",
-        config={"model": "stub/m", "top_k": 7, "top_p": 0.9},
+        config={"model": "stub/m", "top_k": 7, "top_p": 0.9, "system": "ты помощник"},
         created_at=100.0,
         context_length=128_000,
     )
     first.save_history(
         "ag_00042", [_Turn("user", "меня зовут Нина"), _Turn("assistant", "привет, Нина")]
     )
+    # Номер вне формата — так выглядит строка, пришедшая из чужой базы.
+    # Сдвиг счётчика считается по наибольшему занятому номеру, а не по
+    # последней строке таблицы, иначе свежий агент заберёт занятый id.
+    first.save_session("ag_7", label="чужой формат", config={}, created_at=1.0)
+
+    # Повторный init() не переоткрывает файл: соединение одно на Store.
+    conn_before = first.conn
+    assert first.init() is first and first.conn is conn_before, "init() переоткрыл файл"
+
+    # Конфиг лежит в базе читаемым текстом, а не \u-экранированным.
+    raw = first.conn.execute("SELECT config FROM sessions WHERE id = 'ag_00042'").fetchone()[0]
+    assert "помощник" in raw, f"конфиг уехал в базу экранированным: {raw[:80]}"
     first.close()
 
     # Новый объект на том же файле — это и есть перезапуск, а не «тот же
@@ -1890,8 +2054,63 @@ def check_store_reopen():
     rows = second.message_rows("ag_00042")
     assert rows == [(0, "user", "меня зовут Нина"), (1, "assistant", "привет, Нина")], rows
     assert second.max_agent_seq() == 42, second.max_agent_seq()
+
+    # Битый JSON в колонке — так выглядит база, которую правили руками или
+    # писала чужая версия. Чат обязан открыться: конфиг падает на пустой,
+    # метрики — на «их нет», а не роняют чтение целиком.
+    with second.tx() as conn:
+        conn.execute("UPDATE sessions SET config = 'не json' WHERE id = 'ag_00042'")
+        conn.execute("UPDATE messages SET metrics = '{битое' WHERE session_id = 'ag_00042'")
+    assert second.load_session("ag_00042")["config"] == {}, "битый конфиг не упал на пустой"
+    assert [m["metrics"] for m in second.load_messages("ag_00042")] == [None, None], (
+        "битые метрики не упали на «их нет»"
+    )
     second.close()
     return f"каталог создан init(), после переоткрытия {len(rows)} реплики и конфиг на месте"
+
+
+@check("время в базе: заведение не сдвигается правкой, свежесть — сдвигается записью")
+def check_session_timestamps():
+    """Два столбца времени, и каждый держит свой порядок: `created_at` —
+    список слева (он по заведению), `updated_at` — `/сессии` в консоли
+    (там свежие сверху).
+
+    Оба легко потерять молча. `save_session` зовётся на каждую правку панели
+    и не вправе двигать `created_at`, иначе переименованный чат прыгнет в конец
+    списка. `save_history` обязан двигать `updated_at`, иначе разговор
+    не поднимает чат наверх и список свежести замирает навсегда.
+    """
+    path = _temp_db("stamps")
+    store = Store(path).init()
+    older = {"model": "stub/m", "label": "старший"}
+    store.save_session("ag_00001", label="старший", config=older, created_at=100.0)
+    time.sleep(0.01)
+    store.save_session("ag_00002", label="младший", config={"model": "stub/m"}, created_at=200.0)
+
+    # Правка конфига живого чата: имя новое, время заведения прежнее.
+    time.sleep(0.01)
+    store.save_session("ag_00001", label="переименован", config=older, created_at=100.0)
+    saved = store.load_session("ag_00001")
+    assert saved["label"] == "переименован", saved["label"]
+    assert saved["created_at"] == 100.0, (
+        f"правка сдвинула время заведения на {saved['created_at']} — "
+        "переименованный чат уедет в конец списка слева"
+    )
+
+    # Сейчас наверху списка свежести — тот, кого правили последним.
+    assert [row["id"] for row in store.list_sessions()] == ["ag_00001", "ag_00002"]
+
+    # А теперь в младшем говорят: разговор обязан поднять его наверх.
+    time.sleep(0.01)
+    store.save_history("ag_00002", [_Turn("user", "привет"), _Turn("assistant", "и тебе")])
+    order = [row["id"] for row in store.list_sessions()]
+    assert order == ["ag_00002", "ag_00001"], (
+        f"список свежести {order}: запись истории не сдвинула updated_at "
+        "или порядок сортировки перевёрнут"
+    )
+    assert [row["history_len"] for row in store.list_sessions()] == [2, 0]
+    store.close()
+    return "правка не трогает created_at, запись истории поднимает чат в списке свежести"
 
 
 @check("диалог продолжается в новом процессе программы")
@@ -1964,12 +2183,24 @@ def check_session_isolation():
     assert [r[2] for r in store.message_rows(first)] == ["меня зовут Нина", "ответ0"]
     assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"]
 
+    # Вторая запись первого чата переписывает его историю целиком, начиная
+    # с `DELETE`. Забыть в нём `WHERE session_id = ?` — значит стереть ленту
+    # соседа, и набор обязан это увидеть.
+    with TestClient(main.app) as client:
+        client.post(f"/api/agents/{first}/messages", json={"text": "и ещё раз"})
+    assert [r[2] for r in store.message_rows(second)] == ["как меня зовут?", "ответ0"], (
+        "перезапись истории одного чата стёрла реплики соседнего"
+    )
+
     # Схема не даёт записать реплику без сессии: ключ составной, и это
     # единственная защита от «все чаты в одной ленте» после перезапуска.
-    keys = [row[1] for row in store.conn.execute("PRAGMA table_info(messages)") if row[5]]
+    columns = {row[1]: row for row in store.conn.execute("PRAGMA table_info(messages)")}
+    keys = [name for name, row in columns.items() if row[5]]
     assert keys == ["session_id", "seq"], keys
     indexes = {row[1] for row in store.conn.execute("PRAGMA index_list(messages)")}
     assert "messages_by_session" in indexes, indexes
+    for required in ("session_id", "seq", "role", "content", "at"):
+        assert columns[required][3], f"{required} стал NULLable — реплику можно записать без него"
     return "две сессии — две ленты; PK (session_id, seq), индекс по session_id есть"
 
 
@@ -2145,6 +2376,11 @@ def check_numbering_survives_restart():
             third = client.post("/api/agents", json={}).json()["agents"][0]["label"]
             labels = [a["label"] for a in client.get("/api/agents").json()["agents"]]
         assert _meta(store, main.CHAT_NUMBER_KEY) == "3", _meta(store, main.CHAT_NUMBER_KEY)
+
+        # `clear()` уносит и счётчики: оставленный номер отдал бы следующей
+        # базе имя из середины ряда.
+        store.clear()
+        assert _meta(store, main.CHAT_NUMBER_KEY) is None, "clear() оставил счётчик имён"
     finally:
         main.REGISTRY = saved_registry
         store.close()
@@ -2175,15 +2411,22 @@ def check_list_beyond_cap():
         assert len(registry) <= 3, f"в памяти {len(registry)} при потолке 3"
         assert registry.evicted >= 7, registry.evicted
 
-        listing = main._listing()
+        listing = asyncio.run(main.list_agents())
         assert [a["id"] for a in listing["agents"]] == made, listing["agents"]
         assert listing["stored"] == 10 and listing["live"] <= 3
         assert all(a["history_len"] == 2 for a in listing["agents"])
 
         with TestClient(main.app) as client:
             body = client.get(f"/api/agents/{made[0]}").json()
+            health = client.get("/api/health").json()
         texts = [t["content"] for t in body["transcript"]]
         assert texts == ["вопрос 0", "ответ"], texts
+
+        # `/api/health` считает чаты по базе, а не по памяти: выгруженные
+        # из неё ушли, но сохранены — иначе цифра отчитывалась бы за один
+        # слой из двух.
+        assert health["sessions_stored"] == len(made), health
+        assert health["agents_live"] <= 3 < health["sessions_stored"], health
     finally:
         main.REGISTRY = saved_registry
         store.close()
@@ -2289,8 +2532,27 @@ def check_id_claimed_in_store():
 
     assert [row[2] for row in store.message_rows(taken)] == ["СЕКРЕТ соседа", "ответ соседа"]
     assert store.load_session(taken)["label"] == "чужой", "чужой конфиг перезаписан"
+
+    # Разрыв в сотни номеров — обычное дело: консоль писала, пока сервер спал.
+    # Перебором по одному его не пройти, поэтому на конфликте счётчик догоняет
+    # базу разом; иначе попытки кончаются и чат не завести вовсе.
+    occupied = 400
+    with store.tx() as conn:
+        for number in range(1, occupied + 1):
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, created_at, updated_at) VALUES (?, 1, 1)",
+                (f"ag_{number:05d}",),
+            )
+    agent_mod._last_id = 0
+    caught_up = Agent(AgentSpec(label="догнал", model="stub/m"), store=store)
+    assert int(caught_up.id.removeprefix("ag_")) > occupied, (
+        f"{caught_up.id} не догнал базу, где заняты первые {occupied} номеров"
+    )
     store.close()
-    return f"{taken} остался за соседом, свежий агент получил {mine.id}"
+    return (
+        f"{taken} остался за соседом, свежий агент получил {mine.id}; "
+        f"счётчик догнал базу с {occupied} занятыми номерами"
+    )
 
 
 @check("недостроенный агент не оставляет пустую строку чата")
@@ -2427,6 +2689,47 @@ def check_redact_floor():
     return f"ключ короче {MIN_SECRET_LENGTH} символов данные не трогает, настоящий — режется"
 
 
+@check("оборванная запись откатывается целиком: половины обмена в базе не бывает")
+def check_tx_rolls_back():
+    """Обещание «вопроса без ответа не остаётся» держит не `save_history`,
+    а откат: обмен пишется одной транзакцией, и если посреди неё что-то
+    упало, в файле не должно остаться ни строки чата, ни половины реплик.
+
+    Без `ROLLBACK` беда не только в мусоре: транзакция остаётся открытой,
+    и следующая запись падает на «transaction within a transaction» —
+    поэтому здесь же проверяется, что база после отката рабочая.
+    """
+
+    class Boom(RuntimeError):
+        pass
+
+    path = _temp_db("rollback")
+    store = Store(path).init()
+    try:
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO sessions (id, label, created_at, updated_at) "
+                "VALUES ('ag_00777', 'половина', 1, 1)",
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, seq, role, content, at) "
+                "VALUES ('ag_00777', 0, 'user', 'вопрос без ответа', 1)",
+            )
+            raise Boom
+    except Boom:
+        pass
+
+    assert store.load_session("ag_00777") is None, "строка недописанной транзакции осталась"
+    assert store.message_rows("ag_00777") == [], "реплики недописанной транзакции остались"
+
+    store.save_session("ag_00778", label="после отката", config={}, created_at=1.0)
+    assert store.load_session("ag_00778")["label"] == "после отката", (
+        "после отката база не пишет — транзакция осталась открытой"
+    )
+    store.close()
+    return "упавшая транзакция не оставила ни строки чата, ни реплики; запись после неё идёт"
+
+
 @check("транзакция берёт блокировку сразу, а не при первой записи")
 def check_tx_locks_immediately():
     """Седьмая дыра, найденная уже сверкой инвариантов после сокращения:
@@ -2472,7 +2775,7 @@ def check_tx_locks_immediately():
         holder.execute("BEGIN IMMEDIATE")
         try:
             waiting = Store(path).init()
-            waiting.conn.execute(f"PRAGMA busy_timeout=50")
+            waiting.conn.execute("PRAGMA busy_timeout=50")
             try:
                 waiting.save_session(
                     "ag_00001", label="не пройдёт", config={"model": "m"}, created_at=0.0
@@ -2493,7 +2796,7 @@ def check_tx_locks_immediately():
 def check_busy_message():
     import sqlite3
 
-    from app.store import StoreBusyError, _busy
+    from app.store import BUSY_TIMEOUT_MS, StoreBusyError, _busy
 
     translated = _busy(sqlite3.OperationalError("database is locked"), "/tmp/agents.db")
     assert isinstance(translated, StoreBusyError), type(translated)
@@ -2503,6 +2806,9 @@ def check_busy_message():
 
     path = _temp_db("busy")
     store = Store(path).init()
+    assert store.conn.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS, (
+        "busy_timeout не выставлен: второй писатель получит отказ вместо очереди"
+    )
     blocker = sqlite3.connect(str(path), isolation_level=None)
     blocker.execute("PRAGMA busy_timeout=0")
     blocker.execute("BEGIN IMMEDIATE")
@@ -2526,7 +2832,29 @@ def check_busy_message():
     reopened = Store(path).init()
     assert [r["label"] for r in reopened.list_sessions()] == [], reopened.list_sessions()
     reopened.close()
-    return "HTTP 503 с объяснением; чат, который не записали, база не завела"
+
+    # Чтение тоже обязано объясниться. Под WAL читатель писателя не ждёт,
+    # но эксклюзивную блокировку соседа он переждать не может — и там, где
+    # `reading()` перестанет переводить ошибку, наружу поедет голый 500.
+    locked = _temp_db("busy-read")
+    Store(locked).init().close()
+    keeper = sqlite3.connect(str(locked), isolation_level=None)
+    keeper.execute("PRAGMA busy_timeout=0")
+    keeper.execute("PRAGMA locking_mode=EXCLUSIVE")
+    keeper.execute("BEGIN IMMEDIATE")
+    keeper.execute("INSERT INTO sessions (id, created_at, updated_at) VALUES ('ag_00001', 1, 1)")
+    try:
+        on_read = None
+        try:
+            Store(locked).list_sessions()
+        except StoreBusyError as exc:
+            on_read = exc
+        assert on_read is not None, "чтение занятой базы упало голым sqlite3"
+        assert "занята другим процессом" in str(on_read), str(on_read)
+    finally:
+        keeper.execute("ROLLBACK")
+        keeper.close()
+    return "HTTP 503 с объяснением на записи и на чтении; чат, который не записали, база не завела"
 
 
 @check(".gitignore ловит базу и её WAL-файлы")
@@ -2545,7 +2873,14 @@ def check_gitignore_db():
     )
     ignored = set(result.stdout.split())
     assert set(probe) <= ignored, f"git не игнорирует: {sorted(set(probe) - ignored)}"
-    return "git игнорирует *.db, *.db-wal, *.db-shm и каталог data/"
+
+    # Файлы -wal и -shm берутся из журнала WAL. Он же и нужен по делу: без него
+    # читатель ждёт писателя, а консоль рядом с сервером — штатный режим.
+    store = Store(_temp_db("wal")).init()
+    mode = store.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    store.close()
+    assert mode == "wal", f"журнал не WAL, а {mode}: читатель встанет за писателем"
+    return "журнал WAL, git игнорирует *.db, *.db-wal, *.db-shm и каталог data/"
 
 
 @check("CLI продолжает сохранённый чат: --session и /сессии")
@@ -2561,11 +2896,19 @@ def check_cli_session():
     REGISTRY._unload(first.id)
     assert REGISTRY.get(first.id) is None
 
-    second = cli.build_agent(cli._parse_args(["--session", first.id]))
+    # Аргументы при продолжении не применяются: иначе `--session` молча
+    # сменил бы модель сохранённого чата на дефолтную из командной строки.
+    second = cli.build_agent(
+        cli._parse_args(["--session", first.id, "--model", "другая/модель"])
+    )
     assert second.id == first.id and [t.content for t in second.history] == [
         "меня зовут Нина",
         "запомнил",
     ], second.history
+    assert second.spec.model == "stub/m", (
+        f"продолжение сменило модель на {second.spec.model} — аргументы поверх "
+        "сохранённого конфига применяться не должны"
+    )
 
     out = io.StringIO()
     saved_stdin = sys.stdin
@@ -2576,16 +2919,58 @@ def check_cli_session():
         sys.stdin = saved_stdin
     assert "[продолжаем]" in out.getvalue(), out.getvalue()
 
+    # Список сессий шире реестра, и отметка это показывает: только что
+    # выгруженный чат остаётся в нём строкой «в базе».
+    unloaded = cli.build_agent(cli._parse_args(["--model", "stub/m", "--label", "выгруженный"]))
+    REGISTRY._unload(unloaded.id)
+
     listing = io.StringIO()
     cli._print_sessions(listing)
-    assert first.id in listing.getvalue(), listing.getvalue()
+    shown = listing.getvalue()
+    assert first.id in shown, shown
+    marks = {
+        line.split()[0]: line.rsplit("(", 1)[-1].rstrip(")\n")
+        for line in shown.splitlines()
+        if line.startswith("  ag_")
+    }
+    assert marks.get(second.id) == "живая", (second.id, marks)
+    assert marks.get(unloaded.id) == "в базе", (unloaded.id, marks)
 
     try:
         cli.build_agent(cli._parse_args(["--session", "ag_99999"]))
         raise AssertionError("несуществующий чат должен честно падать")
     except SystemExit:
         pass
-    return "--session поднимает чат из базы, /сессии его показывает"
+
+    # Сессий больше, чем влезает в экран: список обязан сказать, сколько их
+    # всего. Молча показать тридцать из тридцати пяти — соврать про то,
+    # что сохранилось.
+    from app.registry import AgentRegistry
+
+    path = _temp_db("cli-sessions")
+    store = Store(path).init()
+    saved_cli_registry = cli.REGISTRY
+    try:
+        cli.REGISTRY = AgentRegistry(max_agents=5, store=store)
+        with store.tx() as conn:
+            for i in range(35):
+                conn.execute(
+                    "INSERT INTO sessions (id, label, config, created_at, updated_at) "
+                    "VALUES (?, ?, '{}', ?, ?)",
+                    (f"ag_{i:05d}", f"чат {i}", float(i), float(i)),
+                )
+        crowded = io.StringIO()
+        cli._print_sessions(crowded)
+        headline = crowded.getvalue().splitlines()[0]
+        assert "сохранённых сессий: 35" in headline, headline
+        assert f"показаны последние {cli.SESSIONS_SHOWN}" in headline, headline
+    finally:
+        cli.REGISTRY = saved_cli_registry
+        store.close()
+    return (
+        "--session поднимает чат из базы и не трогает его конфиг, "
+        "/сессии показывает отметки и общее число"
+    )
 
 
 
@@ -2698,7 +3083,7 @@ def check_rename_survives_restart():
         store.close()
         again = Store(path).init()
         second = _restart(again)
-        listing = main._listing()["agents"]
+        listing = asyncio.run(main.list_agents())["agents"]
     finally:
         main.REGISTRY = saved_registry
 
@@ -2715,11 +3100,12 @@ def check_rename_survives_restart():
     return f"«{created['label']}» → «Про Казань» пережило переоткрытие файла"
 
 
-@check("удалили последний чат — список пуст, а строки в базе не осталось")
+@check("удаление хирургично: сосед цел, последний чат уносит и строки, и реплики")
 def check_last_chat_deleted():
-    """Удаление — из обоих слоёв. Номера здесь не проверяются: их стережёт
-    `check_numbering_survives_restart`, и привязываться к ним второй раз
-    значит ронять эту проверку на чужой поломке."""
+    """Удаление — из обоих слоёв и **только своё**. Номера здесь не проверяются:
+    их стережёт `check_numbering_survives_restart`, и привязываться к ним второй
+    раз значит ронять эту проверку на чужой поломке."""
+    _stub.install(reply="ок")
     path = _temp_db("last-chat")
     store = Store(path).init()
     saved_registry = main.REGISTRY
@@ -2727,14 +3113,25 @@ def check_last_chat_deleted():
         _restart(store)
         with TestClient(main.app) as client:
             first = client.post("/api/agents", json={}).json()["agents"][0]
+            neighbour = client.post("/api/agents", json={}).json()["agents"][0]
+            for chat in (first, neighbour):
+                client.post(f"/api/agents/{chat['id']}/messages", json={"text": "привет"})
+
             assert client.delete(f"/api/agents/{first['id']}").status_code == 200
-            assert client.get("/api/agents").json()["agents"] == [], "чат остался в списке"
+            # Соседа удаление не касается: обе таблицы чистятся по session_id.
+            assert store.load_session(neighbour["id"]) is not None, "удалили соседний чат"
+            assert [r[2] for r in store.message_rows(neighbour["id"])] == ["привет", "ок"], (
+                "удаление чата стёрло реплики соседнего"
+            )
             assert store.load_session(first["id"]) is None, "строка чата осталась в базе"
             assert store.message_rows(first["id"]) == [], "реплики удалённого чата остались"
+
+            assert client.delete(f"/api/agents/{neighbour['id']}").status_code == 200
+            assert client.get("/api/agents").json()["agents"] == [], "чат остался в списке"
     finally:
         main.REGISTRY = saved_registry
         store.close()
-    return "после удаления список пуст, строки и реплик в базе нет"
+    return "удалённый чат унёс только свои строки; после второго удаления список пуст"
 
 
 @check("список не обрезается: тысяча с лишним чатов видна целиком")
@@ -2749,7 +3146,7 @@ def check_list_not_truncated():
         main.REGISTRY = AgentRegistry(max_agents=5, store=store)
         made = 1200
         now = time.time()
-        with store.bulk():
+        with store.tx():
             for i in range(made):
                 store.save_session(
                     f"chat_{i:05d}",
@@ -2757,7 +3154,7 @@ def check_list_not_truncated():
                     config={"model": "stub/m", "label": f"чат {i}"},
                     created_at=now + i,
                 )
-        entries = main._listing()["agents"]
+        entries = asyncio.run(main.list_agents())["agents"]
         assert len(entries) == made, f"в списке {len(entries)} из {made} — список обрезан"
         far = entries[-1]
         assert main.REGISTRY.require(far["id"]).spec.label == far["label"]
