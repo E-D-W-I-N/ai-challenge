@@ -163,9 +163,6 @@ class Agent:
         self.history: list[Turn] = []
         """Только то, что наговорили в диалоге. Системный промпт — в spec."""
 
-        self.detached = False
-        """Агента выгрузили из реестра: писать в сессию он больше не вправе."""
-
         self._lock = asyncio.Lock()
         self._cancel = asyncio.Event()
         self._reserved = False
@@ -271,7 +268,6 @@ class Agent:
         второго. Терять нечего: и история, и конфиг уже записаны.
         """
         self.store = None
-        self.detached = True
 
     def persist(self) -> None:
         """Пишет историю в хранилище. Без хранилища — тихо ничего не делает."""

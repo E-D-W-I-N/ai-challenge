@@ -131,9 +131,6 @@ class AgentRegistry:
         return entries
 
 
-    def get(self, agent_id: str) -> Agent | None:
-        return self._agents.get(agent_id)
-
     def require(self, agent_id: str) -> Agent:
         """Агент по id: живой из памяти, иначе поднятый из базы. Нет и там —
         значит, чат удалили."""
@@ -167,16 +164,14 @@ class AgentRegistry:
         agent.detach()
         return True
 
-    def kill_all(self, *, purge: bool = True) -> list[str]:
-        """Гасит всех живых. purge — заодно стереть базу (нужно только проверкам)."""
-        killed = list(self._agents)
+    def kill_all(self) -> None:
+        """Гасит всех живых и стирает базу. Нужно только проверкам: между ними
+        процесс один, а состояние друг от друга они наследовать не должны."""
         for agent in self._agents.values():
             agent.cancel()
             agent.detach()
         self._agents.clear()
-        if purge:
-            self.store.clear()
-        return killed
+        self.store.clear()
 
     def _make_room(self, need: int) -> None:
         """Освобождает место, вытесняя самых старых простаивающих.

@@ -97,26 +97,8 @@
 
 **Хранилище** (`app/store.py`) — SQLite из стандартной библиотеки, ни одной
 новой зависимости. Путь задаётся переменной `AGENT_DB_PATH`, по умолчанию
-`data/agents.db`. Три таблицы:
-
-```sql
-CREATE TABLE sessions (
-    id TEXT PRIMARY KEY, label TEXT,
-    config TEXT,                 -- конфиг чата одним JSON-полем
-    context_length INTEGER,
-    created_at REAL, updated_at REAL
-);
-
-CREATE TABLE messages (
-    session_id TEXT NOT NULL, seq INTEGER NOT NULL,
-    role TEXT NOT NULL, content TEXT NOT NULL, error TEXT, metrics TEXT,
-    at REAL NOT NULL,
-    PRIMARY KEY (session_id, seq)          -- ключевая строчка дня
-);
-CREATE INDEX messages_by_session ON messages(session_id);
-
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-```
+`data/agents.db`. Три таблицы: `sessions` — чат и его конфиг, `messages` —
+реплики, `meta` — счётчики.
 
 - **`session_id` в первичном ключе сообщений** — то, на чём спотыкаются: без
   него два чата, поднятые из базы, читали бы одни и те же строки, и список

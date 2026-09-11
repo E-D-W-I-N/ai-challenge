@@ -433,15 +433,6 @@ class Store:
             for r in rows
         ]
 
-    def message_rows(self, session_id: str) -> list[tuple]:
-        """(seq, role, content) как лежат в базе — этим проверяют нумерацию."""
-        with self.reading() as conn:
-            rows = conn.execute(
-                "SELECT seq, role, content FROM messages WHERE session_id = ? ORDER BY seq",
-                (session_id,),
-            ).fetchall()
-        return [(r["seq"], r["role"], r["content"]) for r in rows]
-
     # --- meta: счётчики, общие на всю базу -----------------------------------
 
     def next_counter(self, key: str) -> int:

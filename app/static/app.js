@@ -211,7 +211,7 @@ function renderMarkdown(text) {
 async function api(path, options) {
   const res = await fetch(path, options);
   if (!res.ok) throw new Error(await detail(res));
-  return res.status === 204 ? null : res.json();
+  return res.json();
 }
 
 async function detail(res) {
@@ -343,21 +343,44 @@ function startRename(row, agent) {
 
 // Удаление — с подтверждением: переписку нельзя терять одним промахом мыши.
 function askDelete(agent) {
-  confirmBox(
-    "Удалить чат?",
-    `«${agent.label}» удалится вместе со всей перепиской. Восстановить её будет неоткуда.`,
-    "Удалить",
-    async () => {
-      try {
-        await api("/api/agents/" + agent.id, { method: "DELETE" });
-      } catch (err) {
-        hint(String(err.message || err), true);
-        return;
-      }
-      if (state.current && state.current.id === agent.id) state.current = null;
-      await loadAgents();
+  const wrap = el("div", "confirm");
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    wrap.remove();
+  };
+  // Escape закрывает диалог всегда, а не только на узком окне: выйти
+  // из подтверждения необратимого действия надо уметь не глядя.
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+
+  const no = el("button", "", "Отмена");
+  no.type = "button";
+  no.onclick = close;
+  const yes = el("button", "primary", "Удалить");
+  yes.type = "button";
+  yes.onclick = async () => {
+    close();
+    try {
+      await api("/api/agents/" + agent.id, { method: "DELETE" });
+    } catch (err) {
+      hint(String(err.message || err), true);
+      return;
     }
+    if (state.current && state.current.id === agent.id) state.current = null;
+    await loadAgents();
+  };
+
+  const row = el("div", "confirm-row");
+  row.append(no, yes);
+  const box = el("div", "confirm-box");
+  box.append(
+    el("h3", "", "Удалить чат?"),
+    el("p", "", `«${agent.label}» удалится вместе со всей перепиской. Восстановить её будет неоткуда.`),
+    row
   );
+  wrap.appendChild(box);
+  wrap.onclick = (ev) => { if (ev.target === wrap) close(); };
+  document.body.appendChild(wrap);
 }
 
 // ─────────────────────── открытие агента ──────────────────────
@@ -511,10 +534,9 @@ function atBottom(feed) {
   return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= STICK_SLACK;
 }
 
-function scrollFeed(force) {
-  const feed = $("#feed");
-  if (force) state.stick = true;
+function scrollFeed() {
   if (!state.stick) return;
+  const feed = $("#feed");
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -789,8 +811,7 @@ function readNumber(name) {
   return value;
 }
 
-// Стоп-строки: по одной в строке, пустые не в счёт. Отдельной функцией
-// без DOM — разбор проверяется без браузера.
+// Стоп-строки: по одной в строке, пустые не в счёт.
 function readStopLines(text) {
   const lines = String(text || "")
     .split("\n")
@@ -837,7 +858,6 @@ const PROVIDER_PARAMS = [
 // **до** отправки: на каждом вызове стоит provider.require_parameters=true,
 // и параметр, которого модель не заявляет, выкашивает провайдеров — вместо
 // ответа придёт ошибка, по которой не понять, что виноват один переключатель.
-// Отдельной функцией без DOM — решение проверяется без браузера.
 function paramWarnings(model, settings, extraBody, baseModel) {
   const warnings = [];
 
@@ -927,7 +947,6 @@ function sameValue(a, b) {
 // стенограмма и занятость живут своей жизнью, и по ним «изменилось» было бы
 // правдой всегда.
 function configChanged(before, after, fields) {
-  if (!before) return true;
   return fields.some((name) => !sameValue(before[name], after[name]));
 }
 
@@ -979,13 +998,9 @@ function renderWarnings() {
 // не послать вовсе.
 async function ensurePanelApplied() {
   if (!state.current) return true;
-  try {
-    readPanel();
-  } catch (err) {
-    state.panelDirty = true;
-    saveStatus(String(err.message || err), true);
-    return false;
-  }
+  // Поле, которое не разобрать, `applySettings` отметит как недоехавшую
+  // правку и объяснит строкой состояния — второй разбор здесь был бы тем же
+  // самым, сделанным дважды.
   await applySettings();
   return !state.panelDirty;
 }
@@ -1161,64 +1176,16 @@ function syncBackdrop() {
   document.body.appendChild(backdrop);
 }
 
-// Какие борта свёрнуты при данной ширине. Отдельной функцией без DOM —
-// решение проверяется без браузера.
-function layoutFor(narrow, stored) {
-  // На узком окне борта — ящики поверх ленты, и оба закрыты: иначе от чата
-  // остаётся полоска посередине.
-  if (narrow) return { sidebar: true, panel: true };
-  return { sidebar: stored.sidebar === "1", panel: stored.panel === "1" };
-}
-
-// Ширина окна изменилась: на узком закрываем оба борта, на широком
-// возвращаем то, что пользователь выбрал сам.
+// Ширина окна изменилась. На узком окне борта — ящики поверх ленты, и оба
+// закрыты: иначе от чата остаётся полоска посередине. На широком возвращается
+// то, что пользователь выбрал сам.
 function applyWidth() {
-  const want = layoutFor(NARROW.matches, {
-    sidebar: read(KEYS.sidebar, "0"),
-    panel: read(KEYS.panel, "0"),
+  ["sidebar", "panel"].forEach((which) => {
+    applyCollapsed(which, NARROW.matches || read(KEYS[which], "0") === "1");
   });
-  applyCollapsed("sidebar", want.sidebar);
-  applyCollapsed("panel", want.panel);
 }
 
-// ─────────────────── новый чат и подтверждения ────────────────
-
-// Что должен закрыть Escape: диалог подтверждения всегда важнее ящиков.
-// Отдельной функцией без DOM — решение проверяется без браузера.
-function escapeAction(hasDialog, narrow, openDrawerCount) {
-  if (hasDialog) return "dialog";
-  if (narrow && openDrawerCount > 0) return "drawers";
-  return null;
-}
-
-function confirmBox(title, text, confirmLabel, onYes) {
-  const wrap = el("div", "confirm");
-  const box = el("div", "confirm-box");
-  const row = el("div", "confirm-row");
-
-  const close = () => {
-    document.removeEventListener("keydown", onKey);
-    wrap.remove();
-  };
-  // Escape закрывает диалог всегда, а не только на узком окне: выйти
-  // из подтверждения необратимого действия надо уметь не глядя.
-  const onKey = (ev) => {
-    if (ev.key === "Escape") close();
-  };
-  document.addEventListener("keydown", onKey);
-
-  const no = el("button", "", "Отмена");
-  no.type = "button";
-  no.onclick = close;
-  const yes = el("button", "primary", confirmLabel);
-  yes.type = "button";
-  yes.onclick = () => { close(); onYes(); };
-  row.append(no, yes);
-  box.append(el("h3", "", title), el("p", "", text), row);
-  wrap.appendChild(box);
-  wrap.onclick = (ev) => { if (ev.target === wrap) close(); };
-  document.body.appendChild(wrap);
-}
+// ─────────────────── новый чат ────────────────────────────────
 
 async function newChat() {
   stopStream();
@@ -1245,15 +1212,11 @@ function init() {
 
   applyWidth();
   NARROW.addEventListener("change", applyWidth);
+  // Escape на узком окне закрывает ящики. Диалог подтверждения важнее их
+  // и закрывает себя сам — свой обработчик он вешает поверх этого.
   document.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Escape") return;
-    const what = escapeAction(
-      Boolean(document.querySelector(".confirm")),
-      NARROW.matches,
-      openDrawers().length
-    );
-    // Диалог закрывает себя сам — свой обработчик он вешает поверх этого.
-    if (what === "drawers") closeDrawers();
+    if (ev.key !== "Escape" || !NARROW.matches) return;
+    if (!document.querySelector(".confirm")) closeDrawers();
   });
 
   $("#new-chat").onclick = () => newChat();
@@ -1297,14 +1260,5 @@ function init() {
 if (typeof module === "undefined") {
   init();
 } else {
-  module.exports = {
-    init,
-    state,
-    renderMarkdown,
-    layoutFor,
-    escapeAction,
-    readStopLines,
-    parseResponseFormat,
-    paramWarnings,
-  };
+  module.exports = { init, state, renderMarkdown };
 }
