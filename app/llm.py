@@ -6,6 +6,12 @@
 Без него OpenRouter вправе увести запрос к провайдеру, который молча
 проигнорирует temperature или stop, и день покажет неправду.
 
+Второе такое же правило — плагин context-compression выключен. На каждом
+эндпоинте с окном 8k и меньше OpenRouter включает его по умолчанию: когда
+промпт не влезает, он молча выбрасывает середину разговора и отправляет
+остаток. Ошибки нет, ответ приходит — и память чата теряет середину, а
+пользователь списывает это на модель.
+
 HTTP-клиент на процесс один, и одновременных вызовов не больше
 `LLM_MAX_CONCURRENCY`: клиент внутри каждого вызова — это на сотне агентов
 сотня пулов соединений и сотня одновременных запросов к OpenRouter.
@@ -182,8 +188,31 @@ SAMPLING_FIELDS = (
 """
 
 
+NO_COMPRESSION_PLUGIN = {"id": "context-compression", "enabled": False}
+"""Выключенное сжатие контекста — на каждом вызове, как require_parameters.
+
+Умолчание OpenRouter для окон 8k и меньше — стратегия middle-out: середина
+разговора молча выбрасывается, запрос проходит, ошибки нет. С выключенным
+плагином переполнение становится честной ошибкой, а история едет целиком.
+"""
+
+
+def merge_plugins(ours: list[dict], theirs: list) -> list:
+    """Плагины из extra_body — поверх наших, по `id`, как provider по ключам.
+
+    Наш выключенный context-compression не пропадает оттого, что пользователь
+    добавил себе веб-поиск: чужие плагины дописываются рядом. А если он назвал
+    тот же `id` сам — побеждает его запись: включить сжатие обратно можно,
+    но только написав это своей рукой, а не случайным соседством ключей.
+    """
+    named = {item["id"] for item in theirs if isinstance(item, dict) and "id" in item}
+    kept = [item for item in ours if item.get("id") not in named]
+    return [*kept, *theirs]
+
+
 def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
-    """Тело запроса к OpenRouter. require_parameters — на каждом вызове.
+    """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
+    контекста — на каждом вызове.
 
     Промпт приходит снаружи: собирает его агент, из слепка конфига. Конфиг
     ленту не хранит, и брать её здесь неоткуда.
@@ -195,6 +224,8 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
         # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
         "usage": {"include": True},
         "provider": {"require_parameters": True},
+        # Сжатие контекста выключено явно: см. NO_COMPRESSION_PLUGIN.
+        "plugins": [dict(NO_COMPRESSION_PLUGIN)],
     }
     # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль.
     # Пустое поле в панели справа значит «пусть решает провайдер»; отправить
@@ -213,6 +244,8 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
     for key, value in (session.extra_body or {}).items():
         if key == "provider" and isinstance(value, dict):
             payload["provider"] = {**payload["provider"], **value}
+        elif key == "plugins" and isinstance(value, list):
+            payload["plugins"] = merge_plugins(payload["plugins"], value)
         else:
             payload[key] = value
     return payload
