@@ -427,7 +427,6 @@ function renderFeed(agent) {
     p.textContent = "Напишите сообщение — историю разговора хранит сервер, а не браузер.";
     empty.append(h, p);
     feed.appendChild(empty);
-    renderRail();
     feed.scrollTop = 0;
     return;
   }
@@ -435,7 +434,6 @@ function renderFeed(agent) {
   turns.forEach((turn) => {
     feed.appendChild(turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn));
   });
-  renderRail();
   feed.scrollTop = keep === null ? feed.scrollHeight : keep;
 }
 
@@ -545,24 +543,6 @@ async function copyText(text) {
   } catch (e) {
     hint("Скопировать не вышло — браузер не дал доступ к буферу.", true);
   }
-}
-
-// Рельс справа от ленты: точка на сообщение, клик прокручивает к нему.
-function renderRail() {
-  const rail = $("#rail");
-  rail.innerHTML = "";
-  const nodes = [...$("#feed").children].filter(
-    (el) => el.classList.contains("msg-user") || el.classList.contains("card")
-  );
-  nodes.forEach((node) => {
-    const dot = document.createElement("button");
-    dot.type = "button";
-    const isUser = node.classList.contains("msg-user");
-    dot.className = "rail-dot" + (isUser ? " user" : "");
-    dot.title = isUser ? "Ваше сообщение" : "Ответ";
-    dot.onclick = () => node.scrollIntoView({ behavior: "smooth", block: "center" });
-    rail.appendChild(dot);
-  });
 }
 
 // Лента доматывается вниз, только если читатель и так внизу. Отмотал
@@ -676,7 +656,6 @@ async function exchange(path, body, questionText) {
   bodyEl.className = "card-body md";
   card.append(head, bodyEl);
   feed.appendChild(card);
-  renderRail();
   scrollFeed();
 
   setBusy(true);
