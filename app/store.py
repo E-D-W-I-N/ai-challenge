@@ -1,21 +1,15 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Три таблицы: `sessions` (id, имя и **конфиг одним JSON-полем** — чтобы новое
-поле сохранялось само, а не ждало, пока вспомнят про колонку), `messages`
-(реплики) и `meta` (счётчики, общие на всю базу).
-
 Четыре свойства, каждое из которых стоит того, чтобы за ним следить:
 
 * **`session_id` в первичном ключе сообщений.** Без него два чата, поднятые
   из базы, читали бы одни и те же строки, и список слева слился бы в один
   диалог. Это не соглашение, а ключ: строку нельзя записать, не сказав, чья она;
-* **история пишется целиком и одной транзакцией** — `DELETE` реплик плюс
-  `INSERT` заново с номерами от нуля. Поэтому `seq` не получает дыр, а
-  оборванная запись откатывается вся: вопроса без ответа не остаётся;
+* **история пишется целиком и одной транзакцией.** Поэтому `seq` не получает
+  дыр, а оборванная запись откатывается вся: вопроса без ответа не остаётся;
 * **id выдаёт база, а не процесс.** Консоль запускают рядом с сервером, файл
   у них один, и счётчик в памяти выдал бы обоим `ag_00004` — второй стёр бы
-  диалог первого (`save_history` начинается с `DELETE`). Поэтому id занимается
-  `INSERT`-ом строки, а арбитр — конфликт по первичному ключу;
+  диалог первого (`save_history` начинается с `DELETE`);
 * **`redact()` на всех колонках сразу.** Транзакция отдаёт не соединение,
   а обёртку, которая чистит строковые параметры любого запроса, — забыть
   про новую колонку нельзя, она чистится по построению.
@@ -122,13 +116,7 @@ def redact(value):
     key = api_key()
     if not key or len(key) < MIN_SECRET_LENGTH:
         return value
-    if isinstance(value, str):
-        return value.replace(key, "***")
-    if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v) for v in value]
-    return value
+    return value.replace(key, "***") if isinstance(value, str) else value
 
 
 class StoreBusyError(RuntimeError):
@@ -225,14 +213,18 @@ class Store:
             target: str = str(path)
         else:
             target = MEMORY
-        conn = sqlite3.connect(target, check_same_thread=False, isolation_level=None)
+        conn = sqlite3.connect(
+            target,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=BUSY_TIMEOUT_MS / 1000,
+        )
         conn.row_factory = sqlite3.Row
         # WAL: читатель не ждёт писателя. Побочный эффект — файлы -wal и -shm
         # рядом с базой, и .gitignore обязан ловить их тоже.
         if target != MEMORY:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.executescript(SCHEMA)
         self._conn = conn
         return self
@@ -285,9 +277,6 @@ class Store:
                 self._depth -= 1
                 if outer:
                     conn.execute("COMMIT")
-
-    bulk = tx
-    """Читаемое имя для пачки: `with store.bulk(): ...`."""
 
     # --- сессии --------------------------------------------------------------
 
@@ -346,25 +335,23 @@ class Store:
             "updated_at": row["updated_at"],
         }
 
-    def list_sessions(self, *, limit: int | None = None) -> list[dict]:
+    def list_sessions(self) -> list[dict]:
         """Сохранённые чаты, свежие сверху, с числом реплик у каждой.
 
-        `limit=None` — все до одной, и это режим по умолчанию: по этому списку
-        строится список слева, а он не вправе молча что-то скрывать. Запрос
-        дешёвый — пять тысяч чатов читаются за 13 мс.
-        """
-        sql = """
-            SELECT s.*, (
-                SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
-            ) AS history_len
-            FROM sessions s
-            ORDER BY s.updated_at DESC
+        Все до одной, без потолка: по этому списку строится список слева,
+        а он не вправе молча что-то скрывать. Запрос дешёвый — пять тысяч
+        чатов читаются за 13 мс.
         """
         with self.reading() as conn:
-            if limit is None:
-                rows = conn.execute(sql).fetchall()
-            else:
-                rows = conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                """
+                SELECT s.*, (
+                    SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
+                ) AS history_len
+                FROM sessions s
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
         out = []
         for row in rows:
             data = self._session_row(row)
@@ -487,7 +474,7 @@ class Store:
         по `session_id` его первая строчка.
 
         Нарушение ограничения в SQLite откатывает только сам запрос, поэтому
-        цикл безопасно живёт и внутри `bulk()`.
+        цикл безопасно живёт и внутри общей транзакции.
         """
         from .agent import new_agent_id, reserve_ids
 
@@ -536,10 +523,3 @@ def shared_store() -> Store:
             _STORE = Store().init()
         return _STORE
 
-
-def close_shared_store() -> None:
-    global _STORE
-    with _STORE_LOCK:
-        if _STORE is not None:
-            _STORE.close()
-            _STORE = None

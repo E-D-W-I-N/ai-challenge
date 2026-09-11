@@ -180,7 +180,7 @@ def main() -> int:
     assert len(set(made)) == len(made), f"id пересеклись между процессами: {sorted(made)}"
 
     store2 = Store(db2).init()
-    stored = {row["id"]: row for row in store2.list_sessions(limit=1000)}
+    stored = {row["id"]: row for row in store2.list_sessions()}
     assert len(stored) == len(made), (
         f"в базе {len(stored)} сессий вместо {len(made)}: чьи-то записи затёрты"
     )

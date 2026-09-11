@@ -1,9 +1,8 @@
 """Заглушка стрима к модели: проверки идут без сети и без ключа.
 
-Подменяет `stream_completion` там, куда его импортировали, записывает каждый
-вызов (модель и весь промпт целиком) и отдаёт детерминированный ответ чанками.
-По записанным вызовам и проверяется главное: что именно агент отправил
-в модель.
+Подменяет `stream_completion` в `app.agent`, записывает каждый вызов (модель
+и весь промпт целиком) и отдаёт детерминированный ответ чанками. По записанным
+вызовам и проверяется главное: что именно агент отправил в модель.
 """
 
 from __future__ import annotations
@@ -120,14 +119,12 @@ def make(
     return fake_stream_completion
 
 
-def install(module_names=("app.agent",), **kwargs) -> None:
-    """Подменяет stream_completion в перечисленных модулях."""
-    import importlib
+def install(**kwargs) -> None:
+    """Подменяет stream_completion в app.agent — единственном месте, откуда
+    его зовут."""
+    import app.agent
 
-    fake = make(**kwargs)
-    for name in module_names:
-        module = importlib.import_module(name)
-        module.stream_completion = fake
+    app.agent.stream_completion = make(**kwargs)
 
 
 def use_temp_db(path: str | None = None) -> str:
@@ -148,14 +145,14 @@ def use_temp_db(path: str | None = None) -> str:
     return path
 
 
-def install_offline(db_path: str | None = None) -> None:
+def install_offline() -> None:
     """Убирает из проверок всё, что ходит в сеть, кроме самого стрима.
 
     Каталог моделей — живой HTTP-запрос; ключ подменяем на «есть», иначе ручка
     сообщения отдаст 503 раньше, чем дойдёт до агента. Заодно уводит базу
     во временный файл: импорт app.main поднимает реестр, а тот — хранилище.
     """
-    use_temp_db(db_path)
+    use_temp_db()
 
     import app.catalog as catalog
     import app.main as main

@@ -1,7 +1,4 @@
-"""Каталог моделей OpenRouter: /api/v1/models.
-
-~431 запись, ключа НЕ требует — дропдаун живой ещё до того, как появится
-.env. Кэшируется в процессе с TTL.
+"""Каталог моделей OpenRouter: /api/v1/models, ~431 запись, ключа НЕ требует.
 
 Каталог отдаётся целиком, без отбора: какая модель годится, решает
 пользователь. А вот **данные** о модели отдаются все — по ним панель
@@ -24,9 +21,7 @@ _cache: dict[str, object] = {"fetched_at": 0.0, "models": []}
 # при этом честно перечисляя "temperature" в supported_parameters: по нему
 # такая модель выглядит подходящей, и предупредить о потолке больше нечем.
 TEMPERATURE_CAPPED_PREFIXES = ("anthropic/",)
-
 TEMPERATURE_CAP = 1.0
-"""Потолок температуры у семейств из TEMPERATURE_CAPPED_PREFIXES."""
 
 
 async def fetch_models() -> list[dict]:
@@ -58,18 +53,16 @@ def _normalize(raw: dict) -> dict:
     model_id = raw.get("id", "")
     prompt_price = _price(pricing, "prompt")
     completion_price = _price(pricing, "completion")
+    capped = model_id.startswith(TEMPERATURE_CAPPED_PREFIXES)
     return {
         "id": model_id,
         "name": raw.get("name") or model_id,
         "context_length": raw.get("context_length") or 0,
-        # По нему панель предупреждает, что заданный параметр модель
-        # не заявляет: с provider.require_parameters=true это не мелочь,
-        # а разница между ответом и ошибкой без объяснений.
         "supported_parameters": raw.get("supported_parameters") or [],
         # цены за 1M токенов — то, в чём их привычно читать
         "prompt_price_per_m": round(prompt_price * 1_000_000, 4),
         "completion_price_per_m": round(completion_price * 1_000_000, 4),
         "is_free": model_id.endswith(":free") or (prompt_price == 0 and completion_price == 0),
-        "temperature_capped": model_id.startswith(TEMPERATURE_CAPPED_PREFIXES),
-        "temperature_cap": TEMPERATURE_CAP if model_id.startswith(TEMPERATURE_CAPPED_PREFIXES) else None,
+        "temperature_capped": capped,
+        "temperature_cap": TEMPERATURE_CAP if capped else None,
     }

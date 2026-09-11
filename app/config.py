@@ -10,7 +10,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _load_dotenv() -> None:
-    """Читает .env в корне репозитория, не перетирая уже заданные переменные."""
+    """Читает .env в корне репозитория. Уже заданные переменные окружения
+    сильнее файла: так стенд подставляет свои, не трогая .env."""
     env_file = ROOT / ".env"
     if not env_file.exists():
         return

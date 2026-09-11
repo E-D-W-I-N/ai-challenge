@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Iterable
 
-from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config
+from .agent import Agent, spec_as_dict, spec_from_config
 from .schema import AgentSpec
 from .store import Store, shared_store
 
@@ -52,23 +52,12 @@ class AgentRegistry:
         выгружено, а не удалено: в базе они остались."""
 
         self.store = shared_store() if store is None else store
-        # Иначе свежий агент получил бы id уже сохранённого чата
-        # и унаследовал бы его историю.
-        reserve_ids(self.store.max_agent_seq())
 
     def __len__(self) -> int:
         return len(self._agents)
 
-    def __contains__(self, agent_id: object) -> bool:
-        return agent_id in self._agents
-
-    # --- создание ------------------------------------------------------------
-
     def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
-        self._make_room(1)
-        agent = Agent(spec, context_length=context_length, store=self.store)
-        self._agents[agent.id] = agent
-        return agent
+        return self.create_many([spec], context_lengths={spec.model: context_length})[0]
 
     def create_many(
         self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
@@ -79,7 +68,7 @@ class AgentRegistry:
         agents = []
         # Сто чатов — одна транзакция, а не сто: спавн обязан остаться
         # мгновенным и после появления базы.
-        with self.store.bulk():
+        with self.store.tx():
             for spec in specs:
                 agent = Agent(
                     spec,
@@ -90,7 +79,6 @@ class AgentRegistry:
                 agents.append(agent)
         return agents
 
-    # --- восстановление из базы ----------------------------------------------
 
     def load(self, session_id: str) -> Agent | None:
         """Поднимает сохранённый чат в память. Живой возвращается как есть:
@@ -108,10 +96,10 @@ class AgentRegistry:
         self._agents[agent.id] = agent
         return agent
 
-    def sessions(self, *, limit: int | None = None) -> list[dict]:
+    def sessions(self) -> list[dict]:
         """Все сохранённые чаты, а не только живые в процессе."""
         live = set(self._agents)
-        rows = self.store.list_sessions(limit=limit)
+        rows = self.store.list_sessions()
         for row in rows:
             row["live"] = row["id"] in live
         return rows
@@ -142,7 +130,6 @@ class AgentRegistry:
         entries.sort(key=lambda entry: entry["created_at"])
         return entries
 
-    # --- чтение --------------------------------------------------------------
 
     def get(self, agent_id: str) -> Agent | None:
         return self._agents.get(agent_id)
@@ -158,8 +145,6 @@ class AgentRegistry:
     def list(self) -> list[Agent]:
         """Все агенты, в порядке создания."""
         return sorted(self._agents.values(), key=lambda a: a.created_at)
-
-    # --- удаление ------------------------------------------------------------
 
     def kill(self, agent_id: str) -> bool:
         """Удаляет чат из обоих слоёв. False — его нигде нет.
@@ -193,8 +178,6 @@ class AgentRegistry:
             self.store.clear()
         return killed
 
-    # --- вытеснение ----------------------------------------------------------
-
     def _make_room(self, need: int) -> None:
         """Освобождает место, вытесняя самых старых простаивающих.
 
@@ -226,4 +209,3 @@ def _spec_from_row(saved: dict) -> AgentSpec:
 
 
 REGISTRY = AgentRegistry()
-"""Реестр процесса. Один инстанс — внутри него сколько угодно агентов."""
