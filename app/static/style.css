@@ -1,21 +1,18 @@
-/* Чат-клиент: список чатов слева, лента по центру, настройки и метрики
-   справа.
+/* Чат-клиент: список чатов слева, лента по центру, настройки и метрики справа.
 
-   Ничего из сети: ни шрифтов, ни иконок, ни библиотек. Шрифт — системный,
-   иконки — inline SVG из app.js, разметка markdown разбирается своими силами.
+   Ничего из сети: шрифт системный, иконки — inline SVG из app.js.
    Репозиторий публичный и обязан работать без интернета. */
 
 :root {
   --bg: #ffffff;
   --bg-soft: #f7f7f8;
-  --panel: #ffffff;
   --line: #e6e6e9;
   --line-soft: #efeff1;
   --text: #17171a;
   --muted: #77777f;
   --faint: #a1a1aa;
   --accent: #2563eb;
-  --accent-soft: #eff4ff;
+  --error-bg: #eff4ff;
   --bubble: #f1f2f4;
   --danger: #dc2626;
   --ok: #15803d;
@@ -32,14 +29,13 @@
 [data-theme="dark"] {
   --bg: #131417;
   --bg-soft: #17181c;
-  --panel: #17181c;
   --line: #2a2c33;
   --line-soft: #232529;
   --text: #e9e9ee;
   --muted: #9a9aa4;
   --faint: #71717a;
   --accent: #6ea8fe;
-  --accent-soft: #1c2436;
+  --error-bg: #2a1d1f;
   --bubble: #23252b;
   --danger: #f87171;
   --ok: #4ade80;
@@ -198,8 +194,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
   font-size: 13.5px;
 }
 
-/* Карандаш и корзина: проявляются на наведении и у открытого чата, чтобы
-   список не рябил кнопками. На узком окне видны всегда — наводить нечем. */
+/* Кнопки строки проявляются на наведении и у открытого чата, чтобы список
+   не рябил ими. На узком окне видны всегда — наводить нечем. */
 .item-actions { flex: 0 0 auto; display: flex; gap: 1px; opacity: 0; transition: opacity .12s ease; }
 .item:hover .item-actions, .item.active .item-actions, .item:focus-within .item-actions { opacity: 1; }
 .mini {
@@ -260,10 +256,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ──────────────────────────── лента ──────────────────────────── */
 
-/* Композер закреплён у нижнего края: прокручивается лента, а не поле
-   ввода. Держится это на min-height: 0 — без него автоматический минимум
-   grid- и flex-элемента считается по содержимому, лента распирает столбец
-   выше экрана, и поле ввода уезжает вниз вместе с ней. */
+/* Композер закреплён у нижнего края: прокручивается лента, а не поле ввода.
+   Держится это на min-height: 0 — без него автоматический минимум grid-
+   и flex-элемента считается по содержимому, лента распирает столбец выше
+   экрана, и поле ввода уезжает вниз вместе с ней. */
 .chat {
   min-width: 0;
   min-height: 0;
@@ -274,10 +270,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg);
   position: relative;
 }
-/* Лента лежит в чате сама: обёртка вокруг неё была нужна только затем,
-   чтобы поставить рядом рельс, и ушла вместе с ним. `min-height: 0` теперь
-   на самой ленте — без него чат не даёт ей сжаться, и вместо прокрутки
-   лента растягивает его, унося композер за нижнюю границу. */
+/* `min-height: 0` стоит и на самой ленте: без него чат не даёт ей сжаться,
+   и вместо прокрутки лента растягивает его, унося композер за край. */
 .feed {
   flex: 1 1 auto;
   min-width: 0;
@@ -290,10 +284,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 /* Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
-   У карточки к тому же `overflow: hidden`, из-за чего её автоматический
-   минимальный размер равен нулю: вместо прокрутки лента давила карточки
-   в полоску — видно шапку и обрезанную первую строку. Запрещаем сжатие
-   каждому элементу ленты: не помещается — уходит за границу прокрутки. */
+   У карточки к тому же `overflow: hidden`, из-за чего её минимальный размер
+   равен нулю: вместо прокрутки лента давила карточки в полоску. */
 .feed > * { flex: 0 0 auto; }
 
 .empty {
@@ -325,7 +317,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   width: 100%;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--panel);
+  background: var(--bg);
   overflow: hidden;
 }
 .card-head {
@@ -360,13 +352,12 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin: 0 16px 14px;
   padding: 9px 12px;
   border-radius: 9px;
-  background: var(--accent-soft);
+  background: var(--error-bg);
   color: var(--danger);
   font-size: 12.5px;
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
-[data-theme="dark"] .card-error { background: #2a1d1f; }
 
 /* «Рассуждение» — свёрнутый блок над ответом */
 .think {
@@ -523,6 +514,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg-soft);
 }
 .tab {
+  position: relative;
   flex: 1 1 0;
   padding: 6px 10px;
   border: 0;
@@ -591,7 +583,6 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .warn p:last-child { margin: 0; }
 
 /* Точка на вкладке «Модель», если предупреждение есть, а открыта другая. */
-.tab { position: relative; }
 .tab.has-warn::after {
   content: "";
   position: absolute;
@@ -701,10 +692,8 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   :root { --sidebar-w: 232px; --panel-w: 300px; }
 }
 
-/* Узкое окно: лента занимает всё, а сайдбар и панель превращаются в ящики.
-   Оба свёрнуты по умолчанию — иначе на ~900 px от чата остаётся полоска
-   посередине. Открываются кнопками в углах ленты, закрываются кликом вне
-   и по Escape. */
+/* Узкое окно: лента занимает всё, борта становятся ящиками поверх неё.
+   Оба свёрнуты по умолчанию — иначе от чата остаётся полоска посередине. */
 @media (max-width: 940px) {
   .app { grid-template-columns: minmax(0, 1fr); }
   .item-actions { opacity: 1; }

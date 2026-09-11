@@ -1,9 +1,8 @@
 """Заглушка стрима к модели: проверки идут без сети и без ключа.
 
-Подменяет `stream_completion` там, куда его импортировали, записывает каждый
-вызов (модель и весь промпт целиком) и отдаёт детерминированный ответ
-чанками. По записанным вызовам и проверяется главное: что именно агент
-отправил в модель.
+Подменяет `stream_completion` в `app.agent`, записывает каждый вызов (модель
+и весь промпт целиком) и отдаёт детерминированный ответ чанками. По записанным
+вызовам и проверяется главное: что именно агент отправил в модель.
 """
 
 from __future__ import annotations
@@ -119,14 +118,12 @@ def make(
     return fake_stream_completion
 
 
-def install(module_names=("app.agent",), **kwargs) -> None:
-    """Подменяет stream_completion в перечисленных модулях."""
-    import importlib
+def install(**kwargs) -> None:
+    """Подменяет stream_completion в app.agent — единственном месте, откуда
+    его зовут."""
+    import app.agent
 
-    fake = make(**kwargs)
-    for name in module_names:
-        module = importlib.import_module(name)
-        module.stream_completion = fake
+    app.agent.stream_completion = make(**kwargs)
 
 
 def install_offline() -> None:
