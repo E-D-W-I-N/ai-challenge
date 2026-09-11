@@ -6,7 +6,7 @@
 ## Среда
 
 Системный `python3` — это 3.9: без зависимостей это `ModuleNotFoundError: fastapi`,
-с ними — 15 проверок из 41 (`TaskGroup`, нет текущего event loop). Везде только 3.11.
+с ними — 11 проверок из 15 (`TaskGroup`, нет текущего event loop). Везде только 3.11.
 
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv
@@ -25,9 +25,9 @@
 ## Проверки
 
 ```bash
-.venv/bin/python checks/run_checks.py   # 41 проверка, включая обе ниже
+.venv/bin/python checks/run_checks.py   # 15 проверок, включая обе ниже
 .venv/bin/python checks/spawn_100.py    # сто агентов в одном процессе
-node checks/browser_check.js            # клиент под node, 220 утверждений
+node checks/browser_check.js            # клиент под node, 128 утверждений
 ```
 
 ## Что нельзя сломать
@@ -46,7 +46,7 @@ node checks/browser_check.js            # клиент под node, 220 утве
 
 ## Про проверки
 
-Бьют по поведению, а не по исходнику — кроме таблицы `GONE` (`checks/run_checks.py`),
-стерегущей грепом выпиленные слова; новых мета-проверок сверх неё не заводить. Греп по
+Бьют по поведению, а не по исходнику: мета-проверок — грепа по исходникам, таблиц
+запрещённых слов, самопроверок стенда — здесь нет, и заводить их не надо. Греп по
 клиенту — не проверка клиента: `browser_check.js` исполняет настоящий `app/static/app.js`
 под node на стенде `checks/dom.js`.

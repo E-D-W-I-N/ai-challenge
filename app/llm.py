@@ -170,14 +170,14 @@ SAMPLING_FIELDS = (
 """Параметры сэмплирования, которые уходят в тело запроса как есть."""
 
 
-def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
+def build_payload(session: AgentSpec, messages: list[dict]) -> dict:
     """Тело запроса к OpenRouter. require_parameters — на каждом вызове.
 
     Промпт приходит снаружи: собирает его агент, из слепка конфига.
     """
     payload: dict = {
         "model": session.model,
-        "messages": messages or [],
+        "messages": messages,
         "stream": True,
         # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
         "usage": {"include": True},
@@ -209,10 +209,7 @@ class MissingKeyError(RuntimeError):
 
 
 async def stream_completion(
-    session: AgentSpec,
-    *,
-    prompt_override: list[dict] | None = None,
-    context_length: int | None = None,
+    session: AgentSpec, *, prompt_override: list[dict], context_length: int | None
 ) -> AsyncIterator[dict]:
     """События {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}: метрики
     обновляются по мере генерации, финальный usage приходит последним чанком."""
@@ -229,7 +226,7 @@ async def stream_completion(
         **attribution_headers(),
     }
 
-    metrics = Metrics(model=session.model, context_length=context_length or None)
+    metrics = Metrics(model=session.model, context_length=context_length)
     speed = _SpeedTracker()
     started = time.monotonic()
     text_parts: list[str] = []

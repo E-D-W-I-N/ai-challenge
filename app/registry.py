@@ -43,8 +43,8 @@ class AgentRegistry:
     def __len__(self) -> int:
         return len(self._agents)
 
-    def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
-        return self.create_many([spec], context_lengths={spec.model: context_length})[0]
+    def create(self, spec: AgentSpec) -> Agent:
+        return self.create_many([spec])[0]
 
     def create_many(
         self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
@@ -56,9 +56,6 @@ class AgentRegistry:
         for agent in agents:
             self._agents[agent.id] = agent
         return agents
-
-    def get(self, agent_id: str) -> Agent | None:
-        return self._agents.get(agent_id)
 
     def require(self, agent_id: str) -> Agent:
         agent = self._agents.get(agent_id)
@@ -77,13 +74,6 @@ class AgentRegistry:
             return False
         agent.cancel()
         return True
-
-    def kill_all(self) -> list[str]:
-        killed = list(self._agents)
-        for agent in self._agents.values():
-            agent.cancel()
-        self._agents.clear()
-        return killed
 
     def _make_room(self, need: int) -> None:
         """Освобождает место под `need` новых, вытесняя самых старых простаивающих.
