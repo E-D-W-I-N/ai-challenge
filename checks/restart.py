@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import subprocess
@@ -43,9 +44,6 @@ def _child(db: str, session: str | None, text: str) -> dict:
     )
     agent = cli.build_agent(args)
     restored = len(agent.history)
-
-    import io
-
     asyncio.run(cli.ask(agent, text, io.StringIO()))
     return {
         "session": agent.id,
@@ -92,7 +90,7 @@ def main() -> int:
     assert second["prompt"][-1]["content"] == FOLLOW_UP, second["prompt"][-1]
     assert FOLLOW_UP.count("Казань") == 0, "вопрос второго процесса не должен подсказывать"
     print(f"[3] процесс #2: поднято {second['restored']} реплик, в промпте {len(roles)} сообщений")
-    print(f"[4] в промпте после перезапуска есть: Нина, Казань, вегетарианка")
+    print("[4] в промпте после перезапуска есть: Нина, Казань, вегетарианка")
 
     # --- изоляция: свежая сессия в той же базе ничего не знает ---------------
     third = _run_child(db, None, "Как меня зовут?")
