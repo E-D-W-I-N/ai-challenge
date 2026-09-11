@@ -13,7 +13,6 @@ event loop, `TaskGroup`. Везде только `/opt/homebrew/bin/python3.11`.
 /opt/homebrew/bin/python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload --port 8000   # http://127.0.0.1:8000
-.venv/bin/python -m app.cli                           # тот же агент из консоли
 ```
 
 ## Безопасность
