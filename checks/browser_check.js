@@ -115,6 +115,36 @@ check(
   check("текст вокруг метки уцелел", out.includes("до") && out.includes("после"), out);
 }
 
+// ── предупреждение о параметрах, которых модель не заявляет ──
+//
+// На каждом вызове стоит provider.require_parameters=true: параметр, которого
+// модель не заявляет, выкашивает провайдеров, и вместо ответа приходит ошибка,
+// по которой не понять, что виноват один переключатель. Поэтому панель
+// предупреждает **до** отправки — и называет ровно те параметры, что уедут
+// в запрос.
+
+{
+  const { paramWarnings } = app;
+  const plain = { id: "м/одна", supported_parameters: ["top_p"] };
+  const named = paramWarnings(plain, { model: "м/одна", temperature: 0.5 }, {}, "м/одна");
+  check("параметр, которого модель не заявляет, назван",
+    named.length === 1 && named[0].includes("temperature"), JSON.stringify(named));
+  check("о заявленном параметре панель молчит",
+    paramWarnings(plain, { model: "м/одна", top_p: 0.5 }, {}, "м/одна").length === 0,
+    JSON.stringify(paramWarnings(plain, { model: "м/одна", top_p: 0.5 }, {}, "м/одна")));
+
+  const capped = { id: "anthropic/м", supported_parameters: ["temperature"],
+                   temperature_capped: true, temperature_cap: 1.0 };
+  const over = paramWarnings(capped, { model: "anthropic/м", temperature: 1.2 }, {}, "anthropic/м");
+  check("потолок temperature назван, хотя параметр заявлен",
+    over.length === 1 && over[0].includes("1.0"), JSON.stringify(over));
+
+  const pinned = paramWarnings(plain, { model: "м/одна", top_p: 0.5 },
+    { provider: { order: ["стенд"] } }, "м/другая");
+  check("чат, привязанный к поставщику, предупреждает о смене модели",
+    pinned.length === 1 && pinned[0].includes("стенд"), JSON.stringify(pinned));
+}
+
 // ── маршрут целиком: правка в панели → отправка → тело запроса ──
 //
 // Инвариант: сообщение уходит с тем конфигом, что показан в панели.
@@ -182,17 +212,13 @@ function usageText(node, cls) {
 }
 
 const NO_TILE = "(плитки нет)";
-const shownAs = (tile) => tile.v + " / " + tile.sub;
 function tileOf($, name) {
   const el = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
-  if (!el) return { el: null, v: NO_TILE, sub: NO_TILE, row: NO_TILE };
-  const sub = el.querySelector(".tile-sub");
-  const row = el.querySelector(".tile-row");
+  if (!el) return { el: null, v: NO_TILE, row: NO_TILE };
   return {
     el,
-    v: row.querySelector(".tile-v").textContent,
-    sub: sub ? sub.textContent : "",
-    row: row.children.map((c) => c.className).join(","),
+    v: el.querySelector(".tile-v").textContent,
+    row: el.children.slice(1).map((c) => c.className).join(","),
   };
 }
 
@@ -380,10 +406,10 @@ async function routeChecks() {
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
-      empty["Входные токены"].v === "—", shownAs(empty["Входные токены"]));
+      empty["Входные токены"].v === "—", empty["Входные токены"].v);
     // Ноль сообщений — это знание, а не незнание: разговора не было.
-    check("до первого ответа сообщений ноль", empty["Сообщений"].v === "0", shownAs(empty["Сообщений"]));
-    check("и контекст пуст", empty["Контекст"].v === "—", shownAs(empty["Контекст"]));
+    check("до первого ответа сообщений ноль", empty["Сообщений"].v === "0", empty["Сообщений"].v);
+    check("и контекст пуст", empty["Контекст"].v === "—", empty["Контекст"].v);
 
     $("#input").value = "первый вопрос";
     $("#composer").requestSubmit();
@@ -398,10 +424,6 @@ async function routeChecks() {
        one["Стоимость"].v, one["Сообщений"].v].join(" | "));
     check("контекст — доля окна по последнему ответу",
       one["Контекст"].v === "1.2 %", one["Контекст"].v);
-    check("подписей в плитках больше нет: панель и так вся про диалог",
-      PANEL.every((name) => tileOf($, name).sub === ""),
-      PANEL.map((name) => name + ":" + tileOf($, name).sub).join(" | "));
-
     // Цена в девять знаков занимает ширину плитки целиком: окажись в строке
     // значения кто-то ещё, на экране останется «$0.000...».
     check("в строке значения стоимости никого, кроме самого значения",
@@ -501,6 +523,94 @@ async function routeChecks() {
     check("а строка под ответом — числа своей реплики",
       usageText($("#feed"), ".usage-tokens") === "входные токены 10 · выходные токены 12 · всего токенов 22 · $0.000002",
       usageText($("#feed"), ".usage-tokens"));
+  }
+
+  // ── упавший обмен не гасит показанное ──
+  //
+  // У метрик ошибки все числа пустые: заполнены `error`, модель и время.
+  // Класть такой набор поверх прежнего значило бы гасить плитки ровно там,
+  // где числа нужнее всего: на записи переполнения видно ошибку, а сколько
+  // контекста было занято — уже нет. Набор сливается по полям, и показанная
+  // доля окна помечается прошлой, а не выдаётся за свежую.
+  {
+    const first = { prompt_tokens: 1240, completion_tokens: 312, total_tokens: 1552,
+                    cost_usd: 0.000186, tokens_per_second: 12.44, elapsed_ms: 2350,
+                    first_token_ms: 420, ttft_ms: 420, context_fill_pct: 1.2 };
+    const { client, $, settle } = freshClient({
+      usage: (i) => (i === 0 ? first : null),
+      fail: (i) => (i === 0 ? null : { message: "HTTP 402: контекст переполнен" }),
+    });
+    client.init();
+    await settle(30);
+
+    $("#input").value = "первый вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    $("#input").value = "второй вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+
+    const v = (name) => tileOf($, name).v;
+    check("упавший обмен не гасит входные токены", v("Входные токены") === "1 240", v("Входные токены"));
+    check("не гасит стоимость", v("Стоимость") === "$0.000186", v("Стоимость"));
+    check("и не гасит долю окна", v("Контекст") === "1.2 %", v("Контекст"));
+    check("показанная доля окна помечена прошлой",
+      tileOf($, "Контекст").row === "tile-v past", tileOf($, "Контекст").row);
+    check("ошибка названа под полем ввода",
+      /402/.test($("#composer-hint").textContent), $("#composer-hint").textContent);
+    check("а вопрос вернулся в поле ввода: обмена не было",
+      $("#input").value === "второй вопрос", $("#input").value);
+  }
+
+  // ── смена модели гасит долю окна, но не токены ──
+  //
+  // Окно у новой модели другое, и прежний процент к ней не относится: плитка
+  // молчит прочерком, пока не придёт первый ответ на новой модели. Гасит её
+  // сама смена модели в панели, а не расхождение имён: на `openrouter/auto`
+  // провайдер возвращает не то имя, которое просили, и сверка имён гасила бы
+  // плитку после каждого ответа, навсегда. Токенов и цены это не касается —
+  // они сложены за весь разговор, какой бы моделью он ни шёл.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      usage: (i) => ({ prompt_tokens: 1240, completion_tokens: 312, total_tokens: 1552,
+                       cost_usd: 0.000186, context_fill_pct: i === 0 ? 1.2 : 7.5 }),
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("до смены модели доля окна показана", tileOf($, "Контекст").v === "1.2 %",
+      tileOf($, "Контекст").v);
+
+    $("#f-model").value = "вторая/модель";
+    $("#f-model").dispatchEvent(new Evt("change"));
+    await settle(60);
+    check("смена модели гасит долю окна", tileOf($, "Контекст").v === "—",
+      tileOf($, "Контекст").v);
+    check("а всего токенов остаётся на месте", tileOf($, "Всего токенов").v === "1 552",
+      tileOf($, "Всего токенов").v);
+    check("и стоимость тоже", tileOf($, "Стоимость").v === "$0.000186",
+      tileOf($, "Стоимость").v);
+
+    // Гасить навсегда нельзя: первый же ответ на новой модели приносит свою
+    // долю окна, и плитка обязана заговорить снова.
+    $("#input").value = "второй вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("первый ответ на новой модели зажигает долю окна обратно",
+      tileOf($, "Контекст").v === "7.5 %", tileOf($, "Контекст").v);
+    check("а токены к этому времени сложились за оба обмена",
+      tileOf($, "Всего токенов").v === "3 104", tileOf($, "Всего токенов").v);
+
+    // Открытие соседнего чата числа не сливает, а заменяет: показанное
+    // относится к открытому разговору, и протечь из чужого не может.
+    $("#agent-list").querySelectorAll(".item-open")[1].dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("в соседнем чате без ответов всего токенов — прочерк",
+      tileOf($, "Всего токенов").v === "—", tileOf($, "Всего токенов").v);
+    check("и доля окна из прошлого чата не протекла",
+      tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
   }
 }
 

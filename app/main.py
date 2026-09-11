@@ -75,10 +75,6 @@ async def index() -> FileResponse:
 # --- вспомогательное ----------------------------------------------------------
 
 
-def _sse(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-
 async def _context_lengths() -> dict[str, int]:
     """Длины контекста по моделям. Каталог недоступен — просто не покажем заполнение."""
     try:
@@ -90,8 +86,8 @@ async def _context_lengths() -> dict[str, int]:
 
 async def _pump(
     make_events: Callable[[], AsyncIterator[dict]],
-    request: Request | None,
-    on_close: Callable[[], None] | None = None,
+    request: Request,
+    on_close: Callable[[], None],
 ) -> AsyncIterator[str]:
     """Гоняет поток событий в SSE и гасит его, когда клиент ушёл: брошенная
     вкладка иначе жжёт токены.
@@ -116,7 +112,7 @@ async def _pump(
     task = asyncio.create_task(pump())
     try:
         while True:
-            if request is not None and await request.is_disconnected():
+            if await request.is_disconnected():
                 return
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -125,20 +121,19 @@ async def _pump(
                 continue
             if event is done:
                 break
-            yield _sse(event)
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     finally:
         if not task.done():
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        if on_close is not None:
-            on_close()
+        on_close()
 
 
 def _stream(
     make_events: Callable[[], AsyncIterator[dict]],
-    request: Request | None,
-    on_close: Callable[[], None] | None = None,
+    request: Request,
+    on_close: Callable[[], None],
 ):
     return StreamingResponse(
         _pump(make_events, request, on_close),
@@ -231,10 +226,10 @@ def _label_field(payload: dict) -> str:
     return label.strip()
 
 
-def _parse_spec(payload: dict, where: str = "") -> AgentSpec:
+def _parse_spec(payload: dict, where: str) -> AgentSpec:
     """Конфиг агента из JSON. Все ошибки — 400 с текстом, а не 500."""
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail=f"{where[:-1] or 'агент'}: должен быть объектом")
+        raise HTTPException(status_code=400, detail=f"{where[:-1]}: должен быть объектом")
 
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
@@ -265,25 +260,19 @@ def _agent(agent_id: str) -> Agent:
         ) from exc
 
 
-def _listing() -> dict:
+@app.get("/api/agents")
+async def list_agents() -> dict:
     """Всё, что нужно клиенту для списка слева и статуса ключа. Ключа здесь
-    нет и быть не может — наружу уходит только факт его наличия."""
-    agents = REGISTRY.catalogue()
+    нет и быть не может — наружу уходит только факт его наличия. Счётчики,
+    которых список не касается, живут в /api/health."""
     return {
         "has_key": has_key(),
         "live": len(REGISTRY),
-        "stored": len(agents),
         "max_agents": REGISTRY.max_agents,
-        "evicted": REGISTRY.evicted,
         # Список — по базе: чат, вытесненный из памяти по потолку, из него
         # исчезать не должен. Выгрузка — не удаление.
-        "agents": agents,
+        "agents": REGISTRY.catalogue(),
     }
-
-
-@app.get("/api/agents")
-async def list_agents() -> dict:
-    return _listing()
 
 
 @app.post("/api/agents")

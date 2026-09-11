@@ -31,7 +31,7 @@
 .venv/bin/python checks/spawn_100.py      # сто агентов в одном процессе
 .venv/bin/python checks/restart.py        # два процесса подряд на одном файле базы
 .venv/bin/python checks/two_processes.py  # одновременные писатели: id не пересекаются
-node checks/browser_check.js              # клиент под node, 98 утверждений
+node checks/browser_check.js              # клиент под node, 115 утверждений
 ```
 
 ## Что нельзя сломать
@@ -51,4 +51,4 @@ node checks/browser_check.js              # клиент под node, 98 утв�
 `checks/browser_check.js` исполняет настоящий `app/static/app.js` под node на
 стенде `checks/dom.js` (минимальный DOM и сервер с настоящими кадрами SSE).
 Мета-проверок не заводить: ни таблиц запрещённых слов, ни самопроверок стенда,
-ни проверок про проверки. Проверок меньше, чем продукта: 2.9k строк против 5.0k.
+ни проверок про проверки. Проверок меньше, чем продукта: 3.1k строк против 4.9k.

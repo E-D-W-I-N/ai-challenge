@@ -616,7 +616,6 @@ function buildServer(options) {
         has_key: true,
         live: state.agents.length,
         max_agents: 1000,
-        evicted: 0,
         agents: state.agents.map((a) => ({ ...a, transcript: undefined })),
       });
     }

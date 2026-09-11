@@ -211,7 +211,6 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
         # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
         "usage": {"include": True},
         "provider": {"require_parameters": True},
-        # Сжатие контекста выключено явно: см. NO_COMPRESSION_PLUGIN.
         "plugins": [dict(NO_COMPRESSION_PLUGIN)],
     }
     # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль:

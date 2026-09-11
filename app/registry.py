@@ -58,8 +58,8 @@ class AgentRegistry:
     def __len__(self) -> int:
         return len(self._agents)
 
-    def create(self, spec: AgentSpec, *, context_length: int | None = None) -> Agent:
-        return self.create_many([spec], context_lengths={spec.model: context_length})[0]
+    def create(self, spec: AgentSpec) -> Agent:
+        return self.create_many([spec])[0]
 
     def create_many(
         self, specs: Iterable[AgentSpec], *, context_lengths: dict[str, int] | None = None
@@ -98,10 +98,10 @@ class AgentRegistry:
         self._agents[agent.id] = agent
         return agent
 
-    def sessions(self, *, limit: int | None = None) -> list[dict]:
+    def sessions(self) -> list[dict]:
         """Все сохранённые чаты, а не только живые в процессе."""
         live = set(self._agents)
-        rows = self.store.list_sessions(limit=limit)
+        rows = self.store.list_sessions()
         for row in rows:
             row["live"] = row["id"] in live
         return rows
@@ -168,15 +168,14 @@ class AgentRegistry:
         agent.detach()
         return True
 
-    def kill_all(self, *, purge: bool = True) -> list[str]:
-        """Гасит всех живых. purge — заодно стереть базу (нужно только проверкам)."""
+    def kill_all(self) -> list[str]:
+        """Гасит всех живых и стирает базу. Нужно только проверкам."""
         killed = list(self._agents)
         for agent in self._agents.values():
             agent.cancel()
             agent.detach()
         self._agents.clear()
-        if purge:
-            self.store.clear()
+        self.store.clear()
         return killed
 
     def _make_room(self, need: int) -> None:
