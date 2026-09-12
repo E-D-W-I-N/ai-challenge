@@ -494,7 +494,7 @@ class Agent:
         # Второй проход — по сводкам. Вызов на сжатие тоже уехал в модель и
         # тоже оплачен: экономия, не вычитающая стоимость сжатия, — враньё.
         # Сводки живут не в истории, поэтому складываются отдельно; карточкой
-        # в ленте сжатие не становится и `exchanges()` не трогает.
+        # в ленте сжатие не становится и числа сообщений не растит.
         for item in self.summaries:
             if add(item.get("metrics")):
                 answers += 1
@@ -505,16 +505,6 @@ class Agent:
             # Копейки от сложения float'ов: цена показывается до шестого знака.
             totals["cost_usd"] = round(totals["cost_usd"], 8)
         return totals
-
-    def exchanges(self) -> int:
-        """Сколько ответов модели в истории — столько карточек в ленте.
-
-        Считаются **все**, а не только принёсшие числа: плитка «Сообщений»
-        отвечает на «сколько раз поговорили». Слагаемых в суммах может быть
-        меньше — провайдер вправе смолчать о usage, — но это видно по самим
-        суммам, а не по счётчику.
-        """
-        return sum(1 for turn in self.history if turn.role == "assistant")
 
     def transcript(self) -> list[dict]:
         """Ровно реплики диалога. Системного промпта здесь нет: он конфиг,
@@ -527,7 +517,6 @@ class Agent:
             agent_id=self.id,
             history_len=len(self.history),
             usage_total=self.usage_summary(),
-            exchanges=self.exchanges(),
             created_at=self.created_at,
             last_used_at=self.last_used_at,
             busy=self.busy,
@@ -713,7 +702,6 @@ def spec_as_dict(
     last_used_at: float,
     busy: bool = False,
     usage_total: dict | None = None,
-    exchanges: int | None = None,
 ) -> dict:
     """Конфиг чата так, как его ждут список слева и панель справа.
 
@@ -728,15 +716,14 @@ def spec_as_dict(
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
         "system": spec.system,
+        # Длина истории — она же число сообщений в плитке справа: одна реплика,
+        # хоть вопрос, хоть ответ, — одно сообщение. Сжатие её не растит, сводка
+        # живёт вне истории. У чата, которого нет в памяти, то же число считает
+        # SQL (`app/store.py`), и клиенту не приходится различать эти два случая.
         "history_len": history_len,
-        # Итог по чату едет тем же путём, что и длина истории: клиент не должен
-        # различать «чат поднят в память» и «чат лежит в базе» — у выгруженного
-        # сводки нет, и это `None`, то есть прочерк, а не ноль.
+        # Итог по чату едет тем же путём: у выгруженного чата сводки нет,
+        # и это `None`, то есть прочерк, а не ноль.
         "usage_total": usage_total,
-        # Число сообщений едет отдельно от сумм: у чата без единого usage сумм
-        # нет вовсе (`None`), а ответы в нём всё равно были, и плитка обязана
-        # их назвать.
-        "exchanges": exchanges,
         "busy": busy,
         "created_at": created_at,
         "last_used_at": last_used_at,

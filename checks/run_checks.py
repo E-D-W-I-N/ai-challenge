@@ -500,7 +500,7 @@ def check_compression_saves_input():
     plain_total = totals[plain]["usage_total"]["prompt_tokens"]
     folded_total = totals[folded]["usage_total"]["prompt_tokens"]
     assert folded_total < plain_total, (folded_total, plain_total)
-    assert totals[folded]["exchanges"] == 12, totals[folded]["exchanges"]
+    assert totals[folded]["history_len"] == 24, totals[folded]["history_len"]
     saved = 100 - round(100 * folded_total / plain_total)
     return (
         f"12 обменов: без сжатия {plain_total} входных токенов, со сжатием "
@@ -640,8 +640,9 @@ def check_compression_tokens_counted():
     assert total["completion_tokens"] == 9 * 1 + 400, total
     assert total["total_tokens"] == 9 * 2 + 50400, total
     assert round(total["cost_usd"], 8) == round(9 * 0.000001 + 0.05, 8), total
-    # Сжатие — не обмен: карточек в ленте от него не прибавилось.
-    assert body["exchanges"] == 9, body["exchanges"]
+    # Сжатие не растит счётчик сообщений: сводка живёт вне истории, и ни
+    # в счётчике, ни карточкой в ленте её нет.
+    assert body["history_len"] == 18, body["history_len"]
     assert len([t for t in body["transcript"] if t["role"] == "assistant"]) == 9, "сводка попала в ленту"
 
     # И тот же счёт из файла базы: метрики сжатия лежат в `summaries`.
@@ -649,7 +650,7 @@ def check_compression_tokens_counted():
     assert agent.summaries[0]["metrics"]["total_tokens"] == 50400, agent.summaries[0]["metrics"]
     return (
         f"итог {total['total_tokens']} токенов = {9 * 2} за девять обменов "
-        f"плюс 50400 за сжатие; обменов по-прежнему {body['exchanges']}"
+        f"плюс 50400 за сжатие; сообщений по-прежнему {body['history_len']}"
     )
 
 
@@ -943,7 +944,7 @@ def check_usage_summary_sums():
     assert total["completion_tokens"] == 5 + 40 + 7, total
     assert total["total_tokens"] == 16 + 160 + 1307, total
     assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
-    assert body["exchanges"] == 3, body["exchanges"]
+    assert body["history_len"] == 6, body["history_len"]
 
     # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
     # и клиент рисует по ним строку под каждым ответом.
@@ -955,11 +956,11 @@ def check_usage_summary_sums():
     with TestClient(main.app) as client:
         client.post(f"/api/agents/{agent_id}/regenerate")
         after = client.get(f"/api/agents/{agent_id}").json()
-    assert after["exchanges"] == 3, after["exchanges"]
+    assert after["history_len"] == 6, after["history_len"]
     assert after["usage_total"]["total_tokens"] == 16 + 160 + 1100, after["usage_total"]
     return (
         f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
-        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
+        f"всего {total['total_tokens']} за {len(answers)} обмена — сумма сошлась"
     )
 
 
@@ -979,8 +980,9 @@ def check_usage_summary_skips_unknown():
     quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
     assert quiet.usage_summary() is None, quiet.usage_summary()
     assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
-    # Сумм нет, а разговор был: плитка «Сообщений» считает ответы, а не слагаемые.
-    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
+    # Сумм нет, а разговор был: плитка «Сообщений» считает сообщения, а не
+    # слагаемые сумм.
+    assert quiet.as_dict()["history_len"] == 4, quiet.as_dict()["history_len"]
 
     mixed = Agent(spec)
     mixed.remember("user", "вопрос")
@@ -994,7 +996,7 @@ def check_usage_summary_skips_unknown():
     assert total["total_tokens"] == 330, total
     # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
     assert total["cost_usd"] == 0.0002, total
-    assert mixed.exchanges() == 3, mixed.exchanges()
+    assert mixed.as_dict()["history_len"] == 6, mixed.as_dict()["history_len"]
 
     # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
     sneaky = Agent(spec)
@@ -1033,7 +1035,7 @@ def check_usage_summary_survives_restart():
 
     assert before == after, (before, after)
     assert after["total_tokens"] == 420, after
-    assert revived.exchanges() == 2, revived.exchanges()
+    assert revived.as_dict()["history_len"] == 4, revived.as_dict()["history_len"]
     return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
 
 

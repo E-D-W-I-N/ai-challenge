@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 8</span>
+            <span class="brand-sub">чат · день 9</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -137,20 +137,25 @@
             <textarea id="f-system" class="control area" rows="14" placeholder="без системного промпта"></textarea>
           </label>
 
-          <div class="grid2">
-            <label class="field">
-              <span class="field-label">Окно памяти, реплик</span>
-              <input id="f-keep_last" class="control" type="number" step="1" placeholder="без сжатия">
-            </label>
-            <label class="field">
-              <span class="field-label">Сжимать каждые, реплик</span>
-              <input id="f-compress_every" class="control" type="number" step="1" placeholder="—">
-            </label>
-          </div>
+          <!-- Два поля на всю ширину, а не в два столбца: подписи здесь длиннее
+               соседских, и в узкой колонке они переносились на разное число строк,
+               разводя поля ввода по высоте. Сетку это больше не задевает, а страховка
+               от того же на любой длине подписи стоит в .grid2/.grid3 (style.css). -->
+          <label class="field">
+            <span class="field-label">Дословный хвост, сообщений</span>
+            <input id="f-keep_last" class="control" type="number" step="1" placeholder="без сжатия">
+          </label>
+          <label class="field">
+            <span class="field-label">Копить сверх хвоста, сообщений</span>
+            <input id="f-compress_every" class="control" type="number" step="1" placeholder="—">
+          </label>
 
-          <p class="hint">Пустое окно — вся история уезжает в модель целиком. Заполните
-            оба поля, и всё, что старше окна, заменится пересказом: под ответом будет
-            написано, сколько реплик уехало сводкой.</p>
+          <p class="hint">Оба поля пустые — вся история уезжает в модель целиком.
+            Заполните оба: хвост из последних сообщений всегда уезжает дословно, а
+            начало разговора заменяется пересказом каждый раз, когда сверх хвоста
+            накопится ещё столько сообщений, сколько стоит во втором поле. Под
+            ответом будет написано, сколько сообщений уехало сводкой. Сообщение —
+            одна реплика: и вопрос, и ответ.</p>
         </section>
       </div>
 

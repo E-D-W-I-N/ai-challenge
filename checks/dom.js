@@ -472,7 +472,6 @@ function buildServer(options) {
     busy: false,
     transcript: [],
     usage_total: null,
-    exchanges: 0,
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
     ...Object.fromEntries(CONTEXT.map((n) => [n, null])),
   });
@@ -487,9 +486,6 @@ function buildServer(options) {
   // реплика без метрик и поле `null` пропускаются, а чат без чисел даёт `null`,
   // а не нули. Клиенту сумму складывать нельзя — он её только показывает.
   const USAGE_FIELDS = ["prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"];
-  // Обмены считает сервер и считает все ответы, а не только принёсшие числа.
-  const countAnswers = (transcript) =>
-    (transcript || []).filter((turn) => turn.role === "assistant").length;
   function sumUsage(transcript) {
     const out = { prompt_tokens: null, completion_tokens: null, total_tokens: null, cost_usd: null };
     let answers = 0;
@@ -512,7 +508,10 @@ function buildServer(options) {
   ((options && options.chats) || [{ label: "чат" }]).forEach((seed) => {
     const agent = Object.assign(blank(nextId(), seed.label), seed);
     if (!("usage_total" in seed)) agent.usage_total = sumUsage(agent.transcript);
-    if (!("exchanges" in seed)) agent.exchanges = countAnswers(agent.transcript);
+    // Число сообщений считает сервер — это длина истории, реплика к реплике.
+    // Заданное в seed не трогаем: им проверяется, что клиент показывает
+    // серверное число, а не пересчитывает стенограмму сам.
+    if (!("history_len" in seed)) agent.history_len = (agent.transcript || []).length;
     state.agents.push(agent);
   });
 
@@ -547,7 +546,6 @@ function buildServer(options) {
     });
     agent.history_len = agent.transcript.length;
     agent.usage_total = sumUsage(agent.transcript);
-    agent.exchanges = countAnswers(agent.transcript);
 
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
