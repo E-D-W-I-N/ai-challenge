@@ -1105,6 +1105,12 @@ def check_config_survives_by_construction():
 
         assert len(revived.history) == messages + 1, f"из базы поднялось {len(revived.history)}"
         assert revived.history[0].content == "реплика 0", "у поднятого чата отъели начало"
+        # Число сообщений у чата, которого нет в памяти, считает SQL — и это
+        # то же самое число, которое показывает плитка: реплика к реплике,
+        # и вопросы, и ответы. Разойдись счёт, список слева и консоль назвали
+        # бы одну длину, а открытый чат — другую.
+        listed = {row["id"]: row["history_len"] for row in again.list_sessions()}
+        assert listed[agent_id] == len(revived.history), (listed[agent_id], len(revived.history))
         assert revived.history[-1].metrics == {"provider": "stub"}, revived.history[-1].metrics
         # И это же целиком уезжает в модель: восстановленная история — обычная.
         prompt = revived.build_prompt("новый вопрос")
