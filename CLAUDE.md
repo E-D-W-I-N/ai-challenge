@@ -7,9 +7,12 @@
 ## Среда
 
 Системный `python3` — это 3.9: без зависимостей он падает сразу на
-`ModuleNotFoundError: fastapi`, а с ними проходит 8 проверок из 25 — остальные
-17 разваливаются на «There is no current event loop in thread 'MainThread'».
-Везде только `/opt/homebrew/bin/python3.11`.
+`ModuleNotFoundError: fastapi`, а с ними проходит 8 проверок из 25. Корень
+у остальных семнадцати один — на 3.9 нет текущего event loop, — но на глаза
+он попадается по-разному: где голым `RuntimeError: There is no current event
+loop`, где `ExceptionGroup` из TaskGroup, а в проверках на два процесса —
+падением дочернего и таймаутом ожидания. Везде только
+`/opt/homebrew/bin/python3.11`.
 
 ```bash
 /opt/homebrew/bin/python3.11 -m venv .venv
@@ -60,4 +63,4 @@ node checks/browser_check.js              # клиент под node, 122 утв
 `checks/browser_check.js` исполняет настоящий `app/static/app.js` под node на
 стенде `checks/dom.js` (минимальный DOM и сервер с настоящими кадрами SSE).
 Мета-проверок не заводить: ни таблиц запрещённых слов, ни самопроверок стенда,
-ни проверок про проверки. Проверок меньше, чем продукта: 3.5k строк против 5.3k.
+ни проверок про проверки. Проверок меньше, чем продукта: 3.6k строк против 5.3k.

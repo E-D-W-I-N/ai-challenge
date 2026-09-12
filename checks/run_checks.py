@@ -300,6 +300,14 @@ def check_history_never_silently_cut():
         assert "stop" not in folding_body, folding_body.get("stop")
         assert _stub.CALLS[-1]["payload"]["response_format"] == {"type": "json_object"}
         assert _stub.CALLS[-1]["payload"]["stop"] == ["СТОП"]
+        # А модель — та же самая, и это не мелочь: вторая модель развалила бы
+        # счёт токенов на две цены, и «экономия» перестала бы быть сравнимой
+        # с расходом чата. Снимается из того же `replace` — значит и стеречь
+        # его надо целиком, а не по двум полям из трёх.
+        assert folding_body["model"] == _stub.CALLS[-1]["payload"]["model"], (
+            folding_body["model"],
+            _stub.CALLS[-1]["payload"]["model"],
+        )
 
         # Обмен, который уехал сжатым, говорит об этом своими метриками:
         # из них строка под ответом и берёт, сколько реплик уехало сводкой.
@@ -317,6 +325,27 @@ def check_history_never_silently_cut():
         assert "вопрос 5" in again, again[:200]
         assert folded.summary_cover() == 20, folded.summary_cover()
         assert len(folded.history) == 28, len(folded.history)
+
+        # 7. Обратимость, обе её половины разом. Сжатие выключают — история
+        # обязана вернуться в модель **целиком**, а уже накопленные сводки
+        # обязаны **уцелеть**: выключенное сжатие ничего не сжимает, но и
+        # ничего не выбрасывает. Включают обратно — граница та же, и
+        # пересказывать разговор заново не нужно.
+        off = client.patch(f"/api/agents/{folded_id}", json={"keep_last": None})
+        assert off.status_code == 200, off.text
+        client.post(f"/api/agents/{folded_id}/messages", json={"text": "после выключения"})
+        back = _stub.CALLS[-1]["messages"]
+        assert len(back) == 28 + 1, len(back)
+        assert back[0]["content"] == "вопрос 0", back[0]
+        assert folded.summary_cover() == 0, folded.summary_cover()
+        assert not any("пересказ начала разговора" in m["content"] for m in back), back[0]
+        # Сводки не выброшены — их просто перестали подставлять.
+        assert len(folded.summaries) == 2, folded.summaries
+        assert folded.summaries[-1]["upto"] == 20, folded.summaries[-1]
+
+        client.patch(f"/api/agents/{folded_id}", json={"keep_last": KEEP})
+        assert folded.summary_cover() == 20, folded.summary_cover()
+        assert len(folded.summaries) == 2, "включение обратно пересобрало сводки заново"
 
     # 7. Граница сворачивания не рвёт пару: история идёт парами, обе реплики
     # пишутся разом, и свёрнутый вопрос без своего ответа сделал бы хвост
@@ -348,6 +377,21 @@ def check_history_never_silently_cut():
     assert short_cover == 8 == len(short.history), (short_cover, len(short.history))
     short_prompt = short.build_prompt("вопрос после перегенерации")
     assert short_cover + (len(short_prompt) - 2) == len(short.history), short_prompt
+
+    # 9. Умолчание — «сжатия нет», и держится это не на честном слове.
+    # Кнопка «Новый чат» идёт мимо разбора полей, прямо от умолчаний
+    # датакласса (`replace(NEW_CHAT_SPEC, ...)`), и консоль собирает
+    # `AgentSpec` руками. Стань окно и порог умолчаниями — сжимали бы разом
+    # все новые чаты и вся консоль, а разбор полей об этом и не узнал бы.
+    _stub.reset()
+    with TestClient(main.app) as client:
+        fresh = client.post("/api/agents", json={}).json()["agents"][0]
+        assert fresh["keep_last"] is None, fresh["keep_last"]
+        assert fresh["compress_every"] is None, fresh["compress_every"]
+        for i in range(9):
+            client.post(f"/api/agents/{fresh['id']}/messages", json={"text": f"вопрос {i}"})
+    assert not _folding_calls(), "чат из умолчаний сворачивает историю"
+    assert len(_stub.CALLS[-1]["messages"]) == 17, len(_stub.CALLS[-1]["messages"])
 
     return (
         f"{len(sent)} сообщений в промпте вместо 17 после 8 обменов со сводкой; "
@@ -434,6 +478,24 @@ def check_compression_saves_input():
     assert covered + (len(folded_in) - 2) == len(agent.history) - 2, (covered, len(folded_in))
     assert "пересказ начала разговора" in folded_in[0]["content"], folded_in[0]
 
+    # Вызов на сжатие — такой же вызов к модели, и три правила тела на нём
+    # тоже. Особенно третье: собери сводку провайдер со включённым
+    # `context-compression`, и он молча выбросил бы середину того самого
+    # куска, который мы отдали пересказать, — сводка вышла бы дырявой,
+    # а узнать об этом было бы неоткуда.
+    folding_body = _folding_calls()[-1]["payload"]
+    provider = folding_body.get("provider")
+    assert provider and provider.get("require_parameters") is True, (
+        f"вызов на сжатие ушёл без provider.require_parameters: {provider!r}"
+    )
+    assert {"id": "context-compression", "enabled": False} in (folding_body.get("plugins") or []), (
+        f"сводку собирал провайдер со своим сжатием: {folding_body.get('plugins')!r}"
+    )
+    assert folding_body.get("usage") == {"include": True}, (
+        f"вызов на сжатие ушёл без просьбы о usage — его токены было бы не посчитать: "
+        f"{folding_body.get('usage')!r}"
+    )
+
     # Итог по чату — со стоимостью сжатия внутри, и всё равно меньше.
     plain_total = totals[plain]["usage_total"]["prompt_tokens"]
     folded_total = totals[folded]["usage_total"]["prompt_tokens"]
@@ -504,6 +566,19 @@ def check_summary_survives_restart():
         revived.forget()
         assert again.load_summaries(agent_id) == [], again.load_summaries(agent_id)
         assert again.message_rows(agent_id) == [], again.message_rows(agent_id)
+
+        # И в памяти объекта тоже, а не только в файле. `summary_cover` зажат
+        # длиной истории: оставь сводку в памяти — и на первых же репликах
+        # нового разговора она снова стала бы действующей, накрыв собой его
+        # начало. Поэтому смотрим не на пустую таблицу, а на отросшую заново
+        # историю: она обязана уехать в модель целиком.
+        for i in range(2):
+            asyncio.run(drain(revived.ask(f"новый вопрос {i}")))
+        assert revived.summaries == [], revived.summaries
+        assert revived.summary_cover() == 0, revived.summary_cover()
+        fresh_prompt = revived.build_prompt("ещё")
+        assert len(fresh_prompt) == 5, len(fresh_prompt)
+        assert fresh_prompt[0]["content"] == "новый вопрос 0", fresh_prompt[0]
 
         # Удаление чата — второй такой путь. Сводку удалённого чата
         # унаследовал бы чат с тем же id: номера идут по возрастанию,
