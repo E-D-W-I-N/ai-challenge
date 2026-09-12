@@ -176,7 +176,24 @@ def check_cli():
     assert answer == "привет из консоли", answer
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
-    return "ответ напечатан, история записана, агент в реестре"
+
+    # Консоль — вторая видимая поверхность, и единица на ней та же, что в
+    # панели: сообщения, а не пары. Печатается в тот же `out`, что и ответ.
+    cli._print_sessions(out=out)
+    cli._print_agents(out=out)
+    printed = out.getvalue()
+    named = [line for line in printed.splitlines() if agent.id in line]
+    assert len(named) == 2, f"агент назван не в двух списках, а в {len(named)}: {named}"
+    for line in named:
+        # Вопрос и ответ — два сообщения. «сообщений 1» значило бы, что консоль
+        # считает пары; «реплик 2» — что она зовёт ту же величину другим
+        # словом, чем экран, а слово во всём продукте одно.
+        assert "сообщений 2" in line, line
+        assert "реплик" not in line, line
+    return (
+        "ответ напечатан, история записана, агент в реестре; "
+        "консоль называет 2 сообщения в обоих списках"
+    )
 
 
 # --- История: помнится и уезжает в модель целиком ------------------------------
