@@ -732,7 +732,6 @@ function showPrompt(card, prompt) {
   const shown = card.querySelector(".prompt-view");
   if (shown) {
     shown.remove();
-    card.dataset.prompt = "0";
     return;
   }
   const box = el("div", "prompt-view");
@@ -745,8 +744,9 @@ function showPrompt(card, prompt) {
     );
     box.appendChild(row);
   });
+  // Над телом ответа, но под «Рассуждением»: показанный промпт — про то, что
+  // уехало в модель, и стоять ему выше ответа, к которому он привёл.
   card.insertBefore(box, card.querySelector(".card-body"));
-  card.dataset.prompt = "1";
 }
 
 async function copyText(text) {
@@ -875,6 +875,7 @@ async function exchange(path, body, questionText) {
   let failure = null;
   let status = null;
   let prompt = null;
+  let committed = false;
 
   try {
     await streamPost(
@@ -932,6 +933,8 @@ async function exchange(path, body, questionText) {
             if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
             break;
           case "done":
+            // Записался ли обмен в историю — знает агент, и говорит прямо.
+            committed = e.committed === true;
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
             if (e.metrics) keepMetrics(e.metrics);
@@ -967,7 +970,13 @@ async function exchange(path, body, questionText) {
 
   // Лента и список слева перерисовываются по серверу: на экране должно быть
   // ровно то, что у агента в истории, а не то, что мы дорисовали по дороге.
-  await refreshCurrent(prompt);
+  //
+  // Промпт привязывается к ответу, только если обмен **доехал до истории**.
+  // Упавший обмен её не удлиняет, а событие `start` у него уже уехало — со
+  // своим промптом и своей сводкой. Привяжи его по длине истории, и он лёг бы
+  // под ключ **прошлого** ответа: кнопка под давней карточкой показала бы
+  // чужой запрос, внутри которого лежит сам этот ответ.
+  await refreshCurrent(committed ? prompt : null);
 }
 
 async function refreshCurrent(prompt) {
@@ -976,10 +985,10 @@ async function refreshCurrent(prompt) {
     const fresh = await api("/api/agents/" + state.current.id);
     state.current = fresh;
     // Промпт привязываем к реплике до перерисовки: номер ответа в истории
-    // известен только теперь, а рисовать карточку с кнопкой уже пора.
-    // Обмена не случилось (ответа в истории нет) — привязывать не к чему.
-    const last = fresh.transcript[fresh.transcript.length - 1];
-    if (prompt && last && last.role === "assistant") {
+    // известен только теперь, а рисовать карточку с кнопкой уже пора. Сюда он
+    // доезжает, только если обмен записался, — значит последняя реплика
+    // истории и есть его ответ.
+    if (prompt) {
       state.prompts.set(promptKey(fresh.id, fresh.transcript.length - 1), prompt);
     }
     const listed = state.agents.find((a) => a.id === fresh.id);
