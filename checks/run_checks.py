@@ -176,7 +176,24 @@ def check_cli():
     assert answer == "привет из консоли", answer
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert agent.id in {a.id for a in REGISTRY.list()}, "CLI-агент виден в реестре процесса"
-    return "ответ напечатан, история записана, агент в реестре"
+
+    # Консоль — вторая видимая поверхность, и единица на ней та же, что в
+    # панели: сообщения, а не пары. Печатается в тот же `out`, что и ответ.
+    cli._print_sessions(out=out)
+    cli._print_agents(out=out)
+    printed = out.getvalue()
+    named = [line for line in printed.splitlines() if agent.id in line]
+    assert len(named) == 2, f"агент назван не в двух списках, а в {len(named)}: {named}"
+    for line in named:
+        # Вопрос и ответ — два сообщения. «сообщений 1» значило бы, что консоль
+        # считает пары; «реплик 2» — что она зовёт ту же величину другим
+        # словом, чем экран, а слово во всём продукте одно.
+        assert "сообщений 2" in line, line
+        assert "реплик" not in line, line
+    return (
+        "ответ напечатан, история записана, агент в реестре; "
+        "консоль называет 2 сообщения в обоих списках"
+    )
 
 
 # --- История: помнится и уезжает в модель целиком ------------------------------
@@ -500,7 +517,7 @@ def check_compression_saves_input():
     plain_total = totals[plain]["usage_total"]["prompt_tokens"]
     folded_total = totals[folded]["usage_total"]["prompt_tokens"]
     assert folded_total < plain_total, (folded_total, plain_total)
-    assert totals[folded]["exchanges"] == 12, totals[folded]["exchanges"]
+    assert totals[folded]["history_len"] == 24, totals[folded]["history_len"]
     saved = 100 - round(100 * folded_total / plain_total)
     return (
         f"12 обменов: без сжатия {plain_total} входных токенов, со сжатием "
@@ -640,8 +657,9 @@ def check_compression_tokens_counted():
     assert total["completion_tokens"] == 9 * 1 + 400, total
     assert total["total_tokens"] == 9 * 2 + 50400, total
     assert round(total["cost_usd"], 8) == round(9 * 0.000001 + 0.05, 8), total
-    # Сжатие — не обмен: карточек в ленте от него не прибавилось.
-    assert body["exchanges"] == 9, body["exchanges"]
+    # Сжатие не растит счётчик сообщений: сводка живёт вне истории, и ни
+    # в счётчике, ни карточкой в ленте её нет.
+    assert body["history_len"] == 18, body["history_len"]
     assert len([t for t in body["transcript"] if t["role"] == "assistant"]) == 9, "сводка попала в ленту"
 
     # И тот же счёт из файла базы: метрики сжатия лежат в `summaries`.
@@ -649,7 +667,7 @@ def check_compression_tokens_counted():
     assert agent.summaries[0]["metrics"]["total_tokens"] == 50400, agent.summaries[0]["metrics"]
     return (
         f"итог {total['total_tokens']} токенов = {9 * 2} за девять обменов "
-        f"плюс 50400 за сжатие; обменов по-прежнему {body['exchanges']}"
+        f"плюс 50400 за сжатие; сообщений по-прежнему {body['history_len']}"
     )
 
 
@@ -943,7 +961,7 @@ def check_usage_summary_sums():
     assert total["completion_tokens"] == 5 + 40 + 7, total
     assert total["total_tokens"] == 16 + 160 + 1307, total
     assert round(total["cost_usd"], 8) == round(0.000011 + 0.000120 + 0.001300, 8), total
-    assert body["exchanges"] == 3, body["exchanges"]
+    assert body["history_len"] == 6, body["history_len"]
 
     # Сумма — не пересказ последнего обмена: слагаемые лежат в стенограмме,
     # и клиент рисует по ним строку под каждым ответом.
@@ -955,11 +973,11 @@ def check_usage_summary_sums():
     with TestClient(main.app) as client:
         client.post(f"/api/agents/{agent_id}/regenerate")
         after = client.get(f"/api/agents/{agent_id}").json()
-    assert after["exchanges"] == 3, after["exchanges"]
+    assert after["history_len"] == 6, after["history_len"]
     assert after["usage_total"]["total_tokens"] == 16 + 160 + 1100, after["usage_total"]
     return (
         f"вход {total['prompt_tokens']}, выход {total['completion_tokens']}, "
-        f"всего {total['total_tokens']} за {body['exchanges']} обмена — сумма сошлась"
+        f"всего {total['total_tokens']} за {len(answers)} обмена — сумма сошлась"
     )
 
 
@@ -979,8 +997,9 @@ def check_usage_summary_skips_unknown():
     quiet.remember("assistant", "ответ", metrics={"provider": "stub", "cost_usd": None})
     assert quiet.usage_summary() is None, quiet.usage_summary()
     assert quiet.as_dict()["usage_total"] is None, quiet.as_dict()["usage_total"]
-    # Сумм нет, а разговор был: плитка «Сообщений» считает ответы, а не слагаемые.
-    assert quiet.as_dict()["exchanges"] == 2, quiet.as_dict()["exchanges"]
+    # Сумм нет, а разговор был: плитка «Сообщений» считает сообщения, а не
+    # слагаемые сумм.
+    assert quiet.as_dict()["history_len"] == 4, quiet.as_dict()["history_len"]
 
     mixed = Agent(spec)
     mixed.remember("user", "вопрос")
@@ -994,7 +1013,7 @@ def check_usage_summary_skips_unknown():
     assert total["total_tokens"] == 330, total
     # Цену назвал один ответ из трёх — сумма ровно его, а не «0 + 0 + цена».
     assert total["cost_usd"] == 0.0002, total
-    assert mixed.exchanges() == 3, mixed.exchanges()
+    assert mixed.as_dict()["history_len"] == 6, mixed.as_dict()["history_len"]
 
     # Вопросы пользователя в сумму не идут, даже если метрики к ним прицепили.
     sneaky = Agent(spec)
@@ -1033,7 +1052,7 @@ def check_usage_summary_survives_restart():
 
     assert before == after, (before, after)
     assert after["total_tokens"] == 420, after
-    assert revived.exchanges() == 2, revived.exchanges()
+    assert revived.as_dict()["history_len"] == 4, revived.as_dict()["history_len"]
     return f"после переоткрытия файла всего {after['total_tokens']} — как и до него"
 
 
@@ -1103,6 +1122,12 @@ def check_config_survives_by_construction():
 
         assert len(revived.history) == messages + 1, f"из базы поднялось {len(revived.history)}"
         assert revived.history[0].content == "реплика 0", "у поднятого чата отъели начало"
+        # Число сообщений у чата, которого нет в памяти, считает SQL — и это
+        # то же самое число, которое показывает плитка: реплика к реплике,
+        # и вопросы, и ответы. Разойдись счёт, список слева и консоль назвали
+        # бы одну длину, а открытый чат — другую.
+        listed = {row["id"]: row["history_len"] for row in again.list_sessions()}
+        assert listed[agent_id] == len(revived.history), (listed[agent_id], len(revived.history))
         assert revived.history[-1].metrics == {"provider": "stub"}, revived.history[-1].metrics
         # И это же целиком уезжает в модель: восстановленная история — обычная.
         prompt = revived.build_prompt("новый вопрос")

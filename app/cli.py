@@ -128,7 +128,7 @@ def _print_sessions(out=sys.stdout) -> None:
         mark = "живая" if row["live"] else "в базе"
         out.write(
             f"  {row['id']}  {row['label']}  {row['config'].get('model', '')}  "
-            f"реплик {row['history_len']}  ({mark})\n"
+            f"сообщений {row['history_len']}  ({mark})\n"
         )
     out.write("Продолжить: python -m app.cli --session <id>\n")
 
@@ -136,7 +136,7 @@ def _print_sessions(out=sys.stdout) -> None:
 def _print_agents(out=sys.stdout) -> None:
     out.write(f"живых агентов: {len(REGISTRY)} (потолок {REGISTRY.max_agents})\n")
     for agent in REGISTRY.list():
-        out.write(f"  {agent.id}  {agent.spec.label}  {agent.spec.model}  реплик {len(agent.history)}\n")
+        out.write(f"  {agent.id}  {agent.spec.label}  {agent.spec.model}  сообщений {len(agent.history)}\n")
 
 
 async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
@@ -144,7 +144,7 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
     if agent.history:
         # Ради этой строки день и делался: процесс новый, разговор старый.
         out.write(
-            f"[продолжаем] в базе {len(agent.history)} реплик — "
+            f"[продолжаем] в базе {len(agent.history)} сообщений — "
             "агент помнит этот разговор с прошлого запуска\n"
         )
     else:
