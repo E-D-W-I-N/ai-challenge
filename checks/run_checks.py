@@ -80,6 +80,29 @@ def read(path: str) -> str:
     return open(os.path.join(ROOT, path), encoding="utf-8").read()
 
 
+KEEP, EVERY = 6, 10
+"""Окно памяти и порог, на которых проверяется сжатие. Порог выше самого
+длинного сценария остальных проверок (3 обмена, 6 реплик): опусти его — и
+поплывут счётчики вызовов к модели в чужих проверках, где сжатия быть не должно."""
+
+
+def _is_folding(messages) -> bool:
+    """Это вызов на сжатие, а не обмен: у него свой системный промпт."""
+    return bool(messages) and messages[0].get("content") == agent_module.COMPRESS_SYSTEM
+
+
+def _folding_calls() -> list[dict]:
+    return [call for call in _stub.CALLS if _is_folding(call["messages"])]
+
+
+def _folding_aware(messages, index):
+    """Ответ заглушки, по которому видно, чем был вызов: сводка узнаётся
+    в промпте следующего обмена по слову СВОДКА."""
+    if _is_folding(messages):
+        return f"СВОДКА {index}"
+    return f"ответ {index}"
+
+
 def _temp_db(name: str) -> str:
     """Свежий файл базы под одну проверку. Каталога заранее нет — его создаёт Store."""
     import tempfile
@@ -159,14 +182,26 @@ def check_cli():
 # --- История: помнится и уезжает в модель целиком ------------------------------
 
 
-@check("в модель уезжает вся история: ни хвоста, ни отсечки по росту")
-def check_whole_history_goes_to_model():
-    """Управление контекстом — задание Дня 9; здесь обрезки нет вовсе.
-    Пороги выше прежних отсечек (20 в окне, 400 хранимых): вернись любая
-    из них — станет красно."""
+@check("история не теряется молча: без сводки уезжает вся, со сводкой — сводка и хвост")
+def check_history_never_silently_cut():
+    """Контракт Дня 9 одной фразой: **ни одна реплика не исчезает без замены**.
+
+    Три состояния, и молчаливой обрезки нет ни в одном:
+
+    * окно памяти не задано — в модель уезжает вся история, дословно как в
+      Дне 8: ни хвоста, ни отсечки по росту (пороги здесь выше прежних
+      отсечек — 20 в окне, 400 хранимых, — вернись любая, станет красно);
+    * окно задано, но до порога ещё не дошло — тоже вся: **без сводки история
+      не режется**;
+    * сводка есть — уезжает сводка и ровно последние N реплик, а свёрнутое
+      плюс хвост равно длине истории.
+
+    Сама история при этом полная всегда: сжатие её не трогает, иначе сломалась
+    бы перегенерация.
+    """
     _stub.install(reply=lambda m, i: f"ответ {i}")
 
-    # 1. Живой маршрут: 25 обменов — больше прежнего окна по умолчанию.
+    # 1. Живой маршрут без сжатия: 25 обменов — больше прежнего окна.
     turns = 25
     with TestClient(main.app) as client:
         agent_id = new_agent(client, system="СИС")
@@ -184,9 +219,11 @@ def check_whole_history_goes_to_model():
     assert sent[1]["content"] == "вопрос 0", sent[1]
     assert sent[-1]["content"] == f"вопрос {turns - 1}", sent[-1]
     assert [m["content"] for m in sent[1:-1:2]] == [f"вопрос {i}" for i in range(turns - 1)]
+    assert not _folding_calls(), "без окна памяти сжатие не запускается вовсе"
 
     agent = REGISTRY.require(agent_id)
     assert len(agent.history) == 2 * turns, len(agent.history)
+    assert agent.summaries == [], agent.summaries
 
     # 2. Рост истории: 500 реплик — больше прежнего потолка хранимого.
     long_chat = agent_module.Agent(AgentSpec(label="длинный", model="stub/model", system="СИС"))
@@ -198,7 +235,168 @@ def check_whole_history_goes_to_model():
     prompt = long_chat.build_prompt("последний вопрос")
     assert len(prompt) == 502, len(prompt)
     assert prompt[1]["content"] == "реплика 0", prompt[1]
-    return f"{len(sent)} сообщений в промпте после {turns} обменов, 500 реплик хранятся целиком"
+
+    # 3. Окно задано, порог ещё не набран — история всё равно уезжает целиком.
+    _stub.reset()
+    _stub.install(reply=_folding_aware)
+    with TestClient(main.app) as client:
+        folded_id = new_agent(
+            client,
+            keep_last=KEEP,
+            compress_every=EVERY,
+            stop=["СТОП"],
+            response_format={"type": "json_object"},
+        )
+        for i in range(5):
+            client.post(f"/api/agents/{folded_id}/messages", json={"text": f"вопрос {i}"})
+
+        early = _stub.CALLS[-1]["messages"]
+        assert [m["role"] for m in early] == ["user", "assistant"] * 4 + ["user"], early
+        assert early[0]["content"] == "вопрос 0", early[0]
+        assert not _folding_calls(), "сжатие запустилось до порога"
+
+        # 4. Дошли до порога: 9-й обмен сам уезжает уже сжатым.
+        for i in range(5, 9):
+            client.post(f"/api/agents/{folded_id}/messages", json={"text": f"вопрос {i}"})
+
+        folded = REGISTRY.require(folded_id)
+        covered = folded.summary_cover()
+        sent = _stub.CALLS[-1]["messages"]
+        tail = sent[1:-1]
+
+        assert len(folded.summaries) == 1, folded.summaries
+        assert covered == 10, covered
+        # Сводка — первой репликой, с подписью: это не вопрос пользователя.
+        assert sent[0]["role"] == "user" and "пересказ начала разговора" in sent[0]["content"], sent[0]
+        assert "СВОДКА" in sent[0]["content"], sent[0]
+        # Хвост — ровно последние N, и начинается он там, где кончилась сводка.
+        assert len(tail) == KEEP, [m["content"] for m in tail]
+        assert tail[0]["content"] == "вопрос 5", tail[0]
+        # Главное равенство дня: свёрнутое плюс хвост — вся история на момент
+        # сборки промпта. Это 16 реплик восьми обменов: девятый в неё ещё
+        # не записан — он как раз и уехал сжатым.
+        assert covered + len(tail) == 16 == len(folded.history) - 2, (
+            covered, len(tail), len(folded.history)
+        )
+        # Системного сообщения в голом чате нет и со сжатием тоже.
+        assert not any(m["role"] == "system" for m in sent), sent
+
+        # История не тронута: сжатие меняет промпт, а не память чата.
+        assert [t.content for t in folded.history[:2]] == ["вопрос 0", "ответ 0"], folded.history[:2]
+
+        # 5. Свёрнутое уехало в сжатие, а не пропало: вызов на сжатие видел
+        # ровно те реплики, которых больше нет в промпте.
+        folding = _folding_calls()[-1]["messages"]
+        assert folding[0]["role"] == "system", folding[0]
+        assert "вопрос 0" in folding[1]["content"] and "ответ 4" in folding[1]["content"], folding[1]
+        assert "вопрос 5" not in folding[1]["content"], "в сжатие уехал хвост, который остаётся как есть"
+
+        # Формат ответа и стоп-строки на время сжатия сняты: чат с
+        # {"type": "json_object"} вернул бы вместо пересказа объект, а
+        # стоп-строка оборвала бы пересказ на середине. У самого обмена
+        # они на месте — снимаются только у вызова на сжатие.
+        folding_body = _folding_calls()[-1]["payload"]
+        assert "response_format" not in folding_body, folding_body.get("response_format")
+        assert "stop" not in folding_body, folding_body.get("stop")
+        assert _stub.CALLS[-1]["payload"]["response_format"] == {"type": "json_object"}
+        assert _stub.CALLS[-1]["payload"]["stop"] == ["СТОП"]
+        # А модель — та же самая, и это не мелочь: вторая модель развалила бы
+        # счёт токенов на две цены, и «экономия» перестала бы быть сравнимой
+        # с расходом чата. Снимается из того же `replace` — значит и стеречь
+        # его надо целиком, а не по двум полям из трёх.
+        assert folding_body["model"] == _stub.CALLS[-1]["payload"]["model"], (
+            folding_body["model"],
+            _stub.CALLS[-1]["payload"]["model"],
+        )
+
+        # Обмен, который уехал сжатым, говорит об этом своими метриками:
+        # из них строка под ответом и берёт, сколько реплик уехало сводкой.
+        assert folded.history[-1].metrics["summarized"] == 10, folded.history[-1].metrics
+        assert folded.history[-3].metrics.get("summarized") is None, "пометка досталась обмену до сжатия"
+
+        # 6. Второе сворачивание идёт инкрементально: прошлая сводка плюс
+        # только новое, а не пересказ разговора с начала.
+        for i in range(9, 14):
+            client.post(f"/api/agents/{folded_id}/messages", json={"text": f"вопрос {i}"})
+        assert len(folded.summaries) == 2, folded.summaries
+        again = _folding_calls()[-1]["messages"][1]["content"]
+        assert "СВОДКА" in again, "прошлая сводка в сжатие не попала — начало разговора потеряно"
+        assert "вопрос 0" not in again, "сжатие пересказывает историю с начала заново"
+        assert "вопрос 5" in again, again[:200]
+        assert folded.summary_cover() == 20, folded.summary_cover()
+        assert len(folded.history) == 28, len(folded.history)
+
+        # 7. Обратимость, обе её половины разом. Сжатие выключают — история
+        # обязана вернуться в модель **целиком**, а уже накопленные сводки
+        # обязаны **уцелеть**: выключенное сжатие ничего не сжимает, но и
+        # ничего не выбрасывает. Включают обратно — граница та же, и
+        # пересказывать разговор заново не нужно.
+        off = client.patch(f"/api/agents/{folded_id}", json={"keep_last": None})
+        assert off.status_code == 200, off.text
+        client.post(f"/api/agents/{folded_id}/messages", json={"text": "после выключения"})
+        back = _stub.CALLS[-1]["messages"]
+        assert len(back) == 28 + 1, len(back)
+        assert back[0]["content"] == "вопрос 0", back[0]
+        assert folded.summary_cover() == 0, folded.summary_cover()
+        assert not any("пересказ начала разговора" in m["content"] for m in back), back[0]
+        # Сводки не выброшены — их просто перестали подставлять.
+        assert len(folded.summaries) == 2, folded.summaries
+        assert folded.summaries[-1]["upto"] == 20, folded.summaries[-1]
+
+        client.patch(f"/api/agents/{folded_id}", json={"keep_last": KEEP})
+        assert folded.summary_cover() == 20, folded.summary_cover()
+        assert len(folded.summaries) == 2, "включение обратно пересобрало сводки заново"
+
+    # 7. Граница сворачивания не рвёт пару: история идёт парами, обе реплики
+    # пишутся разом, и свёрнутый вопрос без своего ответа сделал бы хвост
+    # бессмысленным. При нечётном окне граница округляется вниз до чётного.
+    odd = agent_module.Agent(
+        AgentSpec(label="нечёт", model="stub/model", keep_last=5, compress_every=EVERY)
+    )
+    for i in range(20):
+        odd.remember("user" if i % 2 == 0 else "assistant", f"реплика {i}", persist=False)
+    asyncio.run(odd.compress(odd.spec))
+    odd_cover = odd.summary_cover()
+    assert odd_cover == 14, odd_cover
+    assert odd_cover % 2 == 0, f"граница разорвала пару: свёрнуто {odd_cover} реплик"
+    assert odd.history[odd_cover].role == "user", odd.history[odd_cover].role
+
+    # 8. Перегенерация снимает пару **с конца**, а сводка покрывает начало:
+    # на коротком чате с нулевым окном они встречаются, и `upto` оказывается
+    # больше истории. Зажатый длиной, он остаётся правдой; незажатый заявил
+    # бы, что свёрнуто реплик больше, чем в чате было.
+    short = agent_module.Agent(
+        AgentSpec(label="перегенерация", model="stub/model", keep_last=0, compress_every=EVERY)
+    )
+    for i in range(10):
+        short.remember("user" if i % 2 == 0 else "assistant", f"реплика {i}", persist=False)
+    asyncio.run(short.compress(short.spec))
+    assert short.summary_cover() == 10, short.summary_cover()
+    assert short.take_last_exchange() is not None, "перегенерация не сняла пару"
+    short_cover = short.summary_cover()
+    assert short_cover == 8 == len(short.history), (short_cover, len(short.history))
+    short_prompt = short.build_prompt("вопрос после перегенерации")
+    assert short_cover + (len(short_prompt) - 2) == len(short.history), short_prompt
+
+    # 9. Умолчание — «сжатия нет», и держится это не на честном слове.
+    # Кнопка «Новый чат» идёт мимо разбора полей, прямо от умолчаний
+    # датакласса (`replace(NEW_CHAT_SPEC, ...)`), и консоль собирает
+    # `AgentSpec` руками. Стань окно и порог умолчаниями — сжимали бы разом
+    # все новые чаты и вся консоль, а разбор полей об этом и не узнал бы.
+    _stub.reset()
+    with TestClient(main.app) as client:
+        fresh = client.post("/api/agents", json={}).json()["agents"][0]
+        assert fresh["keep_last"] is None, fresh["keep_last"]
+        assert fresh["compress_every"] is None, fresh["compress_every"]
+        for i in range(9):
+            client.post(f"/api/agents/{fresh['id']}/messages", json={"text": f"вопрос {i}"})
+    assert not _folding_calls(), "чат из умолчаний сворачивает историю"
+    assert len(_stub.CALLS[-1]["messages"]) == 17, len(_stub.CALLS[-1]["messages"])
+
+    return (
+        f"{len(sent)} сообщений в промпте вместо 17 после 8 обменов со сводкой; "
+        f"без окна памяти — вся история из {2 * turns} реплик и 500 хранимых целиком"
+    )
 
 
 @check("два параллельных запроса к одному агенту: 409, история не перемешана")
@@ -226,6 +424,233 @@ def check_parallel():
     assert [t.role for t in agent.history] == ["user", "assistant"], agent.history
     assert len(_stub.CALLS) == 1, f"в модель ушло {len(_stub.CALLS)} вызовов, а должен один"
     return f"коды {codes}, в истории 2 реплики, вызов к модели один"
+
+
+# --- День 9: сжатие истории ---------------------------------------------------
+
+
+@check("сжатие экономит входные токены, и сводка покрывает выброшенное")
+def check_compression_saves_input():
+    """Сравнение расхода «до/после», которого просит задание, — два одинаковых
+    чата рядом: у одного окно памяти задано, у другого нет. `prompt_tokens`
+    у заглушки считается по длине **отправленных** сообщений, поэтому экономия
+    видна и без живых вызовов.
+
+    Экономия считается честно: в итог по чату у сжатого входит и вызов на
+    сжатие. Меньше должно стать не только у последнего обмена, но и по чату.
+    """
+    _stub.install(reply=_folding_aware)
+    question = "вопрос {i}: " + "довольно длинный текст вопроса, " * 20
+
+    with TestClient(main.app) as client:
+        plain = new_agent(client, label="без сжатия")
+        folded = new_agent(client, label="со сжатием", keep_last=KEEP, compress_every=EVERY)
+        for i in range(12):
+            for agent_id in (plain, folded):
+                response = client.post(
+                    f"/api/agents/{agent_id}/messages", json={"text": question.format(i=i)}
+                )
+                assert response.status_code == 200, response.text
+        totals = {
+            agent_id: client.get(f"/api/agents/{agent_id}").json()
+            for agent_id in (plain, folded)
+        }
+
+    def last_prompt(agent_id):
+        calls = [c for c in _stub.CALLS if c["label"] == totals[agent_id]["label"]]
+        return calls[-1]["payload"]
+
+    plain_in = last_prompt(plain)["messages"]
+    folded_in = last_prompt(folded)["messages"]
+    plain_chars = sum(len(m["content"]) for m in plain_in)
+    folded_chars = sum(len(m["content"]) for m in folded_in)
+
+    # 12 обменов: у несжатого в промпте 11 пар и вопрос, у сжатого — сводка,
+    # 6 непокрытых пар и вопрос. Сворачивалось один раз, на девятом обмене.
+    assert len(plain_in) == 23, len(plain_in)
+    assert len(folded_in) == 14, len(folded_in)
+    assert folded_chars < plain_chars / 1.5, (folded_chars, plain_chars)
+
+    # И ничего не потеряно: выброшенное покрыто сводкой ровно по границе.
+    agent = REGISTRY.require(folded)
+    covered = agent.summary_cover()
+    assert covered == 10, covered
+    assert covered + (len(folded_in) - 2) == len(agent.history) - 2, (covered, len(folded_in))
+    assert "пересказ начала разговора" in folded_in[0]["content"], folded_in[0]
+
+    # Вызов на сжатие — такой же вызов к модели, и три правила тела на нём
+    # тоже. Особенно третье: собери сводку провайдер со включённым
+    # `context-compression`, и он молча выбросил бы середину того самого
+    # куска, который мы отдали пересказать, — сводка вышла бы дырявой,
+    # а узнать об этом было бы неоткуда.
+    folding_body = _folding_calls()[-1]["payload"]
+    provider = folding_body.get("provider")
+    assert provider and provider.get("require_parameters") is True, (
+        f"вызов на сжатие ушёл без provider.require_parameters: {provider!r}"
+    )
+    assert {"id": "context-compression", "enabled": False} in (folding_body.get("plugins") or []), (
+        f"сводку собирал провайдер со своим сжатием: {folding_body.get('plugins')!r}"
+    )
+    assert folding_body.get("usage") == {"include": True}, (
+        f"вызов на сжатие ушёл без просьбы о usage — его токены было бы не посчитать: "
+        f"{folding_body.get('usage')!r}"
+    )
+
+    # Итог по чату — со стоимостью сжатия внутри, и всё равно меньше.
+    plain_total = totals[plain]["usage_total"]["prompt_tokens"]
+    folded_total = totals[folded]["usage_total"]["prompt_tokens"]
+    assert folded_total < plain_total, (folded_total, plain_total)
+    assert totals[folded]["exchanges"] == 12, totals[folded]["exchanges"]
+    saved = 100 - round(100 * folded_total / plain_total)
+    return (
+        f"12 обменов: без сжатия {plain_total} входных токенов, со сжатием "
+        f"{folded_total} (с вызовом на сжатие внутри) — на {saved}% меньше"
+    )
+
+
+@check("сводка живёт отдельно от истории: переживает перезапуск и не переживает очистку")
+def check_summary_survives_restart():
+    """Сводка лежит в своей таблице, а не строкой в `messages`: `save_history`
+    на **каждой** записи делает `DELETE FROM messages` — лежи сводка там,
+    её стирал бы каждый следующий обмен.
+
+    Доказательство — настоящее переоткрытие файла и обмен уже после него:
+    сводка та же, история полная, `seq` без дыр, и текста сводки в репликах нет.
+
+    И обратная половина: отдельная таблица не чистится каскадом — внешних
+    ключей в схеме нет. Значит, все три пути очистки — `forget()`, удаление
+    чата и очистка базы — обязаны уносить сводку сами. Не унесут — id чатов
+    выдаются по возрастанию и после очистки начинаются заново, и в свежий
+    чат уедет пересказ мёртвого разговора.
+    """
+    from app.agent import Agent
+
+    _stub.install(reply=_folding_aware)
+    path = _temp_db("summary-restart")
+    store = Store(path).init()
+    spec = AgentSpec(label="сжатый", model="stub/model", keep_last=KEEP, compress_every=EVERY)
+    agent = Agent(spec, store=store)
+    for i in range(9):
+        asyncio.run(drain(agent.ask(f"вопрос {i}")))
+    before = [(s["upto"], s["content"]) for s in agent.summaries]
+    agent_id = agent.id
+    assert len(before) == 1 and before[0][0] == 10, before
+    store.close()
+
+    # Настоящее переоткрытие файла, а не тот же объект в памяти.
+    again = Store(path).init()
+    try:
+        revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
+        after = [(s["upto"], s["content"]) for s in revived.summaries]
+        assert after == before, (before, after)
+        # Конфиг сжатия поднялся вместе со сводкой — иначе она бы не работала.
+        assert revived.spec.keep_last == KEEP, revived.spec.keep_last
+        assert len(revived.history) == 18, len(revived.history)
+        assert [r[0] for r in again.message_rows(agent_id)] == list(range(18)), "дыры в seq"
+        assert revived.history[0].content == "вопрос 0", revived.history[0]
+
+        # Сводки нет среди реплик: она в своей таблице, а не в ленте.
+        contents = [r[2] for r in again.message_rows(agent_id)]
+        assert not any("СВОДКА" in c for c in contents), contents
+        assert revived.build_prompt("ещё")[0]["content"].count("СВОДКА") == 1, "сводка не подставилась"
+
+        # И обмен после перезапуска её не стирает: `save_history` переписывает
+        # `messages` целиком, а `summaries` не трогает вовсе.
+        asyncio.run(drain(revived.ask("вопрос после перезапуска")))
+        assert [(s["upto"], s["content"]) for s in again.load_summaries(agent_id)] == before, (
+            "обмен после перезапуска затёр сводку"
+        )
+        assert len(revived.history) == 20, len(revived.history)
+
+        # Чистка чата уносит и сводку: каскада в схеме нет.
+        revived.forget()
+        assert again.load_summaries(agent_id) == [], again.load_summaries(agent_id)
+        assert again.message_rows(agent_id) == [], again.message_rows(agent_id)
+
+        # И в памяти объекта тоже, а не только в файле. `summary_cover` зажат
+        # длиной истории: оставь сводку в памяти — и на первых же репликах
+        # нового разговора она снова стала бы действующей, накрыв собой его
+        # начало. Поэтому смотрим не на пустую таблицу, а на отросшую заново
+        # историю: она обязана уехать в модель целиком.
+        for i in range(2):
+            asyncio.run(drain(revived.ask(f"новый вопрос {i}")))
+        assert revived.summaries == [], revived.summaries
+        assert revived.summary_cover() == 0, revived.summary_cover()
+        fresh_prompt = revived.build_prompt("ещё")
+        assert len(fresh_prompt) == 5, len(fresh_prompt)
+        assert fresh_prompt[0]["content"] == "новый вопрос 0", fresh_prompt[0]
+
+        # Удаление чата — второй такой путь. Сводку удалённого чата
+        # унаследовал бы чат с тем же id: номера идут по возрастанию,
+        # а после очистки базы начинаются заново.
+        doomed = Agent(spec, store=again)
+        for i in range(9):
+            asyncio.run(drain(doomed.ask(f"вопрос {i}")))
+        assert again.load_summaries(doomed.id), "сводка не записалась — проверять нечего"
+        again.delete_session(doomed.id)
+        assert again.load_summaries(doomed.id) == [], (
+            "удаление чата оставило его сводку в базе"
+        )
+
+        # Очистка базы — третий. `clear()` стирает и счётчик имён, поэтому
+        # следующий чат получит тот же id, что и стёртый.
+        kept = Agent(spec, store=again)
+        for i in range(9):
+            asyncio.run(drain(kept.ask(f"вопрос {i}")))
+        assert again.load_summaries(kept.id), "сводка не записалась — проверять нечего"
+        again.clear()
+        assert again.load_summaries(kept.id) == [], "очистка базы оставила сводку"
+    finally:
+        again.close()
+    return f"сводка на {before[0][0]} реплик пережила перезапуск и обмен после него; forget(), удаление чата и очистка базы её уносят"
+
+
+@check("токены вызова на сжатие попадают в итог по чату")
+def check_compression_tokens_counted():
+    """Вызов на сжатие тоже уехал в модель и тоже оплачен. Экономия, не
+    вычитающая его стоимость, — враньё, поэтому сводка входит в `usage_total`
+    отдельным слагаемым: в истории её нет, и сама собой она туда не попадёт.
+
+    Числа сжатия здесь заведомо больше всех остальных вместе взятых: потеряйся
+    они, сумма разошлась бы на порядок, а не на округление.
+    """
+    folding_calls: set = set()
+
+    def reply(messages, index):
+        if _is_folding(messages):
+            folding_calls.add(index)
+            return f"СВОДКА {index}"
+        return f"ответ {index}"
+
+    def usage(index):
+        if index in folding_calls:
+            return _usage(50000, 400, 50400, 0.05)
+        return _usage(1, 1, 2, 0.000001)
+
+    _stub.install(reply=reply, usage=usage)
+    with TestClient(main.app) as client:
+        agent_id = new_agent(client, keep_last=KEEP, compress_every=EVERY)
+        for i in range(9):
+            client.post(f"/api/agents/{agent_id}/messages", json={"text": f"вопрос {i}"})
+        body = client.get(f"/api/agents/{agent_id}").json()
+
+    assert len(folding_calls) == 1, folding_calls
+    total = body["usage_total"]
+    assert total["prompt_tokens"] == 9 * 1 + 50000, total
+    assert total["completion_tokens"] == 9 * 1 + 400, total
+    assert total["total_tokens"] == 9 * 2 + 50400, total
+    assert round(total["cost_usd"], 8) == round(9 * 0.000001 + 0.05, 8), total
+    # Сжатие — не обмен: карточек в ленте от него не прибавилось.
+    assert body["exchanges"] == 9, body["exchanges"]
+    assert len([t for t in body["transcript"] if t["role"] == "assistant"]) == 9, "сводка попала в ленту"
+
+    # И тот же счёт из файла базы: метрики сжатия лежат в `summaries`.
+    agent = REGISTRY.require(agent_id)
+    assert agent.summaries[0]["metrics"]["total_tokens"] == 50400, agent.summaries[0]["metrics"]
+    return (
+        f"итог {total['total_tokens']} токенов = {9 * 2} за девять обменов "
+        f"плюс 50400 за сжатие; обменов по-прежнему {body['exchanges']}"
+    )
 
 
 # --- Панель и тело запроса ----------------------------------------------------
@@ -926,6 +1351,13 @@ def check_no_key_in_db():
         )
         agent.remember("user", f"вот мой ключ {key}")
         agent.remember("assistant", "не надо мне его слать", error=f"HTTP 401: {key}")
+        # Сводку пишет модель, и ключ из реплики попадёт в пересказ так же
+        # легко, как в саму реплику: таблица новая, а обещание то же.
+        store.save_summaries(
+            agent.id,
+            [{"upto": 2, "content": f"пересказ, в котором засветился {key}",
+              "metrics": {"заметка": key}}],
+        )
 
         # А это — про колонки, которых ещё нет: любая запись идёт через
         # транзакцию, и параметр чистится независимо от того, вспомнил ли
@@ -935,7 +1367,7 @@ def check_no_key_in_db():
             conn.execute("INSERT INTO meta (key, value) VALUES ('ловушка', ?)", (key,))
 
         leaked = []
-        for table in ("sessions", "messages", "meta"):
+        for table in ("sessions", "messages", "meta", "summaries"):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 for name in row.keys():
                     if isinstance(row[name], str) and key in row[name]:
@@ -1019,8 +1451,13 @@ def check_every_write_path_redacts():
                 "INSERT INTO messages (session_id, seq, role, content, at) VALUES (?, ?, ?, ?, 0)",
                 [("s", 0, "user", key), ("s", 1, "assistant", key)],
             )
+            conn.executemany(
+                "INSERT INTO summaries (session_id, seq, upto, content, at) "
+                "VALUES (?, ?, ?, ?, 0)",
+                [("s", 0, 2, key)],
+            )
         leaked = []
-        for table in ("sessions", "messages", "meta"):
+        for table in ("sessions", "messages", "meta", "summaries"):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 for column in row.keys():
                     if isinstance(row[column], str) and key in row[column]:

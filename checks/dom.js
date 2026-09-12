@@ -456,6 +456,10 @@ function buildServer(options) {
     "repetition_penalty", "presence_penalty", "frequency_penalty",
   ];
 
+  // Управление контекстом едет наружу тем же путём, что и сэмплирование:
+  // панель обязана отличать пустое окно памяти («сжатия нет») от нуля.
+  const CONTEXT = ["keep_last", "compress_every"];
+
   const blank = (id, label) => ({
     id,
     label,
@@ -470,6 +474,7 @@ function buildServer(options) {
     usage_total: null,
     exchanges: 0,
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
+    ...Object.fromEntries(CONTEXT.map((n) => [n, null])),
   });
 
   // Счётчик, как на сервере: только растёт и номера не переиспользует.
@@ -515,6 +520,7 @@ function buildServer(options) {
     const out = { model: agent.model, system: agent.system,
                   stop: agent.stop, response_format: agent.response_format };
     SAMPLING.forEach((n) => { out[n] = agent[n]; });
+    CONTEXT.forEach((n) => { out[n] = agent[n]; });
     return out;
   };
 

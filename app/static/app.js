@@ -603,7 +603,15 @@ function usageLine(turn) {
   if (!m) return null;
 
   const tokens = [];
-  if (has(m.prompt_tokens)) tokens.push("входные токены " + fmt.tokens(m.prompt_tokens));
+  if (has(m.prompt_tokens)) {
+    // Сколько реплик уехало сводкой вместо себя — приписано ровно к тому
+    // числу, которое сводка уменьшила. Отдельной плитки у сжатия нет
+    // намеренно: плитки про весь диалог, а свернулось — в этом обмене.
+    const folded = m.summarized
+      ? " (сводка вместо " + fmt.tokens(m.summarized) + " реплик)"
+      : "";
+    tokens.push("входные токены " + fmt.tokens(m.prompt_tokens) + folded);
+  }
   if (has(m.completion_tokens)) {
     // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
     // думающей модели выход заметно больше видимого текста. Поэтому они
@@ -884,8 +892,17 @@ const NUMBER_FIELDS = [
   "repetition_penalty", "presence_penalty", "frequency_penalty",
 ];
 
+// Управление контекстом — не параметры сэмплирования: в тело запроса они не
+// уезжают ни одним ключом и по `supported_parameters` модели не проверяются.
+// Сжатие наше, а не провайдерское. Отдельным списком именно поэтому: попади
+// они в PROVIDER_PARAMS, панель ругалась бы, что модель их не заявляет.
+const CONTEXT_FIELDS = ["keep_last", "compress_every"];
+
+// Все числовые поля панели: и те, что уезжают в модель, и те, что про память.
+const PANEL_NUMBERS = [...NUMBER_FIELDS, ...CONTEXT_FIELDS];
+
 function fillPanel(agent) {
-  NUMBER_FIELDS.forEach((name) => {
+  PANEL_NUMBERS.forEach((name) => {
     const el = $("#f-" + name);
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
@@ -1095,7 +1112,7 @@ function readPanel() {
       $("#f-response_format").value
     ),
   };
-  NUMBER_FIELDS.forEach((name) => { patch[name] = readNumber(name); });
+  PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
   return patch;
 }
 
