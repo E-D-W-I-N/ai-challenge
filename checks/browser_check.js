@@ -689,18 +689,32 @@ async function routeChecks() {
   //
   // Процентов в строке нет намеренно — сворачивание это один вызов, доли
   // выполнения у него не существует, и полоса называла бы выдуманное число.
+  //
+  // Сворачивается **второй** обмен, а не первый: у сжатого обмена в промпте
+  // есть хвост истории, и в нём — ответ модели. Сверни первый, и подпись
+  // «ответ модели» не исполнилась бы ни разу, а показ обязан различать, где
+  // чей голос.
   const SUMMARY = "[пересказ начала разговора, свёрнуто сообщений: 4]\nговорили про сжатие";
+  const OTHER_SUMMARY = "[пересказ начала разговора, свёрнуто сообщений: 6]\nсводка упавшего обмена";
   {
     const { client, $, settle, Evt } = freshClient({
       delay: 60,
-      // Сворачивается только первый обмен: второй нужен рядом, чтобы было
-      // видно, что кнопка появляется не у каждого ответа.
-      folding: (i) => (i === 0 ? { summary: SUMMARY, covered: 0 } : null),
+      // Первый обмен обычный — он же станет хвостом промпта второго. Третий
+      // сворачивается тоже, но падает: его промпт не должен достаться никому.
+      folding: (i) => (i === 0 ? null : { summary: i === 1 ? SUMMARY : OTHER_SUMMARY, covered: 0 }),
+      fail: (i) => (i === 2 ? { message: "HTTP 502: провайдер не ответил" } : null),
     });
     client.init();
     await settle(40);
 
     $("#input").value = "первый вопрос";
+    $("#composer").requestSubmit();
+    await settle(400);
+    check("обмен без сворачивания строки состояния не показывает",
+      !$("#feed").querySelector(".card-status"),
+      "строка состояния появилась: " + usageText($("#feed"), ".card-status"));
+
+    $("#input").value = "второй вопрос";
     $("#composer").requestSubmit();
     await settle(90);          // пришёл кадр о сворачивании, ответ ещё не пошёл
     const status = $("#feed").querySelector(".card-status");
@@ -722,14 +736,24 @@ async function routeChecks() {
       Boolean($("#feed").querySelector(".card.busy")), "карточка уже не в стриме");
 
     await settle(400);         // обмен дошёл до конца, лента перерисована
-    const card = $("#feed").querySelectorAll(".card")[0];
     check("после сжатого обмена строки состояния не осталось",
       !$("#feed").querySelector(".card-status"), "строка состояния осталась в ленте");
 
-    // ── у сжатого обмена есть кнопка, и по ней виден промпт ──
+    // ── кнопка есть у сжатого обмена и нет у обмена без сводки ──
+    const titles = (node) => node.querySelectorAll(".icon-btn").map((b) => b.title);
+    let cards = $("#feed").querySelectorAll(".card");
+    check("у обмена без сводки кнопки промпта нет",
+      cards[0] && !titles(cards[0]).includes("Показать промпт запроса"),
+      cards[0] && JSON.stringify(titles(cards[0])));
+
+    const card = cards[1];
     cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
     const view = card.querySelector(".prompt-view");
-    check("по кнопке показан промпт запроса", Boolean(view), "промпта в карточке нет");
+    check("по кнопке показан промпт запроса — над ответом, а не под ним",
+      Boolean(view) &&
+        JSON.stringify(card.children.map((c) => c.className)) ===
+          JSON.stringify(["card-head", "prompt-view", "card-body md", "card-usage"]),
+      JSON.stringify(card.children.map((c) => c.className)));
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
     const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
     check("в промпте виден системный промпт",
@@ -739,11 +763,15 @@ async function routeChecks() {
       roles.includes("сводка начала разговора") && texts.includes(SUMMARY),
       JSON.stringify(roles) + " " + JSON.stringify(texts));
     check("в промпте видно сообщение пользователя",
-      roles.includes("сообщение пользователя") && texts.includes("первый вопрос"),
+      roles.includes("сообщение пользователя") && texts.includes("второй вопрос"),
       JSON.stringify(roles) + " " + JSON.stringify(texts));
-    check("роли идут в том порядке, в каком уехали: промпт, сводка, вопрос",
-      JSON.stringify(roles) === JSON.stringify(
-        ["системный промпт", "сводка начала разговора", "сообщение пользователя"]),
+    // Хвост истории уехал как есть, и чей голос где — видно: вопрос
+    // пользователя и ответ модели подписаны по-разному.
+    check("роли идут в том порядке, в каком уехали: промпт, сводка, хвост, вопрос",
+      JSON.stringify(roles) === JSON.stringify([
+        "системный промпт", "сводка начала разговора",
+        "сообщение пользователя", "ответ модели", "сообщение пользователя",
+      ]),
       JSON.stringify(roles));
 
     // Второй клик возвращает карточку как было — как у «сырого текста».
@@ -754,20 +782,55 @@ async function routeChecks() {
       card.querySelector(".card-body").textContent.includes("ответ модели"),
       card.querySelector(".card-body").textContent);
 
-    // ── а у обмена без сводки кнопки нет вовсе ──
-    $("#input").value = "второй вопрос";
+    // ── упавший обмен не отдаёт свой промпт чужой карточке ──
+    //
+    // Обмен, не доехавший до истории, её не удлиняет — а кадр `start` у него
+    // уехал, со своим промптом и своей сводкой. Привяжи его по длине истории,
+    // и он лёг бы под ключ **прошлого** ответа: кнопка под давней карточкой
+    // показала бы чужой запрос, внутри которого лежит сам этот ответ.
+    $("#input").value = "упавший вопрос";
     $("#composer").requestSubmit();
     await settle(400);
-    const cards = $("#feed").querySelectorAll(".card");
-    const titles = (node) => node.querySelectorAll(".icon-btn").map((b) => b.title);
-    check("кнопка промпта осталась у сжатого обмена",
-      cards[0] && titles(cards[0]).includes("Показать промпт запроса"),
+    cards = $("#feed").querySelectorAll(".card");
+    check("упавший обмен карточки в ленте не оставил", cards.length === 2, String(cards.length));
+    check("и кнопки промпта обмену без сводки не принёс",
+      cards[0] && !titles(cards[0]).includes("Показать промпт запроса"),
       cards[0] && JSON.stringify(titles(cards[0])));
-    check("а у обмена без сводки её нет",
-      cards[1] && !titles(cards[1]).includes("Показать промпт запроса"),
-      cards[1] && JSON.stringify(titles(cards[1])));
-    check("и строка состояния над несжатым обменом не появлялась",
-      !$("#feed").querySelector(".card-status"), "строка состояния есть");
+    cardButton(cards[1], "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const after = cards[1].querySelector(".prompt-view");
+    const shown = after ? after.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("а у сжатого обмена под кнопкой остался его собственный промпт",
+      shown.includes(SUMMARY) && shown.includes("второй вопрос") &&
+        !shown.includes(OTHER_SUMMARY) && !shown.includes("упавший вопрос"),
+      JSON.stringify(shown));
+  }
+
+  // ── чат без системного промпта: сводка встаёт первым сообщением ──
+  //
+  // `system` по умолчанию пуст, и такой чат — самый обычный: сводка в его
+  // промпте стоит нулевым сообщением, а `summary_at` равен нулю. Ноль —
+  // не «сводки нет», и кнопка обязана быть на месте.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "без системного", system: "" }],
+      folding: { summary: SUMMARY, covered: 0 },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "вопрос без системного";
+    $("#composer").requestSubmit();
+    await settle(150);
+
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    check("без системного промпта сводка стоит первой, и кнопка на месте",
+      JSON.stringify(roles) ===
+        JSON.stringify(["сводка начала разговора", "сообщение пользователя"]),
+      JSON.stringify(roles));
   }
 
   // ── без сворачивания карточка молчит и кнопки не заводит ──
