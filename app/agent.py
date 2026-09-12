@@ -340,6 +340,43 @@ class Agent:
         messages.append({"role": "user", "content": user_text})
         return messages
 
+    def summary_slot(self, spec: AgentSpec | None = None) -> int | None:
+        """Каким по счёту сообщением промпта встала сводка — или `None`, если
+        её там нет вовсе.
+
+        Живёт рядом с `build_prompt`, потому что знает ровно одно: в каком
+        порядке та складывает промпт. Нужно это снаружи — событие `start`
+        отдаёт число клиенту, и тот показывает промпт с подписанными ролями,
+        не разбирая текст сообщений и не повторяя у себя порядок сборки.
+        """
+        spec = spec if spec is not None else self.spec
+        if not self.summary_cover(spec):
+            return None
+        return 1 if spec.system else 0
+
+    def compress_plan(self, spec: AgentSpec) -> tuple[int, int] | None:
+        """Что предстоит свернуть этим обменом: `(свёрнуто, новая граница)` —
+        или `None`, если порог не набран и сворачивания не будет.
+
+        Отдельно от самого сворачивания, потому что спросить надо **до** него:
+        вызов на сжатие идёт к модели и длится неизвестно сколько, а клиент
+        всё это время смотрит в пустую карточку. Событие `compressing` шлётся
+        по этому же ответу — значит, «сейчас свернём» и «свернули» решаются
+        одним кодом и разойтись не могут: обещание строки состояния держится
+        не совпадением двух условий, а тем, что условие одно.
+        """
+        keep, every = spec.keep_last, spec.compress_every
+        if keep is None or every is None or keep < 0 or every <= 0:
+            return None
+        covered = self.summary_cover(spec)
+        # Граница не рвёт пару: история идёт парами «вопрос — ответ», обе
+        # реплики пишутся разом, и свёрнутый вопрос без своего ответа сделал бы
+        # хвост бессмысленным. Округляем вниз до чётного.
+        border = ((len(self.history) - keep) // 2) * 2
+        if border - covered < every:
+            return None
+        return covered, border
+
     async def compress(self, spec: AgentSpec, context_length: int | None = None) -> None:
         """Сворачивает начало истории в сводку, если несвёрнутого накопилось
         больше порога. Зовётся из `ask` **до** сборки промпта: обмен, который
@@ -350,16 +387,10 @@ class Agent:
         промпта. Не удалось сжатие (ошибка, пустой ответ) — история не режется:
         обмен просто уедет полным.
         """
-        keep, every = spec.keep_last, spec.compress_every
-        if keep is None or every is None or keep < 0 or every <= 0:
+        plan = self.compress_plan(spec)
+        if plan is None:
             return
-        covered = self.summary_cover(spec)
-        # Граница не рвёт пару: история идёт парами «вопрос — ответ», обе
-        # реплики пишутся разом, и свёрнутый вопрос без своего ответа сделал бы
-        # хвост бессмысленным. Округляем вниз до чётного.
-        border = ((len(self.history) - keep) // 2) * 2
-        if border - covered < every:
-            return
+        covered, border = plan
         chunk = self.history[covered:border]
         if not chunk:
             return
@@ -530,7 +561,9 @@ class Agent:
     async def ask(self, user_text: str) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
-        События: `start`, `reasoning`, `delta`, `metrics`, `error`, `done`.
+        События: `compressing`, `start`, `reasoning`, `delta`, `metrics`,
+        `error`, `done`. Первое приходит, только если этот обмен сворачивает
+        начало разговора, и раньше всех остальных: оно про паузу **до** ответа.
 
         История не трогается до конца обмена — откат получается по построению:
 
@@ -562,12 +595,30 @@ class Agent:
             # Сворачиваем лениво и **до** сборки промпта: этот же обмен уедет
             # сжатым, и экономия видна во входных токенах его собственного
             # ответа, а не следующего.
+            #
+            # Но сначала — событие о том, что сворачивание будет: вызов на
+            # сжатие идёт к модели раньше самого ответа, и без этого события
+            # клиент узнал бы о паузе только когда она уже кончилась. Шлём
+            # ровно тогда, когда порог набран: «сворачиваю» на каждом обмене
+            # было бы враньём, а строка состояния, мигающая без повода, —
+            # шумом.
+            if self.compress_plan(spec) is not None:
+                yield {"type": "compressing"}
             await self.compress(spec, context_length)
             covered = self.summary_cover(spec)
 
             prompt = self.build_prompt(user_text, spec=spec)
 
-            yield {"type": "start", "resolved_messages": prompt, "question": user_text}
+            # `summary_at` — место сводки в промпте, `None` — сводки в нём нет.
+            # Сам промпт клиент и так получает; без этого числа он различал бы
+            # сводку разбором текста, то есть повторял бы у себя устройство
+            # `build_prompt` и расходился бы с ним молча.
+            yield {
+                "type": "start",
+                "resolved_messages": prompt,
+                "question": user_text,
+                "summary_at": self.summary_slot(spec),
+            }
 
             text = ""
             reasoning = ""

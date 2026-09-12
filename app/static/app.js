@@ -21,7 +21,18 @@ const state = {
   contextStale: false, // модель сменили — прежняя доля окна к новой не относится
   contextPast: false,  // доля окна осталась от прошлого обмена: последний упал
   statusTimer: null,   // таймер, гасящий строку состояния
+  prompts: new Map(),  // промпты сжатых обменов этой вкладки (см. promptKey)
 };
+
+// Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
+//
+// Карта живёт только до перезагрузки страницы, и это не недоделка: промпт —
+// производная истории, которая и так лежит в базе. Записывать его туда значило
+// бы хранить копию разговора в каждой строке — и хранить её устаревшей, потому
+// что сводка со следующим сворачиванием меняется. Обновил страницу — кнопки
+// у старых ответов нет, и это честнее, чем показать промпт, собранный заново
+// и не тот, что уехал.
+const promptKey = (agentId, index) => agentId + ":" + index;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -50,6 +61,7 @@ const ICONS = {
   clock: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
   pencil: "M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z",
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
+  lines: "M4 6h16M4 10h16M4 14h12M4 18h7",
 };
 
 // Узел одной строкой: тег, класс, текст. Текст ставится через textContent,
@@ -467,6 +479,10 @@ function askDelete(agent) {
         return;
       }
       if (state.current && state.current.id === agent.id) state.current = null;
+      // Чата нет — и промптам его обменов держаться не за что.
+      [...state.prompts.keys()]
+        .filter((key) => key.startsWith(agent.id + ":"))
+        .forEach((key) => state.prompts.delete(key));
       await loadAgents();
     }
   );
@@ -534,8 +550,12 @@ function renderFeed(agent) {
     return;
   }
 
-  turns.forEach((turn) => {
-    feed.appendChild(turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn));
+  turns.forEach((turn, index) => {
+    // Номер реплики в истории — он же ключ промпта: карточка обязана показать
+    // промпт своего обмена, а не соседнего.
+    feed.appendChild(
+      turn.role === "user" ? userBubble(turn.content) : answerCard(agent, turn, index)
+    );
   });
   feed.scrollTop = keep === null ? feed.scrollHeight : keep;
 }
@@ -555,7 +575,7 @@ function cardHead(modelName) {
   return head;
 }
 
-function answerCard(agent, turn) {
+function answerCard(agent, turn, index) {
   const card = el("article", "card" + (turn.error ? " failed" : ""));
   const head = cardHead((turn.metrics && turn.metrics.model) || agent.model);
 
@@ -565,6 +585,16 @@ function answerCard(agent, turn) {
     iconButton("refresh", "Перегенерировать", () => regenerate()),
     iconButton("dots", "Показать сырой текст", () => showRaw(card, turn))
   );
+  // Кнопка появляется только там, где запрос уехал со сводкой: у обычного
+  // обмена в промпте нет ничего, кроме истории, которая и так на экране,
+  // и кнопка под каждым ответом была бы шумом. Промпт берётся из этой же
+  // вкладки — не сохранился, значит и показывать нечего.
+  const prompt = state.prompts.get(promptKey(agent.id, index));
+  if (prompt) {
+    actions.appendChild(
+      iconButton("lines", "Показать промпт запроса", () => showPrompt(card, prompt))
+    );
+  }
   head.appendChild(actions);
   card.appendChild(head);
 
@@ -645,6 +675,16 @@ function usageLine(turn) {
   return box;
 }
 
+// Строка состояния в карточке: что происходит, пока ответа ещё нет.
+// Индикатор неопределённый — крутится, но ничего не отмеряет: сворачивание
+// это один вызов к модели, и доли выполнения у него нет. Полоса с процентами
+// на его месте называла бы числа, которых никто не знает.
+function cardStatus(text) {
+  const row = el("div", "card-status");
+  row.append(el("span", "spinner"), el("span", "card-status-text", text));
+  return row;
+}
+
 function thinkingBlock(text) {
   const box = el("details", "think");
   const summary = document.createElement("summary");
@@ -668,6 +708,45 @@ function showRaw(card, turn) {
     body.textContent = turn.content;
     card.dataset.raw = "1";
   }
+}
+
+// Что уехало в модель этим запросом — целиком и в том же порядке: системный
+// промпт, сводка, непокрытый ею хвост истории и сам вопрос. Переключатель,
+// как «Показать сырой текст»: второй клик убирает показанное и возвращает
+// карточку как была.
+//
+// Роли подписаны, потому что без подписей главное в этом показе теряется:
+// читателю надо видеть, что начало разговора уехало одной сводкой, а не
+// двадцатью сообщениями. Место сводки называет сервер полем `summary_at`
+// события `start` — разбирать текст сообщений и угадывать по нему клиент
+// не вправе: порядок сборки промпта живёт в `Agent.build_prompt`, и вторая
+// его копия здесь разошлась бы с первой молча.
+function promptRole(msg, index, summaryAt) {
+  if (index === summaryAt) return "сводка начала разговора";
+  if (msg.role === "system") return "системный промпт";
+  if (msg.role === "assistant") return "ответ модели";
+  return "сообщение пользователя";
+}
+
+function showPrompt(card, prompt) {
+  const shown = card.querySelector(".prompt-view");
+  if (shown) {
+    shown.remove();
+    card.dataset.prompt = "0";
+    return;
+  }
+  const box = el("div", "prompt-view");
+  box.appendChild(el("div", "prompt-title", "Промпт запроса — что уехало в модель"));
+  prompt.messages.forEach((msg, index) => {
+    const row = el("div", "prompt-msg");
+    row.append(
+      el("div", "prompt-role", promptRole(msg, index, prompt.summaryAt)),
+      el("div", "prompt-text", msg.content)
+    );
+    box.appendChild(row);
+  });
+  card.insertBefore(box, card.querySelector(".card-body"));
+  card.dataset.prompt = "1";
 }
 
 async function copyText(text) {
@@ -794,6 +873,8 @@ async function exchange(path, body, questionText) {
   let reasoning = "";
   let thinking = null;
   let failure = null;
+  let status = null;
+  let prompt = null;
 
   try {
     await streamPost(
@@ -801,6 +882,27 @@ async function exchange(path, body, questionText) {
       body,
       (e) => {
         switch (e.event) {
+          case "compressing":
+            // Сворачивание — отдельный вызов к модели ДО ответа: пауза уже
+            // идёт, и карточка обязана сказать, из-за чего она пустая.
+            // Событие приходит, только когда сворачивание правда будет, —
+            // строке состояния верить можно.
+            if (!status) {
+              status = cardStatus("Сворачиваю начало разговора…");
+              card.insertBefore(status, bodyEl);
+              scrollFeed();
+            }
+            break;
+          case "start":
+            // Промпт собран — значит сворачивание позади и дальше пойдёт
+            // ответ: строке состояния больше нечего показывать.
+            if (status) { status.remove(); status = null; }
+            // Промпт держим, только если в нём есть сводка: у остальных
+            // обменов показывать нечего, кроме истории, которая и так рядом.
+            if (e.resolved_messages && e.summary_at !== null && e.summary_at !== undefined) {
+              prompt = { messages: e.resolved_messages, summaryAt: e.summary_at };
+            }
+            break;
           case "reasoning":
             reasoning += e.text;
             if (!thinking) {
@@ -865,14 +967,21 @@ async function exchange(path, body, questionText) {
 
   // Лента и список слева перерисовываются по серверу: на экране должно быть
   // ровно то, что у агента в истории, а не то, что мы дорисовали по дороге.
-  await refreshCurrent();
+  await refreshCurrent(prompt);
 }
 
-async function refreshCurrent() {
+async function refreshCurrent(prompt) {
   if (!state.current) return;
   try {
     const fresh = await api("/api/agents/" + state.current.id);
     state.current = fresh;
+    // Промпт привязываем к реплике до перерисовки: номер ответа в истории
+    // известен только теперь, а рисовать карточку с кнопкой уже пора.
+    // Обмена не случилось (ответа в истории нет) — привязывать не к чему.
+    const last = fresh.transcript[fresh.transcript.length - 1];
+    if (prompt && last && last.role === "assistant") {
+      state.prompts.set(promptKey(fresh.id, fresh.transcript.length - 1), prompt);
+    }
     const listed = state.agents.find((a) => a.id === fresh.id);
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
