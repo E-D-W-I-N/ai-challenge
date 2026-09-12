@@ -459,15 +459,21 @@ def check_compression_saves_input():
     _stub.install(reply=_folding_aware)
     question = "вопрос {i}: " + "довольно длинный текст вопроса, " * 20
 
+    # События каждого обмена — по ним видно, что наружу сказано про сжатие:
+    # оно идёт **до** ответа, и клиенту надо узнать о паузе, пока она идёт.
+    events: dict[str, list[list[dict]]] = {}
+
     with TestClient(main.app) as client:
         plain = new_agent(client, label="без сжатия")
         folded = new_agent(client, label="со сжатием", keep_last=KEEP, compress_every=EVERY)
+        events = {plain: [], folded: []}
         for i in range(12):
             for agent_id in (plain, folded):
                 response = client.post(
                     f"/api/agents/{agent_id}/messages", json={"text": question.format(i=i)}
                 )
                 assert response.status_code == 200, response.text
+                events[agent_id].append(sse(response.text))
         totals = {
             agent_id: client.get(f"/api/agents/{agent_id}").json()
             for agent_id in (plain, folded)
@@ -490,6 +496,15 @@ def check_compression_saves_input():
 
     # И ничего не потеряно: выброшенное покрыто сводкой ровно по границе.
     agent = REGISTRY.require(folded)
+    # Системный промпт сдвигает сводку на одно место — и `summary_at` едет
+    # вместе с ней: число считается тем же знанием о порядке, что и сборка.
+    with_system = agent_module.copy_spec(agent.spec)
+    with_system.system = "ты бот"
+    slot = agent.summary_slot(with_system)
+    shifted = agent.build_prompt("ещё", spec=with_system)
+    assert slot == 1, slot
+    assert "пересказ начала разговора" in shifted[slot]["content"], shifted[slot]
+
     covered = agent.summary_cover()
     assert covered == 10, covered
     assert covered + (len(folded_in) - 2) == len(agent.history) - 2, (covered, len(folded_in))
@@ -511,6 +526,38 @@ def check_compression_saves_input():
     assert folding_body.get("usage") == {"include": True}, (
         f"вызов на сжатие ушёл без просьбы о usage — его токены было бы не посчитать: "
         f"{folding_body.get('usage')!r}"
+    )
+
+    # Про сворачивание сказано наружу — и ровно тогда, когда оно случилось.
+    # Событие нужно **до** вызова на сжатие: он идёт к модели раньше ответа,
+    # и карточка, узнавшая о паузе после неё, показала бы строку состояния
+    # на пустом месте. «Сворачиваю» на каждом обмене было бы враньём — порог
+    # не набран, сворачивания нет, и события тоже нет.
+    def kinds(items):
+        return [[e["event"] for e in one] for one in items]
+
+    folding_at = [i for i, one in enumerate(kinds(events[folded])) if "compressing" in one]
+    assert folding_at == [8], f"о сворачивании сказано на обменах {folding_at}, а свернулось на 8-м"
+    assert not any("compressing" in one for one in kinds(events[plain])), (
+        "чат без сжатия получил событие о сворачивании"
+    )
+    ninth = kinds(events[folded])[8]
+    assert ninth.index("compressing") < ninth.index("start"), (
+        f"о сворачивании сказано после промпта, а не до вызова: {ninth}"
+    )
+
+    # И сводку в промпте клиенту показывает сервер, а не разбор текста:
+    # `summary_at` — её место в `resolved_messages`. Порядок сборки промпта
+    # живёт в `build_prompt`, и вторая его копия в браузере разошлась бы молча.
+    def start_of(agent_id, index):
+        return next(e for e in events[agent_id][index] if e["event"] == "start")
+
+    assert start_of(folded, 7)["summary_at"] is None, "сводка объявилась раньше сворачивания"
+    assert start_of(plain, 11)["summary_at"] is None, "в чате без сжатия нашлась сводка"
+    last = start_of(folded, 11)
+    assert last["summary_at"] == 0, last["summary_at"]
+    assert "пересказ начала разговора" in last["resolved_messages"][last["summary_at"]]["content"], (
+        f"summary_at показывает не на сводку: {last['resolved_messages'][last['summary_at']]}"
     )
 
     # Итог по чату — со стоимостью сжатия внутри, и всё равно меньше.

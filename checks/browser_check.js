@@ -679,6 +679,120 @@ async function routeChecks() {
     check("и доля окна из прошлого чата не протекла",
       tileOf($, "Контекст").v === "—", tileOf($, "Контекст").v);
   }
+
+  // ── пока сворачивается начало разговора, карточка об этом говорит ──
+  //
+  // Сжатие — отдельный вызов к модели ДО ответа: карточка стоит пустой,
+  // и без строки состояния пауза выглядит зависанием. Кадры стенд подаёт
+  // с задержкой, поэтому смотрим не только итог, но и середину потока:
+  // строка обязана быть видна до ответа и уйти, как только он пошёл.
+  //
+  // Процентов в строке нет намеренно — сворачивание это один вызов, доли
+  // выполнения у него не существует, и полоса называла бы выдуманное число.
+  const SUMMARY = "[пересказ начала разговора, свёрнуто сообщений: 4]\nговорили про сжатие";
+  {
+    const { client, $, settle, Evt } = freshClient({
+      delay: 60,
+      // Сворачивается только первый обмен: второй нужен рядом, чтобы было
+      // видно, что кнопка появляется не у каждого ответа.
+      folding: (i) => (i === 0 ? { summary: SUMMARY, covered: 0 } : null),
+    });
+    client.init();
+    await settle(40);
+
+    $("#input").value = "первый вопрос";
+    $("#composer").requestSubmit();
+    await settle(90);          // пришёл кадр о сворачивании, ответ ещё не пошёл
+    const status = $("#feed").querySelector(".card-status");
+    check("пока идёт сворачивание, карточка говорит об этом",
+      Boolean(status), "строки состояния в карточке нет");
+    check("строка состояния называет, что происходит",
+      Boolean(status) && status.textContent.includes("Сворачиваю начало разговора"),
+      status && status.textContent);
+    check("и показывает неопределённый индикатор, а не долю выполнения",
+      Boolean(status) && Boolean(status.querySelector(".spinner")) &&
+        !/%/.test(status.textContent),
+      status && status.textContent);
+
+    await settle(70);          // пришёл кадр start: сворачивание позади
+    check("ответ пошёл — строка состояния ушла",
+      !$("#feed").querySelector(".card-status"),
+      "строка осталась: " + usageText($("#feed"), ".card-status"));
+    check("а ответ в это время ещё стримится",
+      Boolean($("#feed").querySelector(".card.busy")), "карточка уже не в стриме");
+
+    await settle(400);         // обмен дошёл до конца, лента перерисована
+    const card = $("#feed").querySelectorAll(".card")[0];
+    check("после сжатого обмена строки состояния не осталось",
+      !$("#feed").querySelector(".card-status"), "строка состояния осталась в ленте");
+
+    // ── у сжатого обмена есть кнопка, и по ней виден промпт ──
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    check("по кнопке показан промпт запроса", Boolean(view), "промпта в карточке нет");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("в промпте виден системный промпт",
+      roles.includes("системный промпт") && texts.includes("СТАРЫЙ ПРОМПТ"),
+      JSON.stringify(roles) + " " + JSON.stringify(texts));
+    check("в промпте видна сводка — и подписана сводкой",
+      roles.includes("сводка начала разговора") && texts.includes(SUMMARY),
+      JSON.stringify(roles) + " " + JSON.stringify(texts));
+    check("в промпте видно сообщение пользователя",
+      roles.includes("сообщение пользователя") && texts.includes("первый вопрос"),
+      JSON.stringify(roles) + " " + JSON.stringify(texts));
+    check("роли идут в том порядке, в каком уехали: промпт, сводка, вопрос",
+      JSON.stringify(roles) === JSON.stringify(
+        ["системный промпт", "сводка начала разговора", "сообщение пользователя"]),
+      JSON.stringify(roles));
+
+    // Второй клик возвращает карточку как было — как у «сырого текста».
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    check("второй клик убирает промпт",
+      !card.querySelector(".prompt-view"), "промпт остался на экране");
+    check("и ответ на месте",
+      card.querySelector(".card-body").textContent.includes("ответ модели"),
+      card.querySelector(".card-body").textContent);
+
+    // ── а у обмена без сводки кнопки нет вовсе ──
+    $("#input").value = "второй вопрос";
+    $("#composer").requestSubmit();
+    await settle(400);
+    const cards = $("#feed").querySelectorAll(".card");
+    const titles = (node) => node.querySelectorAll(".icon-btn").map((b) => b.title);
+    check("кнопка промпта осталась у сжатого обмена",
+      cards[0] && titles(cards[0]).includes("Показать промпт запроса"),
+      cards[0] && JSON.stringify(titles(cards[0])));
+    check("а у обмена без сводки её нет",
+      cards[1] && !titles(cards[1]).includes("Показать промпт запроса"),
+      cards[1] && JSON.stringify(titles(cards[1])));
+    check("и строка состояния над несжатым обменом не появлялась",
+      !$("#feed").querySelector(".card-status"), "строка состояния есть");
+  }
+
+  // ── без сворачивания карточка молчит и кнопки не заводит ──
+  //
+  // Обратная половина: событие о сворачивании приходит не на каждом обмене,
+  // и строка состояния, мигающая без повода, была бы шумом — а кнопка,
+  // показывающая промпт без сводки, показывала бы ту же историю, что уже
+  // лежит в ленте.
+  {
+    const { client, $, settle } = freshClient({ delay: 60 });
+    client.init();
+    await settle(40);
+    $("#input").value = "вопрос без сжатия";
+    $("#composer").requestSubmit();
+    await settle(90);
+    check("без сворачивания строки состояния нет",
+      !$("#feed").querySelector(".card-status"),
+      "строка состояния появилась: " + usageText($("#feed"), ".card-status"));
+    await settle(400);
+    const card = $("#feed").querySelector(".card");
+    check("и кнопки промпта у такого обмена нет",
+      card && !card.querySelectorAll(".icon-btn").map((b) => b.title)
+        .includes("Показать промпт запроса"),
+      card && JSON.stringify(card.querySelectorAll(".icon-btn").map((b) => b.title)));
+  }
 }
 
 // ── итог ──
