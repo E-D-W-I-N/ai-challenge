@@ -445,6 +445,12 @@ function buildServer(options) {
     // вправе оборваться на ошибке, и тогда перерисовать плитки некому, кроме
     // самой ветки ошибки.
     fail: (options && options.fail) || null,
+    // Сворачивание начала разговора: словарь или функция (номер обмена) →
+    // null | `{summary, covered}`. Задано — обмен идёт так, как на сервере
+    // идёт сжатый: сперва кадр `compressing` (вызов на сжатие уже пошёл,
+    // ответа ещё нет), потом `start` с промптом, где вместо свёрнутого начала
+    // стоит сводка.
+    folding: (options && options.folding) || null,
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -529,12 +535,36 @@ function buildServer(options) {
     json: async () => JSON.parse(JSON.stringify(data)),
   });
 
+  // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
+  // сводка вместо свёрнутого начала, непокрытый ею хвост истории, вопрос.
+  // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда:
+  // кнопка просмотра обязана держаться на сводке, а не на наличии промпта.
+  function resolvedPrompt(agent, text, folding) {
+    const messages = [];
+    if (agent.system) messages.push({ role: "system", content: agent.system });
+    const tail = (agent.transcript || []).map((t) => ({ role: t.role, content: t.content }));
+    if (folding) {
+      messages.push({ role: "user", content: folding.summary });
+      tail.splice(0, folding.covered || 0);
+    }
+    messages.push(...tail, { role: "user", content: text });
+    return messages;
+  }
+
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     const index = state.sent.length;
     state.sent.push({ id: agent.id, text, config: config(agent) });
     const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
-    if (failed) return errorStream(agent, text, failed);
+    const folding = typeof state.folding === "function" ? state.folding(index) : state.folding;
+    // Промпт собирается до записи обмена в стенограмму: в модель уехало то,
+    // что было в истории **до** этого вопроса.
+    const resolved = resolvedPrompt(agent, text, folding);
+    // Упавший обмен получает те же кадры до места падения: сервер сворачивает
+    // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
+    // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
+    // раздающий чужие промпты упавших обменов, остался бы зелёным.
+    if (failed) return errorStream(agent, text, failed, folding, resolved);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -550,7 +580,13 @@ function buildServer(options) {
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
-      { event: "start", agent: agent.id },
+      // Место сводки в промпте называет сервер — клиент не разбирает текст.
+      ...(folding ? [{ event: "compressing", agent: agent.id }] : []),
+      {
+        event: "start", agent: agent.id, question: text,
+        resolved_messages: resolved,
+        summary_at: folding ? (agent.system ? 1 : 0) : null,
+      },
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
@@ -561,7 +597,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed) {
+  function errorStream(agent, text, failed, folding, resolved) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -577,7 +613,12 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
-      { event: "start", agent: agent.id },
+      ...(folding ? [{ event: "compressing", agent: agent.id }] : []),
+      {
+        event: "start", agent: agent.id, question: text,
+        resolved_messages: resolved,
+        summary_at: folding ? (agent.system ? 1 : 0) : null,
+      },
       { event: "error", agent: agent.id, message: failed.message, metrics },
       ...(failed.done === false
         ? []
