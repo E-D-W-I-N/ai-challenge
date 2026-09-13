@@ -463,8 +463,10 @@ function buildServer(options) {
   ];
 
   // Управление контекстом едет наружу тем же путём, что и сэмплирование:
-  // панель обязана отличать пустое окно памяти («сжатия нет») от нуля.
-  const CONTEXT = ["keep_last", "compress_every"];
+  // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
+  // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
+  // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
+  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
 
   const blank = (id, label) => ({
     id,
@@ -479,7 +481,7 @@ function buildServer(options) {
     transcript: [],
     usage_total: null,
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
-    ...Object.fromEntries(CONTEXT.map((n) => [n, null])),
+    ...CONTEXT,
   });
 
   // Счётчик, как на сервере: только растёт и номера не переиспользует.
@@ -525,7 +527,7 @@ function buildServer(options) {
     const out = { model: agent.model, system: agent.system,
                   stop: agent.stop, response_format: agent.response_format };
     SAMPLING.forEach((n) => { out[n] = agent[n]; });
-    CONTEXT.forEach((n) => { out[n] = agent[n]; });
+    Object.keys(CONTEXT).forEach((n) => { out[n] = agent[n]; });
     return out;
   };
 

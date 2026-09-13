@@ -174,7 +174,10 @@ const PANEL_ROUTE = [
   ["f-stop", "КОНЕЦ\nСТОП", "stop", ["КОНЕЦ", "СТОП"]],
   // Управление контекстом — тоже поля панели, а не константы в коде: два чата
   // рядом, у одного окно памяти задано, у другого нет, — это и есть сравнение
-  // расхода «до/после», которого просит задание дня.
+  // расхода «до/после», которого просит задание дня. Стратегия — оттуда же:
+  // выбранная в панели, она обязана доехать до запроса тем же путём, что и
+  // числа рядом с ней, иначе переключатель переключал бы только картинку.
+  ["f-strategy", "window", "strategy", "window"],
   ["f-keep_last", "6", "keep_last", 6],
   ["f-compress_every", "10", "compress_every", 10],
 ];
@@ -257,6 +260,34 @@ async function routeChecks() {
         `ушло ${JSON.stringify(sent.config[key])}, ждали ${JSON.stringify(expected)}`
       );
     }
+  }
+
+  // ── переключатель показывает то, что правда случится с историей ──
+  //
+  // Стратегия — выбор из закрытого списка, и пустого значения у него нет.
+  // Чат, записанный сервером другой версии, может принести значение, которого
+  // в списке нет: сервер читает такой конфиг как «не резать», и панель обязана
+  // показать то же самое. Покажи она пустое поле — пользователь увидел бы
+  // выбор, которого не делал, а первая же правка соседнего поля отправила бы
+  // его обратно.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      chats: [
+        { label: "со сводкой", strategy: "summary", keep_last: 6, compress_every: 10 },
+        { label: "из будущего", strategy: "факты" },
+      ],
+    });
+    client.init();
+    await settle(20);
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    open(2);
+    await settle(40);
+    check("панель показывает выбранную стратегию",
+      $("#f-strategy").value === "summary", $("#f-strategy").value);
+    open(3);
+    await settle(40);
+    check("незнакомая стратегия показана как «вся история», а не пустым полем",
+      $("#f-strategy").value === "full", $("#f-strategy").value);
   }
 
   // ── формат ответа: список, а не поле ──
@@ -529,6 +560,36 @@ async function routeChecks() {
       $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
   }
 
+  // ── обмен со скользящим окном говорит, сколько сообщений отброшено ──
+  //
+  // Главное требование дня: обрезка бывает только выбранная — и всегда
+  // названная. Окно теряет начало разговора **совсем**, прочитать его потом
+  // негде, и молчать о нём было бы хуже, чем о сводке. Слово другое, чем у
+  // сводки, потому что и случай другой: та заменила, это отбросило.
+  {
+    const windowed = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 120, completion_tokens: 50, total_tokens: 170,
+                   cost_usd: 0.0001, dropped: 14 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "с окном", transcript: windowed, history_len: windowed.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("под ответом с окном сказано, сколько сообщений отброшено",
+      usageText($("#feed"), ".usage-tokens") ===
+        "входные токены 120 (окно: отброшено 14 сообщений) · выходные токены 50 · всего токенов 170 · $0.000100",
+      usageText($("#feed"), ".usage-tokens"));
+    check("а плиток по-прежнему шесть — у обрезки своей нет",
+      $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
+  }
+
   // ── несжатый обмен об этом молчит ──
   //
   // Пометка появляется только там, где сводка действительно уехала: «сводка
@@ -548,7 +609,7 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
-    check("без сжатия под ответом про сводку ни слова",
+    check("без обрезки под ответом про неё ни слова",
       usageText($("#feed"), ".usage-tokens") ===
         "входные токены 400 · выходные токены 50 · всего токенов 450 · $0.000100",
       usageText($("#feed"), ".usage-tokens"));

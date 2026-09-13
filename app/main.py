@@ -27,7 +27,7 @@ from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
-from .schema import CONTEXT_FIELDS, AgentSpec
+from .schema import CONTEXT_FIELDS, CONTEXT_NUMBERS, STRATEGIES, AgentSpec
 from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -179,6 +179,25 @@ def _optional_field(payload: dict, name: str, types: tuple, hint: str, where: st
     return value
 
 
+def _choice_field(payload: dict, name: str, allowed: tuple, default: str, where: str = ""):
+    """Поле из закрытого списка: чужое значение — 400 с перечислением того,
+    что можно, а не молчаливая подмена умолчанием.
+
+    Отсутствие ключа и присланный `null` дают умолчание, а не пустую строку:
+    у стратегии нет состояния «не выбрана» — она всегда какая-то, и `full`
+    это «ничего с историей не делать», а не «ничего не выбрано».
+    """
+    value = payload.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str) or value not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{where}{name}: одно из {', '.join(allowed)}, а не {value!r}",
+        )
+    return value
+
+
 def _model_field(payload: dict, where: str = "") -> str:
     """id модели: непустая строка. Пусто — 400, а не падение внутри вызова."""
     value = payload.get("model")
@@ -212,14 +231,16 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
 
 
 def _context_fields(payload: dict, where: str = "") -> dict:
-    """Окно памяти и порог сжатия: целые или null, как параметры сэмплирования.
+    """Стратегия, окно памяти и порог сжатия.
 
-    `keep_last = null` значит «сжатия нет» и в модель уезжает вся история —
-    это не то же самое, что `keep_last = 0` («не оставлять как есть ничего»),
-    и разница обязана доезжать до агента целой.
+    Числа разбираются как параметры сэмплирования: `keep_last = null` значит
+    «резать нечем» и в модель уезжает вся история — это не то же самое, что
+    `keep_last = 0` («не оставлять как есть ничего»), и разница обязана
+    доезжать до агента целой. Стратегия — из списка: чужое значение
+    отбрасывается здесь, на границе, чтобы дальше по стеку его не встретить.
     """
-    values: dict = {}
-    for name in CONTEXT_FIELDS:
+    values: dict = {"strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where)}
+    for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
     if values["keep_last"] is not None and values["keep_last"] < 0:
         raise HTTPException(
