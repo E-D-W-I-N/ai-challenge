@@ -742,6 +742,12 @@ def check_compression_saves_input():
     assert ninth.index("compressing") < ninth.index("start"), (
         f"о сворачивании сказано после промпта, а не до вызова: {ninth}"
     )
+    # И **чем** занята пауза, называет сервер, а не догадка клиента: служебных
+    # вызовов два, а кадр один, и без этого поля строка состояния не знала бы,
+    # что писать. Промолчи сервер — клиент не покажет её вовсе, ни фактам,
+    # ни сворачиванию.
+    folding_frame = next(e for e in events[folded][8] if e["event"] == "compressing")
+    assert folding_frame.get("strategy") == "summary", folding_frame
 
     # И сводку в промпте клиенту показывает сервер, а не разбор текста:
     # `summary_at` — её место в `resolved_messages`. Порядок сборки промпта
@@ -756,6 +762,10 @@ def check_compression_saves_input():
     assert "пересказ начала разговора" in last["resolved_messages"][last["summary_at"]]["content"], (
         f"summary_at показывает не на сводку: {last['resolved_messages'][last['summary_at']]}"
     )
+    # Место врезки без её имени неполно: подпись роли в просмотре промпта
+    # берётся из того же поля. Промолчи сервер — сводка перестала бы
+    # называться сводкой.
+    assert last.get("strategy") == "summary", last.get("strategy")
 
     # Итог по чату — со стоимостью сжатия внутри, и всё равно меньше.
     plain_total = totals[plain]["usage_total"]["prompt_tokens"]
@@ -905,6 +915,22 @@ def check_facts_reach_prompt():
         agent = REGISTRY.require(agent_id)
         sent = _stub.CALLS[-1]["messages"]
 
+        # Кадр о служебном вызове приходит до промпта и **называет вызов**:
+        # кадр один на оба рода, и без этого поля клиент не знал бы, что
+        # писать в строке состояния, — молчал бы и про факты, и про
+        # сворачивание. Тем же полем подписана врезка в просмотре промпта.
+        frames = sse(response.text)
+        kinds = [e["event"] for e in frames]
+        assert kinds.index("compressing") < kinds.index("start"), kinds
+        pause = next(e for e in frames if e["event"] == "compressing")
+        assert pause.get("strategy") == "facts", pause
+        start = next(e for e in frames if e["event"] == "start")
+        assert start.get("strategy") == "facts", start.get("strategy")
+        assert start["summary_at"] == 1, start["summary_at"]
+        assert "[факты о разговоре]" in start["resolved_messages"][start["summary_at"]]["content"], (
+            start["resolved_messages"][start["summary_at"]]
+        )
+
         # Вызов на извлечение — на каждом обмене, и он единственный служебный:
         # сжатия у этой стратегии нет вовсе.
         assert len(_service_calls("facts")) == 9, len(_service_calls("facts"))
@@ -931,6 +957,11 @@ def check_facts_reach_prompt():
         cut, insert = agent.context_cut()
         assert insert is not None and "[факты о разговоре]" in insert["content"], insert
         assert cut == 12, cut
+        # Слот врезки — то самое число, что уехало в `start`: промолчи он,
+        # клиент не удержал бы промпт, и кнопка «Показать промпт запроса»
+        # у чата с фактами не появилась бы никогда. А на ней держится слово
+        # «вместо»: замену **видно**, в отличие от отброшенного окном.
+        assert agent.context_slot() == 1, agent.context_slot()
         assert agent.history[-1].metrics["facts"] == 10, agent.history[-1].metrics
         assert "dropped" not in agent.history[-1].metrics, "факты назвались окном"
         assert "summarized" not in agent.history[-1].metrics, "факты назвались сводкой"
@@ -979,6 +1010,7 @@ def check_facts_reach_prompt():
                 "строка без двоеточия\n"
                 "пустое значение:   \n"
                 ": без ключа\n"
+                "срок: апрель\n"
                 "срок: май"
             )
         return "никаких пар здесь нет\nи здесь тоже"
@@ -987,7 +1019,11 @@ def check_facts_reach_prompt():
     tolerant = Agent(AgentSpec(label="разбор", model="stub/model", strategy="facts", keep_last=2))
     asyncio.run(drain(tolerant.ask("первый вопрос")))
     # Кривые строки пропущены, ровные разобраны: заголовок «Вот что я понял:»
-    # ушёл в мусор из-за пустого значения, а не унёс с собой соседей.
+    # ушёл в мусор из-за пустого значения, а не унёс с собой соседей. А из двух
+    # строк про один и тот же ключ победила последняя: список переписывается
+    # целиком, «срок» в нём ровно один, и им обязан оказаться свежий —
+    # договорённости в разговоре меняются, и выписка, оставляющая первое
+    # значение, помнила бы отменённое.
     assert tolerant.facts["items"] == [
         {"key": "цель", "value": "собрать ТЗ"},
         {"key": "срок", "value": "май"},
@@ -1019,6 +1055,32 @@ def check_facts_reach_prompt():
     assert not [e for e in events if e["type"] == "error"], events
     assert tolerant.facts["items"][0] == {"key": "цель", "value": "собрать ТЗ"}, tolerant.facts
     assert len(tolerant.history) == 6, len(tolerant.history)
+
+    # И главное про провал: выписка его пережила, а история за это время
+    # выросла. Срез, считанный по одному хвосту, вырос бы вместе с ней и унёс
+    # реплики, которых выписка **никогда не видела**, — молча и под подписью
+    # «факты вместо N сообщений». Поэтому срез зажат ещё и по `upto`:
+    # срезано ровно то, что выписка прочитала.
+    #
+    # Здесь `upto` равен нулю: единственное удачное извлечение случилось на
+    # первом обмене, когда истории ещё не было вовсе, — и значит резать нечего
+    # при любом `keep_last`.
+    assert tolerant.facts["upto"] == 0, tolerant.facts["upto"]
+    assert tolerant.context_cut() == (0, None), tolerant.context_cut()
+    unread = tolerant.build_prompt("после провалов")
+    assert len(unread) == 7, [m["content"] for m in unread]
+    assert [m["content"] for m in unread][::2] == [
+        "первый вопрос", "второй вопрос", "третий вопрос", "после провалов",
+    ], [m["content"] for m in unread]
+    assert not any("[факты о разговоре]" in m["content"] for m in unread), unread[0]
+
+    # А когда извлечение проходит, срез считается по хвосту, как и просили:
+    # зажим бережёт от молчаливой потери, а не отменяет стратегию.
+    mode["reply"] = "мусор"
+    asyncio.run(drain(tolerant.ask("четвёртый вопрос")))
+    assert tolerant.facts["upto"] == 6, tolerant.facts["upto"]
+    assert tolerant.context_cut()[0] == 6, tolerant.context_cut()[0]
+    assert len(tolerant.history) == 8, len(tolerant.history)
 
     # --- 3. Файл: перезапуск переживают, чистку — нет ------------------------
     def remembering(messages, index):
@@ -1103,9 +1165,10 @@ def check_facts_reach_prompt():
         again.close()
 
     return (
-        f"выписка вместо 10 сообщений и хвост в {KEEP} реплик; извлечение на каждом "
-        "из 9 обменов и инкрементально; кривые строки пропущены, провал обмен не уронил; "
-        "перезапуск факты пережили, три пути очистки — нет"
+        f"выписка вместо 10 сообщений и хвост в {KEEP} реплик, слот врезки назван "
+        "в кадре `start`; извлечение на каждом из 9 обменов и инкрементально; кривые "
+        "строки пропущены, повтор ключа взял последнее значение, провал обмен не уронил "
+        "и не дал срезать непрочитанное; перезапуск факты пережили, три пути очистки — нет"
     )
 
 
