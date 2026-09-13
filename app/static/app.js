@@ -585,10 +585,11 @@ function answerCard(agent, turn, index) {
     iconButton("refresh", "Перегенерировать", () => regenerate()),
     iconButton("dots", "Показать сырой текст", () => showRaw(card, turn))
   );
-  // Кнопка появляется только там, где запрос уехал со сводкой: у обычного
-  // обмена в промпте нет ничего, кроме истории, которая и так на экране,
-  // и кнопка под каждым ответом была бы шумом. Промпт берётся из этой же
-  // вкладки — не сохранился, значит и показывать нечего.
+  // Кнопка появляется только там, где запрос уехал с врезкой — сводкой или
+  // выпиской фактов: у обычного обмена в промпте нет ничего, кроме истории,
+  // которая и так на экране, и кнопка под каждым ответом была бы шумом.
+  // Промпт берётся из этой же вкладки — не сохранился, значит и показывать
+  // нечего.
   const prompt = state.prompts.get(promptKey(agent.id, index));
   if (prompt) {
     actions.appendChild(
@@ -631,8 +632,22 @@ function answerCard(agent, turn, index) {
 function cutNote(m) {
   if (m.summarized) return " (сводка вместо " + fmt.tokens(m.summarized) + " сообщений)";
   if (m.dropped) return " (окно: отброшено " + fmt.tokens(m.dropped) + " сообщений)";
+  if (m.facts) return " (факты вместо " + fmt.tokens(m.facts) + " сообщений)";
   return "";
 }
+
+// Служебные вызовы — те, что идут к модели ДО ответа и вместо начала
+// разговора кладут в промпт врезку. Их два, и у каждого своё: чем занята
+// пауза перед ответом и как подписана врезка в просмотре промпта.
+//
+// Один индекс на оба показа, а не две таблицы: строка состояния обещала бы
+// сворачивание, а подпись называла бы факты — и разошлись бы они молча.
+// Какой вызов идёт, говорит сервер полем `strategy`; клиент про это не
+// догадывается по тексту сообщений.
+const SERVICE_CALLS = {
+  summary: { status: "Сворачиваю начало разговора…", role: "сводка начала разговора" },
+  facts: { status: "Обновляю факты…", role: "факты о разговоре" },
+};
 
 function usageLine(turn) {
   const m = turn.metrics;
@@ -724,13 +739,17 @@ function showRaw(card, turn) {
 // карточку как была.
 //
 // Роли подписаны, потому что без подписей главное в этом показе теряется:
-// читателю надо видеть, что начало разговора уехало одной сводкой, а не
-// двадцатью сообщениями. Место сводки называет сервер полем `summary_at`
-// события `start` — разбирать текст сообщений и угадывать по нему клиент
-// не вправе: порядок сборки промпта живёт в `Agent.build_prompt`, и вторая
-// его копия здесь разошлась бы с первой молча.
-function promptRole(msg, index, summaryAt) {
-  if (index === summaryAt) return "сводка начала разговора";
+// читателю надо видеть, что начало разговора уехало одной врезкой, а не
+// двадцатью сообщениями. Место врезки называет сервер полем `summary_at`
+// события `start`, а чем она занята — полем `strategy` там же. Разбирать
+// текст сообщений и угадывать по нему клиент не вправе: порядок сборки
+// промпта живёт в `Agent.build_prompt`, и вторая его копия здесь разошлась
+// бы с первой молча.
+function promptRole(msg, index, prompt) {
+  if (index === prompt.summaryAt) {
+    const call = SERVICE_CALLS[prompt.strategy];
+    return call ? call.role : "врезка вместо начала разговора";
+  }
   if (msg.role === "system") return "системный промпт";
   if (msg.role === "assistant") return "ответ модели";
   return "сообщение пользователя";
@@ -747,7 +766,7 @@ function showPrompt(card, prompt) {
   prompt.messages.forEach((msg, index) => {
     const row = el("div", "prompt-msg");
     row.append(
-      el("div", "prompt-role", promptRole(msg, index, prompt.summaryAt)),
+      el("div", "prompt-role", promptRole(msg, index, prompt)),
       el("div", "prompt-text", msg.content)
     );
     box.appendChild(row);
@@ -892,24 +911,27 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "compressing":
-            // Сворачивание — отдельный вызов к модели ДО ответа: пауза уже
-            // идёт, и карточка обязана сказать, из-за чего она пустая.
-            // Событие приходит, только когда сворачивание правда будет, —
+            // Служебный вызов — отдельное обращение к модели ДО ответа:
+            // пауза уже идёт, и карточка обязана сказать, из-за чего она
+            // пустая. Событие приходит, только когда вызов правда будет, —
             // строке состояния верить можно.
-            if (!status) {
-              status = cardStatus("Сворачиваю начало разговора…");
+            //
+            // Вызов незнакомый (сервер новее клиента) — молчим: назвать его
+            // наугад чужим именем хуже, чем не назвать вовсе.
+            if (!status && SERVICE_CALLS[e.strategy]) {
+              status = cardStatus(SERVICE_CALLS[e.strategy].status);
               card.insertBefore(status, bodyEl);
               scrollFeed();
             }
             break;
           case "start":
-            // Промпт собран — значит сворачивание позади и дальше пойдёт
+            // Промпт собран — значит служебный вызов позади и дальше пойдёт
             // ответ: строке состояния больше нечего показывать.
             if (status) { status.remove(); status = null; }
-            // Промпт держим, только если в нём есть сводка: у остальных
+            // Промпт держим, только если в нём есть врезка: у остальных
             // обменов показывать нечего, кроме истории, которая и так рядом.
             if (e.resolved_messages && e.summary_at !== null && e.summary_at !== undefined) {
-              prompt = { messages: e.resolved_messages, summaryAt: e.summary_at };
+              prompt = { messages: e.resolved_messages, summaryAt: e.summary_at, strategy: e.strategy };
             }
             break;
           case "reasoning":
@@ -1041,6 +1063,10 @@ const CONTEXT_NUMBERS = ["keep_last", "compress_every"];
 const CONTEXT_LABELS = {
   full: {},
   window: { keep_last: "Размер окна, сообщений" },
+  // У фактов число одно, и подпись у него та же, что у суммаризации: это
+  // хвост, который уезжает дословно, а не размер окна — начало разговора не
+  // отброшено, оно заменено выпиской.
+  facts: { keep_last: "Хранить последних, сообщений" },
   summary: {
     keep_last: "Хранить последних, сообщений",
     compress_every: "Сжимать каждые, сообщений",

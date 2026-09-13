@@ -1,8 +1,9 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Четыре таблицы: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+Пять таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
 сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
-(счётчики, общие на всю базу) и `summaries` (сводки начала разговора).
+(счётчики, общие на всю базу), `summaries` (сводки начала разговора) и `facts`
+(что важного сказано в разговоре, парами «ключ — значение»).
 Четыре свойства, за которыми стоит следить:
 
 * **`session_id` в первичном ключе сообщений**: без него два чата из базы
@@ -88,6 +89,45 @@ CREATE TABLE IF NOT EXISTS summaries (
 );
 
 CREATE INDEX IF NOT EXISTS summaries_by_session ON summaries(session_id);
+
+-- Факты о разговоре: цель, ограничения, предпочтения, решения, договорённости.
+-- Своя таблица по тому же доводу, что и `summaries`: колонку в `sessions` не
+-- накатить (миграций в коде нет, `_migrate` удалён), а строкой в `messages`
+-- факт стирался бы каждым обменом — `save_history` начинается с
+-- `DELETE FROM messages`.
+--
+-- Строки — **снимок**, а не журнал: список фактов переписывается целиком на
+-- каждом извлечении, и семь строк здесь значат семь фактов, а не семь вызовов.
+-- Поэтому `upto` и `metrics` у строк одного снимка одинаковые: они про снимок,
+-- а не про отдельный факт, а второй формы строки в одной таблице заводить
+-- незачем.
+--
+-- `upto` — сколько первых реплик истории уже прочитано извлечением. Он и
+-- зажимает срез промпта (`Agent.facts_cover`): срезано ровно то, что выписка
+-- прочитала, а не то, что хотелось бы срезать. Без него провалившееся
+-- извлечение (или подъём чата из базы) дал бы срезать начало, которого
+-- выписка никогда не видела, — молча и под подписью «факты вместо N
+-- сообщений». Он же говорит извлечению, с какой реплики читать дальше.
+--
+-- `metrics` — **накопленные** числа всех вызовов на извлечение этого чата.
+-- Вызов идёт на каждом обмене, снимок переписывается тогда же, и метрики
+-- отдельного вызова в нём не удержались бы; а итог по чату обязан считать их
+-- все — иначе экономия врёт.
+--
+-- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: удаление
+-- чата, очистка базы, `forget()`.
+CREATE TABLE IF NOT EXISTS facts (
+    session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    upto        INTEGER NOT NULL,
+    metrics     TEXT,
+    at          REAL NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS facts_by_session ON facts(session_id);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -375,25 +415,28 @@ class Store:
             return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def delete_session(self, session_id: str) -> bool:
-        """Стирает чат вместе с репликами и сводками, все таблицы одной
-        транзакцией. False — его и не было.
+        """Стирает чат вместе с репликами, сводками и фактами, все таблицы
+        одной транзакцией. False — его и не было.
 
         Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`
-        руками — сводка удалённого разговора достанется чату с тем же id.
+        и `facts` руками — сводка и факты удалённого разговора достанутся
+        чату с тем же id.
         """
         with self.tx() as conn:
             cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM facts WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta` и сводки. Нужно только
+        """Стирает базу целиком, включая `meta`, сводки и факты. Нужно только
         проверкам: оставленный счётчик имён отдал бы следующей номер
         посередине, а оставленная сводка — чужое начало разговора."""
         with self.tx() as conn:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
+            conn.execute("DELETE FROM facts")
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM meta")
 
@@ -498,6 +541,60 @@ class Store:
             }
             for r in rows
         ]
+
+    # --- факты о разговоре ----------------------------------------------------
+
+    def save_facts(self, session_id: str, snapshot: dict) -> None:
+        """Переписывает снимок фактов чата целиком, одной транзакцией.
+
+        Дисциплина ровно как у истории и сводок (`save_history`,
+        `save_summaries`): `DELETE` плюс `INSERT` заново с номерами от нуля —
+        `seq` не получает дыр, а оборванная запись откатывается вся. Пустой
+        список стирает факты и ничего не пишет: это и есть очистка на
+        `forget()`.
+
+        `upto` и `metrics` снимка ложатся в каждую строку одинаковыми: снимок
+        пишется и читается целиком, и отдельная форма строки под его заголовок
+        была бы второй схемой внутри одной таблицы.
+        """
+        items = snapshot.get("items") or []
+        upto = int(snapshot.get("upto") or 0)
+        metrics = _dumps(snapshot["metrics"]) if snapshot.get("metrics") else None
+        at = snapshot.get("at") or time.time()
+        rows = [
+            (session_id, seq, item["key"], item["value"], upto, metrics, at)
+            for seq, item in enumerate(items)
+        ]
+        with self.tx() as conn:
+            conn.execute("DELETE FROM facts WHERE session_id = ?", (session_id,))
+            if rows:
+                conn.executemany(
+                    "INSERT INTO facts (session_id, seq, key, value, upto, metrics, at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+
+    def load_facts(self, session_id: str) -> dict:
+        """Снимок фактов чата: сами факты по порядку плюс то, что про снимок
+        целиком, — докуда прочитана история и во что обошлись все извлечения.
+
+        Фактов нет — снимок пустой, но не `None`: «фактов не набралось» это
+        рабочее состояние, а не отсутствие данных, и звать его надо так же,
+        как свежий чат.
+        """
+        with self.reading() as conn:
+            rows = conn.execute(
+                "SELECT seq, key, value, upto, metrics, at FROM facts "
+                "WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        head = rows[0] if rows else None
+        return {
+            "items": [{"key": r["key"], "value": r["value"]} for r in rows],
+            "upto": head["upto"] if head is not None else 0,
+            "metrics": _loads(head["metrics"], None) if head is not None and head["metrics"] else None,
+            "at": head["at"] if head is not None else None,
+        }
 
     def message_rows(self, session_id: str) -> list[tuple]:
         """(seq, role, content) как лежат в базе — этим проверяют нумерацию."""

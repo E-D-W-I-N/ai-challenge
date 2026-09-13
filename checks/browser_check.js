@@ -178,6 +178,11 @@ const PANEL_ROUTE = [
   // выбранная в панели, она обязана доехать до запроса тем же путём, что и
   // числа рядом с ней, иначе переключатель переключал бы только картинку.
   ["f-strategy", "window", "strategy", "window"],
+  // Факты — вторая строка про ту же ручку не для симметрии: значения, которого
+  // нет в разметке `<select>`, поле не примет вовсе, и строка покраснеет на
+  // пустом значении. Забудь про `<option>` — переключатель знал бы стратегию,
+  // а выбрать её было бы нечем.
+  ["f-strategy", "facts", "strategy", "facts"],
   ["f-keep_last", "6", "keep_last", 6],
   ["f-compress_every", "10", "compress_every", 10],
 ];
@@ -312,6 +317,10 @@ async function routeChecks() {
     const { client, server, $, settle, Evt } = freshClient({
       chats: [{ label: "со сводкой", strategy: "summary", keep_last: 6, compress_every: 10 }],
     });
+    // До `init()` чатов ещё нет, и `syncStrategyFields` не отработал ни разу:
+    // числа прячет сама разметка. Покажи она их — при первой отрисовке, пока
+    // список едет с сервера, панель обещала бы два рабочих поля при `full`.
+    check("до первого чата числа спрятаны самой разметкой", shownContext($) === "", shownContext($));
     client.init();
     await settle(20);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
@@ -329,6 +338,10 @@ async function routeChecks() {
     pick("window");
     check("окно показывает одно число, и это размер окна",
       shownContext($) === "keep_last=Размер окна, сообщений", shownContext($));
+
+    pick("facts");
+    check("факты показывают одно число, и это хвост, а не размер окна",
+      shownContext($) === "keep_last=Хранить последних, сообщений", shownContext($));
 
     pick("full");
     check("вся история не показывает ни одного числа",
@@ -654,6 +667,36 @@ async function routeChecks() {
       $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
   }
 
+  // ── обмен с фактами говорит, сколько сообщений заменила выписка ──
+  //
+  // Слово то же, что у сводки, — «вместо»: начало разговора не отброшено, оно
+  // заменено выпиской «ключ: значение», и прочитать её можно в промпте
+  // запроса. Число берётся из метрик обмена, как и у двух других стратегий:
+  // свой ключ у каждой, потому что говорят они разное.
+  {
+    const withFacts = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 200, completion_tokens: 50, total_tokens: 250,
+                   cost_usd: 0.0001, facts: 12 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "с фактами", transcript: withFacts, history_len: withFacts.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("под ответом с фактами сказано, сколько сообщений заменила выписка",
+      usageText($("#feed"), ".usage-tokens") ===
+        "входные токены 200 (факты вместо 12 сообщений) · выходные токены 50 · всего токенов 250 · $0.000100",
+      usageText($("#feed"), ".usage-tokens"));
+    check("и плиток по-прежнему шесть — своей у фактов нет",
+      $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
+  }
+
   // ── несжатый обмен об этом молчит ──
   //
   // Пометка появляется только там, где сводка действительно уехала: «сводка
@@ -826,7 +869,7 @@ async function routeChecks() {
       delay: 60,
       // Первый обмен обычный — он же станет хвостом промпта второго. Третий
       // сворачивается тоже, но падает: его промпт не должен достаться никому.
-      folding: (i) => (i === 0 ? null : { summary: i === 1 ? SUMMARY : OTHER_SUMMARY, covered: 0 }),
+      service: (i) => (i === 0 ? null : { insert: i === 1 ? SUMMARY : OTHER_SUMMARY, covered: 0 }),
       fail: (i) => (i === 2 ? { message: "HTTP 502: провайдер не ответил" } : null),
     });
     client.init();
@@ -852,6 +895,15 @@ async function routeChecks() {
       Boolean(status) && Boolean(status.querySelector(".spinner")) &&
         !/%/.test(status.textContent),
       status && status.textContent);
+
+    // Панель не запирается на время ответа: показ полей — это показ, а не
+    // правка уехавшего запроса. Уехавший обмен всё равно собран из слепка
+    // конфига, а пользователю может понадобиться посмотреть, что значит
+    // соседняя стратегия, не дожидаясь конца генерации.
+    $("#f-strategy").value = "facts";
+    $("#f-strategy").dispatchEvent(new Evt("change"));
+    check("стратегию видно переключить и пока идёт ответ",
+      shownContext($) === "keep_last=Хранить последних, сообщений", shownContext($));
 
     await settle(70);          // пришёл кадр start: сворачивание позади
     check("ответ пошёл — строка состояния ушла",
@@ -938,7 +990,7 @@ async function routeChecks() {
   {
     const { client, $, settle, Evt } = freshClient({
       chats: [{ label: "без системного", system: "" }],
-      folding: { summary: SUMMARY, covered: 0 },
+      service: { insert: SUMMARY, covered: 0 },
     });
     client.init();
     await settle(30);
@@ -955,6 +1007,51 @@ async function routeChecks() {
     check("без системного промпта сводка стоит первой, и кнопка на месте",
       JSON.stringify(roles) ===
         JSON.stringify(["сводка начала разговора", "сообщение пользователя"]),
+      JSON.stringify(roles));
+  }
+
+  // ── извлечение фактов: та же карточка, другой служебный вызов ──
+  //
+  // Кадр служебного вызова один на оба, и назвать, чем занята пауза, может
+  // только сервер: «Сворачиваю начало разговора…» под извлечением фактов было
+  // бы враньём ровно там, где строка состояния для того и заведена. Тем же
+  // полем подписана врезка в просмотре промпта — одним индексом на оба показа.
+  {
+    const FACTS = "[факты о разговоре]\nцель: собрать ТЗ\nсрок: май\n[дальше — последние сообщения как есть]";
+    const { client, $, settle, Evt } = freshClient({
+      delay: 60,
+      service: { insert: FACTS, covered: 0, strategy: "facts" },
+    });
+    client.init();
+    await settle(40);
+    $("#input").value = "вопрос с фактами";
+    $("#composer").requestSubmit();
+    await settle(90);          // пришёл кадр служебного вызова, ответ ещё не пошёл
+
+    const status = $("#feed").querySelector(".card-status");
+    check("пока обновляются факты, карточка говорит именно об этом",
+      Boolean(status) && status.textContent.includes("Обновляю факты") &&
+        !status.textContent.includes("Сворачиваю"),
+      status && status.textContent);
+    check("и индикатор тот же неопределённый, без долей выполнения",
+      Boolean(status) && Boolean(status.querySelector(".spinner")) &&
+        !/%/.test(status.textContent),
+      status && status.textContent);
+
+    await settle(400);
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("в промпте видна выписка фактов — и подписана фактами, а не сводкой",
+      roles.includes("факты о разговоре") && !roles.includes("сводка начала разговора") &&
+        texts.includes(FACTS),
+      JSON.stringify(roles) + " " + JSON.stringify(texts));
+    check("порядок тот же: системный промпт, врезка, вопрос",
+      JSON.stringify(roles) === JSON.stringify([
+        "системный промпт", "факты о разговоре", "сообщение пользователя",
+      ]),
       JSON.stringify(roles));
   }
 

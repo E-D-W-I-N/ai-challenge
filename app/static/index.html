@@ -144,12 +144,13 @@
 
                Числа спрятаны в разметке, а не показаны: умолчание стратегии — `full`,
                а при ней не работает ни одно из них. Кто виден и как подписан, решает
-               `syncStrategyFields` в app.js — одним местом на все три стратегии. -->
+               `syncStrategyFields` в app.js — одним местом на все четыре стратегии. -->
           <label class="field">
             <span class="field-label">Управление контекстом</span>
             <select id="f-strategy" class="control">
               <option value="full">Вся история</option>
               <option value="window">Скользящее окно</option>
+              <option value="facts">Факты</option>
               <option value="summary">Суммаризация</option>
             </select>
           </label>
