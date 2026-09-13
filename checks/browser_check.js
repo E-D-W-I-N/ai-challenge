@@ -509,7 +509,7 @@ async function routeChecks() {
     // уже поднятом клиенте, а не отдельным сценарием: свой запуск стенда ради
     // одной строки текста дороже самой строки.
     check("в шапке стоит номер этого дня",
-      $(".brand-sub").textContent === "чат · день 9", $(".brand-sub").textContent);
+      $(".brand-sub").textContent === "чат · день 10", $(".brand-sub").textContent);
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
