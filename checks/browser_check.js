@@ -219,6 +219,15 @@ function usageText(node, cls) {
   return el ? el.textContent : "(строки " + cls + " нет)";
 }
 
+// Числа контекста, какими их видит пользователь: только показанные и с той
+// подписью, что стоит над полем. Скрытое поле в строку не попадает вовсе.
+function shownContext($) {
+  return ["keep_last", "compress_every"]
+    .filter((name) => !$("#field-" + name).classList.contains("hidden"))
+    .map((name) => name + "=" + $("#label-" + name).textContent)
+    .join(" | ");
+}
+
 const NO_TILE = "(плитки нет)";
 function tileOf($, name) {
   const el = $("#tiles").children.find((t) => t.querySelector(".tile-k").textContent === name);
@@ -288,6 +297,61 @@ async function routeChecks() {
     await settle(40);
     check("незнакомая стратегия показана как «вся история», а не пустым полем",
       $("#f-strategy").value === "full", $("#f-strategy").value);
+  }
+
+  // ── видны только те поля, что работают при выбранной стратегии ──
+  //
+  // Поле, которое принимает число и молча его игнорирует, врёт ровно так же,
+  // как молчаливая обрезка: по виду оно рабочее. Поэтому при `full` чисел нет
+  // вовсе, у окна одно, у суммаризации два — и одно и то же поле подписано
+  // по-разному, потому что значит разное.
+  //
+  // Переключение проверяется **сразу после события**, без ожидания: пролив
+  // конфига ходит на сервер, а показ обязан смениться на самом выборе.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "со сводкой", strategy: "summary", keep_last: 6, compress_every: 10 }],
+    });
+    client.init();
+    await settle(20);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const pick = (value) => {
+      $("#f-strategy").value = value;
+      $("#f-strategy").dispatchEvent(new Evt("change"));   // ответа сервера не ждём
+    };
+
+    check("суммаризация показывает оба числа и называет их по-своему",
+      shownContext($) === "keep_last=Хранить последних, сообщений | " +
+        "compress_every=Сжимать каждые, сообщений", shownContext($));
+
+    pick("window");
+    check("окно показывает одно число, и это размер окна",
+      shownContext($) === "keep_last=Размер окна, сообщений", shownContext($));
+
+    pick("full");
+    check("вся история не показывает ни одного числа",
+      shownContext($) === "", shownContext($));
+
+    // Спрятанное поле — не очищенное: скрытие это показ, а не правка конфига.
+    pick("summary");
+    check("переключение туда-обратно не теряет набранного",
+      $("#f-keep_last").value === "6" && $("#f-compress_every").value === "10",
+      `${$("#f-keep_last").value} / ${$("#f-compress_every").value}`);
+
+    // И в конфиг спрятанное поле уезжает прежним, а не `null`: ручки
+    // принимают оба числа при любой стратегии, просто не всякая их читает.
+    pick("full");
+    await settle(40);
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+    const sent = server.state.sent[0];
+    check("спрятанные поля уезжают в конфиг прежними, а не пустыми",
+      sent && sent.config.keep_last === 6 && sent.config.compress_every === 10 &&
+        sent.config.strategy === "full",
+      JSON.stringify(sent && [sent.config.strategy, sent.config.keep_last, sent.config.compress_every]));
   }
 
   // ── формат ответа: список, а не поле ──
