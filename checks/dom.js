@@ -445,12 +445,16 @@ function buildServer(options) {
     // вправе оборваться на ошибке, и тогда перерисовать плитки некому, кроме
     // самой ветки ошибки.
     fail: (options && options.fail) || null,
-    // Сворачивание начала разговора: словарь или функция (номер обмена) →
-    // null | `{summary, covered}`. Задано — обмен идёт так, как на сервере
-    // идёт сжатый: сперва кадр `compressing` (вызов на сжатие уже пошёл,
-    // ответа ещё нет), потом `start` с промптом, где вместо свёрнутого начала
-    // стоит сводка.
-    folding: (options && options.folding) || null,
+    // Служебный вызов перед ответом: словарь или функция (номер обмена) →
+    // null | `{insert, covered, strategy}`. Задано — обмен идёт так, как на
+    // сервере идёт обмен со сжатием или с извлечением фактов: сперва кадр
+    // `compressing` (служебный вызов уже пошёл, ответа ещё нет), потом
+    // `start` с промптом, где вместо начала разговора стоит врезка.
+    //
+    // `strategy` называет, какой это был вызов, — ровно как сервер: клиент по
+    // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
+    // Не задана — сводка, с неё служебные вызовы начались.
+    service: (options && options.service) || null,
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -538,35 +542,38 @@ function buildServer(options) {
   });
 
   // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
-  // сводка вместо свёрнутого начала, непокрытый ею хвост истории, вопрос.
+  // врезка вместо начала разговора, непокрытый ею хвост истории, вопрос.
   // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда:
-  // кнопка просмотра обязана держаться на сводке, а не на наличии промпта.
-  function resolvedPrompt(agent, text, folding) {
+  // кнопка просмотра обязана держаться на врезке, а не на наличии промпта.
+  function resolvedPrompt(agent, text, service) {
     const messages = [];
     if (agent.system) messages.push({ role: "system", content: agent.system });
     const tail = (agent.transcript || []).map((t) => ({ role: t.role, content: t.content }));
-    if (folding) {
-      messages.push({ role: "user", content: folding.summary });
-      tail.splice(0, folding.covered || 0);
+    if (service) {
+      messages.push({ role: "user", content: service.insert });
+      tail.splice(0, service.covered || 0);
     }
     messages.push(...tail, { role: "user", content: text });
     return messages;
   }
+
+  // Чем занят служебный вызов — тем же словом, каким это называет сервер.
+  const serviceStrategy = (service) => (service && service.strategy) || "summary";
 
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     const index = state.sent.length;
     state.sent.push({ id: agent.id, text, config: config(agent) });
     const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
-    const folding = typeof state.folding === "function" ? state.folding(index) : state.folding;
+    const service = typeof state.service === "function" ? state.service(index) : state.service;
     // Промпт собирается до записи обмена в стенограмму: в модель уехало то,
     // что было в истории **до** этого вопроса.
-    const resolved = resolvedPrompt(agent, text, folding);
+    const resolved = resolvedPrompt(agent, text, service);
     // Упавший обмен получает те же кадры до места падения: сервер сворачивает
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, folding, resolved);
+    if (failed) return errorStream(agent, text, failed, service, resolved);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -582,12 +589,14 @@ function buildServer(options) {
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
-      // Место сводки в промпте называет сервер — клиент не разбирает текст.
-      ...(folding ? [{ event: "compressing", agent: agent.id }] : []),
+      // Место врезки в промпте и чем она занята называет сервер — клиент не
+      // разбирает текст сообщений.
+      ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       {
         event: "start", agent: agent.id, question: text,
         resolved_messages: resolved,
-        summary_at: folding ? (agent.system ? 1 : 0) : null,
+        summary_at: service ? (agent.system ? 1 : 0) : null,
+        strategy: service ? serviceStrategy(service) : agent.strategy,
       },
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
@@ -599,7 +608,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, folding, resolved) {
+  function errorStream(agent, text, failed, service, resolved) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -615,11 +624,12 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
-      ...(folding ? [{ event: "compressing", agent: agent.id }] : []),
+      ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       {
         event: "start", agent: agent.id, question: text,
         resolved_messages: resolved,
-        summary_at: folding ? (agent.system ? 1 : 0) : null,
+        summary_at: service ? (agent.system ? 1 : 0) : null,
+        strategy: service ? serviceStrategy(service) : agent.strategy,
       },
       { event: "error", agent: agent.id, message: failed.message, metrics },
       ...(failed.done === false
