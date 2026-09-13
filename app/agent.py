@@ -84,6 +84,15 @@ def summary_message(content: str, covered: int) -> dict:
     }
 
 
+CUT_METRIC = {"summary": "summarized", "window": "dropped"}
+"""Каким ключом обмен говорит, что начало истории не уехало дословно, — по
+стратегии, которая его срезала. Ключ уходит в метрики обмена, и строка под
+ответом называет по нему число: «сводка вместо N сообщений» или «окно:
+отброшено N сообщений». Слово на оба случая одно соврало бы про один из них:
+сводка начало **заменила**, окно его **отбросило**. В суммы по чату ключ не
+идёт — их считает USAGE_FIELDS."""
+
+
 _last_id = 0
 _id_lock = threading.Lock()
 
@@ -315,14 +324,49 @@ class Agent:
             return 0
         return min(upto, len(self.history))
 
-    def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
-        """Системный промпт + сводка и хвост истории (или вся история) + вопрос.
+    def context_cut(self, spec: AgentSpec | None = None) -> tuple[int, dict | None]:
+        """Что стратегия делает с началом истории: сколько первых реплик не
+        уехало в модель дословно и что встало вместо них (`None` — ничего).
 
-        **Без сводки история не режется.** Сжатие выключено (`keep_last is
-        None`) или сворачиваться ещё не успело — уезжает вся история целиком,
-        как в Дне 8. Есть сводка — уезжает она и ровно те реплики, которых
-        она не покрывает. Молчаливой обрезки нет ни в одном состоянии: число
-        свёрнутых плюс длина хвоста всегда равно длине истории.
+        Одна точка разбора по `spec.strategy`, и обе половины ответа берутся
+        из неё разом: разъедься число с врезкой — промпт заявил бы сводку на
+        десять реплик, а срезал бы восемь, и узнать об этом было бы неоткуда.
+
+        * `full` — не срезается ничего, уезжает вся история, как в Дне 8;
+        * `window` — уезжают последние `keep_last` реплик, остальные
+          отброшены **вовсе**, и вместо них не встаёт ничего: сколько их
+          было, сказано под ответом, а не в промпте;
+        * `summary` — срезано ровно то, что покрыла сводка, и она же встаёт
+          вместо срезанного.
+
+        Незнакомое значение читается как `full`. Ручки чужого не пропустят
+        (`_choice_field`), но конфиг мог записать сервер другой версии, и
+        падать на нём — значит потерять диалог. Резать по значению, смысла
+        которого мы не знаем, нельзя: обрезка бывает только выбранная.
+        """
+        spec = spec if spec is not None else self.spec
+        if spec.strategy == "window":
+            # Пустое поле — отбрасывать нечем: идиом тот же, что у
+            # сэмплирования, None это «не делать», а не «делать с нулём».
+            if spec.keep_last is None:
+                return 0, None
+            return max(0, len(self.history) - spec.keep_last), None
+        if spec.strategy == "summary":
+            covered = self.summary_cover(spec)
+            if not covered:
+                return 0, None
+            return covered, summary_message(self.summaries[-1]["content"], covered)
+        return 0, None
+
+    def build_prompt(self, user_text: str, *, spec: AgentSpec | None = None) -> list[dict]:
+        """Системный промпт + начало истории по стратегии + хвост + вопрос.
+
+        Единственное место, где решается состав промпта, — и решается он одним
+        разбором, `context_cut`. Обрезка бывает только та, которую выбрали
+        переключателем, и всегда названа: `full` и `summary` не теряют ни
+        реплики (у сводки свёрнутое плюс хвост равно длине истории), `window`
+        отбрасывает начало по прямой просьбе, и сколько именно — написано
+        под ответом (`dropped` в метриках обмена).
 
         Конфиг читается каждый раз, поэтому правка в панели видна со следующего
         сообщения; `spec` передаёт обмен — он собирает промпт и тело запроса
@@ -333,24 +377,27 @@ class Agent:
         messages: list[dict] = []
         if spec.system:
             messages.append({"role": "system", "content": spec.system})
-        covered = self.summary_cover(spec)
-        if covered:
-            messages.append(summary_message(self.summaries[-1]["content"], covered))
-        messages.extend(turn.as_message() for turn in self.history[covered:])
+        cut, insert = self.context_cut(spec)
+        if insert is not None:
+            messages.append(insert)
+        messages.extend(turn.as_message() for turn in self.history[cut:])
         messages.append({"role": "user", "content": user_text})
         return messages
 
-    def summary_slot(self, spec: AgentSpec | None = None) -> int | None:
-        """Каким по счёту сообщением промпта встала сводка — или `None`, если
-        её там нет вовсе.
+    def context_slot(self, spec: AgentSpec | None = None) -> int | None:
+        """Каким по счёту сообщением промпта встала врезка — или `None`, если
+        врезки в нём нет вовсе.
 
         Живёт рядом с `build_prompt`, потому что знает ровно одно: в каком
         порядке та складывает промпт. Нужно это снаружи — событие `start`
         отдаёт число клиенту, и тот показывает промпт с подписанными ролями,
         не разбирая текст сообщений и не повторяя у себя порядок сборки.
+
+        Врезка сегодня одна — сводка; окно не вставляет ничего и слота не
+        занимает, поэтому у него здесь `None`, как и у полной истории.
         """
         spec = spec if spec is not None else self.spec
-        if not self.summary_cover(spec):
+        if self.context_cut(spec)[1] is None:
             return None
         return 1 if spec.system else 0
 
@@ -365,6 +412,11 @@ class Agent:
         одним кодом и разойтись не могут: обещание строки состояния держится
         не совпадением двух условий, а тем, что условие одно.
         """
+        # Стратегия спрашивается здесь же, где порог: «сворачивать ли» обязано
+        # решаться одним кодом. Второе условие рядом — у события `compressing`
+        # или у сборки промпта — однажды разошлось бы с этим молча.
+        if spec.strategy != "summary":
+            return None
         keep, every = spec.keep_last, spec.compress_every
         if keep is None or every is None or keep < 0 or every <= 0:
             return None
@@ -605,7 +657,7 @@ class Agent:
             if self.compress_plan(spec) is not None:
                 yield {"type": "compressing"}
             await self.compress(spec, context_length)
-            covered = self.summary_cover(spec)
+            cut, _ = self.context_cut(spec)
 
             prompt = self.build_prompt(user_text, spec=spec)
 
@@ -617,7 +669,7 @@ class Agent:
                 "type": "start",
                 "resolved_messages": prompt,
                 "question": user_text,
-                "summary_at": self.summary_slot(spec),
+                "summary_at": self.context_slot(spec),
             }
 
             text = ""
@@ -667,12 +719,16 @@ class Agent:
             if cancelled and failure is None:
                 failure = "генерация отменена"
 
-            # Сколько реплик уехало сводкой вместо себя — знание агента, а не
+            # Сколько реплик не уехало дословно — знание агента, а не
             # провайдера, и место ему рядом с числами обмена: строка под
             # ответом покажет его там же, где входные токены, которые оно
             # уменьшило. В суммы по чату ключ не идёт — их считает USAGE_FIELDS.
-            if covered and isinstance(final_metrics, dict):
-                final_metrics = {**final_metrics, "summarized": covered}
+            #
+            # Ключ у каждой стратегии свой, потому что говорят они разное:
+            # сводка **заменила** начало, окно **отбросило** его. Одно слово
+            # на оба случая соврало бы про одно из них.
+            if cut and isinstance(final_metrics, dict):
+                final_metrics = {**final_metrics, CUT_METRIC[spec.strategy]: cut}
 
             committed = self._commit(user_text, text, failure, reasoning, final_metrics)
 

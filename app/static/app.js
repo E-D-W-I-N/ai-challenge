@@ -628,19 +628,27 @@ function answerCard(agent, turn, index) {
 // `_apply_usage` в `app/llm.py`) — сложи её здесь, и «всего» под ответом
 // разошлось бы с «Всего токенов» в плитке. Строки нет, только если чисел нет
 // совсем. У оборванного ответа она есть: его числа идут в итог чата, он оплачен.
+function cutNote(m) {
+  if (m.summarized) return " (сводка вместо " + fmt.tokens(m.summarized) + " сообщений)";
+  if (m.dropped) return " (окно: отброшено " + fmt.tokens(m.dropped) + " сообщений)";
+  return "";
+}
+
 function usageLine(turn) {
   const m = turn.metrics;
   if (!m) return null;
 
   const tokens = [];
   if (has(m.prompt_tokens)) {
-    // Сколько сообщений уехало сводкой вместо себя — приписано ровно к тому
-    // числу, которое сводка уменьшила. Отдельной плитки у сжатия нет
-    // намеренно: плитки про весь диалог, а свернулось — в этом обмене.
-    const folded = m.summarized
-      ? " (сводка вместо " + fmt.tokens(m.summarized) + " сообщений)"
-      : "";
-    tokens.push("входные токены " + fmt.tokens(m.prompt_tokens) + folded);
+    // Сколько сообщений не уехало дословно — приписано ровно к тому числу,
+    // которое от этого уменьшилось. Отдельной плитки у обрезки нет намеренно:
+    // плитки про весь диалог, а срезано — в этом обмене.
+    //
+    // Два ключа, два разных слова: сводка начало **заменила** и его ещё можно
+    // прочитать в промпте запроса, окно его **отбросило** совсем. Назови оба
+    // одинаково — и «отброшено» стало бы неправдой про сводку, а «вместо»
+    // про окно. Обрезка бывает только выбранная, и молчать о ней нельзя.
+    tokens.push("входные токены " + fmt.tokens(m.prompt_tokens) + cutNote(m));
   }
   if (has(m.completion_tokens)) {
     // Токены рассуждения провайдер кладёт **внутрь** completion_tokens: на
@@ -1014,16 +1022,21 @@ const NUMBER_FIELDS = [
 // уезжают ни одним ключом и по `supported_parameters` модели не проверяются.
 // Сжатие наше, а не провайдерское. Отдельным списком именно поэтому: попади
 // они в PROVIDER_PARAMS, панель ругалась бы, что модель их не заявляет.
-const CONTEXT_FIELDS = ["keep_last", "compress_every"];
+//
+// Здесь только числовая половина: третье поле контекста — стратегия — не
+// число, а выбор из списка, и читается оно как `response_format`, своей
+// строкой.
+const CONTEXT_NUMBERS = ["keep_last", "compress_every"];
 
 // Все числовые поля панели: и те, что уезжают в модель, и те, что про память.
-const PANEL_NUMBERS = [...NUMBER_FIELDS, ...CONTEXT_FIELDS];
+const PANEL_NUMBERS = [...NUMBER_FIELDS, ...CONTEXT_NUMBERS];
 
 function fillPanel(agent) {
   PANEL_NUMBERS.forEach((name) => {
     const el = $("#f-" + name);
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
+  fillStrategy(agent.strategy);
   $("#f-system").value = agent.system || "";
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
@@ -1034,6 +1047,17 @@ function fillPanel(agent) {
   state.baseModel = agent.model;
   fillModels(agent.model).then(renderWarnings);
   saveStatus("");
+}
+
+// Стратегия — выбор из закрытого списка, и пустого значения у него нет.
+// Значение, которого в списке не оказалось (чат записан сервером другой
+// версии), select снимает с выбора совсем — тогда показываем `full`: сервер
+// такой конфиг читает так же, и панель обязана показывать то, что на самом
+// деле произойдёт с историей, а не пустое поле.
+function fillStrategy(value) {
+  const select = $("#f-strategy");
+  select.value = value || "full";
+  if (!select.value) select.value = "full";
 }
 
 function fillResponseFormat(value) {
@@ -1229,6 +1253,7 @@ function readPanel() {
       $("#f-response_format_kind").value,
       $("#f-response_format").value
     ),
+    strategy: $("#f-strategy").value,
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
   return patch;
