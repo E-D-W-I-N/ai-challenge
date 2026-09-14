@@ -484,6 +484,10 @@ function buildServer(options) {
     busy: false,
     transcript: [],
     usage_total: null,
+    // Происхождение: у чата, заведённого сам по себе, его нет — `null`,
+    // как на сервере. У ветки — `{parent_id, forked_at}`, и имени родителя
+    // в нём нет: клиент находит его сам по id.
+    branch: null,
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
     ...CONTEXT,
   });
@@ -698,6 +702,27 @@ function buildServer(options) {
 
     if (tail === "/messages" && method === "POST") return sse(agent, body.text);
     if (tail === "/regenerate" && method === "POST") return sse(agent, "перегенерация");
+    // Ветвление: новый чат с копией начала истории и копией конфига — ровно
+    // то, что делает сервер. Ответ в том же виде, что у создания: ветка и
+    // есть обычный чат.
+    if (tail === "/fork" && method === "POST") {
+      const at = body && body.at;
+      if (typeof at !== "number" || !Number.isInteger(at) || at < 0 || at > agent.transcript.length) {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ detail: "at: целое число от 0 до " + agent.transcript.length }),
+        };
+      }
+      const id = nextId();
+      const child = Object.assign(blank(id, "Ветка " + id.slice(3)), config(agent));
+      child.transcript = agent.transcript.slice(0, at).map((turn) => ({ ...turn }));
+      child.history_len = child.transcript.length;
+      child.usage_total = sumUsage(child.transcript);
+      child.branch = { parent_id: agent.id, forked_at: at };
+      state.agents.push(child);
+      return json({ created: 1, live: state.agents.length, agents: [child] });
+    }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(agent);
     if (!tail && method === "DELETE") {

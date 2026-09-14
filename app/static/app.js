@@ -62,6 +62,7 @@ const ICONS = {
   pencil: "M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z",
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
   lines: "M4 6h16M4 10h16M4 14h12M4 18h7",
+  branch: "M7 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM7 9v10M17 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM17 9v2a4 4 0 0 1-4 4H7",
 };
 
 // Узел одной строкой: тег, класс, текст. Текст ставится через textContent,
@@ -406,6 +407,26 @@ function renderList() {
   state.agents.forEach((agent) => box.appendChild(listItem(agent)));
 }
 
+// Пометка ветки: от кого чат отделился и сколько сообщений унёс. Одна
+// функция на список слева и на панель справа — двумя они назвали бы разные
+// числа, и какое из двух правда, было бы не видно.
+//
+// Имя родителя клиент находит сам, по id из `branch`: в списке слева у него
+// все чаты, и переименование родителя видно сразу, без перезагрузки. Сервер
+// имени не присылает намеренно — копия рядом с родством разошлась бы с ним
+// на первом же переименовании.
+//
+// Родителя могли удалить, и это штатно: ветка самостоятельный чат и его
+// переживает. Тогда пометка говорит именно это, а не молчит: смолчи она —
+// ветка выглядела бы обычным чатом, хотя начало разговора в ней чужое.
+function branchNote(agent) {
+  const branch = agent && agent.branch;
+  if (!branch) return "";
+  const parent = state.agents.find((a) => a.id === branch.parent_id);
+  const from = parent ? "«" + parent.label + "»" : "удалённого чата";
+  return "ветка от " + from + " — унесено " + fmt.tokens(branch.forked_at) + " сообщений";
+}
+
 function listItem(agent) {
   const active = state.current && agent.id === state.current.id;
   const row = el("div", "item" + (active ? " active" : ""));
@@ -414,8 +435,15 @@ function listItem(agent) {
   open.type = "button";
   const ico = el("span", "item-icon");
   ico.appendChild(icon("chat"));
-  open.append(ico, el("span", "item-title", agent.label));
-  open.title = agent.label + "\n" + agent.model;
+  // Имя и пометка — в столбик: пометка обязана быть видна, а не только
+  // в подсказке. Ветка от чужого начала разговора выглядит как обычный чат,
+  // и по одному имени этого не узнать никак.
+  const text = el("span", "item-text");
+  text.appendChild(el("span", "item-title", agent.label));
+  const note = branchNote(agent);
+  if (note) text.appendChild(el("span", "item-branch", note));
+  open.append(ico, text);
+  open.title = agent.label + "\n" + agent.model + (note ? "\n" + note : "");
   open.onclick = () => openAgent(agent.id);
 
   const actions = el("div", "item-actions");
@@ -583,7 +611,11 @@ function answerCard(agent, turn, index) {
   actions.append(
     iconButton("copy", "Копировать ответ", () => copyText(turn.content)),
     iconButton("refresh", "Перегенерировать", () => regenerate()),
-    iconButton("dots", "Показать сырой текст", () => showRaw(card, turn))
+    iconButton("dots", "Показать сырой текст", () => showRaw(card, turn)),
+    // Ветка отсюда — у каждого ответа и при любой стратегии: ветвление про
+    // структуру разговора, а не про то, что уезжает в модель, и от выбора
+    // в переключателе оно не зависит.
+    iconButton("branch", "Ветка отсюда", () => forkFrom(agent, index))
   );
   // Кнопка появляется у всякого ответа, чей промпт клиент видел, — при любой
   // стратегии. У окна это единственный способ прочитать отброшенное начало,
@@ -611,6 +643,32 @@ function answerCard(agent, turn, index) {
 
   if (turn.error) card.appendChild(el("div", "card-error", turn.error));
   return card;
+}
+
+// Ветка отсюда: новый чат уносит разговор по эту карточку включительно
+// и открывается. Дальше он обычный чат — переключаться между ветками нечем
+// и не надо, они уже в списке слева.
+//
+// `index` — номер реплики-ответа в истории, значит унести надо `index + 1`
+// сообщений: карточка входит в ветку целиком, вместе со своим вопросом.
+//
+// Пока идёт ответ, уходить из чата нельзя: поток оборвался бы на середине,
+// а история родителя дописывается только в конце обмена — ветка унесла бы
+// разговор без него.
+async function forkFrom(agent, index) {
+  if (state.busy) return;
+  let created;
+  try {
+    created = await api("/api/agents/" + agent.id + "/fork", json("POST", { at: index + 1 }));
+  } catch (err) {
+    hint(String(err.message || err), true);
+    return;
+  }
+  state.current = null;
+  await loadAgents(created.agents[0].id);
+  // Открытие чата гасит подсказку, поэтому говорим после него: ветка
+  // открылась молча, и без строки было бы непонятно, тот это чат или нет.
+  hint("Ветка заведена: унесено " + fmt.tokens(index + 1) + " сообщений.");
 }
 
 // Что под ответом: всё про этот обмен и только про него. Первой строкой —
@@ -1085,7 +1143,24 @@ const CONTEXT_LABELS = {
 // Все числовые поля панели: и те, что уезжают в модель, и те, что про память.
 const PANEL_NUMBERS = [...NUMBER_FIELDS, ...CONTEXT_NUMBERS];
 
+// Пометка ветки в панели: та же правда, что в списке, плюс то, чего в узкую
+// строку списка не влезло, — ветка самостоятельна. Знать это важно прежде,
+// чем продолжать в ней разговор: правки здесь родителя не задевают, и
+// наоборот.
+function fillBranch(agent) {
+  const box = $("#branch-note");
+  const note = branchNote(agent);
+  box.textContent = note
+    ? "Это " +
+      note +
+      ". Дальше чат сам по себе: продолжение здесь родителя не меняет, " +
+      "а удаление родителя эту ветку не удалит."
+    : "";
+  box.classList.toggle("hidden", !note);
+}
+
 function fillPanel(agent) {
+  fillBranch(agent);
   PANEL_NUMBERS.forEach((name) => {
     const el = $("#f-" + name);
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);

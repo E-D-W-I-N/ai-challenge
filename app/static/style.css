@@ -185,13 +185,29 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .item-icon { flex: 0 0 auto; color: var(--faint); display: grid; place-items: center; }
 .item-icon svg { width: 15px; height: 15px; }
 .item.active .item-icon { color: var(--accent); }
-.item-title {
+/* Имя и пометка ветки — в столбик внутри кнопки открытия: у обычного чата
+   вторая строка не заводится вовсе, и высота строки списка не меняется. */
+.item-text {
   flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.item-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13.5px;
+}
+.item-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--faint);
 }
 
 /* Кнопки строки проявляются на наведении и у открытого чата, чтобы список
@@ -636,6 +652,19 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .grid2 > .field, .grid3 > .field { justify-content: space-between; }
 
 .hint { font-size: 11.5px; line-height: 1.5; color: var(--faint); margin: 0; }
+
+/* Пометка ветки в панели: не поле и не предупреждение — просто то, что
+   про этот чат надо знать, прежде чем продолжать в нём разговор. */
+.branch-note {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--faint);
+}
 
 /* Предупреждение о параметрах, которых выбранная модель не заявляет.
    Не запрет: отправить всё равно можно — но не вслепую. */
