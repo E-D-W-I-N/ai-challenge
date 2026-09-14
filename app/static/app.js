@@ -805,10 +805,15 @@ function showRaw(card, turn) {
 // промпта живёт в `Agent.build_prompt`, и вторая его копия здесь разошлась
 // бы с первой молча.
 function promptRole(msg, index, prompt) {
+  // Долговременная память — первой веткой, потому что первой она стоит и
+  // в промпте: слой не этого разговора идёт раньше врезки, заменяющей его
+  // начало. Порядок веток здесь обязан повторять порядок сообщений там.
+  if (index === prompt.memoryAt) return "долговременная память";
   // Врезки в промпте может не быть вовсе — окно и «Вся история» не вставляют
-  // ничего, и `summary_at` приходит пустым. Сравнение строгое именно поэтому:
-  // подставь сюда ноль «по умолчанию», и запасная подпись встала бы над первым
-  // сообщением промпта там, где никакой врезки нет.
+  // ничего, и `summary_at` приходит пустым; память не едет и подавно, когда
+  // её нет или выключатель чата в «выключено». Сравнение строгое именно
+  // поэтому: подставь сюда ноль «по умолчанию», и запасная подпись встала бы
+  // над первым сообщением промпта там, где никакой врезки нет.
   if (index === prompt.summaryAt) {
     const call = SERVICE_CALLS[prompt.strategy];
     return call ? call.role : "врезка вместо начала разговора";
@@ -998,7 +1003,16 @@ async function exchange(path, body, questionText) {
             // вовсе: `summary_at` придёт пустым, и подписывать в промпте
             // будет просто нечего.
             if (e.resolved_messages) {
-              prompt = { messages: e.resolved_messages, summaryAt: e.summary_at, strategy: e.strategy };
+              prompt = {
+                messages: e.resolved_messages,
+                // Слотов два: врезка долговременной памяти и врезка стратегии.
+                // Оба называет сервер, оба бывают пустыми, и в одном промпте
+                // они встречаются вместе — память слой не этого разговора
+                // и стратегию не отменяет.
+                memoryAt: e.memory_at,
+                summaryAt: e.summary_at,
+                strategy: e.strategy,
+              };
             }
             break;
           case "reasoning":
@@ -1166,6 +1180,7 @@ function fillPanel(agent) {
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
   fillStrategy(agent.strategy);
+  fillMemory(agent.memory);
   $("#f-system").value = agent.system || "";
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
@@ -1188,6 +1203,17 @@ function fillStrategy(value) {
   select.value = value || "full";
   if (!select.value) select.value = "full";
   syncStrategyFields();
+}
+
+// Выключатель долговременной памяти. Значение, которого в списке нет (чат
+// записан сервером другой версии), select снимает с выбора совсем — тогда
+// показываем «включена»: сервер читает такой конфиг так же, и панель обязана
+// показывать то, что на самом деле уедет в модель. Полей у выключателя нет
+// и прятать его нечем: память едет врезкой при любой стратегии.
+function fillMemory(value) {
+  const select = $("#f-memory");
+  select.value = value || "on";
+  if (!select.value) select.value = "on";
 }
 
 // Показ полей контекста по выбранной стратегии. Это именно показ, а не правка
@@ -1401,6 +1427,9 @@ function readPanel() {
       $("#f-response_format").value
     ),
     strategy: $("#f-strategy").value,
+    // Выключатель памяти уезжает при любой стратегии: он не про историю,
+    // а про слой поверх неё, и прятать его не за чем.
+    memory: $("#f-memory").value,
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
   return patch;
