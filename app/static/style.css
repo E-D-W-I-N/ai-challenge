@@ -699,6 +699,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .mem-item {
   display: flex;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 7px 9px;
   border: 1px solid var(--line);
@@ -707,7 +708,10 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   font-size: 12.5px;
 }
 .mem-item.column { flex-direction: column; gap: 4px; }
-.mem-text { flex: 1 1 auto; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
+/* Основа в процентах, а не `auto`: в узком ящике (панель там 300px и уже)
+   кнопка рядом с длинной строкой факта сжимала бы текст в столбик по слову.
+   С этой основой она уезжает на свою строку и встаёт справа. */
+.mem-text { flex: 1 1 55%; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
 .mem-kind {
   flex: 0 0 auto;
   padding-top: 1px;
@@ -719,6 +723,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 }
 .mem-btn {
   flex: 0 0 auto;
+  margin-left: auto;
   padding: 3px 7px;
   border: 1px solid var(--line);
   border-radius: 7px;
