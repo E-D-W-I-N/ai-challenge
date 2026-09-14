@@ -27,7 +27,14 @@ from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
-from .schema import CONTEXT_FIELDS, CONTEXT_NUMBERS, STRATEGIES, AgentSpec
+from .schema import (
+    CONTEXT_FIELDS,
+    CONTEXT_NUMBERS,
+    MEMORY_CHOICES,
+    MEMORY_KINDS,
+    STRATEGIES,
+    AgentSpec,
+)
 from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -240,7 +247,7 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
 
 
 def _context_fields(payload: dict, where: str = "") -> dict:
-    """Стратегия, окно памяти и порог сжатия.
+    """Стратегия, окно памяти, порог сжатия и выключатель долговременной памяти.
 
     Числа разбираются как параметры сэмплирования: `keep_last = null` значит
     «резать нечем» и в модель уезжает вся история — это не то же самое, что
@@ -248,7 +255,14 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     доезжать до агента целой. Стратегия — из списка: чужое значение
     отбрасывается здесь, на границе, чтобы дальше по стеку его не встретить.
     """
-    values: dict = {"strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where)}
+    values: dict = {
+        "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
+        # Выключатель долговременной памяти разбирается тем же способом и
+        # здесь же: он часть того, что уедет в промпт, — просто решает это
+        # не про историю, а про слой поверх неё. Умолчание `on` безопасно:
+        # пустая память неотличима от отсутствующей.
+        "memory": _choice_field(payload, "memory", MEMORY_CHOICES, "on", where),
+    }
     for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
     if values["keep_last"] is not None and values["keep_last"] < 0:
@@ -326,6 +340,39 @@ def _label_field(payload: dict) -> str:
     if not isinstance(label, str) or not label.strip():
         raise HTTPException(status_code=400, detail="label: непустая строка")
     return label.strip()
+
+
+def _kind_field(payload: dict) -> str:
+    """Род записи долговременной памяти: обязателен и только из списка.
+
+    Намеренно **не** `_choice_field`: тот отдаёт умолчание и на отсутствующий
+    ключ, и на присланный `null`, — а здесь это ровно то, чего быть не должно.
+    «Явно выбирать, что и куда сохраняется» — единственная работа пользователя
+    в этом слое, и подставленный сервером род тихо превратил бы её
+    в «сервер решил за него». Умолчания у рода поэтому нет вовсе.
+    """
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or kind not in MEMORY_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"kind: одно из {', '.join(MEMORY_KINDS)}, а не {kind!r} — "
+                "род записи выбирает человек, сервер за него не выбирает"
+            ),
+        )
+    return kind
+
+
+def _content_field(payload: dict) -> str:
+    """Текст записи памяти: непустая строка. Образец — `_label_field`.
+
+    Пустая запись уехала бы в промпт строкой «профиль: » и заняла бы место
+    врезки, ничего не сказав, — это 400, а не молчаливый пропуск.
+    """
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=400, detail="content: непустая строка")
+    return content.strip()
 
 
 def _parse_spec(payload: dict, where: str) -> AgentSpec:
@@ -508,6 +555,89 @@ async def cancel_agent(agent_id: str) -> dict:
     agent = _agent(agent_id)
     agent.cancel()
     return {"cancelled": agent_id, "was_busy": agent.busy}
+
+
+# --- долговременная память ----------------------------------------------------
+#
+# Ручки глобальные, без `agent_id`: слой один на всю базу, и чат ему не
+# владелец, а читатель. Отсюда и путь `/api/memory` рядом с `/api/agents`,
+# а не под чатом — путь под чатом обещал бы память, принадлежащую чату.
+
+
+@app.get("/api/memory")
+async def list_memory() -> dict:
+    """Вся долговременная память целиком: отбирать не по чему, и скрывать
+    от пользователя часть того, что уезжает в его промпты, нельзя."""
+    records = REGISTRY.store.list_memory()
+    return {"total": len(records), "records": records}
+
+
+@app.post("/api/memory")
+async def add_memory(payload: dict = Body(...)) -> dict:
+    """Новая запись памяти. Тело: `{"kind": ..., "content": "..."}` — оба поля
+    обязательны, род без умолчания (см. `_kind_field`).
+
+    Ответ — записанная строка целиком, с номером от базы: клиенту незачем
+    перечитывать список, чтобы узнать, что у него получилось. И это именно
+    записанное, а не присланное: `redact()` чистит текст по дороге в базу.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail='тело: объект {"kind": "...", "content": "..."}'
+        )
+    unknown = [key for key in payload if key not in ("kind", "content")]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "тело записи памяти — только kind и content: номер и время "
+                f"выдаёт база. Лишние поля: {', '.join(sorted(unknown))}"
+            ),
+        )
+    return REGISTRY.store.add_memory(_kind_field(payload), _content_field(payload))
+
+
+@app.delete("/api/memory/{seq}")
+async def delete_memory(seq: int) -> dict:
+    """Удаляет одну запись по номеру. Нет такой — 404, а не тихое «ок»:
+    вторая вкладка показывает список с прошлой минуты, и разница между
+    «удалил» и «нечего было удалять» ей важна."""
+    if not REGISTRY.store.delete_memory(seq):
+        raise HTTPException(
+            status_code=404,
+            detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
+        )
+    return {"deleted": seq}
+
+
+@app.get("/api/agents/{agent_id}/memory")
+async def agent_memory(agent_id: str) -> dict:
+    """Все три слоя памяти этого чата разом — то самое «какие данные попадают
+    в каждый слой», ради которого день и затеян.
+
+    Краткосрочная отдаётся **счётчиком**, а не стенограммой: лента уже едет
+    в `GET /api/agents/{id}`, и второй её источник разошёлся бы с первым.
+    Рабочая — факты и сводки без метрик: во что они обошлись, показывают
+    плитки, а здесь вопрос не «сколько стоило», а «что запомнено».
+    Долговременная — выключатель этого чата и общий список: слой один на всю
+    базу, и одинаков он у всех чатов, кроме положения выключателя.
+    """
+    agent = _agent(agent_id)
+    return {
+        "short_term": {"messages": len(agent.history)},
+        "working": {
+            "facts": list(agent.facts["items"]),
+            "facts_upto": agent.facts["upto"],
+            "summaries": [
+                {"seq": i, "upto": item["upto"], "content": item["content"]}
+                for i, item in enumerate(agent.summaries)
+            ],
+        },
+        "long_term": {
+            "enabled": agent.spec.memory == "on",
+            "records": REGISTRY.store.list_memory(),
+        },
+    }
 
 
 # --- каталог моделей ----------------------------------------------------------
