@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import Iterable
 
 from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config
@@ -82,6 +83,42 @@ class AgentRegistry:
             self._agents[agent.id] = agent
         return agents
 
+    def fork(self, parent: Agent, at: int, *, label: str) -> Agent:
+        """Заводит ветку: новый чат с копией начала разговора и копией конфига.
+
+        **Ветка есть отдельный чат** — своя строка в `sessions`, свой id от
+        базы, своя история под своим `session_id`. Отсюда сразу два свойства
+        дня, и ни одно из них не пришлось писать: переключение между ветками
+        бесплатно (ветка уже в списке слева и уже открывается), а продолжение
+        одной не трогает другую — владелец сессии ровно один, и у ветки он
+        свой. Схему `messages` ветвление не тронуло вовсе.
+
+        Копия читается **до** создания: `create_many` освобождает место под
+        новый чат и может вытеснить самого родителя, а вытесненный теряет
+        право писать в свою сессию (`Agent.detach`). Читать его историю после
+        этого можно, но собирать копию из чата, у которого уже отобрали
+        хранилище, — значит зависеть от порядка, которого никто не обещал.
+
+        Всё одной транзакцией: и строка нового чата, и копия истории, и
+        родство. Оборвись запись посередине — в списке слева повис бы
+        чат-обрубок.
+        """
+        carried = parent.carry_off(at)
+        with self.store.tx():
+            agent = self.create_many(
+                # Только имя своё: остальное ветка берёт у родителя как есть.
+                # Вглубь конфиг копирует конструктор агента — там это место
+                # одно на всех, кого поднимают из готового spec, и второй
+                # копии здесь не нужно.
+                [replace(parent.spec, label=label)],
+                # Длина контекста берётся у родителя, а не из каталога: модель
+                # у ветки та же, а каталог — сетевой запрос, и ветвление
+                # не должно его ждать.
+                context_lengths={parent.spec.model: parent.context_length},
+            )[0]
+            agent.take_branch(carried, parent_id=parent.id, forked_at=at)
+        return agent
+
     def load(self, session_id: str) -> Agent | None:
         """Поднимает сохранённый чат в память. Живой возвращается как есть:
         вторая копия раздвоила бы историю одного диалога."""
@@ -127,6 +164,10 @@ class AgentRegistry:
                     history_len=row["history_len"],
                     created_at=row["created_at"],
                     last_used_at=row["updated_at"],
+                    # Родство выгруженного чата приезжает тем же запросом, что
+                    # и он сам: пометка ветки в списке не должна зависеть
+                    # от того, поднят чат в память или нет.
+                    branch=row.get("branch"),
                 )
             )
         entries.sort(key=lambda entry: entry["created_at"])
