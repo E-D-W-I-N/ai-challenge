@@ -1168,6 +1168,106 @@ async function routeChecks() {
       $("#feed").textContent.includes("давний вопрос"),
       $("#feed").textContent.slice(0, 200));
   }
+
+  // ── ветвление: «Ветка отсюда» уносит разговор по карточку и открывает его ──
+  //
+  // Ветвление живёт поверх любой стратегии, поэтому кнопка стоит у каждого
+  // ответа, а не только там, где что-то срезано. Проверяется весь путь:
+  // с какой точкой уходит запрос, что открылось после него и видно ли
+  // в списке и в панели, что этот чат — ветка, от кого и с какого места.
+  //
+  // Имя родителя клиент находит сам, по его id: сервер присылает только id,
+  // и переименование родителя обязано быть видно в пометке сразу.
+  {
+    const talk = [
+      { role: "user", content: "первый вопрос", error: null, reasoning: "", metrics: null },
+      { role: "assistant", content: "первый ответ", error: null, reasoning: "", metrics: null },
+      { role: "user", content: "второй вопрос", error: null, reasoning: "", metrics: null },
+      { role: "assistant", content: "второй ответ", error: null, reasoning: "", metrics: null },
+    ];
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [
+        { label: "родитель", system: "ПРОМПТ РОДИТЕЛЯ", transcript: talk, history_len: talk.length },
+        // Ветка чата, которого в списке нет: родителя удалили, а ветка его
+        // пережила — она самостоятельный чат. Пометка обязана сказать это,
+        // а не смолчать: смолчи она, ветка выглядела бы обычным чатом, хотя
+        // начало разговора в ней чужое.
+        { label: "сирота", branch: { parent_id: "ag_нет-такого", forked_at: 2 } },
+      ],
+    });
+    client.init();
+    await settle(20);
+    const rows = () => $("#agent-list").querySelectorAll(".item");
+    const noteOf = (i) => {
+      const node = rows()[i] && rows()[i].querySelector(".item-branch");
+      return node ? node.textContent : "(пометки нет)";
+    };
+    const open = (i) => rows()[i].querySelector(".item-open").dispatchEvent(new Evt("click"));
+
+    check("у обычного чата пометки ветки в списке нет",
+      noteOf(2) === "(пометки нет)", noteOf(2));
+    check("ветка удалённого родителя всё равно помечена веткой",
+      noteOf(3) === "ветка от удалённого чата — унесено 2 сообщений", noteOf(3));
+
+    // Открываем родителя и ветвимся от первого ответа: карточка входит
+    // в ветку целиком, вместе со своим вопросом, — это два сообщения.
+    open(2);
+    await settle(40);
+    check("у родителя в панели пометки ветки нет",
+      $("#branch-note").classList.contains("hidden"), $("#branch-note").textContent);
+
+    const first = $("#feed").querySelectorAll(".card")[0];
+    check("кнопка «Ветка отсюда» есть у ответа при любой стратегии",
+      Boolean(first) && first.querySelectorAll(".icon-btn").map((b) => b.title)
+        .includes("Ветка отсюда"),
+      first && first.querySelectorAll(".icon-btn").map((b) => b.title).join(" | "));
+    cardButton(first, "Ветка отсюда").dispatchEvent(new Evt("click"));
+    await settle(80);
+
+    const forks = server.state.requests.filter((r) => /\/fork$/.test(r.path));
+    check("ветвление ушло одним запросом", forks.length === 1, String(forks.length));
+    check("и унести просит ровно по эту карточку включительно",
+      Boolean(forks[0] && forks[0].body) && forks[0].body.at === 2,
+      forks[0] && JSON.stringify(forks[0].body));
+    check("ветка открылась сама, без второго клика",
+      $("#feed").textContent.includes("первый вопрос"), $("#feed").textContent.slice(0, 120));
+    check("и в ней ровно унесённое начало, а не весь разговор родителя",
+      !$("#feed").textContent.includes("второй вопрос"), $("#feed").textContent.slice(0, 200));
+    check("в панели открытой ветки сказано, от кого она и сколько унесла",
+      /ветка от «родитель» — унесено 2 сообщений/.test($("#branch-note").textContent) &&
+        !$("#branch-note").classList.contains("hidden"),
+      $("#branch-note").textContent);
+    check("и там же — что ветка самостоятельна",
+      /удаление родителя эту ветку не удалит/.test($("#branch-note").textContent),
+      $("#branch-note").textContent);
+    check("в списке у ветки та же пометка, что в панели",
+      noteOf(4) === "ветка от «родитель» — унесено 2 сообщений", noteOf(4));
+
+    // Переименование родителя видно в пометке сразу: имени в ней не
+    // хранится, оно найдено по id.
+    const row = rows()[2];
+    const rename = row.querySelectorAll(".mini").find((b) => b.title === "Переименовать");
+    if (!rename) check("у строки списка есть кнопка «Переименовать»", false, "её нет");
+    else {
+      rename.dispatchEvent(new Evt("click"));
+      const field = row.querySelector(".item-rename");
+      field.value = "родитель под новым именем";
+      field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+      await settle(60);
+      check("переименовали родителя — пометка ветки называет новое имя",
+        noteOf(4) === "ветка от «родитель под новым именем» — унесено 2 сообщений", noteOf(4));
+    }
+
+    // И обратно к родителю: у него своя история целиком и своя панель.
+    // Это и есть «переключайтесь между ветками» — ветка обычный чат, и
+    // отдельного переключателя ей не нужно.
+    open(2);
+    await settle(40);
+    check("вернулись к родителю — разговор у него целиком",
+      $("#feed").textContent.includes("второй вопрос"), $("#feed").textContent.slice(0, 200));
+    check("и пометка ветки в панели снова спрятана",
+      $("#branch-note").classList.contains("hidden"), $("#branch-note").textContent);
+  }
 }
 
 // ── итог ──
