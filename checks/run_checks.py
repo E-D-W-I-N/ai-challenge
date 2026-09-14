@@ -1208,6 +1208,13 @@ def check_branch_independent():
         for i in range(3):
             client.post(f"/api/agents/{parent}/messages", json={"text": f"вопрос {i}"})
         spoken = len(_stub.CALLS)
+        store = REGISTRY.store
+        # Снимок ленты родителя **до** ветвления. Это единственное окно,
+        # в котором видно, тронуло ли ветвление чужую сессию: заговори
+        # родитель снова — и `persist()` живого объекта перепишет `messages`
+        # из памяти целиком, затерев любое повреждение в базе.
+        before_fork = [row[2] for row in store.message_rows(parent)]
+        assert len(before_fork) == 6, before_fork
 
         # Чекпойнт — два первых обмена, четыре сообщения.
         first = client.post(f"/api/agents/{parent}/fork", json={"at": 4})
@@ -1221,6 +1228,26 @@ def check_branch_independent():
 
         # К модели ветвление не ходит: оно копирует, а не спрашивает.
         assert len(_stub.CALLS) == spoken, "ветвление сходило к модели"
+
+        # Для родителя ветвление — операция **только на чтение**: лента
+        # в базе та же, и родства ему не записано. Смотрим сразу, пока никто
+        # не заговорил снова. Одна лишняя строка в записи ветки —
+        # `save_history(parent_id, ...)` — стёрла бы родителю хвост
+        # разговора насовсем: `save_history` начинается с `DELETE`, и
+        # перезапустись процесс сразу после ветвления, восстанавливать было
+        # бы нечего. После первой же реплики родителя это уже не видно.
+        assert [row[2] for row in store.message_rows(parent)] == before_fork, (
+            "ветвление тронуло ленту родителя"
+        )
+        assert store.load_branch(parent) is None, "ветвление записало родство родителю"
+        # И то же окно с другой стороны: в ветке лежит ровно унесённое
+        # и ничего чужого.
+        assert [row[2] for row in store.message_rows(one["id"])] == before_fork[:4], (
+            store.message_rows(one["id"])
+        )
+        assert store.message_rows(two["id"]) == store.message_rows(one["id"]), (
+            "две ветки от одного места унесли разное"
+        )
 
         assert one["id"] not in (parent, two["id"]) and two["id"] != parent, (one, two)
         # Имена разные: две ветки от одного места — это ровно то, о чём
@@ -1260,7 +1287,6 @@ def check_branch_independent():
         # И в базе три разные ленты: ни одна запись не затёрла чужую.
         # `save_history` начинается с `DELETE` по `session_id` — общая сессия
         # тут стоила бы разговора.
-        store = REGISTRY.store
         rows = {ident: store.message_rows(ident) for ident in (parent, one["id"], two["id"])}
         assert [r[2] for r in rows[parent]] == [
             "вопрос 0", "ответ на вопрос 0", "вопрос 1", "ответ на вопрос 1",
@@ -1284,6 +1310,34 @@ def check_branch_independent():
         assert listed[one["id"]]["branch"]["forked_at"] == 4, listed[one["id"]]
         assert listed[parent]["branch"] is None, listed[parent]
 
+        # Тот же список, но **холодным** путём: выгружаем ветку из памяти —
+        # так выглядит и вытеснение по потолку, и перезапуск сервера, — и
+        # читаем список снова. Пометка обязана быть та же, а приезжает она
+        # другой ветвью кода: у живого чата её отдаёт он сам, у выгруженного
+        # — строка из базы. Не проверь холодную, и пометка ветки пропадала бы
+        # после перезапуска, оставаясь на месте до него.
+        assert REGISTRY._unload(one["id"]) is True, "ветка не была живой"
+        cold = {a["id"]: a for a in client.get("/api/agents").json()["agents"]}
+        assert cold[one["id"]]["branch"] == {"parent_id": parent, "forked_at": 4}, cold[one["id"]]
+        assert cold[one["id"]]["history_len"] == 4, cold[one["id"]]
+        assert cold[parent]["branch"] is None, cold[parent]
+
+        # Ветка от ветки. Родство называет того, от кого отделились, а не
+        # деда: иначе пометка внучки указывала бы на живого деда, а после
+        # удаления настоящего родителя говорила бы «ветка от удалённого
+        # чата» про чат, который на месте. Ветвимся от только что
+        # выгруженной ветки — заодно видно, что поднятая из базы ветка
+        # остаётся веткой и годится в родители.
+        grand = client.post(f"/api/agents/{one['id']}/fork", json={"at": 2}).json()["agents"][0]
+        assert grand["branch"] == {"parent_id": one["id"], "forked_at": 2}, grand["branch"]
+        assert [row[2] for row in store.message_rows(grand["id"])] == [
+            "вопрос 0", "ответ на вопрос 0",
+        ], store.message_rows(grand["id"])
+        # А у самой ветки родство прежнее: ветвление от неё её не переписало.
+        assert store.load_branch(one["id"]) == {"parent_id": parent, "forked_at": 4}, (
+            store.load_branch(one["id"])
+        )
+
         # Кривое `N` — 400 с текстом, а не 500 и не молчаливый зажим.
         history_len = len(live_parent.history)
         for bad in ({"at": -1}, {"at": history_len + 1}, {"at": "два"}, {"at": True}, {},
@@ -1295,6 +1349,72 @@ def check_branch_independent():
         empty = client.post(f"/api/agents/{parent}/fork", json={"at": 0}).json()["agents"][0]
         assert empty["history_len"] == 0 and empty["system"] == "СИС", empty
         assert empty["branch"] == {"parent_id": parent, "forked_at": 0}, empty["branch"]
+
+        # И чат, в котором ещё не сказано ни слова, ветвится так же: унести
+        # нечего, но конфиг у ветки его. Это не край, а первый день чата —
+        # падать на нём нельзя, а `at = 0` у чата с историей этого случая
+        # не покрывает: там длина не ноль.
+        fresh = new_agent(client, label="свежий")
+        blank = client.post(f"/api/agents/{fresh}/fork", json={"at": 0})
+        assert blank.status_code == 200, blank.text
+        sprout = blank.json()["agents"][0]
+        assert sprout["history_len"] == 0, sprout["history_len"]
+        assert sprout["branch"] == {"parent_id": fresh, "forked_at": 0}, sprout["branch"]
+        # А `at = 1` у такого чата — 400: уносить нечего.
+        assert client.post(f"/api/agents/{fresh}/fork", json={"at": 1}).status_code == 400
+
+    # --- ветвление у занятого родителя ------------------------------------
+    #
+    # Ручка обещает, что занятость родителя ветвлению не мешает: история
+    # не меняется до конца обмена, и ветка унесёт то, что записано прямо
+    # сейчас. Обещание без утверждения отменяется одной строкой — 409
+    # у занятого, «занят — уноси всю историю», «занят — уноси на пару меньше»,
+    # — и набор этого не заметит. Поэтому ветвимся **посреди** ответа,
+    # и точку берём меньше длины истории: сравнение «унесено ровно `at`»
+    # тогда отличает её и от полной истории, и от укороченной.
+    async def fork_mid_answer():
+        from httpx import ASGITransport, AsyncClient
+
+        _stub.reset()
+        _stub.install(
+            reply=lambda messages, i: "ответ на " + messages[-1]["content"],
+            chunks=8,
+            delay=0.03,
+        )
+        transport = ASGITransport(app=main.app)
+        async with AsyncClient(transport=transport, base_url="http://stub") as client:
+            made = await client.post(
+                "/api/agents", json={"agent": {"model": "stub/model", "label": "занятый"}}
+            )
+            busy_id = made.json()["agents"][0]["id"]
+            for i in range(2):
+                await client.post(f"/api/agents/{busy_id}/messages", json={"text": f"реплика {i}"})
+            talking = asyncio.create_task(
+                client.post(f"/api/agents/{busy_id}/messages", json={"text": "долгий вопрос"})
+            )
+            await asyncio.sleep(0.05)
+            live = REGISTRY.require(busy_id)
+            assert live.busy, "родитель не занят — проверять нечего"
+            # Это и есть то, на чём держится обещание: история не растёт
+            # до конца обмена, поэтому ветвиться посреди ответа безопасно.
+            assert len(live.history) == 4, len(live.history)
+            forked = await client.post(f"/api/agents/{busy_id}/fork", json={"at": 2})
+            answered = await talking
+        assert answered.status_code == 200, answered.text
+        return forked, live
+
+    forked, busy_parent = asyncio.run(fork_mid_answer())
+    assert forked.status_code == 200, forked.text
+    mid = forked.json()["agents"][0]
+    assert mid["history_len"] == 2, mid["history_len"]
+    assert mid["branch"] == {"parent_id": busy_parent.id, "forked_at": 2}, mid["branch"]
+    assert [row[2] for row in REGISTRY.store.message_rows(mid["id"])] == [
+        "реплика 0", "ответ на реплика 0",
+    ], REGISTRY.store.message_rows(mid["id"])
+    # А обмен родителя тем временем дописался целиком: ветвление его
+    # не оборвало и не потеряло.
+    assert len(busy_parent.history) == 6, len(busy_parent.history)
+    assert busy_parent.history[-1].content == "ответ на долгий вопрос", busy_parent.history[-1]
 
     # --- врезка едет только та, что покрывает одно унесённое ---------------
     #
@@ -1319,14 +1439,24 @@ def check_branch_independent():
         asyncio.run(drain(folded.ask(f"вопрос {i}")))
     assert folded.summary_cover() == 10 and len(folded.history) == 18, folded.summary_cover()
 
-    near = reg.fork(folded, 6, label="ветка до сводки")
+    # Границу берём **вплотную**: на единицу и ошибаются в таком сравнении,
+    # а ветка в четырёх сообщениях от границы сдвига на единицу не заметит.
+    edge = reg.fork(folded, 10, label="ровно по границе сводки")
+    near = reg.fork(folded, 9, label="на одно раньше границы")
     far = reg.fork(folded, 18, label="ветка после сводки")
-    assert len(near.history) == 6 and len(far.history) == 18, (len(near.history), len(far.history))
-    # Граница сводки (10) дальше точки ветвления (6) — сводка не поехала,
-    # и резать в ветке нечем: её история уезжает целиком.
+    assert (len(edge.history), len(near.history), len(far.history)) == (10, 9, 18), (
+        len(edge.history), len(near.history), len(far.history)
+    )
+    # `upto == at`: сводка покрывает ровно унесённое — едет. Хвоста у такой
+    # ветки нет вовсе, и свёрнутое плюс хвост по-прежнему равно её истории.
+    assert [item["upto"] for item in edge.summaries] == [10], edge.summaries
+    assert edge.summary_cover() == 10, edge.summary_cover()
+    assert len(edge.build_prompt("ещё")) == 2, edge.build_prompt("ещё")
+    # `upto == at + 1`: одной из покрытых сводкой реплик в ветке уже нет —
+    # не едет. Резать в такой ветке нечем, её история уезжает целиком.
     assert near.summaries == [], near.summaries
     assert store.load_summaries(near.id) == [], store.load_summaries(near.id)
-    assert near.summary_cover() == 0 and len(near.build_prompt("ещё")) == 7, near.summary_cover()
+    assert near.summary_cover() == 0 and len(near.build_prompt("ещё")) == 10, near.summary_cover()
     # А у дальней сводка своя и покрывает ровно унесённое.
     assert [item["upto"] for item in far.summaries] == [10], far.summaries
     assert [item["upto"] for item in store.load_summaries(far.id)] == [10]
@@ -1356,14 +1486,22 @@ def check_branch_independent():
         asyncio.run(drain(listing.ask(f"вопрос {i}")))
     upto = listing.facts["upto"]
     assert upto == 8 and listing.facts["items"], listing.facts
-    thin = reg.fork(listing, upto - 2, label="ветка до выписки")
+    # Та же граница и так же вплотную: `upto - 1` и ровно `upto`.
+    thin = reg.fork(listing, upto - 1, label="на одно раньше границы выписки")
+    brim = reg.fork(listing, upto, label="ровно по границе выписки")
     fat = reg.fork(listing, 10, label="ветка после выписки")
-    # Выписка прочитала восемь реплик, а ветка унесла шесть: в ней выписки
+    # Выписка прочитала восемь реплик, а ветка унесла семь: в ней выписки
     # нет вовсе — иначе она рассказала бы про разговор, которого в ветке
     # не было, и под ответом стояло бы «факты вместо N сообщений» про это.
     assert thin.facts == agent_module.empty_facts(), thin.facts
     assert store.load_facts(thin.id)["items"] == [], store.load_facts(thin.id)
     assert thin.context_cut() == (0, None), thin.context_cut()
+    # А унёсшая ровно прочитанное — уносит выписку с её же границей, и режет
+    # ею столько, сколько выписка прочитала, а не сколько хотелось бы.
+    assert brim.facts["items"] == listing.facts["items"], brim.facts["items"]
+    assert brim.facts["upto"] == upto, brim.facts["upto"]
+    assert store.load_facts(brim.id)["items"] == listing.facts["items"]
+    assert brim.context_cut()[0] == upto - KEEP, brim.context_cut()
     # А унёсшая всё прочитанное — уносит и выписку, и её границу.
     assert fat.facts["items"] == listing.facts["items"], fat.facts["items"]
     assert fat.facts["upto"] == upto, fat.facts["upto"]
@@ -1426,10 +1564,13 @@ def check_branch_independent():
     finally:
         again.close()
     return (
-        "две ветки от одного места унесли по 4 сообщения, три ленты в базе не "
-        "перемешались; сводка на 10 реплик уехала в ветку на 18 и не уехала "
-        "в ветку на 6, выписка на 8 — так же; перезапуск и удаление родителя "
-        "ветка пережила, удаление и очистка уносят родство"
+        "две ветки от одного места унесли по 4 сообщения, лента родителя "
+        "сразу после ветвления та же; ветка от ветки называет родителя, "
+        "а не деда; пометка та же и у выгруженной; ветвление посреди ответа "
+        "унесло ровно записанное; сводка с границей 10 уехала в ветку на 10 "
+        "и не уехала в ветку на 9, выписка с границей 8 — в 8 и не в 7; "
+        "перезапуск и удаление родителя ветка пережила, удаление чата "
+        "и очистка базы уносят родство"
     )
 
 
