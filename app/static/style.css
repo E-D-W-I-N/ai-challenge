@@ -666,6 +666,91 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   color: var(--faint);
 }
 
+/* ── вкладка «Память»: три слоя, по разделу на каждый ──
+   Разделы идут от короткого слоя к долгому и выглядят одинаково: заголовок,
+   тело, пояснение мелким. Разница между слоями — в том, что в них лежит и
+   кто это пишет, а не в оформлении. Всё раскладывается в столбик: колонка
+   панели узкая, и в два столбца здесь не влезает ни строка факта, ни запись
+   памяти. */
+.mem-layer { display: flex; flex-direction: column; gap: 7px; }
+.mem-title {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.mem-body { display: flex; flex-direction: column; gap: 6px; }
+.mem-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 13px; }
+.mem-k { color: var(--muted); min-width: 0; }
+.mem-v { flex: 0 0 auto; font-weight: 650; font-variant-numeric: tabular-nums; }
+.mem-note { margin: 0; font-size: 11.5px; line-height: 1.5; color: var(--faint); }
+.mem-sub {
+  margin-top: 3px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+/* Строка факта, сводки или записи памяти. Кнопка справа не сжимается:
+   текст переносится, а действие остаётся на месте и видно его всегда. */
+.mem-item {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  font-size: 12.5px;
+}
+.mem-item.column { flex-direction: column; gap: 4px; }
+/* Основа в процентах, а не `auto`: в узком ящике (панель там 300px и уже)
+   кнопка рядом с длинной строкой факта сжимала бы текст в столбик по слову.
+   С этой основой она уезжает на свою строку и встаёт справа. */
+.mem-text { flex: 1 1 55%; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
+.mem-kind {
+  flex: 0 0 auto;
+  padding-top: 1px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.mem-btn {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.mem-btn:hover { color: var(--text); border-color: var(--faint); }
+/* Род и кнопка в одном ряду: выбор рода — часть самого добавления, а не
+   отдельный шаг перед ним. */
+.mem-add-row { display: flex; align-items: flex-end; gap: 8px; }
+.mem-add-row .field { flex: 1 1 auto; }
+.mem-add {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.mem-add:hover { background: var(--bg-soft); border-color: var(--faint); }
+/* Отказ ручки виден там же, где обещание успеха: под самой формой. */
+.hint.error { color: var(--danger); }
+
 /* Предупреждение о параметрах, которых выбранная модель не заявляет.
    Не запрет: отправить всё равно можно — но не вслепую. */
 .warn {

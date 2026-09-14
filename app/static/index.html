@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 10</span>
+            <span class="brand-sub">чат · день 11</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -55,6 +55,7 @@
         <div class="tabs" role="tablist">
           <button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab">Модель</button>
           <button class="tab" data-tab="agent" type="button" role="tab">Агент</button>
+          <button class="tab" data-tab="memory" type="button" role="tab">Память</button>
         </div>
         <button class="icon-btn" id="panel-toggle" type="button"
                 title="Свернуть настройки" aria-label="Свернуть настройки"></button>
@@ -182,6 +183,56 @@
               <option value="off">Выключена</option>
             </select>
           </label>
+        </section>
+
+        <!-- Память агента: три слоя, по разделу на каждый, в порядке от
+             короткого к долгому. Разделы пусты в разметке намеренно — их
+             наполняет `renderMemory` по ответу `GET /api/agents/{id}/memory`,
+             и запрашивается он лениво, на открытие вкладки: панель
+             перерисовывается на каждый обмен, а слои меняются заметно реже.
+
+             Поля этого раздела нарочно **без** приставки `f-`: её носят поля
+             конфига чата, которые пролив панели шлёт PATCH'ем. Память — не
+             настройка чата, у неё свои ручки, и общий слушатель `change`
+             на #panel-body отличает одно от другого ровно по этой приставке. -->
+        <section class="tab-page hidden" id="tab-memory">
+          <div class="mem-layer">
+            <h3 class="mem-title">Краткосрочная — этот диалог</h3>
+            <div class="mem-body" id="mem-short"></div>
+          </div>
+
+          <div class="mem-layer">
+            <h3 class="mem-title">Рабочая — что выписано об этом чате</h3>
+            <div class="mem-body" id="mem-working"></div>
+          </div>
+
+          <div class="mem-layer">
+            <h3 class="mem-title">Долговременная — общая на все чаты</h3>
+            <div class="mem-body" id="mem-long"></div>
+
+            <!-- Форма добавления. Род записи выбирается явно и умолчания
+                 не имеет ни здесь, ни на сервере: первым пунктом списка стоит
+                 пустой «— выберите род —», а ручка отказывает и отсутствующему
+                 ключу. «Явно выбирать, что и куда сохраняется» — единственная
+                 работа пользователя в этом слое, и подставить её за него
+                 не вправе ни сервер, ни форма. -->
+            <label class="field">
+              <span class="field-label">Что запомнить</span>
+              <textarea id="mem-content" class="control area" rows="2"
+                        placeholder="например: пишу на Kotlin"></textarea>
+            </label>
+            <div class="mem-add-row">
+              <label class="field">
+                <span class="field-label">Род записи</span>
+                <!-- Опции пусты в разметке: их строит `fillKinds` из той же
+                     карты родов, по которой подписаны записи в списке. Двумя
+                     таблицами подписи разъехались бы молча. -->
+                <select id="mem-kind" class="control"></select>
+              </label>
+              <button class="mem-add" id="mem-add" type="button">Запомнить</button>
+            </div>
+            <p class="hint" id="mem-status"></p>
+          </div>
         </section>
       </div>
 

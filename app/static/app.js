@@ -22,6 +22,8 @@ const state = {
   contextPast: false,  // доля окна осталась от прошлого обмена: последний упал
   statusTimer: null,   // таймер, гасящий строку состояния
   prompts: new Map(),  // промпты обменов этой вкладки (см. promptKey)
+  memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
+  memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -540,6 +542,12 @@ async function openAgent(agentId) {
   renderFeed(agent);
   fillPanel(agent);
   renderTiles();
+
+  // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
+  // заново, но только если вкладка открыта: закрытой они не нужны.
+  state.memory = null;
+  if (memoryTabOpen()) loadMemory();
+  else renderMemory();
 
   const input = $("#input");
   input.value = "";
@@ -1112,9 +1120,17 @@ async function refreshCurrent(prompt) {
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
   } catch (e) { /* чат исчез — список обновится при следующем открытии */ }
+  // Обмен меняет первые два слоя: история выросла, выписка обновилась.
+  // Это событие, а не отрисовка, и при закрытой вкладке оно молчит.
+  if (memoryTabOpen()) loadMemory();
 }
 
 // ─────────────────────── панель настроек ──────────────────────
+
+// Страницы панели. Переключение перечисляет их поимённо: страница, забытая
+// в списке, осталась бы на экране поверх открытой — и видно это только
+// глазами. Список здесь один на всех.
+const PANEL_TABS = ["model", "agent", "memory"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -1525,6 +1541,283 @@ function applySettings() {
   return state.applying;
 }
 
+
+// ────────────────────── вкладка «Память» ──────────────────────
+
+// Три слоя памяти агента — по разделу на каждый, в порядке от короткого
+// к долгому. Данные приходят одним ответом `GET /api/agents/{id}/memory`:
+// `short_term` — счётчик сообщений этого чата, `working` — факты и сводки
+// этого чата, `long_term` — выключатель чата и общий на всю базу список.
+//
+// Ответ лежит в `state.memory`, и отрисовка берёт всё оттуда: **запрос идёт
+// на открытие вкладки, а не на отрисовку**. Панель перерисовывается на каждый
+// обмен и на каждую правку конфига, а слои столько раз не меняются — запрос
+// внутри отрисовки превратил бы один поход на сервер в поток.
+//
+// Перечитывается память там, где она правда изменилась: при открытии другого
+// чата (первые два слоя — его собственные) и после обмена (история выросла,
+// выписка обновилась). И то и другое — события, а не отрисовки, и оба молчат,
+// пока вкладка закрыта.
+
+// Роды записей: токен для сервера и русская подпись. Одна карта на список
+// записей и на дропдаун формы — его опции строятся отсюда же (`fillKinds`).
+// Второй таблицей подписи разъехались бы молча: в списке стояло бы одно
+// слово, а в форме другое. Слова те же, что в `MEMORY_LABELS` на сервере, —
+// ими же память подписана и в промпте.
+const MEMORY_KINDS = [
+  ["profile", "профиль"],
+  ["decision", "решение"],
+  ["knowledge", "знание"],
+];
+
+const memoryKindLabel = (kind) =>
+  (MEMORY_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
+
+// Факт так, как он записан у сервера и как уезжает в промпт: «ключ: значение»
+// (`facts_lines`, app/agent.py). В той же форме он и продвигается в
+// долговременную память — иначе запись говорила бы не то, что показано.
+const factLine = (fact) => fact.key + ": " + fact.value;
+
+function memoryTabOpen() {
+  return !$("#tab-memory").classList.contains("hidden");
+}
+
+// Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
+async function loadMemory() {
+  const id = state.current && state.current.id;
+  state.memoryNote = "Читаю память…";
+  renderMemory();
+  try {
+    // Чата ещё нет — общий слой всё равно можно показать: он не про чат.
+    // Первые два раздела в этом случае честно говорят, что показывать нечего.
+    state.memory = id
+      ? await api("/api/agents/" + id + "/memory")
+      : { short_term: null, working: null, long_term: { enabled: null, ...(await api("/api/memory")) } };
+    state.memoryNote = "";
+  } catch (err) {
+    state.memory = null;
+    state.memoryNote = String(err.message || err);
+  }
+  renderMemory();
+}
+
+// Сколько первых реплик не уедет в модель дословно при нынешней стратегии —
+// и каким словом это называется.
+//
+// Расчёт повторяет серверный (`Agent.context_cut` с `facts_cover` и
+// `summary_cover`): ручка отдаёт его **входы** — длину истории, докуда
+// прочитана выписка, докуда покрывает последняя сводка, — а не готовое число.
+// Считается по конфигу агента, а не по полям панели: в панели может стоять
+// непролитая правка, а раздел говорит о том, что уедет сейчас. Незнакомая
+// стратегия читается как «вся история» — ровно как на сервере.
+function shortTermCut(agent, layers) {
+  const total = layers.short_term.messages;
+  const keep = agent && agent.keep_last !== undefined ? agent.keep_last : null;
+  const working = layers.working || {};
+  const strategy = agent ? agent.strategy : "full";
+  // Пустое поле — резать нечем: идиом тот же, что у сервера, `null` это
+  // «не делать», а не «делать с нулём».
+  const nothing = keep === null || keep === undefined;
+  if (strategy === "window") {
+    return { cut: nothing ? 0 : Math.max(0, total - keep), word: "отброшено окном" };
+  }
+  if (strategy === "facts") {
+    const facts = working.facts || [];
+    const upto = working.facts_upto || 0;
+    return {
+      cut: nothing || !facts.length ? 0 : Math.max(0, Math.min(total - keep, upto)),
+      word: "заменено выпиской фактов",
+    };
+  }
+  if (strategy === "summary") {
+    const summaries = working.summaries || [];
+    const last = summaries.length ? summaries[summaries.length - 1] : null;
+    const upto = last && typeof last.upto === "number" ? last.upto : 0;
+    return { cut: nothing || upto <= 0 ? 0 : Math.min(upto, total), word: "заменено сводкой" };
+  }
+  return { cut: 0, word: "" };
+}
+
+function memRow(label, value) {
+  const row = el("div", "mem-row");
+  row.append(el("span", "mem-k", label), el("span", "mem-v", value));
+  return row;
+}
+
+const memNote = (text) => el("p", "mem-note", text);
+
+// Раздела нет данных — говорим почему: читаем, не открыт чат или ручка
+// ответила ошибкой. Пустой раздел молчал бы о разнице между «пусто»
+// и «не доехало».
+const memBlank = () => memNote(state.memoryNote || "Чат ещё не открыт.");
+
+function renderMemory() {
+  renderShortTerm($("#mem-short"));
+  renderWorking($("#mem-working"));
+  renderLongTerm($("#mem-long"));
+}
+
+function renderShortTerm(box) {
+  box.innerHTML = "";
+  const layers = state.memory;
+  if (!layers || !layers.short_term) { box.appendChild(memBlank()); return; }
+  const total = layers.short_term.messages;
+  const cut = shortTermCut(state.current, layers);
+  box.append(
+    memRow("Сообщений в истории", fmt.tokens(total)),
+    memRow("Уезжает дословно", fmt.tokens(total - cut.cut)),
+    memNote(cut.cut
+      ? "Остальные " + fmt.tokens(cut.cut) + " — " + cut.word + "."
+      : "Вся история уезжает в модель дословно.")
+  );
+}
+
+function renderWorking(box) {
+  box.innerHTML = "";
+  const working = state.memory && state.memory.working;
+  if (!working) { box.appendChild(memBlank()); return; }
+
+  const facts = working.facts || [];
+  box.appendChild(el("div", "mem-sub", "Факты"));
+  if (!facts.length) box.appendChild(memNote("Фактов ещё нет: их выписывает стратегия «Факты»."));
+  facts.forEach((fact) => {
+    const line = factLine(fact);
+    const row = el("div", "mem-item");
+    // Продвижение факта в долговременную память — единственный путь, которым
+    // в неё попадает что-то, кроме набранного руками. И это по-прежнему
+    // нажатие: само не переезжает ничего.
+    const btn = el("button", "mem-btn", "Запомнить надолго");
+    btn.type = "button";
+    btn.title = "Запомнить надолго";
+    btn.onclick = () => remember("knowledge", line);
+    row.append(el("div", "mem-text", line), btn);
+    box.appendChild(row);
+  });
+
+  const summaries = working.summaries || [];
+  box.appendChild(el("div", "mem-sub", "Сводки"));
+  if (!summaries.length) {
+    box.appendChild(memNote("Сводок ещё нет: их пишет стратегия «Суммаризация»."));
+  }
+  summaries.forEach((item) => {
+    const row = el("div", "mem-item column");
+    row.append(
+      el("div", "mem-text", item.content),
+      memNote("вместо первых " + fmt.tokens(item.upto) + " сообщений")
+    );
+    box.appendChild(row);
+  });
+}
+
+function renderLongTerm(box) {
+  box.innerHTML = "";
+  const long = state.memory && state.memory.long_term;
+  if (!long) { box.appendChild(memBlank()); return; }
+  const records = long.records || [];
+  if (long.enabled === false) {
+    box.appendChild(memNote("Выключатель этого чата стоит в «выключена»: в его промпт записи не едут."));
+  } else if (long.enabled === true) {
+    box.appendChild(memNote("Записи едут врезкой в промпт этого чата при любой стратегии."));
+  } else {
+    box.appendChild(memNote("Список общий: он одинаков у всех чатов."));
+  }
+  if (!records.length) {
+    box.appendChild(memNote("Пусто. Сюда ничего не попадает само — только нажатием."));
+    return;
+  }
+  records.forEach((record) => {
+    const row = el("div", "mem-item");
+    row.append(
+      el("div", "mem-kind", memoryKindLabel(record.kind)),
+      el("div", "mem-text", record.content),
+      iconButton("trash", "Забыть запись", () => forget(record.seq), "mini danger")
+    );
+    box.appendChild(row);
+  });
+}
+
+function memoryStatus(text, isError) {
+  const box = $("#mem-status");
+  box.className = "hint" + (isError ? " error" : "");
+  box.textContent = text || "";
+}
+
+// Новая запись долговременной памяти. Список пополняется **записанным
+// ответом**, а не присланным телом: номер выдаёт база, а текст по дороге
+// чистит `redact()`. Перечитывать слой целиком для этого незачем.
+//
+// Дедупликации нет намеренно: второй клик по тому же факту заводит вторую
+// запись. Отличить «то же самое» от «похожего» может только человек, и
+// удаляется лишняя одной кнопкой.
+async function remember(kind, content) {
+  const text = (content || "").trim();
+  if (!text) {
+    memoryStatus("Текст записи пуст: записывать нечего.", true);
+    return false;
+  }
+  try {
+    const record = await api("/api/memory", json("POST", { kind, content: text }));
+    const long = state.memory && state.memory.long_term;
+    if (long) long.records = [...(long.records || []), record];
+    renderMemory();
+    memoryStatus("Запомнено: " + memoryKindLabel(record.kind) + ".");
+    return true;
+  } catch (err) {
+    memoryStatus(String(err.message || err), true);
+    return false;
+  }
+}
+
+async function forget(seq) {
+  try {
+    await api("/api/memory/" + seq, { method: "DELETE" });
+  } catch (err) {
+    memoryStatus(String(err.message || err), true);
+    return;
+  }
+  const long = state.memory && state.memory.long_term;
+  if (long) long.records = (long.records || []).filter((record) => record.seq !== seq);
+  renderMemory();
+  memoryStatus("Запись забыта.");
+}
+
+// Род записи уезжает тот, что выбран в списке: умолчания у него нет ни здесь,
+// ни на сервере — `_kind_field` отказывает и отсутствию ключа тоже.
+async function addFromForm() {
+  const kind = $("#mem-kind").value;
+  // Род не выбран — не шлём вовсе: ручка ответит 400, и незачем спрашивать
+  // сервер о том, что видно здесь. Отказ при этом тот же по смыслу —
+  // «род записи выбирает человек».
+  if (!kind) {
+    memoryStatus("Род записи не выбран: профиль, решение или знание.", true);
+    return;
+  }
+  const field = $("#mem-content");
+  const saved = await remember(kind, field.value);
+  if (saved) field.value = "";
+}
+
+// Опции дропдауна — из той же карты, что и подписи в списке.
+//
+// Первым пунктом — пустой: **умолчания у рода нет и в форме**, ровно как
+// на сервере, где `_kind_field` отказывает и отсутствующему ключу. Уберём
+// пустой пункт — список возьмёт первый настоящий, и пользователь, не тронувший
+// его, запишет «профиль», ничего не выбрав: сервер за него не выбирает, а
+// форма выбрала бы. День про явный выбор, и выбор обязан быть нажатием
+// человека в обоих местах.
+function fillKinds() {
+  const select = $("#mem-kind");
+  select.innerHTML = "";
+  const blank = el("option", "", "— выберите род —");
+  blank.value = "";
+  select.appendChild(blank);
+  MEMORY_KINDS.forEach(([token, label]) => {
+    const option = el("option", "", label);
+    option.value = token;
+    select.appendChild(option);
+  });
+}
+
 // ─────────────────────────── плитки ───────────────────────────
 
 // Плитки справа — про весь диалог, а не про последний ответ: сколько всего
@@ -1748,6 +2041,10 @@ function init() {
   // Настройки применяются по change: у полей ввода это потеря фокуса,
   // у списков — выбор. Отдельной кнопки сохранения нет.
   $("#panel-body").addEventListener("change", (ev) => {
+    // Пролив панели — про конфиг чата, и поля его носят приставку `f-`.
+    // Поля вкладки «Память» её не носят: у памяти свои ручки, и PATCH чата
+    // при выборе рода записи был бы запросом ни о чём.
+    if (!String(ev.target.id || "").startsWith("f-")) return;
     if (ev.target.id === "f-response_format_kind") syncResponseFormat();
     // Показ полей меняется на самом выборе, а не после сохранения: пролив
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
@@ -1760,8 +2057,10 @@ function init() {
     tab.onclick = () => {
       const which = tab.dataset.tab;
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      $("#tab-model").classList.toggle("hidden", which !== "model");
-      $("#tab-agent").classList.toggle("hidden", which !== "agent");
+      PANEL_TABS.forEach((name) => $("#tab-" + name).classList.toggle("hidden", name !== which));
+      // Память запрашивается здесь и только здесь: лениво, на открытие
+      // вкладки. Отрисовка своего запроса не делает — см. `loadMemory`.
+      if (which === "memory") loadMemory();
     };
   });
 
@@ -1779,8 +2078,12 @@ function init() {
   });
   $("#composer").addEventListener("submit", (ev) => { ev.preventDefault(); send(); });
 
+  fillKinds();
+  $("#mem-add").onclick = () => addFromForm();
+
   setBusy(false);
   renderTiles();
+  renderMemory();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
 
