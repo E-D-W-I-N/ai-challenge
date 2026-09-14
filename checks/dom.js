@@ -466,6 +466,13 @@ function buildServer(options) {
     records: ((options && options.records) || []).map((seed, i) => ({
       seq: i + 1, at: i, ...seed,
     })),
+    // Секрет, который сервер вырезает из всего, что уезжает в базу
+    // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
+    // на «***» — и только когда секрет задан, ровно как сервер без ключа
+    // не чистит ничего. Без этого половина инварианта «список пополняется
+    // ответом ручки, а не присланным телом» через интерфейс ненаблюдаема:
+    // присланное и записанное совпадали бы посимвольно.
+    secret: (options && options.secret) || "",
     // Рабочий слой чата: факты и сводки. Лежит отдельно от самого чата —
     // ровно как на сервере, где у них свои таблицы, а не колонка в `sessions`.
     // Ключ — имя чата: чаты стенд и так заводит по именам.
@@ -760,7 +767,10 @@ function buildServer(options) {
       if (typeof content !== "string" || !content.trim()) {
         return { ok: false, status: 400, json: async () => ({ detail: "content: непустая строка" }) };
       }
-      const record = { seq: (issuedMemory += 1), kind, content: content.trim(), at: state.records.length };
+      const clean = state.secret
+        ? content.trim().split(state.secret).join("***")
+        : content.trim();
+      const record = { seq: (issuedMemory += 1), kind, content: clean, at: state.records.length };
       state.records.push(record);
       return json(record);
     }

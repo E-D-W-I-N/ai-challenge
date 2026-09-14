@@ -1784,15 +1784,33 @@ async function forget(seq) {
 // Род записи уезжает тот, что выбран в списке: умолчания у него нет ни здесь,
 // ни на сервере — `_kind_field` отказывает и отсутствию ключа тоже.
 async function addFromForm() {
+  const kind = $("#mem-kind").value;
+  // Род не выбран — не шлём вовсе: ручка ответит 400, и незачем спрашивать
+  // сервер о том, что видно здесь. Отказ при этом тот же по смыслу —
+  // «род записи выбирает человек».
+  if (!kind) {
+    memoryStatus("Род записи не выбран: профиль, решение или знание.", true);
+    return;
+  }
   const field = $("#mem-content");
-  const saved = await remember($("#mem-kind").value, field.value);
+  const saved = await remember(kind, field.value);
   if (saved) field.value = "";
 }
 
 // Опции дропдауна — из той же карты, что и подписи в списке.
+//
+// Первым пунктом — пустой: **умолчания у рода нет и в форме**, ровно как
+// на сервере, где `_kind_field` отказывает и отсутствующему ключу. Уберём
+// пустой пункт — список возьмёт первый настоящий, и пользователь, не тронувший
+// его, запишет «профиль», ничего не выбрав: сервер за него не выбирает, а
+// форма выбрала бы. День про явный выбор, и выбор обязан быть нажатием
+// человека в обоих местах.
 function fillKinds() {
   const select = $("#mem-kind");
   select.innerHTML = "";
+  const blank = el("option", "", "— выберите род —");
+  blank.value = "";
+  select.appendChild(blank);
   MEMORY_KINDS.forEach(([token, label]) => {
     const option = el("option", "", label);
     option.value = token;

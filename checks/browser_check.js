@@ -1393,49 +1393,81 @@ async function routeChecks() {
   // открылась, в каждом разделе своё, факт продвинут в долговременный слой
   // нажатием, запись заведена формой с явно выбранным родом и удалена по
   // номеру — и всё это на один поход за слоями, а не на каждую отрисовку.
+  //
+  // Чатов в посеве четыре, по одному на стратегию с обрезкой плюс тот, у кого
+  // выписки ещё нет: число «уезжает дословно» считается по всем четырём
+  // ветвям одной формулы, и ветвь, которую не исполнило ни одно утверждение,
+  // вольна врать словом или брать не ту границу — проверке это не видно.
   {
+    const SECRET = "sk-стенд-секрет-длинный-достаточно";
     const talk = [];
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 4; i += 1) {
       talk.push({ role: "user", content: "вопрос " + i, error: null, reasoning: "", metrics: null });
       talk.push({ role: "assistant", content: "ответ " + i, error: null, reasoning: "", metrics: null });
     }
     const { client, server, $, settle, Evt } = freshClient({
+      secret: SECRET,
       chats: [
-        { label: "с фактами", strategy: "facts", keep_last: 2, transcript: talk },
+        { label: "с фактами", strategy: "facts", keep_last: 2, transcript: talk.slice(0, 6) },
         // Тот же выбор, что у соседа, но выписки ещё нет ни одной: фактов
         // нет — не режется ничего, ровно как на сервере. Число рядом со
         // стратегией само по себе не значит ничего.
         { label: "без выписки", strategy: "facts", keep_last: 2, transcript: talk.slice(0, 4) },
+        // Окно — единственная стратегия, которая начало **отбрасывает**,
+        // а не заменяет, и слово под числами обязано это различать. Заодно
+        // выключатель памяти у него в «выключена»: строка о том, едут ли
+        // записи в промпт этого чата, есть у каждого положения.
+        { label: "окно", strategy: "window", keep_last: 2, memory: "off",
+          transcript: talk.slice(0, 6) },
+        // Сводок две: срез считается по **последней**, и чат с одним
+        // сворачиванием этого не различил бы.
+        { label: "со сводками", strategy: "summary", keep_last: 2, transcript: talk },
       ],
       working: {
         "с фактами": {
           facts: [{ key: "цель", value: "собрать ТЗ" }, { key: "язык", value: "Kotlin" }],
           // Выписка отстала от истории: последнее извлечение прочитало две
-          // реплики из шести. Хвост от этого уезжает длиннее просимых двух —
+          // первые реплики. Хвост от этого уезжает длиннее просимых двух —
           // ровно так режет сервер (`facts_cover`), и раздел обязан назвать
           // то число, которое правда уедет, а не то, которое просили.
           facts_upto: 2,
           summaries: [{ seq: 0, upto: 4, content: "говорили про ТЗ и сроки" }],
+        },
+        "со сводками": {
+          summaries: [
+            { seq: 0, upto: 2, content: "первое сворачивание" },
+            { seq: 1, upto: 4, content: "второе сворачивание" },
+          ],
         },
       },
       records: [{ kind: "profile", content: "пишу на Kotlin" }],
     });
     client.init();
     await settle(30);
-    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    open(2);
     await settle(40);
 
     const layerCalls = () =>
       server.state.requests.filter((r) => /\/memory$/.test(r.path) && r.method === "GET");
     const memoryCalls = () => server.state.requests.filter((r) => /^\/api\/memory/.test(r.path));
+    const posts = () => memoryCalls().filter((r) => r.method === "POST");
+    const patches = () => server.state.requests.filter((r) => r.method === "PATCH");
     const openTab = (which) =>
       document.querySelectorAll(".tab").find((t) => t.dataset.tab === which)
         .dispatchEvent(new Evt("click"));
     const texts = (sel) => $(sel).querySelectorAll(".mem-text").map((n) => n.textContent);
+    const nums = (sel) => $(sel).querySelectorAll(".mem-v").map((n) => n.textContent).join("|");
     const shown = (sel) => $(sel).textContent;
 
-    // Лениво: вкладка закрыта — за слоями никто не ходил.
-    check("пока вкладка «Память» закрыта, за слоями не ходят вовсе",
+    // Лениво, и в обе стороны. Обмен слои меняет — история выросла, — но при
+    // закрытой вкладке за ними всё равно никто не идёт: перечитывание висит
+    // на событии, а не на самой отрисовке, и разница видна только так —
+    // обменом до открытия вкладки.
+    $("#input").value = "вопрос при закрытой вкладке";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("пока вкладка «Память» закрыта, за слоями не ходят вовсе — и после обмена тоже",
       layerCalls().length === 0, JSON.stringify(layerCalls().map((r) => r.path)));
 
     openTab("memory");
@@ -1450,14 +1482,14 @@ async function routeChecks() {
       layerCalls().length === 1, JSON.stringify(layerCalls().map((r) => r.path)));
 
     // Краткосрочная: длину истории называет сервер, а сколько из неё уедет
-    // дословно — считается по той же формуле, что режет промпт. Шесть
-    // сообщений, хвост просили в два, но выписка прочитала только две первые
-    // реплики — заменены ими ровно две, и дословно уезжают четыре, а не два.
-    // Меньшее из двух, как в `facts_cover`: срез по одному хвосту унёс бы
-    // начало, которого выписка никогда не видела.
+    // дословно — считается по той же формуле, что режет промпт. Восемь
+    // сообщений (шесть посева плюс обмен), хвост просили в два, но выписка
+    // прочитала только две первые реплики — заменены ими ровно две, и
+    // дословно уезжают шесть. Меньшее из двух, как в `facts_cover`: срез
+    // по одному хвосту унёс бы начало, которого выписка никогда не видела.
     check("в краткосрочной — длина истории и сколько из неё уезжает дословно",
       /Сообщений в истории/.test(shown("#mem-short")) && /Уезжает дословно/.test(shown("#mem-short")) &&
-        $("#mem-short").querySelectorAll(".mem-v").map((n) => n.textContent).join("|") === "6|4",
+        nums("#mem-short") === "8|6",
       shown("#mem-short"));
     check("и сказано, куда делось начало: выписка, а не окно и не сводка",
       /Остальные 2 — заменено выпиской фактов\./.test(shown("#mem-short")), shown("#mem-short"));
@@ -1471,10 +1503,14 @@ async function routeChecks() {
       texts("#mem-working").includes("говорили про ТЗ и сроки") &&
         /вместо первых 4 сообщений/.test(shown("#mem-working")), shown("#mem-working"));
 
-    // Долговременная: общий список с подписью рода по-русски.
+    // Долговременная: общий список с подписью рода по-русски — и строка
+    // о том, что с этими записями будет в промпте **этого** чата.
     check("в долговременной — запись с подписью рода",
       texts("#mem-long").join(" | ") === "пишу на Kotlin" &&
         $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|") === "профиль",
+      shown("#mem-long"));
+    check("и сказано, что у этого чата записи в промпт едут",
+      /Записи едут врезкой в промпт этого чата при любой стратегии\./.test(shown("#mem-long")),
       shown("#mem-long"));
 
     // ── «Запомнить надолго»: факт переезжает в долговременный слой ──
@@ -1484,13 +1520,12 @@ async function routeChecks() {
     else {
       promote.dispatchEvent(new Evt("click"));
       await settle(40);
-      const posted = memoryCalls().filter((r) => r.method === "POST");
       check("«Запомнить надолго» шлёт добавление с родом «знание»",
-        posted.length === 1 && posted[0].path === "/api/memory" && posted[0].body.kind === "knowledge",
-        JSON.stringify(posted.map((r) => r.body)));
+        posts().length === 1 && posts()[0].path === "/api/memory" && posts()[0].body.kind === "knowledge",
+        JSON.stringify(posts().map((r) => r.body)));
       check("и текстом самого факта, в той же форме «ключ: значение»",
-        posted.length === 1 && posted[0].body.content === "цель: собрать ТЗ",
-        JSON.stringify(posted.map((r) => r.body && r.body.content)));
+        posts().length === 1 && posts()[0].body.content === "цель: собрать ТЗ",
+        JSON.stringify(posts().map((r) => r.body && r.body.content)));
       check("запись появилась в долговременном списке тут же",
         texts("#mem-long").join(" | ") === "пишу на Kotlin | цель: собрать ТЗ", shown("#mem-long"));
       check("и рядом с ней подпись рода — «знание»",
@@ -1499,22 +1534,43 @@ async function routeChecks() {
         $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|"));
     }
 
-    // ── форма: род уезжает выбранный, а не подставленный ──
+    // ── форма: род выбирает человек, и до выбора не уходит ничего ──
     //
-    // Сперва про то, чего быть не должно: выбор рода — не правка конфига
-    // чата. Пролив панели слушает `change` на всей панели разом, и поле
-    // памяти, попавшее в его сито, уезжало бы PATCH'ем ни о чём.
-    $("#mem-content").value = "оплата только картой";
+    // Умолчания у рода нет ни на сервере, ни в форме: список открывается
+    // на пустом пункте. Предвыбери форма первый настоящий род — «явно
+    // выбирал» из задания стало бы «форма выбрала за него», ровно то, чего
+    // `_kind_field` не даёт сделать серверу.
+    const beforeForm = posts().length;
+    check("до выбора род не подставлен: список стоит на пустом пункте",
+      $("#mem-kind").value === "", JSON.stringify($("#mem-kind").value));
+    $("#mem-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("без выбранного рода добавление не уходит вовсе",
+      posts().length === beforeForm, JSON.stringify(posts().slice(beforeForm).map((r) => r.body)));
+    check("и форма говорит, чего не хватает",
+      /Род записи не выбран/.test($("#mem-status").textContent), $("#mem-status").textContent);
+
+    // Род выбран, текста нет: пустая запись уехала бы в промпт строкой
+    // «решение: » и заняла бы место врезки, ничего не сказав.
+    // Выбор рода — не правка конфига чата. Пролив панели слушает `change`
+    // на всей панели разом, и поле памяти, попавшее в его сито, уезжало бы
+    // PATCH'ем ни о чём. Слепок снимается **до** выбора: обмен выше свой
+    // PATCH уже сделал, и считается прирост, а не общее число.
+    const patchesBeforeKind = patches().length;
     $("#mem-kind").value = "decision";
     $("#mem-kind").dispatchEvent(new Evt("change"));
     await settle(40);
-    check("выбор рода записи конфиг чата не трогает: PATCH'а не было",
-      server.state.requests.filter((r) => r.method === "PATCH").length === 0,
-      JSON.stringify(server.state.requests.filter((r) => r.method === "PATCH").map((r) => r.body)));
-
     $("#mem-add").dispatchEvent(new Evt("click"));
     await settle(40);
-    const added = memoryCalls().filter((r) => r.method === "POST").slice(-1)[0];
+    check("с пустым текстом добавление тоже не уходит",
+      posts().length === beforeForm, JSON.stringify(posts().slice(beforeForm).map((r) => r.body)));
+    check("и причина названа: записывать нечего",
+      /Текст записи пуст/.test($("#mem-status").textContent), $("#mem-status").textContent);
+
+    $("#mem-content").value = "  оплата только картой  ";
+    $("#mem-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    const added = posts().slice(-1)[0];
     check("форма шлёт тот род, что выбран в списке",
       Boolean(added) && added.body.kind === "decision" && added.body.content === "оплата только картой",
       JSON.stringify(added && added.body));
@@ -1523,6 +1579,24 @@ async function routeChecks() {
       shown("#mem-long"));
     check("поле ввода после успеха пусто — второй клик не заведёт ту же запись молча",
       $("#mem-content").value === "", $("#mem-content").value);
+    check("выбор рода записи конфиг чата не трогает: PATCH'ей не прибавилось",
+      patches().length === patchesBeforeKind,
+      JSON.stringify(patches().slice(patchesBeforeKind).map((r) => r.body)));
+
+    // ── список пополняется записанным, а не присланным ──
+    //
+    // Ключ, случайно вставленный в текст, сервер вырезает по дороге в базу
+    // (`redact`), и ручка отдаёт уже чистую строку. Показывай клиент своё
+    // тело запроса — на экране остался бы ключ, которого в базе нет.
+    $("#mem-kind").value = "knowledge";
+    $("#mem-content").value = "ключ " + SECRET;
+    $("#mem-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("в запросе ушёл текст как есть",
+      posts().slice(-1)[0].body.content === "ключ " + SECRET,
+      JSON.stringify(posts().slice(-1)[0].body.content));
+    check("а в списке стоит записанное: секрет вычищен ответом ручки",
+      texts("#mem-long").slice(-1)[0] === "ключ ***", JSON.stringify(texts("#mem-long")));
 
     // ── удаление: уходит номер именно той записи ──
     const rows = $("#mem-long").querySelectorAll(".mem-item");
@@ -1536,30 +1610,69 @@ async function routeChecks() {
         deleted.length === 1 && deleted[0].path === "/api/memory/2",
         JSON.stringify(deleted.map((r) => r.path)));
       check("из списка ушла она одна, соседние остались",
-        texts("#mem-long").join(" | ") === "пишу на Kotlin | оплата только картой",
+        texts("#mem-long").join(" | ") === "пишу на Kotlin | оплата только картой | ключ ***",
         shown("#mem-long"));
     }
 
-    // Весь круг — добавление, продвижение, удаление — прошёл на одном походе
+    // Весь круг — продвижение, добавление, удаление — прошёл на одном походе
     // за слоями: список правится по ответу ручки, а не перечитыванием.
     check("за всё время слои перечитаны один раз, а не на каждую перерисовку",
       layerCalls().length === 1, JSON.stringify(layerCalls().map((r) => r.path)));
 
     // ── открыли другой чат: первые два слоя теперь его ──
-    $("#agent-list").querySelectorAll(".item-open")[3].dispatchEvent(new Evt("click"));
+    open(3);
     await settle(60);
     check("в другом чате краткосрочная показывает его историю, а не прежнюю",
-      $("#mem-short").querySelectorAll(".mem-v").map((n) => n.textContent).join("|") === "4|4",
-      shown("#mem-short"));
+      nums("#mem-short") === "4|4", shown("#mem-short"));
     check("выписки у него нет — не срезано ничего, и сказано именно это",
       /Вся история уезжает в модель дословно\./.test(shown("#mem-short")), shown("#mem-short"));
     check("фактов у него своих нет, и об этом сказано словами",
       /Фактов ещё нет/.test(shown("#mem-working")), shown("#mem-working"));
     check("а долговременный слой у обоих чатов один и тот же",
-      texts("#mem-long").join(" | ") === "пишу на Kotlin | оплата только картой",
+      texts("#mem-long").join(" | ") === "пишу на Kotlin | оплата только картой | ключ ***",
       shown("#mem-long"));
     check("слои перечитаны, потому что чат другой — второй раз, а не третий",
       layerCalls().length === 2, JSON.stringify(layerCalls().map((r) => r.path)));
+
+    // ── окно: начало не заменено, а отброшено, и памяти этот чат не видит ──
+    open(4);
+    await settle(60);
+    check("у окна дословно уезжает ровно окно",
+      nums("#mem-short") === "6|2", shown("#mem-short"));
+    check("и слово под числами — «отброшено», а не «заменено»",
+      /Остальные 4 — отброшено окном\./.test(shown("#mem-short")), shown("#mem-short"));
+    check("у чата с выключенной памятью сказано, что записи в его промпт не едут",
+      /Выключатель этого чата стоит в «выключена»/.test(shown("#mem-long")), shown("#mem-long"));
+    check("но сами записи он видит: слой общий, а выключатель про промпт",
+      texts("#mem-long").join(" | ") === "пишу на Kotlin | оплата только картой | ключ ***",
+      shown("#mem-long"));
+
+    // ── сводка: срез считается по последней, а не по первой ──
+    open(5);
+    await settle(60);
+    check("у суммаризации срез — по последней сводке",
+      nums("#mem-short") === "8|4", shown("#mem-short"));
+    check("и слово своё: начало заменено сводкой",
+      /Остальные 4 — заменено сводкой\./.test(shown("#mem-short")), shown("#mem-short"));
+    check("обе сводки видны в рабочем слое, каждая со своей границей",
+      texts("#mem-working").join(" | ") === "первое сворачивание | второе сворачивание" &&
+        /вместо первых 2 сообщений/.test(shown("#mem-working")) &&
+        /вместо первых 4 сообщений/.test(shown("#mem-working")),
+      shown("#mem-working"));
+
+    // ── переключение на соседнюю вкладку за слоями не ходит ──
+    //
+    // Обратная сторона ленивости: запрос висит на открытии **этой** вкладки,
+    // а не на переключении вообще. Считаем после четырёх открытий чатов.
+    const beforeSwitch = layerCalls().length;
+    openTab("agent");
+    await settle(40);
+    openTab("model");
+    await settle(40);
+    check("переключение на «Агент» и «Модель» за слоями не ходит",
+      layerCalls().length === beforeSwitch, JSON.stringify(layerCalls().map((r) => r.path)));
+    check("и вкладка «Память» при этом спрятана",
+      $("#tab-memory").classList.contains("hidden"), "она открыта");
   }
 }
 
