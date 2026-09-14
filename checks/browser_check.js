@@ -185,6 +185,9 @@ const PANEL_ROUTE = [
   ["f-strategy", "facts", "strategy", "facts"],
   ["f-keep_last", "6", "keep_last", 6],
   ["f-compress_every", "10", "compress_every", 10],
+  // Выключатель долговременной памяти — тем же путём и при любой стратегии:
+  // он не про историю, а про слой поверх неё, и прятать его не за чем.
+  ["f-memory", "off", "memory", "off"],
 ];
 
 function freshClient(options) {
@@ -1082,6 +1085,119 @@ async function routeChecks() {
         "системный промпт", "факты о разговоре", "сообщение пользователя",
       ]),
       JSON.stringify(roles));
+  }
+
+  // ── две врезки разом: долговременная память и врезка стратегии ──
+  //
+  // Главное место дня на клиенте. Память — слой не этого разговора, врезка
+  // стратегии — выписка про этот; в одном промпте они стоят вдвоём, память
+  // первой. Оба места называет сервер, двумя разными полями кадра `start`,
+  // и подписать их клиент обязан по ним, а не по тексту сообщений: считай он
+  // слоты сам — подписал бы памятью факты ровно тогда, когда врезок две.
+  {
+    const MEMORY = "[долговременная память]\nпрофиль: пишу на Kotlin\n[конец долговременной памяти]";
+    const FACTS = "[факты о разговоре]\nцель: собрать ТЗ\n[дальше — последние сообщения как есть]";
+    const { client, server, $, settle, Evt } = freshClient({
+      memory: MEMORY,
+      service: { insert: FACTS, covered: 0, strategy: "facts" },
+    });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос с памятью и фактами";
+    $("#composer").requestSubmit();
+    await settle(150);
+
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("врезок в промпте две, и подписаны они разными словами в нужном порядке",
+      JSON.stringify(roles) === JSON.stringify([
+        "системный промпт", "долговременная память", "факты о разговоре",
+        "сообщение пользователя",
+      ]), JSON.stringify(roles));
+    check("и под подписями стоят те самые тексты, а не перепутанные местами",
+      texts[1] === MEMORY && texts[2] === FACTS,
+      JSON.stringify(texts));
+
+    // ── выключатель памяти уезжает PATCH'ем и виден в следующем промпте ──
+    //
+    // Переключение — на самом выборе, как у стратегии. Смотрим не только
+    // на запрос: поле, доехавшее до сервера, но не изменившее промпт,
+    // означало бы, что клиент показывает одно, а модель видит другое.
+    $("#f-memory").value = "off";
+    $("#f-memory").dispatchEvent(new Evt("change"));
+    await settle(60);
+    const patched = server.state.requests.filter((r) => r.method === "PATCH");
+    check("переключение долговременной памяти уехало PATCH'ем",
+      patched.length > 0 && patched[patched.length - 1].body.memory === "off",
+      JSON.stringify(patched.map((r) => r.body && r.body.memory)));
+
+    $("#input").value = "вопрос без памяти";
+    $("#composer").requestSubmit();
+    await settle(150);
+    const second = $("#feed").querySelectorAll(".card")[1];
+    cardButton(second, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const off = second.querySelector(".prompt-view");
+    const offRoles = off ? off.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    check("с выключенной памятью врезка одна, и это врезка стратегии",
+      JSON.stringify(offRoles) === JSON.stringify([
+        "системный промпт", "факты о разговоре", "сообщение пользователя",
+        "ответ модели", "сообщение пользователя",
+      ]), JSON.stringify(offRoles));
+  }
+
+  // ── без памяти подпись не вылезает ни над одним сообщением ──
+  //
+  // Обратная половина: `memory_at` приходит пустым — и пустым он приходит
+  // и когда память выключена, и когда её нет вовсе, и когда хранилища нет.
+  // Сравнение строгое именно поэтому: подставь клиент ноль «по умолчанию»,
+  // и подпись памяти встала бы над системным промптом у каждого чата.
+  {
+    const { client, $, settle, Evt } = freshClient({ delay: 20 });
+    client.init();
+    await settle(30);
+    $("#input").value = "вопрос без памяти вовсе";
+    $("#composer").requestSubmit();
+    await settle(200);
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    check("без памяти её подпись не вылезает ни над одним сообщением промпта",
+      JSON.stringify(roles) === JSON.stringify([
+        "системный промпт", "сообщение пользователя",
+      ]), JSON.stringify(roles));
+  }
+
+  // ── чат без системного промпта: память стоит нулевым сообщением ──
+  //
+  // `memory_at` равен нулю, и ноль — не «памяти нет». Тот же случай, что
+  // у сводки без системного промпта, и та же цена ошибки: нестрогое
+  // сравнение здесь спрятало бы врезку, которая в модель уехала.
+  {
+    const MEMORY = "[долговременная память]\nрешение: оплата только картой\n[конец долговременной памяти]";
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "без системного", system: "" }],
+      memory: MEMORY,
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "вопрос без системного";
+    $("#composer").requestSubmit();
+    await settle(150);
+
+    const card = $("#feed").querySelector(".card");
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    check("без системного промпта память стоит первой, и подпись у неё своя",
+      JSON.stringify(roles) === JSON.stringify([
+        "долговременная память", "сообщение пользователя",
+      ]), JSON.stringify(roles));
   }
 
   // ── без сворачивания карточка молчит, но промпт показать даёт ──

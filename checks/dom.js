@@ -455,6 +455,11 @@ function buildServer(options) {
     // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
+    // Долговременная память: готовая врезка строкой или null. Слой глобальный
+    // и наполняется руками, поэтому у стенда он один на все чаты — а вот
+    // едет ли он в промпт, решает выключатель самого чата (`memory`), ровно
+    // как на сервере.
+    memory: (options && options.memory) || null,
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -470,7 +475,9 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
+  // Выключатель долговременной памяти живёт здесь же: наружу он едет тем же
+  // путём, что стратегия, и умолчание у него такое же непустое — «on».
+  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null, memory: "on" };
 
   const blank = (id, label) => ({
     id,
@@ -546,16 +553,24 @@ function buildServer(options) {
   });
 
   // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
-  // врезка вместо начала разговора, непокрытый ею хвост истории, вопрос.
+  // врезка долговременной памяти, врезка вместо начала разговора, непокрытый
+  // ею хвост истории, вопрос.
   // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда.
   //
   // Окно — единственная стратегия, которая режет **без** врезки: вместо
   // отброшенного начала не встаёт ничего, и в промпте остаётся ровно хвост.
   // Стенд режет так же, иначе проверить, что кнопка промпта показывает у окна
   // уехавшее, было бы не на чем: полная история в ленте и так лежит.
+  // Врезка долговременной памяти этого чата — или null. Одно условие на три
+  // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
+  const memoryInsert = (agent) => (agent.memory === "off" ? null : state.memory);
+
   function resolvedPrompt(agent, text, service) {
     const messages = [];
     if (agent.system) messages.push({ role: "system", content: agent.system });
+    // Память идёт до врезки стратегии: слой не этого разговора — первым.
+    const memory = memoryInsert(agent);
+    if (memory) messages.push({ role: "user", content: memory });
     const tail = (agent.transcript || []).map((t) => ({ role: t.role, content: t.content }));
     if (service) {
       messages.push({ role: "user", content: service.insert });
@@ -570,6 +585,27 @@ function buildServer(options) {
 
   // Чем занят служебный вызов — тем же словом, каким это называет сервер.
   const serviceStrategy = (service) => (service && service.strategy) || "summary";
+
+  // Кадр `start` — **один** на оба потока: и на удачный обмен, и на упавший.
+  // Формула слотов в нём одна, и переписанная дважды она разъехалась бы
+  // молча: слот упавшего обмена через интерфейс ненаблюдаем вовсе — карточка
+  // падения промпта не показывает, — и вторую копию не поймало бы ничто.
+  //
+  // Слот стратегии сдвигается врезкой памяти на единицу: врезок в одном
+  // промпте бывает две, и сдвиг — ровно то место, где ошибается тот, кто
+  // считает их по одной.
+  function startFrame(agent, text, resolved, service) {
+    const memoryAt = memoryInsert(agent) ? (agent.system ? 1 : 0) : null;
+    return {
+      event: "start",
+      agent: agent.id,
+      question: text,
+      resolved_messages: resolved,
+      memory_at: memoryAt,
+      summary_at: service ? (agent.system ? 1 : 0) + (memoryAt === null ? 0 : 1) : null,
+      strategy: service ? serviceStrategy(service) : agent.strategy,
+    };
+  }
 
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
@@ -603,12 +639,7 @@ function buildServer(options) {
       // Место врезки в промпте и чем она занята называет сервер — клиент не
       // разбирает текст сообщений.
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
-      {
-        event: "start", agent: agent.id, question: text,
-        resolved_messages: resolved,
-        summary_at: service ? (agent.system ? 1 : 0) : null,
-        strategy: service ? serviceStrategy(service) : agent.strategy,
-      },
+      startFrame(agent, text, resolved, service),
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
@@ -636,12 +667,7 @@ function buildServer(options) {
     };
     const frames = [
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
-      {
-        event: "start", agent: agent.id, question: text,
-        resolved_messages: resolved,
-        summary_at: service ? (agent.system ? 1 : 0) : null,
-        strategy: service ? serviceStrategy(service) : agent.strategy,
-      },
+      startFrame(agent, text, resolved, service),
       { event: "error", agent: agent.id, message: failed.message, metrics },
       ...(failed.done === false
         ? []
