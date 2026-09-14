@@ -1,9 +1,10 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Пять таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+Шесть таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
 сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
-(счётчики, общие на всю базу), `summaries` (сводки начала разговора) и `facts`
-(что важного сказано в разговоре, парами «ключ — значение»).
+(счётчики, общие на всю базу), `summaries` (сводки начала разговора), `facts`
+(что важного сказано в разговоре, парами «ключ — значение») и `branches`
+(чей потомок этот чат и сколько сообщений он унёс).
 Четыре свойства, за которыми стоит следить:
 
 * **`session_id` в первичном ключе сообщений**: без него два чата из базы
@@ -128,6 +129,32 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 
 CREATE INDEX IF NOT EXISTS facts_by_session ON facts(session_id);
+
+-- Происхождение чата: чей он потомок и сколько первых сообщений унёс.
+-- Ветка — обычный чат, отдельная строка в `sessions` с копией истории до
+-- точки ветвления; схему `messages` ветвление не трогает вовсе, изоляция
+-- сессий там уже по `session_id`, а `seq` у копии идёт от нуля и без дыр.
+--
+-- Своя таблица, а не поле в `config`: `config` это `asdict(spec)`, «чем один
+-- чат отличается от другого», а происхождение — не настройка. Тот же довод,
+-- по которому в контекст не поехали ни сводка, ни факты. И тот же, по
+-- которому это таблица, а не колонка: `CREATE TABLE IF NOT EXISTS` накатится
+-- на живую базу сам, а колонка бы не накатилась — миграций в коде нет.
+--
+-- `session_id` первичным ключом: у разговора ровно одно происхождение.
+-- `forked_at` — сколько первых сообщений родителя унесено, оно же место
+-- ветвления. Каскада нет, FK не объявлены, и это здесь не упущение:
+-- **удаление родителя ветку не удаляет** — ветка самостоятельный чат, и
+-- строка о том, от кого она отделилась, живёт дольше родителя. Чистится
+-- строка только вместе со своим чатом: `delete_session` и `clear`.
+CREATE TABLE IF NOT EXISTS branches (
+    session_id  TEXT PRIMARY KEY,
+    parent_id   TEXT NOT NULL,
+    forked_at   INTEGER NOT NULL,
+    at          REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS branches_by_parent ON branches(parent_id);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -161,6 +188,16 @@ def _loads(raw: str, fallback):
         return json.loads(raw)
     except (TypeError, ValueError):
         return fallback
+
+
+def _branch_row(parent_id, forked_at) -> dict | None:
+    """Родство в том виде, в каком его ждут список слева и панель: от кого
+    и сколько сообщений унесено. Одна форма на оба чтения — по строке и
+    списком: разъедься они, пометка ветки в списке и в панели назвала бы
+    разные числа."""
+    if parent_id is None:
+        return None
+    return {"parent_id": parent_id, "forked_at": forked_at}
 
 
 MIN_SECRET_LENGTH = 16
@@ -394,8 +431,10 @@ class Store:
         sql = """
             SELECT s.*, (
                 SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
-            ) AS history_len
+            ) AS history_len,
+            b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at
             FROM sessions s
+            LEFT JOIN branches b ON b.session_id = s.id
             ORDER BY s.updated_at DESC
         """
         with self.reading() as conn:
@@ -407,6 +446,10 @@ class Store:
         for row in rows:
             data = self._session_row(row)
             data["history_len"] = row["history_len"]
+            # Происхождение приезжает тем же запросом, а не по строке на чат:
+            # список слева рисуется по нему целиком, и пометка ветки обязана
+            # стоить столько же, сколько имя чата.
+            data["branch"] = _branch_row(row["branch_parent_id"], row["branch_forked_at"])
             out.append(data)
         return out
 
@@ -418,25 +461,33 @@ class Store:
         """Стирает чат вместе с репликами, сводками и фактами, все таблицы
         одной транзакцией. False — его и не было.
 
-        Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`
-        и `facts` руками — сводка и факты удалённого разговора достанутся
-        чату с тем же id.
+        Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`,
+        `facts` и `branches` руками — сводка, факты и происхождение удалённого
+        разговора достанутся чату с тем же id.
+
+        Своя строка в `branches` уносится, а строки **потомков** — нет:
+        удаление родителя ветку не удаляет, она самостоятельный чат со своей
+        историей. Пометка в ней остаётся честной и после: чат, от которого
+        она отделилась, называется по id, а имени у него больше нет.
         """
         with self.tx() as conn:
             cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM facts WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta`, сводки и факты. Нужно только
-        проверкам: оставленный счётчик имён отдал бы следующей номер
-        посередине, а оставленная сводка — чужое начало разговора."""
+        """Стирает базу целиком, включая `meta`, сводки, факты и родство.
+        Нужно только проверкам: оставленный счётчик имён отдал бы следующей
+        номер посередине, оставленная сводка — чужое начало разговора,
+        а оставленная строка родства сделала бы свежий чат веткой мёртвого."""
         with self.tx() as conn:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM facts")
+            conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM meta")
 
@@ -595,6 +646,47 @@ class Store:
             "metrics": _loads(head["metrics"], None) if head is not None and head["metrics"] else None,
             "at": head["at"] if head is not None else None,
         }
+
+    # --- происхождение чата ---------------------------------------------------
+
+    def save_branch(self, session_id: str, *, parent_id: str, forked_at: int, at=None) -> None:
+        """Записывает, чей этот чат потомок и сколько первых сообщений унёс.
+
+        Идёт через `tx()`, как любая запись: обёртка чистит строковые
+        параметры, и `parent_id` попадает под `redact()` наравне с репликой.
+
+        `ON CONFLICT` здесь ради идемпотентности записи, а не ради второго
+        происхождения: id у ветки свежий, занят базой минуту назад, и
+        переписывать эту строку некому — одно происхождение на чат стережёт
+        первичный ключ.
+        """
+        with self.tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO branches (session_id, parent_id, forked_at, at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    parent_id = excluded.parent_id,
+                    forked_at = excluded.forked_at,
+                    at        = excluded.at
+                """,
+                (session_id, parent_id, int(forked_at), time.time() if at is None else at),
+            )
+
+    def load_branch(self, session_id: str) -> dict | None:
+        """Происхождение чата или `None` — чат заведён сам по себе.
+
+        Имени родителя здесь нет намеренно: имя меняют из списка слева, и
+        копия рядом с родством разошлась бы с ним на первом же
+        переименовании. Наружу уезжает id, а имя по нему находит тот, кто
+        рисует список, — у него все чаты и так на руках.
+        """
+        with self.reading() as conn:
+            row = conn.execute(
+                "SELECT parent_id, forked_at FROM branches WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else _branch_row(row["parent_id"], row["forked_at"])
 
     def message_rows(self, session_id: str) -> list[tuple]:
         """(seq, role, content) как лежат в базе — этим проверяют нумерацию."""

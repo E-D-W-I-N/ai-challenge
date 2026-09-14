@@ -48,6 +48,15 @@ def _next_chat_label() -> str:
     return f"Новый чат {REGISTRY.store.next_counter(CHAT_NUMBER_KEY)}"
 
 
+def _next_branch_label() -> str:
+    """Имя ветки. Счётчик тот же, что у «Нового чата»: он только растёт и
+    номера не переиспользует, поэтому две ветки от одного места получают
+    разные имена — а в этом весь смысл задания, «создайте 2 ветки от одного
+    места». Имя родителя в имя не вписывается: его меняют из списка слева,
+    и вписанное разошлось бы с ним; от кого отделились, говорит пометка."""
+    return f"Ветка {REGISTRY.store.next_counter(CHAT_NUMBER_KEY)}"
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     yield
@@ -253,6 +262,49 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     return values
 
 
+def _fork_point(payload: dict, history_len: int) -> int:
+    """Сколько первых сообщений унести. Кривое число — 400 с текстом, а не 500.
+
+    Ключ обязателен: «сколько унести» — это и есть точка ветвления, и
+    подставить её за пользователя нельзя. Пропущенный `at`, истолкованный
+    как «всю историю», молча завёл бы копию всего разговора там, где просили
+    ветку от середины.
+
+    Больше длины истории тоже 400: унести сообщений больше, чем их есть, —
+    не просьба, а промах (карточку успели перегенерировать, ветку просят
+    из соседнего чата). Молчаливый зажим до длины дал бы ветку не от того
+    места, о котором просили, и узнать об этом было бы неоткуда.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail='тело: объект {"at": N}')
+    unknown = [key for key in payload if key != "at"]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "тело ветвления — только at: остальное ветка берёт у родителя. "
+                f"Лишние поля: {', '.join(sorted(unknown))}"
+            ),
+        )
+    at = payload.get("at")
+    # bool отбрасывается отдельно: в Python True — это int, и `{"at": true}`
+    # уехало бы ветвлением по первому сообщению.
+    if isinstance(at, bool) or not isinstance(at, int):
+        raise HTTPException(
+            status_code=400,
+            detail=f"at: сколько первых сообщений унести — целое число от 0 до {history_len}",
+        )
+    if at < 0 or at > history_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"at: {at} — а в истории сообщений {history_len}. "
+                f"Унести можно от 0 до {history_len}"
+            ),
+        )
+    return at
+
+
 def _text_field(payload: dict, name: str, where: str = "") -> str:
     """Строка или null. Снятое поле — пустая строка, а не None."""
     return _optional_field(payload, name, (str,), "строка или null", where) or ""
@@ -425,6 +477,30 @@ async def delete_agent(agent_id: str) -> dict:
     _agent(agent_id)
     REGISTRY.kill(agent_id)
     return {"killed": [agent_id], "live": len(REGISTRY)}
+
+
+@app.post("/api/agents/{agent_id}/fork")
+async def fork_agent(agent_id: str, payload: dict = Body(default=None)) -> dict:
+    """Ветка от этого чата: тело `{"at": N}` — сколько первых сообщений унести.
+
+    Ответ — новый чат в том же виде, что отдаёт создание: ветка и есть
+    обычный чат, и клиенту незачем различать, как он появился. Переключаться
+    между ветками поэтому нечем и не надо — они уже в списке слева.
+
+    Ключа к модели здесь не нужно: ветвление никуда не ходит, оно копирует.
+    Занятость родителя тоже не мешает — история не меняется до конца обмена,
+    и ветка унесёт то, что в ней есть прямо сейчас.
+    """
+    parent = _agent(agent_id)
+    at = _fork_point({} if payload is None else payload, len(parent.history))
+    started = time.perf_counter()
+    branch = REGISTRY.fork(parent, at, label=_next_branch_label())
+    return {
+        "created": 1,
+        "spawn_ms": round((time.perf_counter() - started) * 1000, 2),
+        "live": len(REGISTRY),
+        "agents": [branch.as_dict()],
+    }
 
 
 @app.post("/api/agents/{agent_id}/cancel")
