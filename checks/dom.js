@@ -460,6 +460,16 @@ function buildServer(options) {
     // едет ли он в промпт, решает выключатель самого чата (`memory`), ровно
     // как на сервере.
     memory: (options && options.memory) || null,
+    // Записи долговременной памяти: список на всю базу, как на сервере, и
+    // не привязанный ни к одному чату. Врезка выше — уже готовая строка,
+    // а это то, что вкладка «Память» показывает, добавляет и удаляет.
+    records: ((options && options.records) || []).map((seed, i) => ({
+      seq: i + 1, at: i, ...seed,
+    })),
+    // Рабочий слой чата: факты и сводки. Лежит отдельно от самого чата —
+    // ровно как на сервере, где у них свои таблицы, а не колонка в `sessions`.
+    // Ключ — имя чата: чаты стенд и так заводит по именам.
+    working: (options && options.working) || {},
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -504,6 +514,12 @@ function buildServer(options) {
   // проверка «после удаления появился свежий» прошла бы на подложном равенстве.
   let issued = 0;
   const nextId = () => "ag_" + (issued += 1);
+
+  // Номера записей памяти, как на сервере: AUTOINCREMENT. Только растут и
+  // номер удалённой заново не выдаётся — иначе вторая вкладка удалила бы
+  // не ту запись, и проверка этого не заметила бы.
+  let issuedMemory = state.records.length;
+  const MEMORY_KINDS = ["profile", "decision", "knowledge"];
 
   // Итог по чату считает сервер, и стенд считает его теми же правилами:
   // реплика без метрик и поле `null` пропускаются, а чат без чисел даёт `null`,
@@ -720,6 +736,45 @@ function buildServer(options) {
       return json({ created: 1, agents: [agent] });
     }
 
+    // ── долговременная память: ручки глобальные, без agent_id ──
+    //
+    // Проверки границы здесь те же, что на сервере, и это не придирка:
+    // стенд, принимающий то, чего сервер не принимает, оставляет зелёной
+    // форму, которая в браузере получает 400. Род записи поэтому обязателен
+    // и умолчания не имеет — ровно как `_kind_field`.
+    if (path === "/api/memory" && method === "GET") {
+      return json({ total: state.records.length, records: state.records });
+    }
+    if (path === "/api/memory" && method === "POST") {
+      const unknown = Object.keys(body || {}).filter((k) => k !== "kind" && k !== "content");
+      if (unknown.length) {
+        return { ok: false, status: 400,
+                 json: async () => ({ detail: "лишние поля: " + unknown.join(", ") }) };
+      }
+      const kind = body && body.kind;
+      if (typeof kind !== "string" || !MEMORY_KINDS.includes(kind)) {
+        return { ok: false, status: 400,
+                 json: async () => ({ detail: "kind: одно из " + MEMORY_KINDS.join(", ") }) };
+      }
+      const content = body && body.content;
+      if (typeof content !== "string" || !content.trim()) {
+        return { ok: false, status: 400, json: async () => ({ detail: "content: непустая строка" }) };
+      }
+      const record = { seq: (issuedMemory += 1), kind, content: content.trim(), at: state.records.length };
+      state.records.push(record);
+      return json(record);
+    }
+    const memoryMatch = /^\/api\/memory\/(\d+)$/.exec(path);
+    if (memoryMatch && method === "DELETE") {
+      const seq = Number(memoryMatch[1]);
+      const i = state.records.findIndex((r) => r.seq === seq);
+      if (i < 0) {
+        return { ok: false, status: 404, json: async () => ({ detail: "записи памяти " + seq + " нет" }) };
+      }
+      state.records.splice(i, 1);
+      return json({ deleted: seq });
+    }
+
     const match = /^\/api\/agents\/([^/]+)(\/.*)?$/.exec(path);
     if (!match) return { ok: false, status: 404, json: async () => ({ detail: "нет такой ручки" }) };
     const agent = state.agents.find((a) => a.id === match[1]);
@@ -748,6 +803,20 @@ function buildServer(options) {
       child.branch = { parent_id: agent.id, forked_at: at };
       state.agents.push(child);
       return json({ created: 1, live: state.agents.length, agents: [child] });
+    }
+    // Три слоя разом — тем же составом, что у сервера: счётчик сообщений,
+    // факты и сводки этого чата без метрик, выключатель чата и общий список.
+    if (tail === "/memory" && method === "GET") {
+      const working = state.working[agent.label] || {};
+      return json({
+        short_term: { messages: agent.history_len },
+        working: {
+          facts: working.facts || [],
+          facts_upto: working.facts_upto || 0,
+          summaries: working.summaries || [],
+        },
+        long_term: { enabled: agent.memory !== "off", records: state.records },
+      });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(agent);
