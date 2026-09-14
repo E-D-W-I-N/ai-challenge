@@ -916,12 +916,35 @@ async function routeChecks() {
     check("после сжатого обмена строки состояния не осталось",
       !$("#feed").querySelector(".card-status"), "строка состояния осталась в ленте");
 
-    // ── кнопка есть у сжатого обмена и нет у обмена без сводки ──
+    // ── кнопка есть у каждого обмена, и у каждого — свой промпт ──
+    //
+    // Врезка кнопку не заводит: её заводит увиденный промпт. У обмена без
+    // сводки показывать тоже есть что — системный промпт и вопрос, — а подпись
+    // врезки при пустом `summary_at` вылезать не смеет ни над одним из них.
     const titles = (node) => node.querySelectorAll(".icon-btn").map((b) => b.title);
+    const promptRoles = (node) => {
+      const shown = node && node.querySelector(".prompt-view");
+      return shown ? shown.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    };
+    const promptTexts = (node) => {
+      const shown = node && node.querySelector(".prompt-view");
+      return shown ? shown.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    };
     let cards = $("#feed").querySelectorAll(".card");
-    check("у обмена без сводки кнопки промпта нет",
-      cards[0] && !titles(cards[0]).includes("Показать промпт запроса"),
+    check("кнопка промпта есть и у обмена без сводки",
+      cards[0] && titles(cards[0]).includes("Показать промпт запроса"),
       cards[0] && JSON.stringify(titles(cards[0])));
+    cardButton(cards[0], "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    check("и под ней — его собственный промпт, без врезки и без чужого вопроса",
+      JSON.stringify(promptRoles(cards[0])) ===
+        JSON.stringify(["системный промпт", "сообщение пользователя"]) &&
+        promptTexts(cards[0]).includes("первый вопрос") &&
+        !promptTexts(cards[0]).includes(SUMMARY),
+      JSON.stringify(promptRoles(cards[0])) + " " + JSON.stringify(promptTexts(cards[0])));
+    check("без врезки запасная подпись роли не вылезает",
+      !promptRoles(cards[0]).includes("врезка вместо начала разговора"),
+      JSON.stringify(promptRoles(cards[0])));
+    cardButton(cards[0], "Показать промпт запроса").dispatchEvent(new Evt("click"));
 
     const card = cards[1];
     cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
@@ -970,9 +993,15 @@ async function routeChecks() {
     await settle(400);
     cards = $("#feed").querySelectorAll(".card");
     check("упавший обмен карточки в ленте не оставил", cards.length === 2, String(cards.length));
-    check("и кнопки промпта обмену без сводки не принёс",
-      cards[0] && !titles(cards[0]).includes("Показать промпт запроса"),
-      cards[0] && JSON.stringify(titles(cards[0])));
+    // Кнопка теперь есть у обоих обменов — тем важнее, что под каждой лежит
+    // его собственный запрос: промпт упавшего не достался ни одному из них.
+    cardButton(cards[0], "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    check("и своего промпта первый обмен на чужой не сменил",
+      promptTexts(cards[0]).includes("первый вопрос") &&
+        !promptTexts(cards[0]).includes(OTHER_SUMMARY) &&
+        !promptTexts(cards[0]).includes("упавший вопрос"),
+      JSON.stringify(promptTexts(cards[0])));
+    cardButton(cards[0], "Показать промпт запроса").dispatchEvent(new Evt("click"));
     cardButton(cards[1], "Показать промпт запроса").dispatchEvent(new Evt("click"));
     const after = cards[1].querySelector(".prompt-view");
     const shown = after ? after.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
@@ -1055,14 +1084,14 @@ async function routeChecks() {
       JSON.stringify(roles));
   }
 
-  // ── без сворачивания карточка молчит и кнопки не заводит ──
+  // ── без сворачивания карточка молчит, но промпт показать даёт ──
   //
   // Обратная половина: событие о сворачивании приходит не на каждом обмене,
-  // и строка состояния, мигающая без повода, была бы шумом — а кнопка,
-  // показывающая промпт без сводки, показывала бы ту же историю, что уже
-  // лежит в ленте.
+  // и строка состояния, мигающая без повода, была бы шумом. Кнопка промпта —
+  // не такая: её заводит не врезка, а увиденный запрос, и он есть у каждого
+  // обмена.
   {
-    const { client, $, settle } = freshClient({ delay: 60 });
+    const { client, $, settle, Evt } = freshClient({ delay: 60 });
     client.init();
     await settle(40);
     $("#input").value = "вопрос без сжатия";
@@ -1073,10 +1102,71 @@ async function routeChecks() {
       "строка состояния появилась: " + usageText($("#feed"), ".card-status"));
     await settle(400);
     const card = $("#feed").querySelector(".card");
-    check("и кнопки промпта у такого обмена нет",
-      card && !card.querySelectorAll(".icon-btn").map((b) => b.title)
+    check("а кнопка промпта у такого обмена есть",
+      card && card.querySelectorAll(".icon-btn").map((b) => b.title)
         .includes("Показать промпт запроса"),
       card && JSON.stringify(card.querySelectorAll(".icon-btn").map((b) => b.title)));
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    check("в промпте несжатого обмена — системный промпт и вопрос, врезки нет",
+      JSON.stringify(roles) ===
+        JSON.stringify(["системный промпт", "сообщение пользователя"]),
+      JSON.stringify(roles));
+  }
+
+  // ── у скользящего окна промпт показывает ровно то, что уехало ──
+  //
+  // Окно — единственная стратегия, которая теряет реплики совсем: вместо
+  // отброшенного начала в промпт не встаёт ничего, и прочитать уехавшее
+  // больше негде — лента-то показывает всю историю. Ровно поэтому кнопка
+  // обязана быть и здесь, хотя врезки у окна нет и `summary_at` пуст.
+  {
+    const past = [
+      { role: "user", content: "давний вопрос", error: null, reasoning: "", metrics: null },
+      { role: "assistant", content: "давний ответ", error: null, reasoning: "", metrics: null },
+      { role: "user", content: "свежий вопрос", error: null, reasoning: "", metrics: null },
+      { role: "assistant", content: "свежий ответ", error: null, reasoning: "", metrics: null },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      delay: 60,
+      chats: [{
+        label: "окно", system: "ПРОМПТ ОКНА", strategy: "window", keep_last: 2,
+        transcript: past, history_len: past.length,
+      }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "вопрос в окне";
+    $("#composer").requestSubmit();
+    await settle(400);
+
+    const card = $("#feed").querySelectorAll(".card")[2];
+    check("у обмена со скользящим окном кнопка промпта есть",
+      card && card.querySelectorAll(".icon-btn").map((b) => b.title)
+        .includes("Показать промпт запроса"),
+      card && JSON.stringify(card && card.querySelectorAll(".icon-btn").map((b) => b.title)));
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("в промпте окна видно окно, а отброшенное начало — нет",
+      texts.includes("свежий вопрос") && texts.includes("свежий ответ") &&
+        !texts.includes("давний вопрос") && !texts.includes("давний ответ"),
+      JSON.stringify(texts));
+    check("врезки у окна в промпте нет, и роли подписаны как обычно",
+      JSON.stringify(roles) === JSON.stringify([
+        "системный промпт", "сообщение пользователя", "ответ модели",
+        "сообщение пользователя",
+      ]),
+      JSON.stringify(roles));
+    // Лента при этом показывает историю целиком: промпт — про уехавшее,
+    // а не про то, что помнит чат.
+    check("а в ленте отброшенное начало осталось на месте",
+      $("#feed").textContent.includes("давний вопрос"),
+      $("#feed").textContent.slice(0, 200));
   }
 }
 

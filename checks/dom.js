@@ -543,8 +543,12 @@ function buildServer(options) {
 
   // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
   // врезка вместо начала разговора, непокрытый ею хвост истории, вопрос.
-  // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда:
-  // кнопка просмотра обязана держаться на врезке, а не на наличии промпта.
+  // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда.
+  //
+  // Окно — единственная стратегия, которая режет **без** врезки: вместо
+  // отброшенного начала не встаёт ничего, и в промпте остаётся ровно хвост.
+  // Стенд режет так же, иначе проверить, что кнопка промпта показывает у окна
+  // уехавшее, было бы не на чем: полная история в ленте и так лежит.
   function resolvedPrompt(agent, text, service) {
     const messages = [];
     if (agent.system) messages.push({ role: "system", content: agent.system });
@@ -552,6 +556,9 @@ function buildServer(options) {
     if (service) {
       messages.push({ role: "user", content: service.insert });
       tail.splice(0, service.covered || 0);
+    } else if (agent.strategy === "window" && typeof agent.keep_last === "number") {
+      // Пустое поле — отбрасывать нечем, ровно как на сервере.
+      tail.splice(0, Math.max(0, tail.length - agent.keep_last));
     }
     messages.push(...tail, { role: "user", content: text });
     return messages;
