@@ -87,20 +87,20 @@ KEEP, EVERY = 6, 10
 
 
 def _service_kind(messages) -> str | None:
-    """Чем был этот вызов: `summary` — сжатие, `facts` — извлечение фактов,
-    `None` — обычный обмен. У каждого служебного вызова свой системный промпт,
-    по нему и различаем.
+    """Чем был этот вызов: `summary` — сжатие, `facts` — ведение рабочей
+    памяти, `None` — обычный обмен. У каждого служебного вызова свой
+    системный промпт, по нему и различаем.
 
-    Раньше здесь был вопрос «это сжатие?» — с фактами служебных вызовов стало
-    два, и вопрос обязан был стать «какой это вызов?»: иначе извлечение
-    считалось бы обменом и счётчики вызовов поплыли бы в чужих проверках,
-    где к модели ходят ровно столько раз, сколько задано.
+    Раньше здесь был вопрос «это сжатие?» — с рабочей памятью служебных
+    вызовов стало два, и вопрос обязан был стать «какой это вызов?»: иначе
+    ведение считалось бы обменом и счётчики вызовов поплыли бы в чужих
+    проверках, где к модели ходят ровно столько раз, сколько задано.
     """
     if not messages:
         return None
     return {
         agent_module.COMPRESS_SYSTEM: "summary",
-        agent_module.FACTS_SYSTEM: "facts",
+        agent_module.WORKING_SYSTEM: "facts",
     }.get(messages[0].get("content"))
 
 
@@ -114,15 +114,28 @@ def _service_calls(kind: str | None = None) -> list[dict]:
     ]
 
 
+def _working_edit(messages, line: str) -> str:
+    """Правка рабочей памяти в том виде, в каком её просят у модели: первый
+    раз — новая запись, дальше — правка **той же** записи по её номеру.
+
+    Номер берётся из листинга, который вызову и показали: так отвечала бы
+    модель, и так проверяется то, ради чего память перестала быть снимком —
+    список не переписывается целиком, правка адресуется записи.
+    """
+    listing = messages[-1].get("content", "")
+    first = re.search(r"^(\d+) ", listing, re.M)
+    return (f"{first.group(1)} " if first else "+ ") + line
+
+
 def _service_aware(messages, index):
     """Ответ заглушки, по которому видно, чем был вызов: сводка узнаётся
-    в промпте следующего обмена по слову СВОДКА, выписка фактов — парами
-    «ключ: значение», как их и просят у модели."""
+    в промпте следующего обмена по слову СВОДКА, ведение памяти — правкой
+    единственной записи, в которой стоит номер вызова."""
     kind = _service_kind(messages)
     if kind == "summary":
         return f"СВОДКА {index}"
     if kind == "facts":
-        return f"вызов: {index}\nчто обсуждали: факты"
+        return _working_edit(messages, f"решение: вызов {index}")
     return f"ответ {index}"
 
 
@@ -365,10 +378,10 @@ def check_cut_only_where_chosen():
         bare.build_prompt("вопрос")
     )
 
-    # --- facts: выписка вместо начала, и только при своей стратегии ----------
+    # --- facts: рабочая память вместо начала, и только при своей стратегии ---
     #
     # Что именно уезжает при `facts` и как названо заменённое — у своей
-    # проверки; здесь — половина про выбор: при чужой стратегии выписка
+    # проверки; здесь — половина про выбор: при чужой стратегии врезка
     # не подставляется, а без своего числа не собирается вовсе.
     _stub.reset()
     _stub.install(reply=_service_aware)
@@ -377,7 +390,7 @@ def check_cut_only_where_chosen():
         for i in range(9):
             client.post(f"/api/agents/{facts_id}/messages", json={"text": f"вопрос {i}"})
         with_facts = REGISTRY.require(facts_id)
-        assert with_facts.facts["items"], "факты не собрались — проверять нечего"
+        assert with_facts.working["items"], "память не собралась — проверять нечего"
         assert len(_stub.CALLS[-1]["messages"]) == KEEP + 2, len(_stub.CALLS[-1]["messages"])
 
         # `full` — история возвращается целиком, и выписка не подставляется,
@@ -390,9 +403,9 @@ def check_cut_only_where_chosen():
         assert back[0]["content"] == "вопрос 0", back[0]
         assert not any("[факты о разговоре]" in m["content"] for m in back), back[0]
         assert with_facts.context_cut() == (0, None), with_facts.context_cut()
-        assert with_facts.facts["items"], "факты выброшены переключателем"
+        assert with_facts.working["items"], "записи выброшены переключателем"
 
-        # `window` на том же чате: факты в базе есть, а в промпт не идут —
+        # `window` на том же чате: записи в базе есть, а в промпт не идут —
         # у окна врезки нет, начало просто отброшено.
         client.patch(f"/api/agents/{facts_id}", json={"strategy": "window"})
         client.post(f"/api/agents/{facts_id}/messages", json={"text": "с окном"})
@@ -402,13 +415,13 @@ def check_cut_only_where_chosen():
         assert with_facts.history[-1].metrics["dropped"] == 20 - KEEP, with_facts.history[-1].metrics
         assert "facts" not in with_facts.history[-1].metrics, "окно назвалось фактами"
 
-        # И ни на `full`, ни на `window` за фактами к модели не ходят: вызов
-        # на извлечение оплачен так же, как обмен, а воспользоваться им при
+        # И ни на `full`, ни на `window` за памятью к модели не ходят: вызов
+        # на ведение оплачен так же, как обмен, а воспользоваться им при
         # чужой стратегии некому.
         assert len(_service_calls("facts")) == 9, len(_service_calls("facts"))
 
-    # Стратегия выбрана, а числа нет — извлекать не для кого: резать нечем,
-    # уедет вся история, и выписке в промпте места нет. Платить за вызов,
+    # Стратегия выбрана, а числа нет — вести память не для кого: резать нечем,
+    # уедет вся история, и врезке в промпте места нет. Платить за вызов,
     # которым никто не воспользуется, нельзя.
     _stub.reset()
     _stub.install(reply=_service_aware)
@@ -416,7 +429,7 @@ def check_cut_only_where_chosen():
         bare_facts = new_agent(client, strategy="facts")
         for i in range(4):
             client.post(f"/api/agents/{bare_facts}/messages", json={"text": f"вопрос {i}"})
-        assert not _service_calls(), "факты извлекаются без своего числа"
+        assert not _service_calls(), "память ведётся без своего числа"
         assert len(_stub.CALLS[-1]["messages"]) == 7, len(_stub.CALLS[-1]["messages"])
         assert REGISTRY.require(bare_facts).context_cut() == (0, None), "пустое число режет историю"
 
@@ -879,25 +892,28 @@ def check_summary_survives_restart():
     return f"сводка на {before[0][0]} реплик пережила перезапуск и обмен после него; forget(), удаление чата и очистка базы её уносят"
 
 
-@check("факты доезжают до промпта, переживают перезапуск и умирают вместе с чатом")
-def check_facts_reach_prompt():
-    """Стратегия `facts`: вместо начала разговора в промпт встаёт выписка
-    «ключ: значение», а хвост в `keep_last` реплик уезжает дословно.
+@check("рабочая память: записи с устойчивыми номерами, правка по одной, чужое не трогается")
+def check_working_memory():
+    """Рабочая память — **список записей**, а не снимок, и вся проверка про
+    разницу между этими двумя словами.
 
-    Три части, потому что подвести факты могут в трёх разных местах: в промпте
-    (не встали, встали не той ролью, встали при чужой стратегии), в разборе
-    (кривая строка унесла с собой остальные, провал извлечения уронил сам
-    обмен) и в файле (не пережили перезапуск — и разговор потерял всё, что
-    о нём знали; пережили чистку — и цели мёртвого чата достались живому,
-    потому что каскада в схеме нет).
+    Снимок можно было переписывать целиком: он был производным от истории и
+    целиком принадлежал служебному вызову. Список — нет: у записи есть номер,
+    по нему её правят и удаляют, и рядом с записями агента лежат записи
+    человека, которых служебный вызов не вправе касаться. Отсюда четыре
+    части: промпт (врезка встаёт той же ролью и на то же место, что у
+    выписки Дня 10), ручки (род обязателен, номер устойчив, чужая запись
+    переживает извлечение), разбор (правка адресуется записи, кривая строка
+    пропускается, провал не роняет обмен) и файл (номера и авторство
+    переживают перезапуск, а три пути очистки — нет).
 
-    Извлечение зовётся **на каждом обмене**: задание требует обновлять факты
-    после каждого сообщения пользователя. Это удваивает число обращений
-    к модели — и так и задумано.
+    Вызов на ведение памяти идёт **на каждом обмене**: задание требует
+    обновлять её после каждого сообщения пользователя. Это удваивает число
+    обращений к модели — и так и задумано.
     """
     from app.agent import Agent
 
-    # --- 1. Живой маршрут: выписка вместо начала, хвост как есть -------------
+    # --- 1. Живой маршрут: врезка вместо начала, хвост как есть -------------
     _stub.install(reply=_service_aware)
     with TestClient(main.app) as client:
         agent_id = new_agent(
@@ -917,7 +933,7 @@ def check_facts_reach_prompt():
 
         # Кадр о служебном вызове приходит до промпта и **называет вызов**:
         # кадр один на оба рода, и без этого поля клиент не знал бы, что
-        # писать в строке состояния, — молчал бы и про факты, и про
+        # писать в строке состояния, — молчал бы и про память, и про
         # сворачивание. Тем же полем подписана врезка в просмотре промпта.
         frames = sse(response.text)
         kinds = [e["event"] for e in frames]
@@ -931,27 +947,44 @@ def check_facts_reach_prompt():
             start["resolved_messages"][start["summary_at"]]
         )
 
-        # Вызов на извлечение — на каждом обмене, и он единственный служебный:
-        # сжатия у этой стратегии нет вовсе.
+        # Вызов на ведение памяти — на каждом обмене, и он единственный
+        # служебный: сжатия у этой стратегии нет вовсе.
         assert len(_service_calls("facts")) == 9, len(_service_calls("facts"))
-        assert _service_calls("summary") == [], "факты зачем-то сворачивают историю"
+        assert _service_calls("summary") == [], "память зачем-то сворачивает историю"
         assert len(_stub.CALLS) == 18, len(_stub.CALLS)
 
-        # Промпт: системный промпт, выписка, хвост в KEEP реплик, вопрос.
+        # Девять вызовов — **одна** запись: каждый следующий правил ту же
+        # по номеру, а не заводил вторую такую же. Ровно это и отличает
+        # список записей от снимка: снимок переписывался целиком и не мог
+        # не совпасть сам с собой, а список обязан адресовать правку.
+        assert len(agent.working["items"]) == 1, agent.working["items"]
+        kept = agent.working["items"][0]
+        assert kept["author"] == "agent", kept
+        assert kept["kind"] == "decision" and kept["content"] == "вызов 16", kept
+
+        # Промпт: системный промпт, врезка, хвост в KEEP реплик, вопрос.
         assert [m["role"] for m in sent] == (
             ["system", "user"] + ["user", "assistant"] * 3 + ["user"]
         ), [m["role"] for m in sent]
         assert sent[0]["content"] == "СИС", sent[0]
-        # Выписка едет ролью `user` с подписью, а не системной репликой:
+        # Врезка едет ролью `user` с подписью, а не системной репликой:
         # системный промпт живёт ровно в одном месте — `spec.system`, — и
         # второй системной репликой чат перестал бы быть тем, что настроили.
-        assert sent[1]["role"] == "user" and "[факты о разговоре]" in sent[1]["content"], sent[1]
-        assert "что обсуждали: факты" in sent[1]["content"], sent[1]
+        # Вид записи подписан по-русски — той же картой, какой подписана
+        # долговременная память и какой отвечает сам служебный вызов.
+        assert sent[1] == {
+            "role": "user",
+            "content": (
+                "[факты о разговоре]\n"
+                "решение: вызов 16\n"
+                "[дальше — последние сообщения как есть]"
+            ),
+        }, sent[1]
         assert len([m for m in sent if m["role"] == "system"]) == 1, sent
         assert sent[2]["content"] == "вопрос 5", sent[2]
         assert sent[-1]["content"] == "вопрос 8", sent[-1]
 
-        # Заменённое названо числом, и слово у фактов своё: выписка начало
+        # Заменённое названо числом, и слово у памяти своё: врезка начало
         # **заменила**, прочитать её можно в промпте запроса; окно бы его
         # отбросило совсем, и назвать оба одинаково значило бы соврать.
         cut, insert = agent.context_cut()
@@ -959,45 +992,111 @@ def check_facts_reach_prompt():
         assert cut == 12, cut
         # Слот врезки — то самое число, что уехало в `start`: промолчи он,
         # клиент не удержал бы промпт, и кнопка «Показать промпт запроса»
-        # у чата с фактами не появилась бы никогда. А на ней держится слово
+        # у этого чата не появилась бы никогда. А на ней держится слово
         # «вместо»: замену **видно**, в отличие от отброшенного окном.
         assert agent.context_slot() == 1, agent.context_slot()
         assert agent.history[-1].metrics["facts"] == 10, agent.history[-1].metrics
-        assert "dropped" not in agent.history[-1].metrics, "факты назвались окном"
-        assert "summarized" not in agent.history[-1].metrics, "факты назвались сводкой"
+        assert "dropped" not in agent.history[-1].metrics, "память назвалась окном"
+        assert "summarized" not in agent.history[-1].metrics, "память назвалась сводкой"
 
-        # Извлечение идёт инкрементально: прошлая выписка плюс только новое.
+        # Ведение идёт инкрементально: нынешние записи плюс только новое.
         # Перечитывай оно разговор с начала — а вызов на каждом обмене, — и
         # платить пришлось бы за весь чат столько раз, сколько в нём сообщений.
+        # Записи показаны **с номерами**: без них правка не адресуется.
         asked = _service_calls("facts")[-1]["messages"]
-        assert asked[0]["content"] == agent_module.FACTS_SYSTEM, asked[0]
-        assert "Факты, которые уже собраны" in asked[1]["content"], asked[1]
-        assert "вопрос 0" not in asked[1]["content"], "извлечение перечитывает разговор с начала"
+        assert asked[0]["content"] == agent_module.WORKING_SYSTEM, asked[0]
+        assert f"{kept['seq']} решение: " in asked[1]["content"], asked[1]
+        assert "вопрос 0" not in asked[1]["content"], "ведение перечитывает разговор с начала"
         assert "вопрос 7" in asked[1]["content"] and "вопрос 8" in asked[1]["content"], asked[1]
 
         # Тело служебного вызова: формат ответа и стоп-строки сняты — объект
-        # вместо выписки не разобрался бы, а стоп-строка оборвала бы её на
+        # вместо правок не разобрался бы, а стоп-строка оборвала бы их на
         # середине. Модель та же: вторая развалила бы счёт на две цены. И три
         # правила тела на нём тоже — особенно выключенное провайдерское
         # сжатие: оно молча выбросило бы середину того, что мы отдали читать.
-        facts_body = _service_calls("facts")[-1]["payload"]
-        assert "response_format" not in facts_body, facts_body.get("response_format")
-        assert "stop" not in facts_body, facts_body.get("stop")
-        assert facts_body["model"] == _stub.CALLS[-1]["payload"]["model"], facts_body["model"]
+        service_body = _service_calls("facts")[-1]["payload"]
+        assert "response_format" not in service_body, service_body.get("response_format")
+        assert "stop" not in service_body, service_body.get("stop")
+        assert service_body["model"] == _stub.CALLS[-1]["payload"]["model"], service_body["model"]
         assert _stub.CALLS[-1]["payload"]["response_format"] == {"type": "json_object"}
-        assert facts_body["provider"]["require_parameters"] is True, facts_body["provider"]
-        assert {"id": "context-compression", "enabled": False} in (facts_body.get("plugins") or []), (
-            f"выписку собирал провайдер со своим сжатием: {facts_body.get('plugins')!r}"
+        assert service_body["provider"]["require_parameters"] is True, service_body["provider"]
+        assert {"id": "context-compression", "enabled": False} in (service_body.get("plugins") or []), (
+            f"память собирал провайдер со своим сжатием: {service_body.get('plugins')!r}"
         )
-        assert facts_body["usage"] == {"include": True}, facts_body.get("usage")
+        assert service_body["usage"] == {"include": True}, service_body.get("usage")
 
-        # История цела: факты живут в сборке промпта, а не в памяти чата.
+        # История цела: память живёт в сборке промпта, а не в ленте чата.
         # На этом держится перегенерация — она ждёт хвост и сверяет длину.
         assert len(agent.history) == 18, len(agent.history)
         assert agent.history[0].content == "вопрос 0", agent.history[0]
         assert agent.take_last_exchange() is not None, "перегенерация не сняла пару"
 
-    # --- 2. Разбор терпимый, а провал извлечения обмен не роняет -------------
+        # --- ручки чата: род обязателен, номер выдаёт база ------------------
+        #
+        # Разбор тела — по образцу долговременной памяти, и род здесь так же
+        # без умолчания: «явно выбирать, что и куда сохраняется» перестало бы
+        # быть работой человека, подставь сервер род за него.
+        url = f"/api/agents/{agent_id}/working"
+        listed = client.get(url).json()
+        assert listed["total"] == 1 and listed["upto"] == 16, listed
+        assert listed["records"][0]["seq"] == kept["seq"], listed["records"]
+
+        bad = client.post(url, json={"content": "без рода"})
+        assert bad.status_code == 400 and "goal" in bad.text, bad.text
+        assert client.post(url, json={"kind": "цель", "content": "подписью"}).status_code == 400
+        assert client.post(url, json={"kind": "profile", "content": "чужой слой"}).status_code == 400
+        assert client.post(url, json={"kind": "goal", "content": "   "}).status_code == 400
+        # Автора и номер выдаёт сервер: тело, которое их присылает, просит
+        # не то, что ручка делает.
+        assert client.post(
+            url, json={"kind": "goal", "content": "х", "author": "agent"}
+        ).status_code == 400
+
+        human = client.post(url, json={"kind": "limit", "content": "  бюджет 100к  "})
+        assert human.status_code == 200, human.text
+        human = human.json()
+        assert human["author"] == "human", human
+        assert human["content"] == "бюджет 100к", human
+        assert human["seq"] > kept["seq"], (human, kept)
+
+        edited = client.patch(f"{url}/{human['seq']}", json={"content": "бюджет 200к"})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["seq"] == human["seq"], edited.json()
+        assert edited.json()["kind"] == "limit", edited.json()
+        assert client.patch(f"{url}/{human['seq']}", json={}).status_code == 400
+        assert client.patch(f"{url}/{human['seq']}", json={"kind": "х"}).status_code == 400
+        assert client.patch(f"{url}/9999", json={"content": "нет такой"}).status_code == 404
+        assert client.delete(f"{url}/9999").status_code == 404
+
+        # --- и главный инвариант: чужую запись извлечение не трогает --------
+        #
+        # Служебному вызову тут прямо велено её переписать и удалить —
+        # и оба раза мимо. Проверяется кодом, а не обещанием в промпте:
+        # инструкция модели — просьба, а не гарантия, и первая же правка
+        # руками жила бы до ближайшего обмена.
+        def hostile(messages, index):
+            if _service_kind(messages) != "facts":
+                return f"ответ {index}"
+            return f"{human['seq']} цель: подменённая чужая запись\n- {human['seq']}"
+
+        _stub.install(reply=hostile)
+        client.post(f"/api/agents/{agent_id}/messages", json={"text": "вопрос после правки"})
+        survived = client.get(url).json()["records"]
+        assert [r["seq"] for r in survived] == [kept["seq"], human["seq"]], survived
+        assert survived[1] == {**human, "content": "бюджет 200к", "at": survived[1]["at"]}, survived[1]
+        assert survived[1]["author"] == "human", survived[1]
+
+        # И запись человека уезжает в промпт наравне с агентской — слой один,
+        # и врезка не различает, кто её наполнил.
+        block = _stub.CALLS[-1]["messages"][1]["content"]
+        assert "ограничение: бюджет 200к" in block, block
+        assert "подменённая" not in block, block
+
+    # --- 2. Разбор правок: адресуется запись, номера устойчивы --------------
+    #
+    # Хранилище здесь настоящее: номера выдаёт база (AUTOINCREMENT), и
+    # «номер удалённой записи не достаётся следующей» проверяется там, где
+    # он и обещан, — первичным ключом, а не счётчиком в памяти процесса.
     mode = {"reply": "мусор"}
 
     def replies(messages, index):
@@ -1006,117 +1105,190 @@ def check_facts_reach_prompt():
         if mode["reply"] == "мусор":
             return (
                 "Вот что я понял:\n"
-                "- цель: собрать ТЗ\n"
+                "+ цель: собрать ТЗ\n"
                 "строка без двоеточия\n"
-                "пустое значение:   \n"
-                ": без ключа\n"
-                "срок: апрель\n"
-                "срок: май"
+                "+ ограничение:   \n"
+                "+ : без вида\n"
+                "+ срок: апрель\n"
+                "цель: строка без маркера\n"
+                "1. цель: пункт нумерованного списка\n"
+                "- 9999\n"
+                "+ открытый вопрос: когда релиз"
             )
-        return "никаких пар здесь нет\nи здесь тоже"
+        if mode["reply"] == "правка":
+            return "1 цель: собрать ТЗ и смету"
+        if mode["reply"] == "удаление":
+            return "- 2\n+ решение: платим картой"
+        return "никаких правок здесь нет\nи здесь тоже"
 
     _stub.install(reply=replies)
-    tolerant = Agent(AgentSpec(label="разбор", model="stub/model", strategy="facts", keep_last=2))
+    store = Store(":memory:").init()
+    tolerant = Agent(
+        AgentSpec(label="разбор", model="stub/model", strategy="facts", keep_last=2), store=store
+    )
     asyncio.run(drain(tolerant.ask("первый вопрос")))
-    # Кривые строки пропущены, ровные разобраны: заголовок «Вот что я понял:»
-    # ушёл в мусор из-за пустого значения, а не унёс с собой соседей. А из двух
-    # строк про один и тот же ключ победила последняя: список переписывается
-    # целиком, «срок» в нём ровно один, и им обязан оказаться свежий —
-    # договорённости в разговоре меняются, и выписка, оставляющая первое
-    # значение, помнила бы отменённое.
-    assert tolerant.facts["items"] == [
-        {"key": "цель", "value": "собрать ТЗ"},
-        {"key": "срок", "value": "май"},
-    ], tolerant.facts["items"]
 
-    # Ни одной пары — прошлая выписка остаётся прежней, а обмен уезжает как
-    # уехал бы: служебный вызов не вправе обрушить сам разговор.
+    # Кривые строки пропущены, ровные разобраны: заголовок «Вот что я понял:»
+    # ушёл в мусор, а не унёс с собой соседей; пустое содержимое, неназванный
+    # и незнакомый вид — туда же, рода по умолчанию нет ни здесь, ни у ручки.
+    # А строка **без маркера** — не правка вовсе: повтор всего списка (самое
+    # естественное, что сделает модель, если ей позволить) завёл бы вторые
+    # копии всех записей на каждом обмене. «1. цель» — пункт нумерованного
+    # списка, а не правка первой записи: принять его значило бы молча
+    # переписать чужую.
+    assert [(r["seq"], r["kind"], r["content"]) for r in tolerant.working["items"]] == [
+        (1, "goal", "собрать ТЗ"),
+        (2, "question", "когда релиз"),
+    ], tolerant.working["items"]
+    assert store.list_working(tolerant.id) == tolerant.working["items"], store.list_working(tolerant.id)
+
+    # Правка адресована первой записи: у неё сменилось содержимое, номер
+    # остался её, а соседнюю не сдвинуло. Перенумеруй запись правка — и
+    # вторая вкладка, показывающая список с прошлой минуты, удалила бы не ту.
+    mode["reply"] = "правка"
+    asyncio.run(drain(tolerant.ask("второй вопрос")))
+    assert [(r["seq"], r["content"]) for r in tolerant.working["items"]] == [
+        (1, "собрать ТЗ и смету"),
+        (2, "когда релиз"),
+    ], tolerant.working["items"]
+
+    # Удаление плюс новая запись: номер удалённой не достаётся следующей.
+    # Обычный `INTEGER PRIMARY KEY` снял бы номер с последней и отдал его
+    # новой — и правка «по номеру два» попала бы не в ту запись.
+    mode["reply"] = "удаление"
+    asyncio.run(drain(tolerant.ask("третий вопрос")))
+    assert [(r["seq"], r["kind"], r["content"]) for r in tolerant.working["items"]] == [
+        (1, "goal", "собрать ТЗ и смету"),
+        (3, "decision", "платим картой"),
+    ], tolerant.working["items"]
+    # И то же самое из базы: номера там те же, что в памяти процесса. Перенумеруй
+    # их хоть запись, хоть чтение — дыра на месте второй записи затянулась бы,
+    # и правка «по номеру три» после подъёма чата попала бы не в ту запись.
+    assert store.list_working(tolerant.id) == tolerant.working["items"], store.list_working(tolerant.id)
+
+    # Запись человека переживает извлечение: ни правка, ни удаление её
+    # не берут — а соседнюю, свою, тот же вызов правит как ни в чём не бывало.
+    mine = tolerant.add_working_record("limit", "бюджет 100к")
+    assert mine["author"] == "human", mine
+    mode["reply"] = "чужое"
+    _stub.install(reply=lambda m, i: (
+        f"ответ {i}" if _service_kind(m) != "facts"
+        else f"{mine['seq']} цель: подмена\n- {mine['seq']}\n1 цель: собрать ТЗ, смету и сроки"
+    ))
+    asyncio.run(drain(tolerant.ask("четвёртый вопрос")))
+    assert [(r["seq"], r["content"], r["author"]) for r in tolerant.working["items"]] == [
+        (1, "собрать ТЗ, смету и сроки", "agent"),
+        (3, "платим картой", "agent"),
+        (mine["seq"], "бюджет 100к", "human"),
+    ], tolerant.working["items"]
+
+    # Правка руками метит запись человеком, даже если завёл её вызов: с этой
+    # минуты переписывать её обратно извлечение не вправе.
+    tolerant.edit_working_record(3, content="платим только картой")
+    _stub.install(reply=lambda m, i: (
+        f"ответ {i}" if _service_kind(m) != "facts" else "3 решение: платим как угодно"
+    ))
+    asyncio.run(drain(tolerant.ask("пятый вопрос")))
+    assert [(r["seq"], r["content"], r["author"]) for r in tolerant.working["items"]][1] == (
+        3, "платим только картой", "human"
+    ), tolerant.working["items"]
+
+    # --- 3. Провал ведения обмен не роняет и не даёт срезать непрочитанное --
+    _stub.install(reply=replies)
     mode["reply"] = "пусто"
-    events = asyncio.run(drain(tolerant.ask("второй вопрос")))
+    before = [dict(r) for r in tolerant.working["items"]]
+    upto_before = tolerant.working["upto"]
+    events = asyncio.run(drain(tolerant.ask("шестой вопрос")))
     done = [e for e in events if e["type"] == "done"][-1]
     assert done["committed"] and done["text"], done
-    assert tolerant.facts["items"][0] == {"key": "цель", "value": "собрать ТЗ"}, tolerant.facts
+    assert tolerant.working["items"] == before, tolerant.working["items"]
+    assert tolerant.working["upto"] == upto_before, tolerant.working["upto"]
 
     # И то же самое, когда вызов падает исключением, а не пустым ответом.
     real_stream = agent_module.stream_completion
 
     def falling(spec, *, prompt_override=None, context_length=None):
         if _service_kind(prompt_override) == "facts":
-            raise RuntimeError("извлечение упало")
+            raise RuntimeError("ведение памяти упало")
         return real_stream(spec, prompt_override=prompt_override, context_length=context_length)
 
     agent_module.stream_completion = falling
     try:
-        events = asyncio.run(drain(tolerant.ask("третий вопрос")))
+        events = asyncio.run(drain(tolerant.ask("седьмой вопрос")))
     finally:
         agent_module.stream_completion = real_stream
     done = [e for e in events if e["type"] == "done"][-1]
     assert done["committed"] and done["text"], done
     assert not [e for e in events if e["type"] == "error"], events
-    assert tolerant.facts["items"][0] == {"key": "цель", "value": "собрать ТЗ"}, tolerant.facts
-    assert len(tolerant.history) == 6, len(tolerant.history)
+    assert tolerant.working["items"] == before, tolerant.working["items"]
+    assert len(tolerant.history) == 14, len(tolerant.history)
 
-    # И главное про провал: выписка его пережила, а история за это время
+    # И главное про провал: память его пережила, а история за это время
     # выросла. Срез, считанный по одному хвосту, вырос бы вместе с ней и унёс
-    # реплики, которых выписка **никогда не видела**, — молча и под подписью
+    # реплики, которых память **никогда не видела**, — молча и под подписью
     # «факты вместо N сообщений». Поэтому срез зажат ещё и по `upto`:
-    # срезано ровно то, что выписка прочитала.
-    #
-    # Здесь `upto` равен нулю: единственное удачное извлечение случилось на
-    # первом обмене, когда истории ещё не было вовсе, — и значит резать нечего
-    # при любом `keep_last`.
-    assert tolerant.facts["upto"] == 0, tolerant.facts["upto"]
-    assert tolerant.context_cut() == (0, None), tolerant.context_cut()
-    unread = tolerant.build_prompt("после провалов")
-    assert len(unread) == 7, [m["content"] for m in unread]
-    assert [m["content"] for m in unread][::2] == [
-        "первый вопрос", "второй вопрос", "третий вопрос", "после провалов",
-    ], [m["content"] for m in unread]
-    assert not any("[факты о разговоре]" in m["content"] for m in unread), unread[0]
+    # срезано ровно то, что память прочитала.
+    assert upto_before == 6, upto_before
+    assert tolerant.context_cut()[0] == 6, tolerant.context_cut()
+    # Врезка плюс восемь непрочитанных реплик плюс вопрос: хвост уехал длиннее
+    # просимых двух — это и есть цена провала, дорогая, но честная.
+    assert len(tolerant.build_prompt("после провалов")) == 1 + 8 + 1, tolerant.build_prompt(
+        "после провалов"
+    )
 
-    # А когда извлечение проходит, срез считается по хвосту, как и просили:
-    # зажим бережёт от молчаливой потери, а не отменяет стратегию.
-    mode["reply"] = "мусор"
-    asyncio.run(drain(tolerant.ask("четвёртый вопрос")))
-    assert tolerant.facts["upto"] == 6, tolerant.facts["upto"]
-    assert tolerant.context_cut()[0] == 6, tolerant.context_cut()[0]
-    assert len(tolerant.history) == 8, len(tolerant.history)
+    # А когда вызов проходит, срез считается по хвосту, как и просили: зажим
+    # бережёт от молчаливой потери, а не отменяет стратегию.
+    mode["reply"] = "правка"
+    asyncio.run(drain(tolerant.ask("восьмой вопрос")))
+    assert tolerant.working["upto"] == 14, tolerant.working["upto"]
+    assert tolerant.context_cut()[0] == 14, tolerant.context_cut()[0]
+    assert len(tolerant.history) == 16, len(tolerant.history)
+    store.close()
 
-    # --- 3. Файл: перезапуск переживают, чистку — нет ------------------------
+    # --- 4. Файл: перезапуск переживают, чистку — нет -----------------------
     def remembering(messages, index):
         if _service_kind(messages) != "facts":
             return f"ответ {index}"
-        # Выписка помнит последний вопрос, который видела: по ней и видно,
-        # что именно уехало в извлечение и чья это выписка.
-        return "последний вопрос: " + messages[1]["content"].strip().splitlines()[-1]
+        # Память помнит последний вопрос, который видела: по ней и видно,
+        # что именно уехало в вызов и чья это память.
+        return _working_edit(
+            messages, "цель: " + messages[1]["content"].strip().splitlines()[-1]
+        )
 
     _stub.install(reply=remembering)
-    path = _temp_db("facts-restart")
+    path = _temp_db("working-restart")
     store = Store(path).init()
-    spec = AgentSpec(label="с фактами", model="stub/model", strategy="facts", keep_last=KEEP)
+    spec = AgentSpec(label="с памятью", model="stub/model", strategy="facts", keep_last=KEEP)
     agent = Agent(spec, store=store)
     for i in range(9):
         asyncio.run(drain(agent.ask(f"вопрос {i}")))
-    before = list(agent.facts["items"])
+    mine = agent.add_working_record("question", "успеем ли к маю")
+    before = [dict(r) for r in agent.working["items"]]
     agent_id = agent.id
-    assert before == [{"key": "последний вопрос", "value": "Пользователь: вопрос 8"}], before
-    assert agent.facts["upto"] == 16, agent.facts["upto"]
+    assert [(r["kind"], r["content"], r["author"]) for r in before] == [
+        ("goal", "Пользователь: вопрос 8", "agent"),
+        ("question", "успеем ли к маю", "human"),
+    ], before
+    assert agent.working["upto"] == 16, agent.working["upto"]
     store.close()
 
     # Настоящее переоткрытие файла, а не тот же объект в памяти.
     again = Store(path).init()
     try:
         revived = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=again)
-        assert revived.facts["items"] == before, (before, revived.facts["items"])
-        # Вместе с выпиской поднялось и то, докуда прочитана история: без
-        # этого числа извлечение после перезапуска перечитало бы разговор
+        # Номера и авторство пережили перезапуск: без них правка «по номеру»
+        # после подъёма чата попала бы не в ту запись, а чужая запись стала бы
+        # своей и первое же извлечение её переписало.
+        assert revived.working["items"] == before, (before, revived.working["items"])
+        # Вместе с записями поднялось и то, докуда прочитана история: без
+        # этого числа ведение после перезапуска перечитало бы разговор
         # с начала — а окно успело бы срезать его раньше.
-        assert revived.facts["upto"] == 16, revived.facts["upto"]
-        assert revived.facts["metrics"], "метрики извлечений не пережили перезапуск"
+        assert revived.working["upto"] == 16, revived.working["upto"]
+        assert revived.working["metrics"], "метрики ведения не пережили перезапуск"
         assert len(revived.history) == 18, len(revived.history)
-        assert "[факты о разговоре]" in revived.build_prompt("ещё")[0]["content"], "выписка не встала"
+        assert "[факты о разговоре]" in revived.build_prompt("ещё")[0]["content"], "врезка не встала"
 
-        # Фактов нет среди реплик: они в своей таблице, а не в ленте. Лежи они
+        # Записей нет среди реплик: они в своей таблице, а не в ленте. Лежи они
         # строкой в `messages`, их стирал бы каждый следующий обмен —
         # `save_history` начинается с `DELETE FROM messages`.
         contents = [r[2] for r in again.message_rows(agent_id)]
@@ -1125,50 +1297,57 @@ def check_facts_reach_prompt():
         _stub.reset()
         asyncio.run(drain(revived.ask("вопрос после перезапуска")))
         asked = _service_calls("facts")[-1]["messages"][1]["content"]
-        assert "вопрос 0" not in asked, "после перезапуска извлечение читает историю заново"
+        assert "вопрос 0" not in asked, "после перезапуска ведение читает историю заново"
         assert "вопрос после перезапуска" in asked, asked
-        assert again.load_facts(agent_id)["items"] == [
-            {"key": "последний вопрос", "value": "Пользователь: вопрос после перезапуска"}
-        ], again.load_facts(agent_id)
+        saved = again.list_working(agent_id)
+        assert [(r["content"], r["author"]) for r in saved] == [
+            ("Пользователь: вопрос после перезапуска", "agent"),
+            ("успеем ли к маю", "human"),
+        ], saved
+        assert [r["seq"] for r in saved] == [r["seq"] for r in before], (saved, before)
         assert len(revived.history) == 20, len(revived.history)
 
-        # Чистка чата уносит и факты: каскада в схеме нет. Зажима по длине
-        # истории у выписки нет вовсе — она встаёт в промпт, пока в ней есть
-        # хоть одна пара, — и забытый разговор оставил бы свои цели
-        # и договорённости следующему.
+        # Чистка чата уносит и рабочую память: каскада в схеме нет. Зажима
+        # по длине истории у неё нет вовсе — врезка встаёт в промпт, пока
+        # в памяти есть хоть одна запись, — и забытый разговор оставил бы
+        # свои цели и решения следующему.
         revived.forget()
-        assert again.load_facts(agent_id)["items"] == [], again.load_facts(agent_id)
-        assert revived.facts["items"] == [], revived.facts
+        assert again.list_working(agent_id) == [], again.list_working(agent_id)
+        assert again.load_working_state(agent_id)["upto"] == 0, again.load_working_state(agent_id)
+        assert revived.working["items"] == [], revived.working
         assert again.message_rows(agent_id) == [], again.message_rows(agent_id)
         for i in range(4):
             asyncio.run(drain(revived.ask(f"новый вопрос {i}")))
         block = revived.build_prompt("ещё")[0]["content"]
         assert "[факты о разговоре]" in block, block
-        assert "вопрос 8" not in block, "забытый разговор оставил свои факты следующему"
+        assert "вопрос 8" not in block, "забытый разговор оставил свою память следующему"
 
         # Удаление чата — второй такой путь: номера чатов идут по возрастанию,
-        # а после очистки базы начинаются заново, и факты удалённого разговора
-        # достались бы чату с тем же id.
+        # а после очистки базы начинаются заново, и память удалённого
+        # разговора досталась бы чату с тем же id.
         doomed = Agent(spec, store=again)
         asyncio.run(drain(doomed.ask("вопрос удаляемого")))
-        assert again.load_facts(doomed.id)["items"], "факты не записались — проверять нечего"
+        assert again.list_working(doomed.id), "память не записалась — проверять нечего"
         again.delete_session(doomed.id)
-        assert again.load_facts(doomed.id)["items"] == [], "удаление чата оставило его факты"
+        assert again.list_working(doomed.id) == [], "удаление чата оставило его память"
+        assert again.load_working_state(doomed.id)["upto"] == 0, "удаление чата оставило прочитанное"
 
         # Очистка базы — третий.
-        kept = Agent(spec, store=again)
-        asyncio.run(drain(kept.ask("вопрос стираемого")))
-        assert again.load_facts(kept.id)["items"], "факты не записались — проверять нечего"
+        keeper = Agent(spec, store=again)
+        asyncio.run(drain(keeper.ask("вопрос стираемого")))
+        assert again.list_working(keeper.id), "память не записалась — проверять нечего"
         again.clear()
-        assert again.load_facts(kept.id)["items"] == [], "очистка базы оставила факты"
+        assert again.list_working(keeper.id) == [], "очистка базы оставила память"
+        assert again.load_working_state(keeper.id)["upto"] == 0, "очистка базы оставила прочитанное"
     finally:
         again.close()
 
     return (
-        f"выписка вместо 10 сообщений и хвост в {KEEP} реплик, слот врезки назван "
-        "в кадре `start`; извлечение на каждом из 9 обменов и инкрементально; кривые "
-        "строки пропущены, повтор ключа взял последнее значение, провал обмен не уронил "
-        "и не дал срезать непрочитанное; перезапуск факты пережили, три пути очистки — нет"
+        f"врезка вместо 10 сообщений и хвост в {KEEP} реплик, слот врезки назван "
+        "в кадре `start`; вызов на каждом из 9 обменов правит одну запись по номеру; "
+        "кривые строки и строка без маркера пропущены, удалённый номер не выдан заново, "
+        "запись человека пережила и правку, и удаление; провал обмен не уронил и не дал "
+        "срезать непрочитанное; перезапуск номера и авторство пережили, три пути очистки — нет"
     )
 
 
@@ -1479,37 +1658,48 @@ def check_branch_independent():
     assert far.build_prompt("ещё") == far_prompt, "сворачивание родителя сменило промпт ветки"
 
     listing = agent_module.Agent(
-        AgentSpec(label="выписка", model="stub/model", strategy="facts", keep_last=KEEP),
+        AgentSpec(label="память", model="stub/model", strategy="facts", keep_last=KEEP),
         store=store,
     )
     for i in range(5):
         asyncio.run(drain(listing.ask(f"вопрос {i}")))
-    upto = listing.facts["upto"]
-    assert upto == 8 and listing.facts["items"], listing.facts
+    upto = listing.working["upto"]
+    said = [(r["kind"], r["content"], r["author"]) for r in listing.working["items"]]
+    assert upto == 8 and said, listing.working
     # Та же граница и так же вплотную: `upto - 1` и ровно `upto`.
-    thin = reg.fork(listing, upto - 1, label="на одно раньше границы выписки")
-    brim = reg.fork(listing, upto, label="ровно по границе выписки")
-    fat = reg.fork(listing, 10, label="ветка после выписки")
-    # Выписка прочитала восемь реплик, а ветка унесла семь: в ней выписки
+    thin = reg.fork(listing, upto - 1, label="на одно раньше границы памяти")
+    brim = reg.fork(listing, upto, label="ровно по границе памяти")
+    fat = reg.fork(listing, 10, label="ветка после границы памяти")
+    # Память прочитала восемь реплик, а ветка унесла семь: в ней памяти
     # нет вовсе — иначе она рассказала бы про разговор, которого в ветке
     # не было, и под ответом стояло бы «факты вместо N сообщений» про это.
-    assert thin.facts == agent_module.empty_facts(), thin.facts
-    assert store.load_facts(thin.id)["items"] == [], store.load_facts(thin.id)
+    assert thin.working == agent_module.empty_working(), thin.working
+    assert store.list_working(thin.id) == [], store.list_working(thin.id)
     assert thin.context_cut() == (0, None), thin.context_cut()
-    # А унёсшая ровно прочитанное — уносит выписку с её же границей, и режет
-    # ею столько, сколько выписка прочитала, а не сколько хотелось бы.
-    assert brim.facts["items"] == listing.facts["items"], brim.facts["items"]
-    assert brim.facts["upto"] == upto, brim.facts["upto"]
-    assert store.load_facts(brim.id)["items"] == listing.facts["items"]
+    # А унёсшая ровно прочитанное — уносит память с её же границей, и режет
+    # ею столько, сколько память прочитала, а не сколько хотелось бы.
+    assert [(r["kind"], r["content"], r["author"]) for r in brim.working["items"]] == said, (
+        brim.working["items"]
+    )
+    assert brim.working["upto"] == upto, brim.working["upto"]
+    assert store.list_working(brim.id) == brim.working["items"], store.list_working(brim.id)
     assert brim.context_cut()[0] == upto - KEEP, brim.context_cut()
-    # А унёсшая всё прочитанное — уносит и выписку, и её границу.
-    assert fat.facts["items"] == listing.facts["items"], fat.facts["items"]
-    assert fat.facts["upto"] == upto, fat.facts["upto"]
-    assert store.load_facts(fat.id)["items"] == listing.facts["items"]
-    assert fat.context_cut()[1] is not None, "выписка не встала в промпт ветки"
+    # Номера у копий свои: номер принадлежит одному чату, и две записи под
+    # одним номером в разных разговорах — ровно та путаница, из-за которой
+    # он и стал сквозным на всю базу.
+    assert {r["seq"] for r in brim.working["items"]}.isdisjoint(
+        {r["seq"] for r in listing.working["items"]}
+    ), (brim.working["items"], listing.working["items"])
+    # А унёсшая всё прочитанное — уносит и память, и её границу.
+    assert [(r["kind"], r["content"], r["author"]) for r in fat.working["items"]] == said, (
+        fat.working["items"]
+    )
+    assert fat.working["upto"] == upto, fat.working["upto"]
+    assert store.list_working(fat.id) == fat.working["items"]
+    assert fat.context_cut()[1] is not None, "память не встала в промпт ветки"
     # Копия глубокая: правка у ветки не видна родителю.
-    fat.facts["items"].append({"key": "чужое", "value": "значение"})
-    assert len(listing.facts["items"]) + 1 == len(fat.facts["items"]), "выписка общая"
+    fat.add_working_record("limit", "чужое ограничение")
+    assert len(listing.working["items"]) + 1 == len(fat.working["items"]), "память общая"
 
     branch_id, parent_id = far.id, folded.id
     store.close()
@@ -1579,8 +1769,8 @@ def check_long_term_memory():
     """День 11: три слоя памяти, и третий из них — долговременный.
 
     Два слоя были и раньше, оба привязаны к чату: краткосрочная — сама
-    история (`messages`), рабочая — то, что о чате выписано машинально
-    (`facts`, `summaries`). Третий отличается всем сразу: таблица **без**
+    история (`messages`), рабочая — состояние задачи и сводки
+    (`working_memory`, `summaries`). Третий отличается всем сразу: таблица **без**
     `session_id`, наполняется **только руками**, и чат ему читатель, а не
     владелец — удаление чата и `forget()` память не трогают.
 
@@ -1692,9 +1882,9 @@ def check_long_term_memory():
         assert [m["role"] for m in prompt] == ["system", "user", "user", "user", "assistant", "user"], prompt
         assert prompt[-1]["content"] == "вопрос 3", prompt[-1]
 
-        # Служебные вызовы память не получают: у извлечения свой системный
-        # промпт и своя работа — выписывать факты **этого разговора**, а не
-        # пересказывать то, что мы и так знаем.
+        # Служебные вызовы память не получают: у ведения рабочей памяти свой
+        # системный промпт и своя работа — состояние **этого разговора**, а не
+        # пересказ того, что мы и так знаем.
         extraction = _service_calls("facts")[-1]["messages"]
         assert not any("[долговременная память]" in m["content"] for m in extraction), extraction
 
@@ -1766,7 +1956,9 @@ def check_long_term_memory():
         # --- 6. Три слоя одной ручкой ----------------------------------------
         layers = client.get(f"/api/agents/{both}/memory").json()
         assert layers["short_term"]["messages"] == len(REGISTRY.require(both).history), layers
-        assert layers["working"]["facts"], layers["working"]
+        assert layers["working"]["records"], layers["working"]
+        assert layers["working"]["records"][0]["author"] == "agent", layers["working"]
+        assert layers["working"]["upto"] > 0, layers["working"]
         assert layers["long_term"]["enabled"] is True, layers["long_term"]
         assert [r["seq"] for r in layers["long_term"]["records"]] == [
             r["seq"] for r in client.get("/api/memory").json()["records"]
@@ -1783,7 +1975,7 @@ def check_long_term_memory():
         columns = {r["name"] for r in store.conn.execute("PRAGMA table_info(memory)")}
         assert columns == {"seq", "kind", "content", "at"}, columns
         assert "session_id" not in columns, "у глобального слоя завёлся владелец"
-        for table in ("messages", "summaries", "facts"):
+        for table in ("messages", "summaries", "working_memory"):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 text = " ".join(str(row[name]) for name in row.keys())
                 assert "пишу на Kotlin" not in text, f"память утекла в {table}"
@@ -1928,13 +2120,13 @@ def check_service_tokens_counted():
     agent = REGISTRY.require(agent_id)
     assert agent.summaries[0]["metrics"]["total_tokens"] == 50400, agent.summaries[0]["metrics"]
 
-    # --- то же самое для фактов, и вызовов здесь не один, а девять ----------
+    # --- то же самое для рабочей памяти, и вызовов не один, а девять --------
     facts_calls: set = set()
 
     def facts_reply(messages, index):
         if _service_kind(messages) == "facts":
             facts_calls.add(index)
-            return f"обмен: {index}"
+            return _working_edit(messages, f"решение: обмен {index}")
         return f"ответ {index}"
 
     def facts_usage(index):
@@ -1956,13 +2148,13 @@ def check_service_tokens_counted():
     assert facts_total["completion_tokens"] == 9 * 1 + 9 * 30, facts_total
     assert facts_total["total_tokens"] == 9 * 2 + 9 * 730, facts_total
     assert round(facts_total["cost_usd"], 8) == round(9 * 0.000001 + 9 * 0.002, 8), facts_total
-    # Снимок фактов переписывается на каждом извлечении, и числа в нём
-    # накопленные: держи он только последний вызов — в итог попала бы девятая
-    # часть того, что заплачено.
+    # Правки ложатся по записям, и держать числа отдельного вызова негде —
+    # значит они накопленные: храни состояние только последний вызов, в итог
+    # попала бы девятая часть того, что заплачено.
     agent = REGISTRY.require(with_facts)
-    assert agent.facts["metrics"]["total_tokens"] == 9 * 730, agent.facts["metrics"]
-    # Извлечение не растит счётчик сообщений: выписка живёт вне истории, и ни
-    # в счётчике, ни карточкой в ленте её нет.
+    assert agent.working["metrics"]["total_tokens"] == 9 * 730, agent.working["metrics"]
+    # Ведение памяти не растит счётчик сообщений: записи живут вне истории,
+    # и ни в счётчике, ни карточкой в ленте их нет.
     assert facts_body["history_len"] == 18, facts_body["history_len"]
     assert len([t for t in facts_body["transcript"] if t["role"] == "assistant"]) == 9, (
         "выписка попала в ленту"
@@ -2690,14 +2882,20 @@ def check_no_key_in_db():
         # `parent_id` это строка из запроса, и обещание про любой строковый
         # параметр любого запроса касается её наравне с репликой.
         store.save_branch(agent.id, parent_id=f"ag_{key}", forked_at=2)
-        # И в факты — тем же явным путём: выписку пишет модель, и ключ
-        # из реплики попадёт в неё так же легко, как в пересказ. Таблица
-        # новая, а обещание то же.
-        store.save_facts(
-            agent.id,
-            {"items": [{"key": f"ключ {key}", "value": f"значение {key}"}],
-             "upto": 2, "metrics": {"заметка": key}, "at": 0.0},
+        # И в рабочую память — тем же явным путём: записи ведёт модель, и ключ
+        # из реплики попадёт в них так же легко, как в пересказ. Пишут её обе
+        # стороны, поэтому и путей здесь три: своя запись, чужая и состояние
+        # извлечения — таблицы новые, а обещание то же.
+        store.add_working(agent.id, "goal", f"цель с ключом {key}", "agent")
+        # Правка — по **второй** записи, а не по первой: перепиши она
+        # засветившуюся, утечка добавления затёрлась бы чистой правкой,
+        # и проверка стерегла бы один путь вместо двух.
+        poked = store.add_working(agent.id, "question", "запись под правку", "agent")
+        store.update_working(
+            agent.id, poked["seq"], kind="limit", content=f"правка с ключом {key}",
+            author="human",
         )
+        store.save_working_state(agent.id, upto=2, metrics={"заметка": key})
 
         # И в долговременную память — тем же явным путём. Запись в неё делает
         # человек руками, а ключ он вставляет туда ровно так же, как в реплику:
@@ -2713,7 +2911,10 @@ def check_no_key_in_db():
             conn.execute("INSERT INTO meta (key, value) VALUES ('ловушка', ?)", (key,))
 
         leaked = []
-        for table in ("sessions", "messages", "meta", "summaries", "facts", "branches", "memory"):
+        for table in (
+            "sessions", "messages", "meta", "summaries", "facts", "branches", "memory",
+            "working_memory", "working_state",
+        ):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 for name in row.keys():
                     if isinstance(row[name], str) and key in row[name]:
@@ -2808,6 +3009,16 @@ def check_every_write_path_redacts():
                 [("s", 0, key, key)],
             )
             conn.executemany(
+                "INSERT INTO working_memory (session_id, kind, content, author, at) "
+                "VALUES (?, 'goal', ?, ?, 0)",
+                [("s", key, key)],
+            )
+            conn.execute(
+                "INSERT INTO working_state (session_id, upto, metrics, at) "
+                "VALUES (?, 2, ?, 0)",
+                ("s", key),
+            )
+            conn.executemany(
                 "INSERT INTO branches (session_id, parent_id, forked_at, at) "
                 "VALUES (?, ?, 2, 0)",
                 [("s", key)],
@@ -2816,7 +3027,10 @@ def check_every_write_path_redacts():
                 "INSERT INTO memory (kind, content, at) VALUES ('knowledge', ?, 0)", (key,)
             )
         leaked = []
-        for table in ("sessions", "messages", "meta", "summaries", "facts", "branches", "memory"):
+        for table in (
+            "sessions", "messages", "meta", "summaries", "facts", "branches", "memory",
+            "working_memory", "working_state",
+        ):
             for row in store.conn.execute(f"SELECT * FROM {table}"):
                 for column in row.keys():
                     if isinstance(row[column], str) and key in row[column]:

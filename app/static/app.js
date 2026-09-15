@@ -1546,8 +1546,9 @@ function applySettings() {
 
 // Три слоя памяти агента — по разделу на каждый, в порядке от короткого
 // к долгому. Данные приходят одним ответом `GET /api/agents/{id}/memory`:
-// `short_term` — счётчик сообщений этого чата, `working` — факты и сводки
-// этого чата, `long_term` — выключатель чата и общий на всю базу список.
+// `short_term` — счётчик сообщений этого чата, `working` — записи о состоянии
+// задачи и сводки этого чата, `long_term` — выключатель чата и общий на всю
+// базу список.
 //
 // Ответ лежит в `state.memory`, и отрисовка берёт всё оттуда: **запрос идёт
 // на открытие вкладки, а не на отрисовку**. Панель перерисовывается на каждый
@@ -1556,7 +1557,7 @@ function applySettings() {
 //
 // Перечитывается память там, где она правда изменилась: при открытии другого
 // чата (первые два слоя — его собственные) и после обмена (история выросла,
-// выписка обновилась). И то и другое — события, а не отрисовки, и оба молчат,
+// память обновилась). И то и другое — события, а не отрисовки, и оба молчат,
 // пока вкладка закрыта.
 
 // Роды записей: токен для сервера и русская подпись. Одна карта на список
@@ -1573,10 +1574,25 @@ const MEMORY_KINDS = [
 const memoryKindLabel = (kind) =>
   (MEMORY_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
 
-// Факт так, как он записан у сервера и как уезжает в промпт: «ключ: значение»
-// (`facts_lines`, app/agent.py). В той же форме он и продвигается в
-// долговременную память — иначе запись говорила бы не то, что показано.
-const factLine = (fact) => fact.key + ": " + fact.value;
+// Роды записей рабочей памяти — состояние задачи. Список свой, а не общий
+// с долговременной: слои разные, и «цель» в одном не значит того же, что
+// «профиль» в другом. Слова те же, что в `WORKING_LABELS` на сервере, — ими
+// же запись подписана и в промпте.
+const WORKING_KINDS = [
+  ["goal", "цель"],
+  ["limit", "ограничение"],
+  ["decision", "решение"],
+  ["question", "открытый вопрос"],
+];
+
+const workingKindLabel = (kind) =>
+  (WORKING_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
+
+// Запись рабочей памяти так, как она уезжает в промпт: «подпись вида:
+// содержимое» (`working_lines`, app/agent.py). В той же форме она и
+// продвигается в долговременную память — иначе запись говорила бы не то,
+// что показано.
+const workingLine = (record) => workingKindLabel(record.kind) + ": " + record.content;
 
 function memoryTabOpen() {
   return !$("#tab-memory").classList.contains("hidden");
@@ -1604,9 +1620,9 @@ async function loadMemory() {
 // Сколько первых реплик не уедет в модель дословно при нынешней стратегии —
 // и каким словом это называется.
 //
-// Расчёт повторяет серверный (`Agent.context_cut` с `facts_cover` и
+// Расчёт повторяет серверный (`Agent.context_cut` с `working_cover` и
 // `summary_cover`): ручка отдаёт его **входы** — длину истории, докуда
-// прочитана выписка, докуда покрывает последняя сводка, — а не готовое число.
+// прочитана память, докуда покрывает последняя сводка, — а не готовое число.
 // Считается по конфигу агента, а не по полям панели: в панели может стоять
 // непролитая правка, а раздел говорит о том, что уедет сейчас. Незнакомая
 // стратегия читается как «вся история» — ровно как на сервере.
@@ -1622,11 +1638,11 @@ function shortTermCut(agent, layers) {
     return { cut: nothing ? 0 : Math.max(0, total - keep), word: "отброшено окном" };
   }
   if (strategy === "facts") {
-    const facts = working.facts || [];
-    const upto = working.facts_upto || 0;
+    const records = working.records || [];
+    const upto = working.upto || 0;
     return {
-      cut: nothing || !facts.length ? 0 : Math.max(0, Math.min(total - keep, upto)),
-      word: "заменено выпиской фактов",
+      cut: nothing || !records.length ? 0 : Math.max(0, Math.min(total - keep, upto)),
+      word: "заменено рабочей памятью",
     };
   }
   if (strategy === "summary") {
@@ -1677,13 +1693,15 @@ function renderWorking(box) {
   const working = state.memory && state.memory.working;
   if (!working) { box.appendChild(memBlank()); return; }
 
-  const facts = working.facts || [];
-  box.appendChild(el("div", "mem-sub", "Факты"));
-  if (!facts.length) box.appendChild(memNote("Фактов ещё нет: их выписывает стратегия «Факты»."));
-  facts.forEach((fact) => {
-    const line = factLine(fact);
+  const records = working.records || [];
+  box.appendChild(el("div", "mem-sub", "Состояние задачи"));
+  if (!records.length) {
+    box.appendChild(memNote("Записей ещё нет: их ведёт стратегия «Факты»."));
+  }
+  records.forEach((record) => {
+    const line = workingLine(record);
     const row = el("div", "mem-item");
-    // Продвижение факта в долговременную память — единственный путь, которым
+    // Продвижение записи в долговременную память — единственный путь, которым
     // в неё попадает что-то, кроме набранного руками. И это по-прежнему
     // нажатие: само не переезжает ничего.
     const btn = el("button", "mem-btn", "Запомнить надолго");

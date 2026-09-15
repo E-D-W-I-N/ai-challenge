@@ -15,13 +15,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
-from .schema import CONTEXT_FIELDS, MEMORY_LABELS, AgentSpec
+from .schema import (
+    CONTEXT_FIELDS,
+    MEMORY_LABELS,
+    WORKING_KINDS,
+    WORKING_LABELS,
+    AgentSpec,
+)
 from .store import Store
 
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd")
@@ -84,57 +91,135 @@ def summary_message(content: str, covered: int) -> dict:
     }
 
 
-FACTS_SYSTEM = (
-    "Ты ведёшь список фактов о разговоре: цели, ограничения, предпочтения, "
-    "решения, договорённости, имена и числа. Не отвечай на сообщения и не "
-    "обращайся к собеседнику: твой ответ целиком — список строк вида "
-    "«ключ: значение», по одной на строку, без нумерации и пояснений. Обнови "
-    "им прошлый список: изменившееся замени, новое допиши, остальное повтори "
-    "как было — список встанет в контекст вместо начала разговора, и чего "
-    "в нём нет, того дальше не вспомнит никто."
+WORKING_SYSTEM = (
+    "Ты ведёшь рабочую память разговора — состояние задачи: цели, ограничения, "
+    "решения, открытые вопросы. Память уже есть, и она пронумерована: твой "
+    "ответ целиком — список правок к ней, по одной на строку, без нумерации "
+    "и пояснений. Не отвечай на сообщения и не обращайся к собеседнику. "
+    "Правка бывает трёх видов:\n"
+    "«+ вид: содержимое» — завести новую запись;\n"
+    "«номер вид: содержимое» — переписать запись с этим номером;\n"
+    "«- номер» — убрать запись, потерявшую смысл.\n"
+    "Вид — одно из четырёх слов: цель, ограничение, решение, открытый вопрос. "
+    "Изменилось что-то в записи — правь её по номеру, а не добавляй рядом. "
+    "Не изменившиеся записи не повторяй: они уже записаны, и строка без "
+    "номера завела бы вторую такую же. Менять нечего — не пиши ничего."
 )
-"""Системный промпт вызова на извлечение фактов. Свой, а не `spec.system`,
-по тому же доводу, что и у сжатия: чат просили отвечать, а здесь просят
-выписывать, и чужая роль испортила бы выписку."""
+"""Системный промпт вызова на ведение рабочей памяти. Свой, а не `spec.system`,
+по тому же доводу, что и у сжатия: чат просили отвечать, а здесь просят вести
+список, и чужая роль испортила бы его.
+
+Просим **правки**, а не список целиком, и это не стиль, а устройство: список
+целиком нельзя было бы отличить от «переписать всё заново», а рядом с записями
+агента в нём лежат записи человека, которых служебный вызов не вправе касаться.
+Правка называет номер — значит, и трогает ровно названное."""
 
 
-def facts_lines(items: list[dict]) -> str:
-    """Факты строками «ключ: значение» — в том же виде, в каком их просят
-    у модели и в каком они уезжают в промпт. Одна форма на запись, показ
-    и разбор: разъедься они, круг «выписал — прочитал — выписал снова»
-    терял бы факты на каждом обороте."""
-    return "\n".join(f"{item['key']}: {item['value']}" for item in items)
+def working_lines(items: list[dict]) -> str:
+    """Рабочая память строками «подпись вида: содержимое» — в том виде,
+    в каком она уезжает в промпт. Номеров здесь нет: в промпте разговора
+    они ни к чему, а врезка обязана выглядеть так же, как выглядела выписка
+    фактов, — читает её модель, которая отвечает собеседнику, а не правит
+    список.
+
+    Вид подписан по-русски и по одной карте с интерфейсом (`WORKING_LABELS`),
+    ровно как у долговременной памяти: второй таблицей подписей модель читала
+    бы одно слово, а пользователь видел бы другое."""
+    return "\n".join(
+        f"{WORKING_LABELS.get(item['kind'], item['kind'])}: {item['content']}"
+        for item in items
+    )
 
 
-def parse_facts(text: str) -> list[dict]:
-    """Строки ответа обратно в пары. Разбор терпимый: JSON здесь не просят
-    (`response_format` у служебного вызова снят — он вернул бы объект вместо
-    выписки), а модель вправе добавить маркер списка или строку-заголовок.
+def working_listing(items: list[dict]) -> str:
+    """То же, но **с номерами** — так память показывают служебному вызову.
 
-    Кривая строка **пропускается**, а не роняет разбор: за неё заплачено, и
-    из-за одного «Вот факты:» терять остальные девять строк незачем. Не
-    разобралось вовсе — вернётся пустой список, и вызывающий оставит прошлые
-    факты как были.
-
-    Ключ повторился — побеждает последнее значение: список переписывается
-    целиком, и «цель» в нём ровно одна.
+    Форма у листинга и у правки одна: «номер вид: содержимое» читается и
+    пишется одинаково, и модели не приходится переводить одно в другое.
+    Номер здесь не украшение: им правка и попадает в запись, а без него
+    единственным способом что-то изменить было бы переписать список целиком.
     """
-    out: dict[str, str] = {}
-    for line in (text or "").splitlines():
-        line = line.strip().lstrip("-*•").strip()
-        key, sep, value = line.partition(":")
+    return "\n".join(
+        f"{item['seq']} {WORKING_LABELS.get(item['kind'], item['kind'])}: {item['content']}"
+        for item in items
+    )
+
+
+_KIND_BY_WORD = {label: token for token, label in WORKING_LABELS.items()}
+_KIND_BY_WORD.update({token: token for token in WORKING_KINDS})
+"""Слово ответа — в род записи. Принимаются и русская подпись, и токен: просим
+мы подпись, но модель вольна ответить тем словом, каким род зовут в коде, и
+терять из-за этого правку незачем."""
+
+_DROP_RE = re.compile(r"^-\s*(\d+)\s*$")
+"""«- 7» — убрать седьмую. Разбирается **до** снятия маркеров списка: тот же
+дефис бывает и буллитом, и разница между ними ровно в том, что за ним стоит —
+одно число и ничего больше."""
+
+_EDIT_RE = re.compile(r"^(\d+)(?=[\s:])\s*(.*)$")
+"""«12 цель: …» и «12: …» — правка двенадцатой. За номером обязан идти пробел
+или двоеточие: «12. цель» это пункт нумерованного списка, а не правка записи
+номер двенадцать, и принять его значило бы молча переписать чужую запись."""
+
+
+def parse_working_edits(text: str) -> list[dict]:
+    """Ответ вызова — в список правок: `{"op": "add"|"set"|"del", "seq",
+    "kind", "content"}`.
+
+    Разбор терпимый, тем же правилом, каким разбиралась выписка «ключ:
+    значение»: JSON здесь не просят (`response_format` у служебного вызова
+    снят — он вернул бы объект вместо правок), и модель вправе добавить
+    заголовок или маркер списка. **Кривая строка пропускается**, а не роняет
+    разбор: за вызов заплачено, и из-за одного «Вот правки:» терять девять
+    остальных незачем.
+
+    Строка без маркера — не правка вовсе. Это и есть разница между списком
+    записей и снимком: повтор всего списка (самое естественное, что делает
+    модель, если ей позволить) завёл бы вторые копии всех записей на каждом
+    обмене. Не разобралось ничего — вызывающий оставит память как была.
+
+    Неизвестный вид у новой записи — пропуск, а не подстановка умолчания:
+    довод тот же, по которому его нет и у ручки (`_kind_field`, app/main.py).
+    У правки вид назвать необязательно: «12: новое содержимое» меняет текст,
+    оставляя род прежним.
+    """
+    out: list[dict] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        gone = _DROP_RE.match(line)
+        if gone:
+            out.append({"op": "del", "seq": int(gone.group(1)), "kind": None, "content": ""})
+            continue
+        line = line.lstrip("-*•").strip()
+        op, seq = None, None
+        if line.startswith("+"):
+            op, line = "add", line[1:].strip()
+        else:
+            edit = _EDIT_RE.match(line)
+            if edit is not None:
+                op, seq, line = "set", int(edit.group(1)), edit.group(2).strip()
+        if op is None:
+            continue
+        word, sep, content = line.partition(":")
         if not sep:
             continue
-        key, value = key.strip(), value.strip()
-        if not key or not value:
+        word, content = word.strip(), content.strip()
+        if not content:
             continue
-        out[key] = value
-    return [{"key": key, "value": value} for key, value in out.items()]
+        kind = _KIND_BY_WORD.get(word.lower())
+        # Вид не назван — у правки это «оставить прежний», у новой записи
+        # ничего: рода по умолчанию нет ни здесь, ни на ручке.
+        if kind is None and not (op == "set" and not word):
+            continue
+        out.append({"op": op, "seq": seq, "kind": kind, "content": content})
+    return out
 
 
-def build_facts_prompt(items: list[dict], chunk: list["Turn"], user_text: str) -> list[dict]:
-    """Промпт вызова на извлечение: прошлые факты плюс **новые** реплики и
-    вопрос, который задают прямо сейчас.
+def build_working_prompt(items: list[dict], chunk: list["Turn"], user_text: str) -> list[dict]:
+    """Промпт вызова на ведение памяти: нынешние записи **с номерами** плюс
+    новые реплики и вопрос, который задают прямо сейчас.
 
     Инкрементально, как и сжатие: перечитывать разговор с начала на каждом
     обмене — а вызов идёт на каждом — значило бы платить за весь чат заново
@@ -142,34 +227,40 @@ def build_facts_prompt(items: list[dict], chunk: list["Turn"], user_text: str) -
 
     Вопрос этого обмена уедет сюда ещё раз следующим — уже репликой истории
     и вместе со своим ответом, которого сейчас ещё нет. Повтор дешевле
-    пропуска: не доедь обмен до истории, факты остались бы без него совсем.
+    пропуска: не доедь обмен до истории, память осталась бы без него совсем.
     """
     parts = []
     if items:
-        parts.append("Факты, которые уже собраны:\n" + facts_lines(items))
+        parts.append("Рабочая память сейчас:\n" + working_listing(items))
     lines = [
         f"{'Пользователь' if turn.role == 'user' else 'Ассистент'}: {turn.content}"
         for turn in chunk
     ]
     lines.append(f"Пользователь: {user_text}")
-    parts.append("Новые сообщения, по которым надо обновить список:\n" + "\n".join(lines))
+    parts.append("Новые сообщения, по которым надо обновить память:\n" + "\n".join(lines))
     return [
-        {"role": "system", "content": FACTS_SYSTEM},
+        {"role": "system", "content": WORKING_SYSTEM},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
 
 
-def facts_message(items: list[dict]) -> dict:
-    """Факты так, как они встают в промпт: роль `user` и явная подпись,
-    **не** `system`. Довод тот же, что у сводки: системный промпт живёт ровно
-    в одном месте — `spec.system`, — и голый чат обязан уходить в модель без
-    системной реплики. Без подписи модель приняла бы выписку за реплику
-    пользователя и стала бы отвечать на неё."""
+def working_message(items: list[dict]) -> dict:
+    """Рабочая память так, как она встаёт в промпт: роль `user` и явная
+    подпись, **не** `system`. Довод тот же, что у сводки: системный промпт
+    живёт ровно в одном месте — `spec.system`, — и голый чат обязан уходить
+    в модель без системной реплики. Без подписи модель приняла бы врезку
+    за реплику пользователя и стала бы отвечать на неё.
+
+    Подпись осталась прежней, хотя хранение сменилось целиком: врезка — это
+    то, что видит модель, отвечающая собеседнику, и менять ей текст заодно
+    со схемой базы значило бы поменять два ответа на один вопрос. Слово
+    в подписи сменится там же, где сменится и стратегия, которая её заказывает.
+    """
     return {
         "role": "user",
         "content": (
             "[факты о разговоре]\n"
-            f"{facts_lines(items)}\n"
+            f"{working_lines(items)}\n"
             "[дальше — последние сообщения как есть]"
         ),
     }
@@ -207,9 +298,14 @@ def memory_message(records: list[dict]) -> dict:
     }
 
 
-def empty_facts() -> dict:
-    """Снимок фактов свежего чата. Функция, а не константа: снимок изменяемый,
-    и один на всех агентов сделал бы факты общими."""
+def empty_working() -> dict:
+    """Рабочая память свежего чата: записей нет, не прочитано ничего, не
+    потрачено ничего. Функция, а не константа: список изменяемый, и один
+    на всех агентов сделал бы память общей.
+
+    `items` — записи, `upto` и `metrics` — про извлечение, а не про запись:
+    лежат они и в базе врозь (`working_memory` и `working_state`), потому что
+    у записи, набранной руками, никакого `upto` нет и быть не может."""
     return {"items": [], "upto": 0, "metrics": None, "at": None}
 
 
@@ -388,18 +484,25 @@ class Agent:
         у каждого сворачивания свои метрики, и без них счёт стоимости сжатия
         был бы неполным."""
 
-        self.facts: dict = empty_facts()
-        """Снимок фактов о разговоре: `{items, upto, metrics, at}`.
+        self.working: dict = empty_working()
+        """Рабочая память чата: `{items, upto, metrics, at}`.
 
-        `items` — пары «ключ — значение» в том порядке, в каком их выписала
-        модель; `upto` — сколько первых реплик истории извлечение уже читало;
-        `metrics` — **накопленные** числа всех вызовов на извлечение.
+        `items` — записи о состоянии задачи, `{seq, kind, content, author,
+        at}` каждая, в порядке номеров; `upto` — сколько первых реплик истории
+        извлечение уже читало; `metrics` — **накопленные** числа всех его
+        вызовов.
 
-        Снимок, а не журнал: список фактов переписывается целиком на каждом
-        извлечении. Поэтому метрики и накопленные: числа отдельного вызова
-        в переписанном снимке не удержались бы, а итог по чату обязан считать
-        их все — вызов идёт на каждом обмене.
+        Список записей, а не снимок: у записи есть номер, и правится она
+        по нему — служебным вызовом или руками. Метрики поэтому и накопленные:
+        числа отдельного вызова держать было бы негде, а итог по чату обязан
+        считать их все — вызов идёт на каждом обмене.
         """
+
+        self._working_seq = 0
+        """Последний выданный номер записи — на случай агента **без
+        хранилища**. С хранилищем номера выдаёт база (AUTOINCREMENT), и здесь
+        просто запоминается наибольший выданный: правило у обоих одно —
+        только вперёд, номер удалённой записи заново не выдаётся."""
 
         self.branch: dict | None = None
         """Происхождение чата: `{parent_id, forked_at}` — или `None`, если чат
@@ -449,10 +552,15 @@ class Agent:
                 # перезапись истории их не трогает, и после перезапуска
                 # свёрнутое начало разговора остаётся свёрнутым.
                 self.summaries = store.load_summaries(self.id)
-                # Факты — тем же порядком и по тому же доводу. Вместе с ними
-                # поднимается `upto`: без него извлечение перечитало бы
-                # историю с начала, а окно успело бы срезать её раньше.
-                self.facts = store.load_facts(self.id)
+                # Рабочая память — тем же порядком и по тому же доводу.
+                # Вместе с записями поднимается состояние извлечения: без
+                # `upto` оно перечитало бы историю с начала, а окно успело бы
+                # срезать её раньше.
+                self.working = store.load_working_state(self.id)
+                self.working["items"] = store.list_working(self.id)
+                self._working_seq = max(
+                    (item["seq"] for item in self.working["items"]), default=0
+                )
                 # И происхождение: ветка остаётся веткой и после перезапуска,
                 # и после вытеснения из памяти — пометка в списке и в панели
                 # берётся отсюда.
@@ -504,9 +612,9 @@ class Agent:
             return 0
         return min(upto, len(self.history))
 
-    def facts_cover(self, spec: AgentSpec | None = None) -> int:
-        """Сколько первых реплик истории заменено блоком фактов — 0, если
-        фактов ещё нет или резать нечем.
+    def working_cover(self, spec: AgentSpec | None = None) -> int:
+        """Сколько первых реплик истории заменено врезкой рабочей памяти —
+        0, если записей ещё нет или резать нечем.
 
         Меньшее из двух: сколько просили оставить дословно
         (`len(history) - keep_last`) и сколько выписка успела прочитать
@@ -527,9 +635,9 @@ class Agent:
         Ровно как у сводки: без сводки история тоже не режется.
         """
         spec = spec if spec is not None else self.spec
-        if spec.keep_last is None or not self.facts["items"]:
+        if spec.keep_last is None or not self.working["items"]:
             return 0
-        return max(0, min(len(self.history) - spec.keep_last, self.facts["upto"]))
+        return max(0, min(len(self.history) - spec.keep_last, self.working["upto"]))
 
     def context_cut(self, spec: AgentSpec | None = None) -> tuple[int, dict | None]:
         """Что стратегия делает с началом истории: сколько первых реплик не
@@ -544,7 +652,7 @@ class Agent:
           отброшены **вовсе**, и вместо них не встаёт ничего: сколько их
           было, сказано под ответом, а не в промпте;
         * `facts` — уезжают последние `keep_last` реплик, а вместо начала
-          встаёт выписка «ключ: значение»; фактов ещё нет — не срезается
+          встаёт врезка рабочей памяти; записей ещё нет — не срезается
           ничего;
         * `summary` — срезано ровно то, что покрыла сводка, и она же встаёт
           вместо срезанного.
@@ -562,10 +670,10 @@ class Agent:
                 return 0, None
             return max(0, len(self.history) - spec.keep_last), None
         if spec.strategy == "facts":
-            covered = self.facts_cover(spec)
+            covered = self.working_cover(spec)
             if not covered:
                 return 0, None
-            return covered, facts_message(self.facts["items"])
+            return covered, working_message(self.working["items"])
         if spec.strategy == "summary":
             covered = self.summary_cover(spec)
             if not covered:
@@ -750,28 +858,28 @@ class Agent:
         if self.store is not None:
             self.store.save_summaries(self.id, self.summaries)
 
-    def facts_plan(self, spec: AgentSpec) -> int | None:
+    def working_plan(self, spec: AgentSpec) -> int | None:
         """С какой реплики истории пойдёт материал в извлечение — или `None`,
         если извлекать не для чего.
 
-        Порога у фактов нет: задание требует обновлять их после каждого
-        сообщения пользователя, значит вызов идёт на каждом обмене. Это
-        удваивает число обращений к модели — и так и задумано: список,
-        обновлённый через раз, врал бы ровно про свежую половину разговора.
+        Порога у рабочей памяти нет: задание требует обновлять её после
+        каждого сообщения пользователя, значит вызов идёт на каждом обмене.
+        Это удваивает число обращений к модели — и так и задумано: память,
+        обновлённая через раз, врала бы ровно про свежую половину разговора.
 
-        Пустое `keep_last` — извлекать не для кого: резать нечем, в модель
-        уедет вся история, и выписке в промпте места нет. Платить за вызов,
+        Пустое `keep_last` — вести память не для кого: резать нечем, в модель
+        уедет вся история, и врезке в промпте места нет. Платить за вызов,
         которым никто не воспользуется, нельзя.
 
         Зажимать число длиной истории незачем: перегенерация снимает пару
         с конца, и `upto` оказывается за краем — но срез за краем списка
         и так даёт пустой хвост, а `history[99:]` от `history[len:]`
         неотличим. Там, где зажим действительно нужен, он и стоит —
-        в `facts_cover`, где число решает состав промпта.
+        в `working_cover`, где число решает состав промпта.
         """
         if spec.strategy != "facts" or spec.keep_last is None:
             return None
-        return self.facts["upto"]
+        return self.working["upto"]
 
     def service_plan(self, spec: AgentSpec) -> str | None:
         """Какой служебный вызов предстоит этому обмену: `summary`, `facts`
@@ -787,34 +895,163 @@ class Agent:
         """
         if self.compress_plan(spec) is not None:
             return "summary"
-        if self.facts_plan(spec) is not None:
+        if self.working_plan(spec) is not None:
             return "facts"
         return None
 
-    async def extract_facts(
+    # --- рабочая память: правки по записям ------------------------------------
+    #
+    # Записывает в неё и служебный вызов, и человек — отсюда `author` у каждой
+    # записи и разные точки входа: агент правит только свои, ручки правят любые
+    # и метят правку собой. Обе стороны идут через эти три метода, а не через
+    # хранилище напрямую: список в памяти обязан совпадать с базой — из него
+    # собирается врезка в промпт и он же уезжает ветке.
+
+    def _working_find(self, seq) -> dict | None:
+        """Запись по номеру — или `None`, если такой в этом чате нет."""
+        if not isinstance(seq, int):
+            return None
+        return next((item for item in self.working["items"] if item["seq"] == seq), None)
+
+    def _working_add(self, kind: str, content: str, author: str, at=None) -> dict:
+        """Заводит запись и отдаёт её — вместе с номером.
+
+        Номер выдаёт база: у `working_memory.seq` стоит AUTOINCREMENT, и
+        номер удалённой записи не достаётся следующей. Без хранилища счёт
+        ведёт сам агент — тем же правилом и только вперёд: агент без базы
+        живёт в памяти процесса, но список записей у него такой же.
+        """
+        if self.store is not None:
+            record = self.store.add_working(self.id, kind, content, author, at)
+        else:
+            self._working_seq += 1
+            record = {
+                "seq": self._working_seq,
+                "kind": kind,
+                "content": content,
+                "author": author,
+                "at": time.time() if at is None else at,
+            }
+        self._working_seq = max(self._working_seq, record["seq"])
+        self.working["items"].append(record)
+        return record
+
+    def _working_write(self, record: dict, kind: str, content: str, author: str) -> dict:
+        """Переписывает запись на месте. Номер не трогается: он и есть её
+        идентичность — на него ссылается и служебный вызов, и вторая вкладка,
+        и правка, сдвинувшая бы номера соседей, удалила бы у них не ту запись.
+        """
+        stamp = time.time()
+        if self.store is not None:
+            saved = self.store.update_working(
+                self.id, record["seq"], kind=kind, content=content, author=author, at=stamp
+            )
+            if saved is not None:
+                record.update(saved)
+                return record
+        record.update(kind=kind, content=content, author=author, at=stamp)
+        return record
+
+    def _working_drop(self, record: dict) -> None:
+        """Убирает запись. Номер после этого не достаётся никому."""
+        if self.store is not None:
+            self.store.delete_working(self.id, record["seq"])
+        self.working["items"].remove(record)
+
+    def apply_working_edits(self, edits: list[dict]) -> int:
+        """Применяет разобранные правки и говорит, сколько их прошло.
+
+        **Запись человека служебный вызов не трогает** — ни правкой, ни
+        удалением. Это не вежливость, а единственное, что делает правку руками
+        осмысленной: без этого поправленная запись жила бы до ближайшего
+        обмена, и человек чинил бы одно и то же по кругу. Проверяется здесь,
+        а не обещается в промпте: инструкция модели — просьба, а не гарантия.
+
+        Правка по несуществующему номеру пропускается молча: номер мог уехать
+        вместе с записью, которую только что убрали из соседней вкладки, и
+        ронять из-за этого весь вызов незачем.
+        """
+        applied = 0
+        for edit in edits:
+            if edit["op"] == "add":
+                self._working_add(edit["kind"], edit["content"], "agent")
+                applied += 1
+                continue
+            record = self._working_find(edit["seq"])
+            if record is None or record["author"] != "agent":
+                continue
+            if edit["op"] == "del":
+                self._working_drop(record)
+            else:
+                self._working_write(
+                    record, edit["kind"] or record["kind"], edit["content"], "agent"
+                )
+            applied += 1
+        return applied
+
+    def add_working_record(self, kind: str, content: str) -> dict:
+        """Запись, сделанная человеком. Автор проставляется здесь, а не
+        приходит из тела запроса: «кто записал» — это про путь, которым запись
+        попала в память, и спрашивать об этом того, кто записывает, значило бы
+        позволить назваться кем угодно."""
+        return self._working_add(kind, content, "human")
+
+    def edit_working_record(self, seq: int, *, kind=None, content=None) -> dict | None:
+        """Правка руками: меняет названное, остальное оставляет. `None` —
+        записи с таким номером в этом чате нет.
+
+        Правка метит запись человеком, даже если завёл её служебный вызов:
+        с этой минуты она поправлена руками, и переписывать её обратно
+        извлечение не вправе — иначе правка жила бы до ближайшего обмена.
+        """
+        record = self._working_find(seq)
+        if record is None:
+            return None
+        return self._working_write(
+            record,
+            kind or record["kind"],
+            record["content"] if content is None else content,
+            "human",
+        )
+
+    def drop_working_record(self, seq: int) -> bool:
+        """Удаление руками — любой записи, хоть своей, хоть агентской.
+        False — записи с таким номером в этом чате не было."""
+        record = self._working_find(seq)
+        if record is None:
+            return False
+        self._working_drop(record)
+        return True
+
+    async def update_working(
         self, spec: AgentSpec, user_text: str, context_length: int | None = None
     ) -> None:
-        """Обновляет список фактов о разговоре. Зовётся из `ask` **до** сборки
-        промпта: этот же обмен уедет уже с обновлённой выпиской, а не со
-        вчерашней.
+        """Ведёт рабочую память разговора. Зовётся из `ask` **до** сборки
+        промпта: этот же обмен уедет уже с обновлённой памятью, а не
+        со вчерашней.
 
-        История не трогается — факты лишь заменяют её начало при сборке
-        промпта. Не удалось извлечение (ошибка, пустой ответ, ни одной
-        разобранной строки) — факты остаются прежними, и обмен уезжает как
+        История не трогается — память лишь заменяет её начало при сборке
+        промпта. Не удалось ведение (ошибка, пустой ответ, ни одной
+        разобранной правки) — память остаётся прежней, и обмен уезжает как
         уехал бы: служебный вызов не вправе обрушить сам разговор.
+
+        `upto` и метрики двигаются только вместе с применённой правкой.
+        Вызов, не изменивший ничего, не двигает и границу прочитанного: она
+        зажимает срез промпта, и подвинуть её за ответ, которого мы
+        не поняли, значило бы дать срезать непрочитанное.
         """
-        start = self.facts_plan(spec)
+        start = self.working_plan(spec)
         if start is None:
             return
         chunk = self.history[start:]
 
         # Формат ответа и стоп-строки сняты ровно по тем же доводам, что
         # у сжатия: чат с {"type": "json_object"} вернул бы объект вместо
-        # выписки, а стоп-строка оборвала бы её на середине. Модель и
+        # правок, а стоп-строка оборвала бы их на середине. Модель и
         # параметры сэмплирования — те же: вторая модель развалила бы счёт
         # на две цены.
         asking = replace(spec, response_format=None, stop=None)
-        prompt = build_facts_prompt(self.facts["items"], chunk, user_text)
+        prompt = build_working_prompt(self.working["items"], chunk, user_text)
 
         content = ""
         metrics: dict | None = None
@@ -827,26 +1064,27 @@ class Agent:
                         metrics = event["metrics"]
                     elif event["type"] == "error":
                         return
-        except Exception:  # noqa: BLE001 — падает извлечение, обмен живёт
+        except Exception:  # noqa: BLE001 — падает ведение памяти, обмен живёт
             # Про отсутствие ключа расскажет сам обмен, следом.
             return
 
-        items = parse_facts(content)
-        if not items:
-            # Ни одной пары — прошлую выписку не трогаем: пустая заменила бы
-            # собой начало разговора, ничего о нём не сказав.
+        if not self.apply_working_edits(parse_working_edits(content)):
+            # Ни одной правки — память оставляем как была: непонятый ответ
+            # не повод стирать то, что о разговоре уже знают.
             return
 
-        self.facts = {
-            "items": items,
-            # Докуда прочитано: вопрос этого обмена в историю ещё не записан
-            # и приедет сюда следующим — вместе со своим ответом.
-            "upto": len(self.history),
-            "metrics": merge_usage(self.facts.get("metrics"), metrics),
-            "at": time.time(),
-        }
+        # Докуда прочитано: вопрос этого обмена в историю ещё не записан
+        # и приедет сюда следующим — вместе со своим ответом.
+        self.working["upto"] = len(self.history)
+        self.working["metrics"] = merge_usage(self.working.get("metrics"), metrics)
+        self.working["at"] = time.time()
         if self.store is not None:
-            self.store.save_facts(self.id, self.facts)
+            self.store.save_working_state(
+                self.id,
+                upto=self.working["upto"],
+                metrics=self.working["metrics"],
+                at=self.working["at"],
+            )
 
     def remember(
         self,
@@ -877,16 +1115,16 @@ class Agent:
         никто (см. `detach`), а `save_history` начинается с `DELETE` — одна
         случайная запись отсюда стёрла бы родителю разговор.
 
-        **Сводка и выписка едут не всегда.** Ветка, унёсшая половину
-        разговора, не вправе унести выписку про весь: и сводка, и факты
+        **Сводка и рабочая память едут не всегда.** Ветка, унёсшая половину
+        разговора, не вправе унести память про весь: и сводка, и записи
         заменяют собой начало истории, и заменять им можно ровно то начало,
         которое в ветке есть. Обрезать их по смыслу нельзя — сводка это
-        связный текст, а выписка снимок без привязки к репликам, — поэтому
-        правило одно на оба и по границе: едет то, что покрывает **только**
-        унесённое (`upto <= at`). Сводки инкрементальны, и префикс их списка
-        сам по себе готовая сводка своего начала; выписка одна, и ей
-        остаётся «всё или ничего» — уехавшая целиком, она рассказала бы
-        ветке про разговор, которого в ней не было.
+        связный текст, а запись памяти не привязана к своей реплике, —
+        поэтому правило одно на оба и по границе: едет то, что покрывает
+        **только** унесённое (`upto <= at`). Сводки инкрементальны, и префикс
+        их списка сам по себе готовая сводка своего начала; память одна на
+        чат, и ей остаётся «всё или ничего» — уехавшая целиком, она
+        рассказала бы ветке про разговор, которого в ней не было.
 
         Метрики у копий остаются: ветка уносит и метрики унесённых ответов,
         и итог по чату честно говорит, во что обошёлся тот разговор, который
@@ -903,10 +1141,10 @@ class Agent:
                 for item in self.summaries
                 if isinstance(item.get("upto"), int) and item["upto"] <= at
             ],
-            "facts": (
-                copy.deepcopy(self.facts)
-                if self.facts["items"] and self.facts["upto"] <= at
-                else empty_facts()
+            "working": (
+                copy.deepcopy(self.working)
+                if self.working["items"] and self.working["upto"] <= at
+                else empty_working()
             ),
         }
 
@@ -920,14 +1158,35 @@ class Agent:
         """
         self.history = carried["history"]
         self.summaries = carried["summaries"]
-        self.facts = carried["facts"]
         self.branch = {"parent_id": parent_id, "forked_at": forked_at}
+
+        # Записи памяти заводятся заново, а не переносятся с номерами: номер
+        # принадлежит одному чату, и две записи под одним номером в разных
+        # разговорах — ровно та путаница, из-за которой номера и стали
+        # сквозными. Содержимое, род, автор и время у копий прежние: ветка
+        # уносит память такой, какой её вёл родитель.
+        carried_working = carried["working"]
+        self.working = empty_working()
+        self.working["upto"] = carried_working["upto"]
+        self.working["metrics"] = carried_working["metrics"]
+        self.working["at"] = carried_working["at"]
+
         if self.store is None:
+            for item in carried_working["items"]:
+                self._working_add(item["kind"], item["content"], item["author"], item["at"])
             return
         with self.store.tx():
             self.store.save_branch(self.id, parent_id=parent_id, forked_at=forked_at)
             self.store.save_summaries(self.id, self.summaries)
-            self.store.save_facts(self.id, self.facts)
+            for item in carried_working["items"]:
+                self._working_add(item["kind"], item["content"], item["author"], item["at"])
+            if carried_working["items"] or carried_working["upto"]:
+                self.store.save_working_state(
+                    self.id,
+                    upto=self.working["upto"],
+                    metrics=self.working["metrics"],
+                    at=self.working["at"],
+                )
             self.persist()
 
     def detach(self) -> None:
@@ -962,16 +1221,19 @@ class Agent:
         )
 
     def forget(self) -> None:
-        """Забывает разговор целиком — историю, сводки и факты.
+        """Забывает разговор целиком — историю, сводки и рабочую память.
 
         Сводка заменяла начало истории; истории больше нет, и покрывать ей
         нечего. Оставленная, она накрыла бы собой начало **следующего**
         разговора в этом же чате: `summary_cover` зажат длиной истории, и на
         отросшей заново истории мёртвая сводка снова стала бы действующей.
 
-        С фактами хуже: у них и зажима такого нет — выписка встаёт в промпт,
-        пока в ней есть хоть одна пара. Забытый разговор оставил бы свои цели
-        и договорённости следующему, и тот отвечал бы по ним.
+        С рабочей памятью хуже: у неё и зажима такого нет — врезка встаёт
+        в промпт, пока в памяти есть хоть одна запись. Забытый разговор
+        оставил бы свои цели и решения следующему, и тот отвечал бы по ним.
+
+        А долговременная память не трогается: чат ей не владелец, а читатель,
+        и «забыть этот разговор» не значит «забыть, кто с тобой говорит».
 
         А происхождение (`branch`) не трогается: это не содержимое разговора,
         а то, откуда чат взялся. «Забыть» здесь нечего — ветка, забывшая свою
@@ -981,10 +1243,10 @@ class Agent:
         """
         self.history.clear()
         self.summaries = []
-        self.facts = empty_facts()
+        self.working = empty_working()
         if self.store is not None:
             self.store.save_summaries(self.id, [])
-            self.store.save_facts(self.id, self.facts)
+            self.store.clear_working(self.id)
         self.persist()
 
     def usage_summary(self) -> dict | None:
@@ -993,8 +1255,8 @@ class Agent:
         Считается здесь, а не в браузере: иначе плитки и лента — два источника
         правды, и разъезжаются они молча. Колонки в базе у неё нет: она
         выводится из `messages.metrics`, `summaries.metrics` и
-        `facts.metrics` — из последних двух потому, что служебный вызов тоже
-        уехал в модель и тоже оплачен.
+        `working_state.metrics` — из последних двух потому, что служебный
+        вызов тоже уехал в модель и тоже оплачен.
 
         Реплика без метрик и поле с `None` **пропускаются**, а не считаются
         нулём: неизвестное и ноль на экране обязаны выглядеть по-разному —
@@ -1032,12 +1294,12 @@ class Agent:
             if add(item.get("metrics")):
                 answers += 1
 
-        # Третий — по фактам. Вызов на извлечение идёт на **каждом** обмене,
-        # и не вычитать его цену было бы враньём вдвойне. В снимке лежит уже
-        # накопленное по всем вызовам: сам снимок переписывается на каждом,
-        # и числа отдельного вызова в нём не удержались бы. Карточкой в ленте
-        # извлечение не становится и числа сообщений не растит.
-        if add(self.facts.get("metrics")):
+        # Третий — по рабочей памяти. Вызов на ведение идёт на **каждом**
+        # обмене, и не вычитать его цену было бы враньём вдвойне. В состоянии
+        # лежит уже накопленное по всем вызовам: держать числа отдельного
+        # вызова негде — правки ложатся по записям, а не снимком. Карточкой
+        # в ленте ведение памяти не становится и числа сообщений не растит.
+        if add(self.working.get("metrics")):
             answers += 1
 
         if not answers:
@@ -1121,7 +1383,7 @@ class Agent:
             if pending == "summary":
                 await self.compress(spec, context_length)
             elif pending == "facts":
-                await self.extract_facts(spec, user_text, context_length)
+                await self.update_working(spec, user_text, context_length)
             cut, _ = self.context_cut(spec)
 
             # Долговременная память читается **один раз на обмен** и уезжает
