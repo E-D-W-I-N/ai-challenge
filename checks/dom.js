@@ -473,7 +473,8 @@ function buildServer(options) {
     // ответом ручки, а не присланным телом» через интерфейс ненаблюдаема:
     // присланное и записанное совпадали бы посимвольно.
     secret: (options && options.secret) || "",
-    // Рабочий слой чата: факты и сводки. Лежит отдельно от самого чата —
+    // Рабочий слой чата: записи о состоянии задачи и сводки. Лежит отдельно
+    // от самого чата —
     // ровно как на сервере, где у них свои таблицы, а не колонка в `sessions`.
     // Ключ — имя чата: чаты стенд и так заводит по именам.
     working: (options && options.working) || {},
@@ -815,14 +816,18 @@ function buildServer(options) {
       return json({ created: 1, live: state.agents.length, agents: [child] });
     }
     // Три слоя разом — тем же составом, что у сервера: счётчик сообщений,
-    // факты и сводки этого чата без метрик, выключатель чата и общий список.
+    // записи и сводки этого чата без метрик, выключатель чата и общий список.
+    // Записи приходят с номером и автором, как у сервера: номер — ключ, по
+    // которому запись правят, автор — кто её сделал.
     if (tail === "/memory" && method === "GET") {
       const working = state.working[agent.label] || {};
       return json({
         short_term: { messages: agent.history_len },
         working: {
-          facts: working.facts || [],
-          facts_upto: working.facts_upto || 0,
+          records: (working.records || []).map((seed, i) => ({
+            seq: i + 1, author: "agent", at: i, ...seed,
+          })),
+          upto: working.upto || 0,
           summaries: working.summaries || [],
         },
         long_term: { enabled: agent.memory !== "off", records: state.records },
