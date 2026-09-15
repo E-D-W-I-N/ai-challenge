@@ -1068,6 +1068,19 @@ def check_working_memory():
         assert client.patch(f"{url}/9999", json={"content": "нет такой"}).status_code == 404
         assert client.delete(f"{url}/9999").status_code == 404
 
+        # Род — не ключ: две записи одного рода живут рядом, ключ у списка
+        # это номер. Снимок Дня 10 собирался словарём по ключу, и вторая
+        # «цель» вытесняла первую молча; здесь их две, и это единственное
+        # место, где врезка в промпте отличается от вчерашней.
+        twin = client.post(url, json={"kind": "limit", "content": "срок до мая"})
+        assert twin.status_code == 200, twin.text
+        twin = twin.json()
+        assert twin["seq"] > human["seq"], (twin, human)
+        assert [(r["kind"], r["content"]) for r in client.get(url).json()["records"]] == [
+            ("decision", "вызов 16"), ("limit", "бюджет 200к"), ("limit", "срок до мая"),
+        ], client.get(url).json()["records"]
+        assert client.delete(f"{url}/{twin['seq']}").status_code == 200
+
         # --- и главный инвариант: чужую запись извлечение не трогает --------
         #
         # Служебному вызову тут прямо велено её переписать и удалить —
@@ -1117,6 +1130,8 @@ def check_working_memory():
             )
         if mode["reply"] == "правка":
             return "1 цель: собрать ТЗ и смету"
+        if mode["reply"] == "добавка":
+            return "+ цель: собрать ТЗ и смету"
         if mode["reply"] == "удаление":
             return "- 2\n+ решение: платим картой"
         return "никаких правок здесь нет\nи здесь тоже"
@@ -1193,6 +1208,16 @@ def check_working_memory():
         3, "платим только картой", "human"
     ), tolerant.working["items"]
 
+    # Обратное направление — вторая половина того же инварианта: агент чужого
+    # не трогает, а человек трогает **любое**. Запись 1 завёл служебный вызов,
+    # и удаляется она руками без разговоров: иначе ошибку агента нечем было бы
+    # исправить, а список рос бы записями, которые никто не вправе убрать.
+    assert tolerant.drop_working_record(1) is True, "человек не смог удалить запись агента"
+    assert [(r["seq"], r["author"]) for r in tolerant.working["items"]] == [
+        (3, "human"), (mine["seq"], "human")
+    ], tolerant.working["items"]
+    assert store.list_working(tolerant.id) == tolerant.working["items"], store.list_working(tolerant.id)
+
     # --- 3. Провал ведения обмен не роняет и не даёт срезать непрочитанное --
     _stub.install(reply=replies)
     mode["reply"] = "пусто"
@@ -1237,9 +1262,16 @@ def check_working_memory():
     )
 
     # А когда вызов проходит, срез считается по хвосту, как и просили: зажим
-    # бережёт от молчаливой потери, а не отменяет стратегию.
-    mode["reply"] = "правка"
+    # бережёт от молчаливой потери, а не отменяет стратегию. Вызов здесь
+    # **заводит** запись, а не правит: своих записей у него не осталось —
+    # одну забрал человек правкой, другую удалил, — и это ровно тот случай,
+    # ради которого правка и добавление разные маркеры.
+    mode["reply"] = "добавка"
     asyncio.run(drain(tolerant.ask("восьмой вопрос")))
+    # Номер у новой записи свой: удалённая первая его не вернула.
+    assert [(r["seq"], r["author"]) for r in tolerant.working["items"]] == [
+        (3, "human"), (mine["seq"], "human"), (mine["seq"] + 1, "agent")
+    ], tolerant.working["items"]
     assert tolerant.working["upto"] == 14, tolerant.working["upto"]
     assert tolerant.context_cut()[0] == 14, tolerant.context_cut()[0]
     assert len(tolerant.history) == 16, len(tolerant.history)
@@ -1325,17 +1357,40 @@ def check_working_memory():
         # Удаление чата — второй такой путь: номера чатов идут по возрастанию,
         # а после очистки базы начинаются заново, и память удалённого
         # разговора досталась бы чату с тем же id.
+        #
+        # Обменов здесь **два**, и это не щедрость сценария. Ведение идёт
+        # до записи истории, поэтому после первого обмена курсор ещё ноль —
+        # и утверждение «после очистки ноль» держалось бы само собой, не
+        # заметив оставленной строки `working_state` с непустыми метриками.
+        # Курсор, за которым следят, обязан сперва отличаться от нуля.
         doomed = Agent(spec, store=again)
-        asyncio.run(drain(doomed.ask("вопрос удаляемого")))
+        for i in range(2):
+            asyncio.run(drain(doomed.ask(f"вопрос удаляемого {i}")))
         assert again.list_working(doomed.id), "память не записалась — проверять нечего"
+        assert again.load_working_state(doomed.id)["upto"] == 2, again.load_working_state(doomed.id)
         again.delete_session(doomed.id)
         assert again.list_working(doomed.id) == [], "удаление чата оставило его память"
         assert again.load_working_state(doomed.id)["upto"] == 0, "удаление чата оставило прочитанное"
 
-        # Очистка базы — третий.
+        # Очистка базы — третий, и курсор у неё так же обязан быть не нулевым
+        # до очистки: иначе стерегущее его утверждение вакуумно и здесь.
         keeper = Agent(spec, store=again)
-        asyncio.run(drain(keeper.ask("вопрос стираемого")))
+        for i in range(2):
+            asyncio.run(drain(keeper.ask(f"вопрос стираемого {i}")))
         assert again.list_working(keeper.id), "память не записалась — проверять нечего"
+        assert again.load_working_state(keeper.id)["upto"] == 2, again.load_working_state(keeper.id)
+
+        # И раз чат под рукой — заодно единственное место, где виден страж
+        # чужого чата: номера сквозные на всю базу, и через агента чужой
+        # номер не придёт никогда, а прямым вызовом хранилища — вот так.
+        # Без `session_id` в `WHERE` правка ушла бы в соседний разговор.
+        someone = again.list_working(keeper.id)[0]
+        assert again.update_working(
+            doomed.id, someone["seq"], kind="goal", content="взлом", author="agent"
+        ) is None, "правка по чужому чату прошла"
+        assert again.delete_working(doomed.id, someone["seq"]) is False, "удаление по чужому чату прошло"
+        assert again.list_working(keeper.id)[0] == someone, again.list_working(keeper.id)
+
         again.clear()
         assert again.list_working(keeper.id) == [], "очистка базы оставила память"
         assert again.load_working_state(keeper.id)["upto"] == 0, "очистка базы оставила прочитанное"
@@ -1663,8 +1718,14 @@ def check_branch_independent():
     )
     for i in range(5):
         asyncio.run(drain(listing.ask(f"вопрос {i}")))
+    # Запись человека рядом с агентскими: без неё поле автора в сравнении
+    # ниже ничего не стерегло бы — все записи родителя были бы агентскими,
+    # и ветка, пометившая унесённое собой, прошла бы незамеченной. А цена
+    # у этого прямая: первое же ведение в ветке переписало бы чужую запись.
+    listing.add_working_record("limit", "своя запись")
     upto = listing.working["upto"]
     said = [(r["kind"], r["content"], r["author"]) for r in listing.working["items"]]
+    assert [r["author"] for r in listing.working["items"]] == ["agent", "human"], said
     assert upto == 8 and said, listing.working
     # Та же граница и так же вплотную: `upto - 1` и ровно `upto`.
     thin = reg.fork(listing, upto - 1, label="на одно раньше границы памяти")

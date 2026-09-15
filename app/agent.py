@@ -25,6 +25,7 @@ from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import (
     CONTEXT_FIELDS,
     MEMORY_LABELS,
+    WORKING_AUTHORS,
     WORKING_KINDS,
     WORKING_LABELS,
     AgentSpec,
@@ -143,6 +144,14 @@ def working_listing(items: list[dict]) -> str:
         f"{item['seq']} {WORKING_LABELS.get(item['kind'], item['kind'])}: {item['content']}"
         for item in items
     )
+
+
+BY_AGENT, BY_HUMAN = WORKING_AUTHORS
+"""Два автора записи рабочей памяти — распакованы из `WORKING_AUTHORS`, а не
+набраны строками по месту. Список авторов и код, который их ставит, обязаны
+быть одним источником: разъедься они, `author` в базе стал бы третьим словом,
+и условие «правлю только своё» молча перестало бы совпадать хоть с чем-нибудь.
+Порядок в кортеже тоже значащий: первый — тот, кто пишет сам."""
 
 
 _KIND_BY_WORD = {label: token for token, label in WORKING_LABELS.items()}
@@ -974,17 +983,17 @@ class Agent:
         applied = 0
         for edit in edits:
             if edit["op"] == "add":
-                self._working_add(edit["kind"], edit["content"], "agent")
+                self._working_add(edit["kind"], edit["content"], BY_AGENT)
                 applied += 1
                 continue
             record = self._working_find(edit["seq"])
-            if record is None or record["author"] != "agent":
+            if record is None or record["author"] != BY_AGENT:
                 continue
             if edit["op"] == "del":
                 self._working_drop(record)
             else:
                 self._working_write(
-                    record, edit["kind"] or record["kind"], edit["content"], "agent"
+                    record, edit["kind"] or record["kind"], edit["content"], BY_AGENT
                 )
             applied += 1
         return applied
@@ -994,7 +1003,7 @@ class Agent:
         приходит из тела запроса: «кто записал» — это про путь, которым запись
         попала в память, и спрашивать об этом того, кто записывает, значило бы
         позволить назваться кем угодно."""
-        return self._working_add(kind, content, "human")
+        return self._working_add(kind, content, BY_HUMAN)
 
     def edit_working_record(self, seq: int, *, kind=None, content=None) -> dict | None:
         """Правка руками: меняет названное, остальное оставляет. `None` —
@@ -1011,7 +1020,7 @@ class Agent:
             record,
             kind or record["kind"],
             record["content"] if content is None else content,
-            "human",
+            BY_HUMAN,
         )
 
     def drop_working_record(self, seq: int) -> bool:
