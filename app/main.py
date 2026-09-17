@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm
-from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
+from .agent import BY_HUMAN, SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
@@ -368,6 +368,34 @@ def _kind_field(payload: dict, kinds: tuple = MEMORY_KINDS) -> str:
     return kind
 
 
+def _record_body(payload, allowed: tuple) -> dict:
+    """Тело запроса к записи памяти — любого из двух редактируемых слоёв:
+    объект и только известные поля.
+
+    Лишнее поле — 400, а не молчаливый пропуск: номер, автора и время
+    выдаёт сервер, и запрос, который их присылает, просит не то, что
+    ручка делает, — отвечать ему «ок» значило бы соврать.
+
+    Валидатор один на оба слоя — по тому же доводу, по которому один
+    `_kind_field`: правило у них общее, и вторая копия разошлась бы
+    с первой ровно в том месте, ради которого её писали.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail=f'тело: объект с полями {", ".join(allowed)}'
+        )
+    unknown = [key for key in payload if key not in allowed]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"тело записи памяти — только {', '.join(allowed)}: номер, "
+                f"автора и время выдаёт сервер. Лишние поля: {', '.join(sorted(unknown))}"
+            ),
+        )
+    return payload
+
+
 def _content_field(payload: dict) -> str:
     """Текст записи памяти: непустая строка. Образец — `_label_field`.
 
@@ -579,27 +607,65 @@ async def list_memory() -> dict:
 
 @app.post("/api/memory")
 async def add_memory(payload: dict = Body(...)) -> dict:
-    """Новая запись памяти. Тело: `{"kind": ..., "content": "..."}` — оба поля
-    обязательны, род без умолчания (см. `_kind_field`).
+    """Новая запись памяти, сделанная человеком. Тело:
+    `{"kind": ..., "content": "..."}` — оба поля обязательны, род без
+    умолчания (см. `_kind_field`).
+
+    Автор в теле не спрашивается и прийти оттуда не может: «кто записал» —
+    это про путь, которым запись попала в память, а не про то, кем назвался
+    запрос. Ручка человека метит человеком, служебный вызов — собой.
 
     Ответ — записанная строка целиком, с номером от базы: клиенту незачем
     перечитывать список, чтобы узнать, что у него получилось. И это именно
     записанное, а не присланное: `redact()` чистит текст по дороге в базу.
     """
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400, detail='тело: объект {"kind": "...", "content": "..."}'
-        )
-    unknown = [key for key in payload if key not in ("kind", "content")]
-    if unknown:
+    _record_body(payload, ("kind", "content"))
+    return REGISTRY.store.add_memory(
+        _kind_field(payload), _content_field(payload), BY_HUMAN
+    )
+
+
+@app.patch("/api/memory/{seq}")
+async def edit_memory(seq: int, payload: dict = Body(...)) -> dict:
+    """Правка записи по номеру: `{"kind": ...}`, `{"content": "..."}` или оба.
+    Разбор тела — общий с рабочей памятью (`_record_body`): пустое тело
+    400, лишнее поле 400, род без умолчания.
+
+    Правка руками метит запись человеком, даже если завёл её служебный вызов:
+    с этой минуты она не его, и переписать её обратно он не вправе — иначе
+    правка жила бы до ближайшего обмена.
+
+    Править и удалять человек может **любую** запись, в том числе агентскую:
+    иначе ошибку служебного вызова нечем было бы исправить, а список рос бы
+    записями, которые никто не вправе убрать. Ограничение здесь
+    одностороннее, и это не симметрия ради симметрии — это разные стороны.
+    """
+    _record_body(payload, ("kind", "content"))
+    if not payload:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "тело записи памяти — только kind и content: номер и время "
-                f"выдаёт база. Лишние поля: {', '.join(sorted(unknown))}"
-            ),
+            detail="тело правки пустое: назовите kind, content или оба",
         )
-    return REGISTRY.store.add_memory(_kind_field(payload), _content_field(payload))
+    current = next(
+        (r for r in REGISTRY.store.list_memory() if r["seq"] == seq), None
+    )
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
+        )
+    record = REGISTRY.store.update_memory(
+        seq,
+        kind=_kind_field(payload) if "kind" in payload else current["kind"],
+        content=_content_field(payload) if "content" in payload else current["content"],
+        author=BY_HUMAN,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
+        )
+    return record
 
 
 @app.delete("/api/memory/{seq}")
@@ -641,7 +707,7 @@ async def agent_memory(agent_id: str) -> dict:
             ],
         },
         "long_term": {
-            "enabled": agent.spec.memory == "on",
+            "enabled": agent.keeps_memory(),
             "records": REGISTRY.store.list_memory(),
         },
     }
@@ -654,31 +720,9 @@ async def agent_memory(agent_id: str) -> dict:
 # долговременная, плюс правка: запись здесь ведёт ещё и служебный вызов, и
 # поправить его формулировку — самое частое, что с ней делают.
 #
-# Разбор тела — по образцу `POST /api/memory`: род обязателен и без умолчания
-# (`_kind_field`), текст непустой (`_content_field`), лишние поля — 400.
-
-
-def _working_body(payload, allowed: tuple) -> dict:
-    """Тело запроса к рабочей памяти: объект и только известные поля.
-
-    Лишнее поле — 400, а не молчаливый пропуск: номер, автора и время
-    выдаёт сервер, и запрос, который их присылает, просит не то, что
-    ручка делает, — отвечать ему «ок» значило бы соврать.
-    """
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400, detail=f'тело: объект с полями {", ".join(allowed)}'
-        )
-    unknown = [key for key in payload if key not in allowed]
-    if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"тело записи рабочей памяти — только {', '.join(allowed)}: номер, "
-                f"автора и время выдаёт сервер. Лишние поля: {', '.join(sorted(unknown))}"
-            ),
-        )
-    return payload
+# Разбор тела — общий с долговременной памятью: род обязателен и без
+# умолчания (`_kind_field`), текст непустой (`_content_field`), лишние
+# поля — 400 (`_record_body`).
 
 
 @app.get("/api/agents/{agent_id}/working")
@@ -708,7 +752,7 @@ async def add_working(agent_id: str, payload: dict = Body(...)) -> dict:
     чем эту запись потом правят и удаляют.
     """
     agent = _agent(agent_id)
-    _working_body(payload, ("kind", "content"))
+    _record_body(payload, ("kind", "content"))
     return agent.add_working_record(
         _kind_field(payload, WORKING_KINDS), _content_field(payload)
     )
@@ -726,7 +770,7 @@ async def edit_working(agent_id: str, seq: int, payload: dict = Body(...)) -> di
     человеком — с этой минуты служебный вызов её не трогает.
     """
     agent = _agent(agent_id)
-    _working_body(payload, ("kind", "content"))
+    _record_body(payload, ("kind", "content"))
     if not payload:
         raise HTTPException(
             status_code=400,

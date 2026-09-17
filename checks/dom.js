@@ -447,14 +447,20 @@ function buildServer(options) {
     fail: (options && options.fail) || null,
     // Служебный вызов перед ответом: словарь или функция (номер обмена) →
     // null | `{insert, covered, strategy}`. Задано — обмен идёт так, как на
-    // сервере идёт обмен со сжатием или с извлечением фактов: сперва кадр
-    // `compressing` (служебный вызов уже пошёл, ответа ещё нет), потом
-    // `start` с промптом, где вместо начала разговора стоит врезка.
+    // сервере идёт обмен со сжатием: сперва кадр `compressing` (служебный
+    // вызов уже пошёл, ответа ещё нет), потом `start` с промптом, где вместо
+    // начала разговора стоит врезка.
     //
     // `strategy` называет, какой это был вызов, — ровно как сервер: клиент по
     // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
+    // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
+    // `service`, потому что и на сервере она своя: её ведёт агент при любом
+    // варианте обрезки, а не заказывает стратегия. Задана — значит вызов
+    // на ведение памяти на этом обмене был, и кадр `compressing` про него
+    // приходит первым, ровно как у сервера.
+    facts: (options && options.facts) || null,
     // Долговременная память: готовая врезка строкой или null. Слой глобальный
     // и наполняется руками, поэтому у стенда он один на все чаты — а вот
     // едет ли он в промпт, решает выключатель самого чата (`memory`), ровно
@@ -589,12 +595,18 @@ function buildServer(options) {
   // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
   const memoryInsert = (agent) => (agent.memory === "off" ? null : state.memory);
 
+  const factsInsert = (agent) => (agent.memory === "off" ? null : state.facts);
+
   function resolvedPrompt(agent, text, service) {
     const messages = [];
     if (agent.system) messages.push({ role: "system", content: agent.system });
-    // Память идёт до врезки стратегии: слой не этого разговора — первым.
+    // Порядок тот же, что на сервере: долговременная память, рабочая, врезка
+    // стратегии. От общего к частному — и обе памяти едут при любом варианте
+    // обрезки, ни одну из них не отменяя.
     const memory = memoryInsert(agent);
     if (memory) messages.push({ role: "user", content: memory });
+    const facts = factsInsert(agent);
+    if (facts) messages.push({ role: "user", content: facts });
     const tail = (agent.transcript || []).map((t) => ({ role: t.role, content: t.content }));
     if (service) {
       messages.push({ role: "user", content: service.insert });
@@ -615,18 +627,21 @@ function buildServer(options) {
   // молча: слот упавшего обмена через интерфейс ненаблюдаем вовсе — карточка
   // падения промпта не показывает, — и вторую копию не поймало бы ничто.
   //
-  // Слот стратегии сдвигается врезкой памяти на единицу: врезок в одном
-  // промпте бывает две, и сдвиг — ровно то место, где ошибается тот, кто
-  // считает их по одной.
+  // Слот стратегии сдвигают обе врезки памяти: врезок в одном промпте бывает
+  // три, и сдвиг — ровно то место, где ошибается тот, кто считает их по одной.
   function startFrame(agent, text, resolved, service) {
-    const memoryAt = memoryInsert(agent) ? (agent.system ? 1 : 0) : null;
+    const first = agent.system ? 1 : 0;
+    const memoryAt = memoryInsert(agent) ? first : null;
+    const workingAt = factsInsert(agent) ? first + (memoryAt === null ? 0 : 1) : null;
+    const afterMemory = first + (memoryAt === null ? 0 : 1) + (workingAt === null ? 0 : 1);
     return {
       event: "start",
       agent: agent.id,
       question: text,
       resolved_messages: resolved,
       memory_at: memoryAt,
-      summary_at: service ? (agent.system ? 1 : 0) + (memoryAt === null ? 0 : 1) : null,
+      working_at: workingAt,
+      summary_at: service ? afterMemory : null,
       strategy: service ? serviceStrategy(service) : agent.strategy,
     };
   }
@@ -662,6 +677,7 @@ function buildServer(options) {
     const frames = [
       // Место врезки в промпте и чем она занята называет сервер — клиент не
       // разбирает текст сообщений.
+      ...(factsInsert(agent) ? [{ event: "compressing", agent: agent.id, strategy: "facts" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "delta", text: state.reply, metrics: null },
@@ -690,6 +706,7 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
+      ...(factsInsert(agent) ? [{ event: "compressing", agent: agent.id, strategy: "facts" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "error", agent: agent.id, message: failed.message, metrics },
