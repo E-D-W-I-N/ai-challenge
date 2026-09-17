@@ -33,6 +33,7 @@ from .schema import (
     MEMORY_CHOICES,
     MEMORY_KINDS,
     STRATEGIES,
+    WORKING_KINDS,
     AgentSpec,
 )
 from .store import StoreBusyError
@@ -342,21 +343,25 @@ def _label_field(payload: dict) -> str:
     return label.strip()
 
 
-def _kind_field(payload: dict) -> str:
-    """Род записи долговременной памяти: обязателен и только из списка.
+def _kind_field(payload: dict, kinds: tuple = MEMORY_KINDS) -> str:
+    """Род записи памяти: обязателен и только из списка.
 
     Намеренно **не** `_choice_field`: тот отдаёт умолчание и на отсутствующий
     ключ, и на присланный `null`, — а здесь это ровно то, чего быть не должно.
     «Явно выбирать, что и куда сохраняется» — единственная работа пользователя
     в этом слое, и подставленный сервером род тихо превратил бы её
     в «сервер решил за него». Умолчания у рода поэтому нет вовсе.
+
+    Списков два — свой у каждого слоя, — а валидатор один: правило «род
+    обязателен и без умолчания» у них общее, и вторая копия разошлась бы
+    с первой ровно в том месте, ради которого её и писали.
     """
     kind = payload.get("kind")
-    if not isinstance(kind, str) or kind not in MEMORY_KINDS:
+    if not isinstance(kind, str) or kind not in kinds:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"kind: одно из {', '.join(MEMORY_KINDS)}, а не {kind!r} — "
+                f"kind: одно из {', '.join(kinds)}, а не {kind!r} — "
                 "род записи выбирает человек, сервер за него не выбирает"
             ),
         )
@@ -617,8 +622,10 @@ async def agent_memory(agent_id: str) -> dict:
 
     Краткосрочная отдаётся **счётчиком**, а не стенограммой: лента уже едет
     в `GET /api/agents/{id}`, и второй её источник разошёлся бы с первым.
-    Рабочая — факты и сводки без метрик: во что они обошлись, показывают
-    плитки, а здесь вопрос не «сколько стоило», а «что запомнено».
+    Рабочая — записи и сводки без метрик: во что они обошлись, показывают
+    плитки, а здесь вопрос не «сколько стоило», а «что запомнено». Записи
+    целиком, с номером и автором: по номеру их правят, а автор говорит, чья
+    это запись — служебного вызова или своя.
     Долговременная — выключатель этого чата и общий список: слой один на всю
     базу, и одинаков он у всех чатов, кроме положения выключателя.
     """
@@ -626,8 +633,8 @@ async def agent_memory(agent_id: str) -> dict:
     return {
         "short_term": {"messages": len(agent.history)},
         "working": {
-            "facts": list(agent.facts["items"]),
-            "facts_upto": agent.facts["upto"],
+            "records": list(agent.working["items"]),
+            "upto": agent.working["upto"],
             "summaries": [
                 {"seq": i, "upto": item["upto"], "content": item["content"]}
                 for i, item in enumerate(agent.summaries)
@@ -638,6 +645,122 @@ async def agent_memory(agent_id: str) -> dict:
             "records": REGISTRY.store.list_memory(),
         },
     }
+
+
+# --- рабочая память чата ------------------------------------------------------
+#
+# Ручки под чатом, в отличие от долговременных: область рабочей памяти — сам
+# разговор, и она умирает вместе с ним. Набор тот же, каким правится
+# долговременная, плюс правка: запись здесь ведёт ещё и служебный вызов, и
+# поправить его формулировку — самое частое, что с ней делают.
+#
+# Разбор тела — по образцу `POST /api/memory`: род обязателен и без умолчания
+# (`_kind_field`), текст непустой (`_content_field`), лишние поля — 400.
+
+
+def _working_body(payload, allowed: tuple) -> dict:
+    """Тело запроса к рабочей памяти: объект и только известные поля.
+
+    Лишнее поле — 400, а не молчаливый пропуск: номер, автора и время
+    выдаёт сервер, и запрос, который их присылает, просит не то, что
+    ручка делает, — отвечать ему «ок» значило бы соврать.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail=f'тело: объект с полями {", ".join(allowed)}'
+        )
+    unknown = [key for key in payload if key not in allowed]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"тело записи рабочей памяти — только {', '.join(allowed)}: номер, "
+                f"автора и время выдаёт сервер. Лишние поля: {', '.join(sorted(unknown))}"
+            ),
+        )
+    return payload
+
+
+@app.get("/api/agents/{agent_id}/working")
+async def list_working(agent_id: str) -> dict:
+    """Рабочая память этого чата целиком: записи и докуда их дочитало
+    извлечение.
+
+    `upto` едет рядом с записями, потому что вопрос «что запомнено» без него
+    неполон: он же зажимает срез промпта, и раздел, назвавший записи без
+    него, не смог бы сказать, сколько из истории они собой заменяют.
+    """
+    agent = _agent(agent_id)
+    records = list(agent.working["items"])
+    return {"total": len(records), "records": records, "upto": agent.working["upto"]}
+
+
+@app.post("/api/agents/{agent_id}/working")
+async def add_working(agent_id: str, payload: dict = Body(...)) -> dict:
+    """Новая запись рабочей памяти, сделанная человеком. Тело:
+    `{"kind": ..., "content": "..."}` — оба поля обязательны.
+
+    Автор в теле не спрашивается и прийти оттуда не может: «кто записал» —
+    это про путь, которым запись попала в память, а не про то, кем назвался
+    запрос. Ручка человека метит человеком, служебный вызов — собой.
+
+    Ответ — записанная строка целиком, с номером от базы: номер и есть то,
+    чем эту запись потом правят и удаляют.
+    """
+    agent = _agent(agent_id)
+    _working_body(payload, ("kind", "content"))
+    return agent.add_working_record(
+        _kind_field(payload, WORKING_KINDS), _content_field(payload)
+    )
+
+
+@app.patch("/api/agents/{agent_id}/working/{seq}")
+async def edit_working(agent_id: str, seq: int, payload: dict = Body(...)) -> dict:
+    """Правка записи по номеру: `{"kind": ...}`, `{"content": "..."}` или оба.
+
+    Пустое тело — 400: править нечего, и молчаливое «ок» на запрос ни о чём
+    неотличимо от сломанной кнопки. Названное поле проверяется тем же
+    валидатором, что и при добавлении, — умолчаний у рода нет и здесь.
+
+    Номер не меняется: он и есть идентичность записи. Правка метит запись
+    человеком — с этой минуты служебный вызов её не трогает.
+    """
+    agent = _agent(agent_id)
+    _working_body(payload, ("kind", "content"))
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="тело правки пустое: назовите kind, content или оба",
+        )
+    record = agent.edit_working_record(
+        seq,
+        kind=_kind_field(payload, WORKING_KINDS) if "kind" in payload else None,
+        content=_content_field(payload) if "content" in payload else None,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"записи рабочей памяти {seq} в этом чате нет: её уже удалили",
+        )
+    return record
+
+
+@app.delete("/api/agents/{agent_id}/working/{seq}")
+async def delete_working(agent_id: str, seq: int) -> dict:
+    """Удаляет одну запись по номеру. Нет такой — 404, а не тихое «ок»:
+    вторая вкладка показывает список с прошлой минуты, и разница между
+    «удалил» и «нечего было удалять» ей важна.
+
+    Номер удалённой записи не достанется следующей: у `working_memory.seq`
+    стоит AUTOINCREMENT.
+    """
+    agent = _agent(agent_id)
+    if not agent.drop_working_record(seq):
+        raise HTTPException(
+            status_code=404,
+            detail=f"записи рабочей памяти {seq} в этом чате нет: её уже удалили",
+        )
+    return {"deleted": seq}
 
 
 # --- каталог моделей ----------------------------------------------------------
