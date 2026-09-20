@@ -1599,9 +1599,14 @@ async function routeChecks() {
       await settle(40);
       check("«Запомнить надолго» сама ничего не записывает: тип ещё не выбран",
         posts().length === 0, JSON.stringify(posts().map((r) => r.body)));
-      check("а кладёт запись в форму слоя, в той же форме «тип: содержимое», и без типа",
-        $("#mem-content").value === "цель: собрать ТЗ" && $("#mem-kind").value === "",
-        JSON.stringify([$("#mem-content").value, $("#mem-kind").value]));
+      // Фокус переводится на список типов — тем же нажатием: без этого
+      // «спрашиваю тип» осталось бы строкой состояния под чужим разделом,
+      // а человек смотрел бы на запись, которая молча никуда не уехала.
+      check("а кладёт запись в форму слоя, в той же форме «тип: содержимое», без типа и с фокусом на нём",
+        $("#mem-content").value === "цель: собрать ТЗ" && $("#mem-kind").value === "" &&
+          document.activeElement === $("#mem-kind"),
+        JSON.stringify([$("#mem-content").value, $("#mem-kind").value,
+                        document.activeElement && document.activeElement.id]));
       check("и сказано, чего ждут: при переносе тип выбирает человек",
         /при переносе тип выбирает человек/.test($("#mem-status").textContent),
         $("#mem-status").textContent);
@@ -1951,8 +1956,14 @@ async function routeChecks() {
       if (!kindBox) check("правка открывает и список типов, а не одно поле текста", false, "списка нет");
       else {
         check("правка открывает и список типов, а не одно поле текста", true, "");
-        check("и он открыт пустым: умолчания у типа нет и в правке",
-          kindBox.value === "", JSON.stringify(kindBox.value));
+        // Пустой пункт у правки подписан **иначе**, чем у формы добавления,
+        // и это не украшение: «— оставить тип —» — единственное, чем сказано,
+        // что невыбранный тип значит «прежний», а не «выберите». Подпись
+        // обещана и в README, и в CLAUDE.md — значит стережётся здесь же,
+        // а не рядом отдельным утверждением.
+        check("и он открыт пустым, и пустой пункт назван «оставить», а не «выберите»",
+          kindBox.value === "" && kindBox.children[0].textContent === "— оставить тип —",
+          JSON.stringify([kindBox.value, kindBox.children[0].textContent]));
 
         // Щелчок по списку — не конец правки, хотя фокус с поля и ушёл.
         // Сохраняй мы по `blur` самого поля, список типов исчезал бы
@@ -1963,16 +1974,21 @@ async function routeChecks() {
           patchCount() === beforeKind && Boolean($("#mem-working").querySelector(".mem-edit-kind")),
           patchCount() + " | " + Boolean($("#mem-working").querySelector(".mem-edit-kind")));
 
-        kindBox.value = "decision";
+        // Тип берём **исключительный для этого слоя**: «открытый вопрос»
+        // есть в `WORKING_KINDS` и нет в `MEMORY_KINDS`. «Решение» подошло бы
+        // обоим — оно нарочно лежит в обоих списках, — и утверждение о том,
+        // что правке рабочей записи дали именно её типы, держалось бы
+        // на совпадении: подмени слой целиком, и оно бы промолчало.
+        kindBox.value = "question";
         kindBox.blur();
         await settle(40);
         const kindPatch = requests("PATCH", /\/working\//).slice(-1)[0];
         check("выбранный тип уезжает правкой — и один, без текста, которого не трогали",
           patchCount() === beforeKind + 1 &&
-            JSON.stringify(kindPatch.body) === JSON.stringify({ kind: "decision" }),
+            JSON.stringify(kindPatch.body) === JSON.stringify({ kind: "question" }),
           patchCount() + " | " + JSON.stringify(kindPatch && kindPatch.body));
         check("и в списке у записи новая подпись типа",
-          texts("#mem-working")[0] === "решение: собрать ТЗ к июню",
+          texts("#mem-working")[0] === "открытый вопрос: собрать ТЗ к июню",
           JSON.stringify(texts("#mem-working")));
       }
     }
@@ -2155,15 +2171,19 @@ async function routeChecks() {
       else {
         check("у долговременной правки тоже есть список типов, и тоже пустой",
           longKind.value === "", JSON.stringify(longKind.value));
-        longKind.value = "decision";
+        // И здесь тип **исключительный для слоя**: «о собеседнике» есть
+        // в `MEMORY_KINDS` и нет в `WORKING_KINDS`. Довод тот же, что
+        // у соседнего слоя, и он не про симметрию: это единственное место,
+        // где видно, что правке дали список **её** слоя.
+        longKind.value = "profile";
         longKind.blur();
         await settle(40);
         const typed = requests("PATCH", /^\/api\/memory\//).slice(-1)[0];
         check("тип долговременной записи правится её номером и одним полем",
-          JSON.stringify(typed.body) === JSON.stringify({ kind: "decision" }),
+          JSON.stringify(typed.body) === JSON.stringify({ kind: "profile" }),
           JSON.stringify(typed && [typed.path, typed.body]));
         check("и подпись типа в списке сменилась на выбранную",
-          wasKind === "факт" && kinds().slice(-1)[0] === "решение",
+          wasKind === "факт" && kinds().slice(-1)[0] === "о собеседнике",
           JSON.stringify([wasKind, kinds()]));
       }
     }
