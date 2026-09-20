@@ -754,8 +754,19 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   font-weight: 650;
 }
 /* Правка записи на месте: поле встаёт ровно туда, где стоял текст. */
-.mem-edit {
+/* Поле текста и список типов — один блок на месте показанной строки: правится
+   и то и другое разом, а уход фокуса с поля на список — не конец правки.
+   Основа та же, что у `.mem-text`, которую блок собой заменил: иначе кнопки
+   справа переехали бы на свою строку только на время правки. */
+.mem-edit-box {
+  display: flex;
   flex: 1 1 55%;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.mem-edit {
+  flex: 1 1 auto;
   min-width: 0;
   padding: 3px 6px;
   border: 1px solid var(--accent);
@@ -763,6 +774,16 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   background: var(--bg);
   color: var(--text);
   font: inherit;
+}
+/* Список типов уже поля: тип выбирают реже, чем правят текст, — но он стоит
+   рядом, а не прячется за вторым нажатием. Невыбранный он значит «оставить
+   прежний»: умолчания у типа нет и в правке. */
+.mem-edit-kind {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  padding: 3px 6px;
+  font-size: 11.5px;
 }
 /* Форма добавления — своя у каждого слоя, который правится руками. */
 .mem-form { display: flex; flex-direction: column; gap: 7px; }
@@ -778,7 +799,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   cursor: pointer;
 }
 .mem-btn:hover { color: var(--text); border-color: var(--faint); }
-/* Род и кнопка в одном ряду: выбор рода — часть самого добавления, а не
+/* Тип и кнопка в одном ряду: выбор типа — часть самого добавления, а не
    отдельный шаг перед ним. */
 .mem-add-row { display: flex; align-items: flex-end; gap: 8px; }
 .mem-add-row .field { flex: 1 1 auto; }

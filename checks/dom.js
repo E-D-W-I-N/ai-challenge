@@ -274,15 +274,38 @@ class El {
     this._valueAtFocus = this.value;
   }
 
-  // Потеря фокуса, как в браузере: сначала blur, а следом change — но
-  // только если значение поменялось. Иначе проверке пришлось бы дёргать
+  // Потеря фокуса, как в браузере: сначала blur, следом focusout — и change,
+  // но только если значение поменялось. Иначе проверке пришлось бы дёргать
   // `change` руками, то есть проверять свою догадку о браузере.
-  blur() {
-    if (documentRef.activeElement === this) documentRef.activeElement = null;
+  //
+  // `next` — узел, **получающий** фокус: так браузер и отличает «ушли со
+  // страницы» от «щёлкнули по соседнему полю той же формы». Едет он полем
+  // `relatedTarget`, как в браузере, и у `focusout` он единственный способ
+  // узнать, что фокус остался внутри блока. Без аргумента — фокус потерян
+  // вовсе, и `relatedTarget` пуст, тоже как в браузере.
+  blur(next) {
+    if (documentRef.activeElement === this) documentRef.activeElement = next || null;
     const changed = this._valueAtFocus !== null && this._valueAtFocus !== this.value;
     this._valueAtFocus = null;
-    this.dispatchEvent(new Evt("blur"));
+    const to = next || null;
+    this.dispatchEvent(new Evt("blur", { relatedTarget: to }));
+    // `focusout` всплывает — на этом и держится правка записи памяти: поле
+    // с текстом и список типов лежат в одном блоке, и слушает он блок, а не
+    // каждое поле по отдельности.
+    this.dispatchEvent(new Evt("focusout", { relatedTarget: to }));
     if (changed) this.dispatchEvent(new Evt("change"));
+  }
+
+  // Лежит ли узел внутри этого — как `Node.contains` в браузере, включая
+  // «сам в себе». Пустой аргумент — `false`: фокус, ушедший в никуда,
+  // внутри блока не остался.
+  contains(node) {
+    let walk = node || null;
+    while (walk) {
+      if (walk === this) return true;
+      walk = walk.parentElement;
+    }
+    return false;
   }
 
   select() {}
@@ -294,7 +317,10 @@ class El {
 // Инлайновый обработчик (`el.onclick = ...`) — такой же слушатель, только
 // в единственном экземпляре. Держим его в общем списке, чтобы порядок
 // вызова совпадал с браузерным.
-const INLINE_EVENTS = ["click", "change", "keydown", "keyup", "submit", "input", "scroll", "blur", "focus"];
+const INLINE_EVENTS = [
+  "click", "change", "keydown", "keyup", "submit", "input", "scroll",
+  "blur", "focus", "focusout",
+];
 
 INLINE_EVENTS.forEach((type) => {
   Object.defineProperty(El.prototype, "on" + type, {
@@ -658,7 +684,7 @@ function buildServer(options) {
     (state.secret ? text.trim().split(state.secret).join("***") : text.trim());
 
   // Разбор тела записи — один на оба слоя, как `_record_body` на сервере:
-  // лишние поля 400, род обязателен и **без умолчания**, текст непустой,
+  // лишние поля 400, тип обязателен и **без умолчания**, текст непустой,
   // пустое тело правки 400. Вторая копия правил на втором слое разошлась бы
   // с первой молча, а слой с разбором щедрее серверного прятал бы дыру:
   // форма осталась бы зелёной, получая в браузере 400.
@@ -687,66 +713,79 @@ function buildServer(options) {
     return { value: out };
   }
 
-  // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
-  // врезка долговременной памяти, врезка вместо начала разговора, непокрытый
-  // ею хвост истории, вопрос.
-  // Настоящий сервер шлёт его кадром `start` всегда, и стенд шлёт всегда.
+  // Промпт стенд собирает в том же порядке, в каком его собирает сервер, и
+  // шлёт кадром `start` всегда — как настоящий сервер. Стенд режет историю
+  // так же: иначе проверить, что кнопка промпта показывает у окна уехавшее,
+  // было бы не на чем — полная история в ленте и так лежит.
   //
-  // Окно — единственная стратегия, которая режет **без** врезки: вместо
-  // отброшенного начала не встаёт ничего, и в промпте остаётся ровно хвост.
-  // Стенд режет так же, иначе проверить, что кнопка промпта показывает у окна
-  // уехавшее, было бы не на чем: полная история в ленте и так лежит.
   // Врезка долговременной памяти этого чата — или null. Одно условие на три
   // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
   const memoryInsert = (agent) => (agent.memory === "off" ? null : state.memory);
 
   const factsInsert = (agent) => (agent.memory === "off" ? null : state.facts);
 
-  function resolvedPrompt(agent, text, service) {
+  // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
+  // одним ответом. Формула слота здесь не считается, а берётся из длины уже
+  // собранного начала: сервер делает так же (`Agent.prompt_head`), и по той же
+  // причине — сумма предыдущих врезок, переписанная вторым местом, расходится
+  // молча. Стенд от сервера нарочно независим, но две копии формулы **внутри
+  // стенда** независимостью не являются.
+  //
+  // Порядок тот же, что на сервере: долговременная память, рабочая, врезка
+  // стратегии. От общего к частному — и обе памяти едут при любом варианте
+  // обрезки, ни одну из них не отменяя.
+  function promptHead(agent, service) {
     const messages = [];
+    const slots = { memory_at: null, working_at: null, summary_at: null };
     if (agent.system) messages.push({ role: "system", content: agent.system });
-    // Порядок тот же, что на сервере: долговременная память, рабочая, врезка
-    // стратегии. От общего к частному — и обе памяти едут при любом варианте
-    // обрезки, ни одну из них не отменяя.
+
     const memory = memoryInsert(agent);
-    if (memory) messages.push({ role: "user", content: memory });
+    if (memory) {
+      slots.memory_at = messages.length;
+      messages.push({ role: "user", content: memory });
+    }
     const facts = factsInsert(agent);
-    if (facts) messages.push({ role: "user", content: facts });
+    if (facts) {
+      slots.working_at = messages.length;
+      messages.push({ role: "user", content: facts });
+    }
+    // Окно — единственная стратегия, которая режет **без** врезки: вместо
+    // отброшенного начала не встаёт ничего, слот у неё пуст, и в промпте
+    // остаётся ровно хвост.
+    if (service) {
+      slots.summary_at = messages.length;
+      messages.push({ role: "user", content: service.insert });
+    }
+    return { messages, slots };
+  }
+
+  function resolvedPrompt(agent, text, service) {
+    const { messages } = promptHead(agent, service);
     const tail = (agent.transcript || []).map((t) => ({ role: t.role, content: t.content }));
     if (service) {
-      messages.push({ role: "user", content: service.insert });
       tail.splice(0, service.covered || 0);
     } else if (agent.strategy === "window" && typeof agent.keep_last === "number") {
       // Пустое поле — отбрасывать нечем, ровно как на сервере.
       tail.splice(0, Math.max(0, tail.length - agent.keep_last));
     }
-    messages.push(...tail, { role: "user", content: text });
-    return messages;
+    return [...messages, ...tail, { role: "user", content: text }];
   }
 
   // Чем занят служебный вызов — тем же словом, каким это называет сервер.
   const serviceStrategy = (service) => (service && service.strategy) || "summary";
 
   // Кадр `start` — **один** на оба потока: и на удачный обмен, и на упавший.
-  // Формула слотов в нём одна, и переписанная дважды она разъехалась бы
-  // молча: слот упавшего обмена через интерфейс ненаблюдаем вовсе — карточка
-  // падения промпта не показывает, — и вторую копию не поймало бы ничто.
-  //
-  // Слот стратегии сдвигают обе врезки памяти: врезок в одном промпте бывает
-  // три, и сдвиг — ровно то место, где ошибается тот, кто считает их по одной.
+  // Слоты в нём не пересчитываются: их отдаёт та же сборка начала промпта,
+  // что этот промпт и собрала. Слот упавшего обмена через интерфейс
+  // ненаблюдаем вовсе — карточка падения промпта не показывает, — и вторую
+  // копию формулы не поймало бы ничто.
   function startFrame(agent, text, resolved, service) {
-    const first = agent.system ? 1 : 0;
-    const memoryAt = memoryInsert(agent) ? first : null;
-    const workingAt = factsInsert(agent) ? first + (memoryAt === null ? 0 : 1) : null;
-    const afterMemory = first + (memoryAt === null ? 0 : 1) + (workingAt === null ? 0 : 1);
     return {
       event: "start",
       agent: agent.id,
       question: text,
       resolved_messages: resolved,
-      memory_at: memoryAt,
-      working_at: workingAt,
-      summary_at: service ? afterMemory : null,
+      ...promptHead(agent, service).slots,
       strategy: service ? serviceStrategy(service) : agent.strategy,
     };
   }
@@ -893,7 +932,7 @@ function buildServer(options) {
     //
     // Проверки границы здесь те же, что на сервере, и это не придирка:
     // стенд, принимающий то, чего сервер не принимает, оставляет зелёной
-    // форму, которая в браузере получает 400. Род записи поэтому обязателен
+    // форму, которая в браузере получает 400. Тип записи поэтому обязателен
     // и умолчания не имеет — ровно как `_kind_field`.
     if (path === "/api/memory" && method === "GET") {
       return json({ total: state.records.length, records: state.records });
@@ -982,7 +1021,7 @@ function buildServer(options) {
     // ── рабочая память: ручки под чатом, набор тот же, что у долговременной ──
     //
     // Границы те же, что на сервере, и разбор тела — общий с долговременным
-    // слоем: род обязателен и без умолчания, текст непустой, лишние поля 400,
+    // слоем: тип обязателен и без умолчания, текст непустой, лишние поля 400,
     // пустое тело правки 400, чужой номер 404.
     if (tail === "/working" && method === "GET") {
       const working = workingOf(agent);
