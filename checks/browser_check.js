@@ -1856,6 +1856,60 @@ async function routeChecks() {
         texts("#mem-working")[0] === "цель: собрать ТЗ к маю", JSON.stringify(texts("#mem-working")));
       check("и запись стала вашей: агент её больше не трогает",
         who("#mem-working")[0] === "записали вы", JSON.stringify(who("#mem-working")));
+
+      // ── остальные четыре выхода из правки ──
+      //
+      // Enter — только один из пяти. Уход фокуса сохраняет (иначе правка
+      // теряется молча от нажатия мимо), Escape отменяет, пустое поле и текст
+      // слово в слово прежний не шлют ничего, а замок не даёт одной правке
+      // уехать дважды. Считаем PATCH'и: лишний и пропавший видны одинаково.
+      const patchCount = () => requests("PATCH", /\/working\//).length;
+      const editRow = async (index, value, finish) => {
+        rows()[index].querySelectorAll(".mini")
+          .find((b) => b.title === "Поправить запись").dispatchEvent(new Evt("click"));
+        await settle(20);
+        const field = $("#mem-working").querySelector(".mem-edit");
+        if (!field) return null;
+        if (value !== null) field.value = value;
+        finish(field);
+        await settle(40);
+        return field;
+      };
+
+      const beforeEscape = patchCount();
+      await editRow(0, "правка, которой не будет",
+        (f) => f.dispatchEvent(new Evt("keydown", { key: "Escape" })));
+      check("Escape отменяет правку: запрос не уходит",
+        patchCount() === beforeEscape, patchCount() + " против " + beforeEscape);
+      check("и в списке остаётся прежний текст",
+        texts("#mem-working")[0] === "цель: собрать ТЗ к маю", JSON.stringify(texts("#mem-working")));
+
+      await editRow(0, "", (f) => f.dispatchEvent(new Evt("keydown", { key: "Enter" })));
+      check("пустое поле правкой не считается: запись не теряется молча",
+        patchCount() === beforeEscape && texts("#mem-working")[0] === "цель: собрать ТЗ к маю",
+        patchCount() + " | " + JSON.stringify(texts("#mem-working")));
+
+      await editRow(0, null, (f) => f.dispatchEvent(new Evt("keydown", { key: "Enter" })));
+      check("текст слово в слово прежний тоже не шлют: правки в нём нет",
+        patchCount() === beforeEscape, patchCount() + " против " + beforeEscape);
+
+      // Потеря фокуса сохраняет — и это единственный выход, который случается
+      // сам: человек нажал мимо поля, а правку терять нельзя.
+      await editRow(0, "собрать ТЗ к концу мая", (f) => f.blur());
+      check("уход фокуса правку сохраняет, а не теряет",
+        patchCount() === beforeEscape + 1 &&
+          texts("#mem-working")[0] === "цель: собрать ТЗ к концу мая",
+        patchCount() + " | " + JSON.stringify(texts("#mem-working")));
+
+      // Enter и следующий за ним уход фокуса — одна правка, а не две:
+      // без замка ушли бы два запроса на одно нажатие.
+      const beforeTwice = patchCount();
+      await editRow(0, "собрать ТЗ к июню", (f) => {
+        f.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+        f.blur();
+      });
+      check("Enter и уход фокуса за ним — одна правка, а не две",
+        patchCount() === beforeTwice + 1, patchCount() + " против " + (beforeTwice + 1));
     }
 
     // ── форма: род выбирает человек, и до выбора не уходит ничего ──
@@ -1870,6 +1924,22 @@ async function routeChecks() {
     check("и форма говорит, чего не хватает",
       /Род записи не выбран/.test($("#mem-work-status").textContent),
       $("#mem-work-status").textContent);
+
+    // Род выбран, текста нет: пустая запись уехала бы в промпт строкой
+    // «ограничение: » и заняла бы место врезки, ничего не сказав. У формы
+    // долговременного слоя этот отказ уже стережётся — слои устроены
+    // одинаково, и второй отказ обязан стеречься наравне с первым.
+    $("#mem-work-kind").value = "goal";
+    $("#mem-work-kind").dispatchEvent(new Evt("change"));
+    $("#mem-work-content").value = "   ";
+    $("#mem-work-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("с пустым текстом запись рабочей памяти тоже не уходит",
+      adds().length === 0, JSON.stringify(adds().map((r) => r.body)));
+    check("и причина названа: записывать нечего",
+      /Текст записи пуст/.test($("#mem-work-status").textContent),
+      $("#mem-work-status").textContent);
+    $("#mem-work-content").value = "срок — конец мая";
 
     const patchesBefore = requests("PATCH", /^\/api\/agents\/[^/]+$/).length;
     $("#mem-work-kind").value = "limit";
@@ -2023,6 +2093,139 @@ async function routeChecks() {
         badge() === "" && badgeHidden() && who("#mem-working").slice(-1)[0] === "записали вы",
         badge() + " | " + JSON.stringify(who("#mem-working")));
     }
+  }
+
+  // ── значок растёт при закрытой вкладке: ради этого он и заведён ──
+  //
+  // Сценарий задания: агент пишет память молча, а вкладку человек открывает
+  // редко. Слои при этом читаются **лениво** — при закрытой вкладке за ними
+  // не ходят вовсе, — и число новых записей приезжает не с ними, а с самим
+  // чатом (`records_by_agent`), тем же запросом, которым клиент и так
+  // обновляет чат после обмена. Считай клиент число по слоям — при закрытой
+  // вкладке ему нечего было бы считать, и значок не появлялся бы никогда
+  // именно тогда, когда нужен.
+  {
+    const talk = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      { role: "assistant", content: "ответ", error: null, reasoning: "", metrics: null },
+    ];
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [
+        { label: "молчун", strategy: "full", transcript: talk },
+        { label: "сосед", strategy: "full", transcript: talk },
+      ],
+      working: {
+        // У «молчуна» записей сперва нет ни одной: число обязано набраться
+        // обменами, а не посевом.
+        "молчун": {
+          records: [],
+          writes: [
+            { kind: "goal", content: "собрать ТЗ" },
+            { kind: "question", content: "успеем ли к маю" },
+            { kind: "decision", content: "берём Kotlin" },
+          ],
+          remembers: [{ kind: "knowledge", content: "оплата картой" }],
+        },
+        // У соседа агентская запись есть, но её никому не показывали.
+        "сосед": { records: [{ kind: "goal", content: "чужая цель" }] },
+      },
+      records: [],
+    });
+    client.init();
+    await settle(30);
+
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    const openTab = (which) =>
+      document.querySelectorAll(".tab").find((t) => t.dataset.tab === which)
+        .dispatchEvent(new Evt("click"));
+    const layerCalls = () =>
+      server.state.requests.filter((r) => /\/memory$/.test(r.path) && r.method === "GET");
+    const badge = () => $("#mem-new").textContent;
+    const fresh = (sel) => $(sel).querySelectorAll(".mem-fresh").length;
+    const texts = (sel) => $(sel).querySelectorAll(".mem-text").map((n) => n.textContent);
+    const ask = async (text) => {
+      $("#input").value = text;
+      $("#composer").requestSubmit();
+      await settle(140);
+    };
+
+    open(2);
+    await settle(40);
+    check("вкладку «Память» не открывали — за слоями не ходили ни разу",
+      layerCalls().length === 0, JSON.stringify(layerCalls().map((r) => r.path)));
+    check("и значка нет: агент в этом чате ещё ничего не записал",
+      badge() === "" && $("#mem-new").classList.contains("hidden"), badge());
+
+    await ask("поговорим про задачу");
+    check("обмен при закрытой вкладке: агент записал в оба слоя, и значок это назвал",
+      badge() === "2", badge());
+    // Одно число само по себе не говорит, о чём оно: подсказка называет это
+    // словами — читать её будет и тот, кто значок видит впервые, и диктор.
+    check("и подсказка у значка говорит, что это за число",
+      /завёл записей с прошлого открытия: 2/.test($("#mem-new").title), $("#mem-new").title);
+    check("и назвал, не сходив за слоями: число приехало с самим чатом",
+      layerCalls().length === 0, JSON.stringify(layerCalls().map((r) => r.path)));
+
+    await ask("и ещё вопрос");
+    check("второй обмен число растит, вкладка по-прежнему закрыта",
+      badge() === "3" && layerCalls().length === 0,
+      badge() + " при " + layerCalls().length + " походах");
+
+    // Смена чата значок не гасит: число у каждого чата своё, и берётся оно
+    // из самого чата, а не из слоёв, которые при переключении сбрасываются.
+    open(3);
+    await settle(40);
+    check("у соседа своё число: его агентскую запись здесь тоже не показывали",
+      badge() === "2", badge());
+    check("и слоёв при закрытой вкладке никто не читал — ни у него, ни у прежнего",
+      layerCalls().length === 0, JSON.stringify(layerCalls().map((r) => r.path)));
+    open(2);
+    await settle(40);
+    check("вернулись — значок прежнего чата на месте, сменой чата он не погас",
+      badge() === "3", badge());
+
+    // Вот теперь вкладку открыли: число гаснет, а пометки «новая» встают
+    // на всех трёх записях — и в рабочем слое, и в долговременном.
+    openTab("memory");
+    await settle(40);
+    check("открытие вкладки: за слоями сходили впервые, и ровно один раз",
+      layerCalls().length === 1, JSON.stringify(layerCalls().map((r) => r.path)));
+    check("число погасло, а пометки назвали все три приехавшие записи",
+      badge() === "" && fresh("#mem-working") === 2 && fresh("#mem-long") === 1,
+      badge() + " | " + fresh("#mem-working") + " + " + fresh("#mem-long"));
+
+    // Переключение чата при **открытой** вкладке: слои перечитываются, потому
+    // что первые два теперь чужие, а значок называет непоказанные записи
+    // соседа — их человек не видел.
+    open(3);
+    await settle(40);
+    check("переключили чат при открытой вкладке — слои перечитаны",
+      layerCalls().length === 2, JSON.stringify(layerCalls().map((r) => r.path)));
+    // Одну, а не две: долговременную запись человеку показали в прежнем чате,
+    // и слой у неё общий — показанное в одном чате показано во всех. Рабочая
+    // память своя у каждого, и эту его запись не показывали.
+    check("и значок назвал непоказанную запись соседа — одну, по областям слоёв",
+      badge() === "1" && fresh("#mem-working") === 1 && fresh("#mem-long") === 0,
+      badge() + " | " + fresh("#mem-working") + " + " + fresh("#mem-long"));
+
+    open(2);
+    await settle(40);
+    check("вернулись к показанному чату — пометок нет и числа нет",
+      badge() === "" && fresh("#mem-working") === 0 && fresh("#mem-long") === 0,
+      badge() + " | " + fresh("#mem-working") + " + " + fresh("#mem-long"));
+
+    // Третий обмен: пометка встаёт **только** на приехавшую запись, а с двух
+    // показанных уходит. Пометка «на всех агентских записях» этого не пройдёт.
+    await ask("продолжаем");
+    check("новая запись помечена одна, а показанные новыми быть перестали",
+      badge() === "1" && fresh("#mem-working") === 1 && texts("#mem-working").length === 3,
+      badge() + " | пометок " + fresh("#mem-working") + " из " + texts("#mem-working").length);
+    check("и помечена именно приехавшая",
+      $("#mem-working").querySelectorAll(".mem-item")
+        .filter((row) => row.querySelectorAll(".mem-fresh").length)
+        .map((row) => row.querySelector(".mem-text").textContent)
+        .join("|") === "решение: берём Kotlin",
+      JSON.stringify(texts("#mem-working")));
   }
 }
 

@@ -573,6 +573,27 @@ function buildServer(options) {
     };
   });
 
+  // Сколько записей обоих слоёв завёл служебный вызов — то же число, что
+  // считает `Agent.records_by_agent`: рабочие записи этого чата плюс
+  // долговременные, и только агентские. Едет он с самим чатом, а не отдельной
+  // ручкой, поэтому и здесь его отдаёт каждый ответ про чат: собери стенд это
+  // число в одном месте из трёх — вкладка получала бы его то с обмена, то нет.
+  // Числа два, а не одно: области слоёв разные — рабочая память живёт в чате,
+  // долговременная одна на всю базу, — и сложенное число вкладка не смогла бы
+  // разделить обратно.
+  const byAgent = (agent) => {
+    const working = state.working[agent.label];
+    const mine = ((working && working.records) || [])
+      .filter((record) => record.author === "agent").length;
+    return {
+      working: mine,
+      long_term: state.records.filter((record) => record.author === "agent").length,
+    };
+  };
+
+  // Чат так, как его отдаёт сервер: с числом агентских записей поверх конфига.
+  const view = (agent) => ({ ...agent, records_by_agent: byAgent(agent) });
+
   // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
   // пустой — ровно как на сервере.
   const workingOf = (agent) => {
@@ -858,14 +879,14 @@ function buildServer(options) {
         has_key: true,
         live: state.agents.length,
         max_agents: 1000,
-        agents: state.agents.map((a) => ({ ...a, transcript: undefined })),
+        agents: state.agents.map((a) => ({ ...view(a), transcript: undefined })),
       });
     }
     if (path === "/api/agents" && method === "POST") {
       const id = nextId();
       const agent = blank(id, "Новый чат " + id.slice(3));
       state.agents.push(agent);
-      return json({ created: 1, agents: [agent] });
+      return json({ created: 1, agents: [view(agent)] });
     }
 
     // ── долговременная память: ручки глобальные, без agent_id ──
@@ -936,7 +957,7 @@ function buildServer(options) {
       child.usage_total = sumUsage(child.transcript);
       child.branch = { parent_id: agent.id, forked_at: at };
       state.agents.push(child);
-      return json({ created: 1, live: state.agents.length, agents: [child] });
+      return json({ created: 1, live: state.agents.length, agents: [view(child)] });
     }
     // Три слоя разом — тем же составом, что у сервера: счётчик сообщений,
     // записи и сводки этого чата без метрик, выключатель чата и общий список.
@@ -999,7 +1020,7 @@ function buildServer(options) {
       return json({ deleted: seq });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
-    if (!tail && method === "GET") return json(agent);
+    if (!tail && method === "GET") return json(view(agent));
     if (!tail && method === "DELETE") {
       state.agents.splice(state.agents.indexOf(agent), 1);
       return json({ killed: [agent.id] });
@@ -1009,7 +1030,7 @@ function buildServer(options) {
         return { ok: false, status: 400, json: async () => ({ detail: "model обязателен" }) };
       }
       Object.assign(agent, body);
-      return json(agent);
+      return json(view(agent));
     }
     return { ok: false, status: 405, json: async () => ({ detail: "не тот метод" }) };
   }

@@ -24,8 +24,14 @@ const state = {
   prompts: new Map(),  // промпты обменов этой вкладки (см. promptKey)
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
-  memorySeen: new Set(),   // ключи агентских записей, показанных на прошлом открытии вкладки
-  memoryFresh: new Set(),  // из них приехавшие после него — те, что помечены «новая»
+  // Что вкладка уже показывала: сколько агентских записей было в области
+  // слоя на её прошлом открытии (область → число) и какие именно. Число
+  // отвечает на вопрос «сколько нового», ключи — «какие именно», и берутся
+  // они из разных мест: число приезжает с самим чатом и потому известно
+  // и при закрытой вкладке, а ключи лежат в слоях, которые читаются лениво.
+  memorySeen: new Map(),
+  memorySeenKeys: new Set(),
+  memoryFresh: new Set(),  // приехавшие после прошлого открытия — те, что помечены «новая»
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -548,6 +554,10 @@ async function openAgent(agentId) {
   // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
   // заново, но только если вкладка открыта: закрытой они не нужны.
   state.memory = null;
+  // Значок новых записей — про **этот** чат, и число ему даёт сам чат, а не
+  // слои: закрытая вкладка его не гасит, а показывает, сколько агент завёл
+  // в открытом чате с тех пор, как ему показывали память. Своего вызова ему
+  // здесь не нужно: обе ветки ниже кончаются отрисовкой, а она его считает.
   if (memoryTabOpen()) loadMemory();
   else renderMemory();
 
@@ -1133,6 +1143,10 @@ async function refreshCurrent(prompt) {
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
     // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
+    // Этим же ответом приехало, сколько записей завёл агент: обмен зовёт
+    // ведение памяти, и значок обязан вырасти **не открывая вкладку** —
+    // ровно в этом смысл счётчика.
+    renderNewCount();
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
   } catch (e) { /* чат исчез — список обновится при следующем открытии */ }
@@ -1682,8 +1696,18 @@ async function loadMemory(opened = false) {
   // отметки: иначе открытие вкладки стёрло бы и пометки на тех записях,
   // ради которых счётчик и заводился.
   const keys = agentRecordKeys();
-  state.memoryFresh = new Set(keys.filter((key) => !state.memorySeen.has(key)));
-  if (opened) keys.forEach((key) => state.memorySeen.add(key));
+  state.memoryFresh = new Set(keys.filter((key) => !state.memorySeenKeys.has(key)));
+  if (opened) {
+    // Отметка «показано» — и числом, и ключами. Числа берутся из **слоёв**,
+    // а не из чата: на экране сейчас ровно они, и если чат отстал на запись,
+    // отметка по нему объявила бы новой уже показанную строку.
+    // Слои не доехали — отмечать нечего: человеку ничего не показали.
+    MEMORY_LAYERS.forEach(([layer, prefix]) => {
+      const shown = keys.filter((key) => key.startsWith(prefix)).length;
+      state.memorySeen.set(seenScope(layer, id), shown);
+    });
+    keys.forEach((key) => state.memorySeenKeys.add(key));
+  }
   renderMemory();
 }
 
@@ -1694,9 +1718,19 @@ async function loadMemory(opened = false) {
 // а значит и не поправит. Считаются только записи **агента**: свою человек
 // только что завёл руками и новостью она ему не является.
 //
-// Число живёт в памяти вкладки, как `state.prompts`, и довод тот же: это
+// Сколько их сейчас, говорит **сам чат** полем `records_by_agent` — тем же
+// запросом, которым клиент и так обновляет чат после каждого обмена. Поэтому
+// число растёт и при закрытой вкладке, а слои при этом по-прежнему читаются
+// лениво и только на её открытие. Считай мы число по слоям — при закрытой
+// вкладке за ними никто не ходит, и в том единственном сценарии, ради которого
+// счётчик заведён, его бы не было видно никогда.
+//
+// Сколько их было на прошлом открытии, помнит вкладка, и значок — разница.
+// Живёт эта разница в памяти вкладки, как `state.prompts`, и довод тот же: это
 // производная того, что и так лежит в базе, и переживать перезагрузку ей
-// незачем — ни таблицы, ни колонки под неё нет.
+// незачем — ни таблицы, ни колонки под неё нет. Ничего не показывали — вычитать
+// нечего, и новым считается всё: что агент записал до нашего прихода, человек
+// в этом сеансе не видел.
 //
 // Ключ записи — слой и номер. Номер один на слой и заново не выдаётся: у обеих
 // таблиц он AUTOINCREMENT, и запись соседнего чата чужого номера не получит.
@@ -1704,6 +1738,15 @@ async function loadMemory(opened = false) {
 // рабочей памяти считалась бы уже показанной за долговременную с тем же
 // номером.
 const RECORD_BY_AGENT = "agent";
+
+// Слои счётчика: имя в ответе чата и приставка ключа. Два, а не один,
+// потому что **области у них разные** — и отметка «показано» живёт по области:
+// рабочая память принадлежит чату, и показанное в нём соседа не касается;
+// долговременный слой один на всю базу, и показанное в любом чате показано
+// во всех. Отсюда `seenScope`.
+const MEMORY_LAYERS = [["working", "w:"], ["long_term", "l:"]];
+
+const seenScope = (layer, agentId) => (layer === "long_term" ? "база" : agentId);
 
 function agentRecordKeys() {
   const layers = state.memory;
@@ -1715,14 +1758,50 @@ function agentRecordKeys() {
       .forEach((record) => keys.push(prefix + record.seq));
   take(layers.working && layers.working.records, "w:");
   take(layers.long_term && layers.long_term.records, "l:");
+  // Порядок ключей роли не играет: их спрашивают по одному.
   return keys;
 }
 
-// Число на вкладке: агентские записи, которых не было на прошлом открытии.
-// Считается из уже прочитанных слоёв — на сервер за ним никто не ходит,
-// и ручка его не называет.
-const memoryNewCount = () =>
-  agentRecordKeys().filter((key) => !state.memorySeen.has(key)).length;
+// Число на вкладке: сколько агентских записей завелось с прошлого открытия.
+// Своего запроса у него нет ни одного — ни в отрисовке, ни рядом с ней:
+// нынешнее число приезжает с чатом, прошлое помнит вкладка.
+function memoryNewCount() {
+  const agent = state.current;
+  const written = agent ? agent.records_by_agent : null;
+  // У выгруженного чата чисел нет вовсе — `null` значит «неизвестно», а не
+  // ноль; показывать на догадке нечего.
+  if (!written) return 0;
+  // По слою: показанное вычитается в своей области, и только потом суммы
+  // складываются. Зажим по нулю на каждой — человек мог забрать агентскую
+  // запись себе правкой, и тогда нынешнее число меньше показанного;
+  // «минус одна новость» — не новость.
+  return MEMORY_LAYERS.reduce((sum, [layer]) => {
+    const seen = state.memorySeen.get(seenScope(layer, agent.id)) || 0;
+    return sum + Math.max(0, (written[layer] || 0) - seen);
+  }, 0);
+}
+
+// Человек забрал агентскую запись себе — правкой или удалением. Агентских
+// записей от этого стало меньше, и число у чата клиент поправляет сам:
+// переспрашивать чат ради единицы незачем, а до следующего его ответа значок
+// иначе показал бы новость, которой нет.
+//
+// Из **показанных** запись уходит только если она среди них была: новую,
+// поправленную тут же, вычитать оттуда нельзя — её там и не было, и значок
+// обязан погаснуть, а не уйти в минус.
+function agentRecordGone(record, key) {
+  if (!record || record.author !== RECORD_BY_AGENT) return;
+  const agent = state.current;
+  const written = agent && agent.records_by_agent;
+  if (!written) return;
+  const [layer] = MEMORY_LAYERS.find(([, prefix]) => key.startsWith(prefix));
+  written[layer] = Math.max(0, (written[layer] || 0) - 1);
+  if (!state.memorySeenKeys.has(key)) return;
+  state.memorySeenKeys.delete(key);
+  const scope = seenScope(layer, agent.id);
+  const seen = state.memorySeen.get(scope);
+  if (seen) state.memorySeen.set(scope, seen - 1);
+}
 
 function renderNewCount() {
   const badge = $("#mem-new");
@@ -1848,7 +1927,7 @@ function renderWorking(box) {
       // служебный вызов её не трогает.
       iconButton("pencil", "Поправить запись",
         () => startRecordEdit(row, record, (text) => editWorking(record, text)), "mini"),
-      iconButton("trash", "Удалить запись", () => dropWorking(record.seq), "mini danger")
+      iconButton("trash", "Удалить запись", () => dropWorking(record), "mini danger")
     );
     box.appendChild(row);
   });
@@ -1895,7 +1974,7 @@ function renderLongTerm(box) {
       ...memMarks(record, "l:" + record.seq),
       iconButton("pencil", "Поправить запись",
         () => startRecordEdit(row, record, (text) => editMemory(record, text)), "mini"),
-      iconButton("trash", "Забыть запись", () => forget(record.seq), "mini danger")
+      iconButton("trash", "Забыть запись", () => forget(record), "mini danger")
     );
     box.appendChild(row);
   });
@@ -1954,6 +2033,7 @@ async function addWorking(kind, content) {
 async function editWorking(record, content) {
   try {
     const updated = await api(workingUrl(record.seq), json("PATCH", { content }));
+    agentRecordGone(record, "w:" + record.seq);
     const working = state.memory && state.memory.working;
     if (working) {
       working.records = (working.records || [])
@@ -1965,16 +2045,17 @@ async function editWorking(record, content) {
   }
 }
 
-async function dropWorking(seq) {
+async function dropWorking(record) {
   try {
-    await api(workingUrl(seq), { method: "DELETE" });
+    await api(workingUrl(record.seq), { method: "DELETE" });
   } catch (err) {
     workingStatus(String(err.message || err), true);
     return;
   }
+  agentRecordGone(record, "w:" + record.seq);
   const working = state.memory && state.memory.working;
   if (working) {
-    working.records = (working.records || []).filter((record) => record.seq !== seq);
+    working.records = (working.records || []).filter((item) => item.seq !== record.seq);
   }
   renderMemory();
   workingStatus("Запись убрана.");
@@ -1985,6 +2066,7 @@ async function dropWorking(seq) {
 async function editMemory(record, content) {
   try {
     const updated = await api("/api/memory/" + record.seq, json("PATCH", { content }));
+    agentRecordGone(record, "l:" + record.seq);
     const long = state.memory && state.memory.long_term;
     if (long) {
       long.records = (long.records || [])
@@ -2022,15 +2104,16 @@ async function remember(kind, content) {
   }
 }
 
-async function forget(seq) {
+async function forget(record) {
   try {
-    await api("/api/memory/" + seq, { method: "DELETE" });
+    await api("/api/memory/" + record.seq, { method: "DELETE" });
   } catch (err) {
     memoryStatus(String(err.message || err), true);
     return;
   }
+  agentRecordGone(record, "l:" + record.seq);
   const long = state.memory && state.memory.long_term;
-  if (long) long.records = (long.records || []).filter((record) => record.seq !== seq);
+  if (long) long.records = (long.records || []).filter((item) => item.seq !== record.seq);
   renderMemory();
   memoryStatus("Запись забыта.");
 }
