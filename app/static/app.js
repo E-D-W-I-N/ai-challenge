@@ -24,6 +24,14 @@ const state = {
   prompts: new Map(),  // промпты обменов этой вкладки (см. promptKey)
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
+  // Что вкладка уже показывала: сколько агентских записей было в области
+  // слоя на её прошлом открытии (область → число) и какие именно. Число
+  // отвечает на вопрос «сколько нового», ключи — «какие именно», и берутся
+  // они из разных мест: число приезжает с самим чатом и потому известно
+  // и при закрытой вкладке, а ключи лежат в слоях, которые читаются лениво.
+  memorySeen: new Map(),
+  memorySeenKeys: new Set(),
+  memoryFresh: new Set(),  // приехавшие после прошлого открытия — те, что помечены «новая»
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -546,6 +554,10 @@ async function openAgent(agentId) {
   // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
   // заново, но только если вкладка открыта: закрытой они не нужны.
   state.memory = null;
+  // Значок новых записей — про **этот** чат, и число ему даёт сам чат, а не
+  // слои: закрытая вкладка его не гасит, а показывает, сколько агент завёл
+  // в открытом чате с тех пор, как ему показывали память. Своего вызова ему
+  // здесь не нужно: обе ветки ниже кончаются отрисовкой, а она его считает.
   if (memoryTabOpen()) loadMemory();
   else renderMemory();
 
@@ -1131,6 +1143,10 @@ async function refreshCurrent(prompt) {
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
     // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
+    // Этим же ответом приехало, сколько записей завёл агент: обмен зовёт
+    // ведение памяти, и значок обязан вырасти **не открывая вкладку** —
+    // ровно в этом смысл счётчика.
+    renderNewCount();
     // Панель намеренно не перерисовываем: пользователь мог печатать в ней
     // прямо сейчас, и затирать его текст ответом сервера нельзя.
   } catch (e) { /* чат исчез — список обновится при следующем открытии */ }
@@ -1604,12 +1620,64 @@ const workingKindLabel = (kind) =>
 // что показано.
 const workingLine = (record) => workingKindLabel(record.kind) + ": " + record.content;
 
+// Кто завёл запись — **словами**, а не цветом: цвет не читают ни люди
+// с нарушением цветовосприятия, ни экранный диктор. Пометка не украшение:
+// свою запись служебный вызов больше не тронет, и человеку полезно видеть,
+// какая строка уже его, а какую агент перепишет на следующем обмене.
+const AUTHOR_LABELS = { agent: "записал агент", human: "записали вы" };
+
+const authorLabel = (author) => AUTHOR_LABELS[author] || author;
+
+// Пометки записи: кто её завёл и — если она приехала после прошлого открытия
+// вкладки — слово «новая». Число на вкладке говорит «сколько», эти пометки —
+// «какие именно»: без них открытие вкладки гасило бы счётчик, не сказав,
+// на что смотреть.
+function memMarks(record, key) {
+  const marks = [el("span", "mem-who", authorLabel(record.author))];
+  if (state.memoryFresh.has(key)) marks.push(el("span", "mem-fresh", "новая"));
+  return marks;
+}
+
+// Правка записи прямо в списке: Enter сохраняет, Escape отменяет, потеря
+// фокуса — тоже сохраняет. Идиом тот же, что у переименования чата слева:
+// второй способ правки на той же странице читался бы как другое действие.
+function startRecordEdit(row, record, commit) {
+  const shown = row.querySelector(".mem-text");
+  const input = el("input", "mem-edit");
+  input.value = record.content;
+  row.replaceChild(input, shown);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = async (save) => {
+    if (settled) return;
+    settled = true;
+    const text = (input.value || "").trim();
+    // Пустой текст — не правка, а потеря записи: удаление здесь рядом,
+    // и делать его вслепую очисткой поля нельзя.
+    if (save && text && text !== record.content) await commit(text);
+    renderMemory();
+  };
+
+  input.onkeydown = (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(false); }
+  };
+  input.onblur = () => finish(true);
+}
+
 function memoryTabOpen() {
   return !$("#tab-memory").classList.contains("hidden");
 }
 
 // Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
-async function loadMemory() {
+//
+// `opened` значит «это человек открыл вкладку», и тогда прочитанное считается
+// показанным: счётчик новых записей обнуляется, а пометки «новая» остаются
+// на тех, что приехали с прошлого открытия. Обмен и смена чата читают слои
+// без отметки — иначе счётчик гас бы в ту же секунду, в которую появился.
+async function loadMemory(opened = false) {
   const id = state.current && state.current.id;
   state.memoryNote = "Читаю память…";
   renderMemory();
@@ -1624,7 +1692,123 @@ async function loadMemory() {
     state.memory = null;
     state.memoryNote = String(err.message || err);
   }
+  // Что из приехавшего агент завёл после прошлого открытия — считается **до**
+  // отметки: иначе открытие вкладки стёрло бы и пометки на тех записях,
+  // ради которых счётчик и заводился.
+  const keys = agentRecordKeys();
+  state.memoryFresh = new Set(keys.filter((key) => !state.memorySeenKeys.has(key)));
+  if (opened) {
+    // Отметка «показано» — и числом, и ключами. Числа берутся из **слоёв**,
+    // а не из чата: на экране сейчас ровно они, и если чат отстал на запись,
+    // отметка по нему объявила бы новой уже показанную строку.
+    // Слои не доехали — отмечать нечего: человеку ничего не показали.
+    MEMORY_LAYERS.forEach(([layer, prefix]) => {
+      const shown = keys.filter((key) => key.startsWith(prefix)).length;
+      state.memorySeen.set(seenScope(layer, id), shown);
+    });
+    keys.forEach((key) => state.memorySeenKeys.add(key));
+  }
   renderMemory();
+}
+
+// ── счётчик новых записей агента ──
+//
+// Агент ведёт оба слоя памяти сам и молча: вкладку человек открывает редко,
+// и без числа на ней он не узнает, что с прошлого раза что-то приехало, —
+// а значит и не поправит. Считаются только записи **агента**: свою человек
+// только что завёл руками и новостью она ему не является.
+//
+// Сколько их сейчас, говорит **сам чат** полем `records_by_agent` — тем же
+// запросом, которым клиент и так обновляет чат после каждого обмена. Поэтому
+// число растёт и при закрытой вкладке, а слои при этом по-прежнему читаются
+// лениво и только на её открытие. Считай мы число по слоям — при закрытой
+// вкладке за ними никто не ходит, и в том единственном сценарии, ради которого
+// счётчик заведён, его бы не было видно никогда.
+//
+// Сколько их было на прошлом открытии, помнит вкладка, и значок — разница.
+// Живёт эта разница в памяти вкладки, как `state.prompts`, и довод тот же: это
+// производная того, что и так лежит в базе, и переживать перезагрузку ей
+// незачем — ни таблицы, ни колонки под неё нет. Ничего не показывали — вычитать
+// нечего, и новым считается всё: что агент записал до нашего прихода, человек
+// в этом сеансе не видел.
+//
+// Ключ записи — слой и номер. Номер один на слой и заново не выдаётся: у обеих
+// таблиц он AUTOINCREMENT, и запись соседнего чата чужого номера не получит.
+// А вот слой в ключе обязателен: номера у слоёв свои, и без него запись
+// рабочей памяти считалась бы уже показанной за долговременную с тем же
+// номером.
+const RECORD_BY_AGENT = "agent";
+
+// Слои счётчика: имя в ответе чата и приставка ключа. Два, а не один,
+// потому что **области у них разные** — и отметка «показано» живёт по области:
+// рабочая память принадлежит чату, и показанное в нём соседа не касается;
+// долговременный слой один на всю базу, и показанное в любом чате показано
+// во всех. Отсюда `seenScope`.
+const MEMORY_LAYERS = [["working", "w:"], ["long_term", "l:"]];
+
+const seenScope = (layer, agentId) => (layer === "long_term" ? "база" : agentId);
+
+function agentRecordKeys() {
+  const layers = state.memory;
+  if (!layers) return [];
+  const keys = [];
+  const take = (records, prefix) =>
+    (records || [])
+      .filter((record) => record.author === RECORD_BY_AGENT)
+      .forEach((record) => keys.push(prefix + record.seq));
+  take(layers.working && layers.working.records, "w:");
+  take(layers.long_term && layers.long_term.records, "l:");
+  // Порядок ключей роли не играет: их спрашивают по одному.
+  return keys;
+}
+
+// Число на вкладке: сколько агентских записей завелось с прошлого открытия.
+// Своего запроса у него нет ни одного — ни в отрисовке, ни рядом с ней:
+// нынешнее число приезжает с чатом, прошлое помнит вкладка.
+function memoryNewCount() {
+  const agent = state.current;
+  const written = agent ? agent.records_by_agent : null;
+  // У выгруженного чата чисел нет вовсе — `null` значит «неизвестно», а не
+  // ноль; показывать на догадке нечего.
+  if (!written) return 0;
+  // По слою: показанное вычитается в своей области, и только потом суммы
+  // складываются. Зажим по нулю на каждой — человек мог забрать агентскую
+  // запись себе правкой, и тогда нынешнее число меньше показанного;
+  // «минус одна новость» — не новость.
+  return MEMORY_LAYERS.reduce((sum, [layer]) => {
+    const seen = state.memorySeen.get(seenScope(layer, agent.id)) || 0;
+    return sum + Math.max(0, (written[layer] || 0) - seen);
+  }, 0);
+}
+
+// Человек забрал агентскую запись себе — правкой или удалением. Агентских
+// записей от этого стало меньше, и число у чата клиент поправляет сам:
+// переспрашивать чат ради единицы незачем, а до следующего его ответа значок
+// иначе показал бы новость, которой нет.
+//
+// Из **показанных** запись уходит только если она среди них была: новую,
+// поправленную тут же, вычитать оттуда нельзя — её там и не было, и значок
+// обязан погаснуть, а не уйти в минус.
+function agentRecordGone(record, key) {
+  if (!record || record.author !== RECORD_BY_AGENT) return;
+  const agent = state.current;
+  const written = agent && agent.records_by_agent;
+  if (!written) return;
+  const [layer] = MEMORY_LAYERS.find(([, prefix]) => key.startsWith(prefix));
+  written[layer] = Math.max(0, (written[layer] || 0) - 1);
+  if (!state.memorySeenKeys.has(key)) return;
+  state.memorySeenKeys.delete(key);
+  const scope = seenScope(layer, agent.id);
+  const seen = state.memorySeen.get(scope);
+  if (seen) state.memorySeen.set(scope, seen - 1);
+}
+
+function renderNewCount() {
+  const badge = $("#mem-new");
+  const count = memoryNewCount();
+  badge.textContent = count ? String(count) : "";
+  badge.classList.toggle("hidden", count === 0);
+  badge.title = count ? "Агент завёл записей с прошлого открытия: " + count : "";
 }
 
 // Сколько первых реплик не уедет в модель дословно при нынешней стратегии —
@@ -1684,6 +1868,9 @@ function renderMemory() {
   renderShortTerm($("#mem-short"));
   renderWorking($("#mem-working"));
   renderLongTerm($("#mem-long"));
+  // Счётчик — производная тех же прочитанных слоёв: на сервер за ним
+  // не ходят ни здесь, ни где-либо ещё.
+  renderNewCount();
 }
 
 function renderShortTerm(box) {
@@ -1704,6 +1891,10 @@ function renderShortTerm(box) {
 function renderWorking(box) {
   box.innerHTML = "";
   const working = state.memory && state.memory.working;
+  // Форма прячется вместе со слоем: область рабочей памяти — разговор,
+  // и пока слоя нет на экране — чат не открыт или ручка ответила отказом, —
+  // записывать некуда.
+  $("#mem-work-form").classList.toggle("hidden", !working);
   if (!working) { box.appendChild(memBlank()); return; }
 
   const records = working.records || [];
@@ -1712,7 +1903,7 @@ function renderWorking(box) {
     const off = state.memory.long_term && state.memory.long_term.enabled === false;
     box.appendChild(memNote(off
       ? "Память этого чата выключена: агент здесь ничего не выписывает."
-      : "Записей ещё нет: агент выписывает их сам, на каждом обмене."));
+      : "Записей ещё нет: агент выписывает их сам, на каждом обмене, — или запишите сами."));
   }
   records.forEach((record) => {
     const line = workingLine(record);
@@ -1725,7 +1916,19 @@ function renderWorking(box) {
     btn.type = "button";
     btn.title = "Запомнить надолго";
     btn.onclick = () => remember("knowledge", line);
-    row.append(el("div", "mem-text", line), btn);
+    row.append(
+      el("div", "mem-text", line),
+      ...memMarks(record, "w:" + record.seq),
+      btn,
+      // Правка и удаление — у **каждой** записи, включая агентскую: ошибку
+      // служебного вызова иначе нечем было бы исправить, а список рос бы
+      // строками, которые никто не вправе убрать. Обратное направление
+      // закрыто на сервере: правка метит запись человеком, и с этой минуты
+      // служебный вызов её не трогает.
+      iconButton("pencil", "Поправить запись",
+        () => startRecordEdit(row, record, (text) => editWorking(record, text)), "mini"),
+      iconButton("trash", "Удалить запись", () => dropWorking(record), "mini danger")
+    );
     box.appendChild(row);
   });
 
@@ -1765,7 +1968,13 @@ function renderLongTerm(box) {
     row.append(
       el("div", "mem-kind", memoryKindLabel(record.kind)),
       el("div", "mem-text", record.content),
-      iconButton("trash", "Забыть запись", () => forget(record.seq), "mini danger")
+      // Автор виден и здесь, и здесь он важнее всего: ошибка этого слоя
+      // уезжает во все будущие разговоры, и «кто это записал» — первое,
+      // что о ней надо знать.
+      ...memMarks(record, "l:" + record.seq),
+      iconButton("pencil", "Поправить запись",
+        () => startRecordEdit(row, record, (text) => editMemory(record, text)), "mini"),
+      iconButton("trash", "Забыть запись", () => forget(record), "mini danger")
     );
     box.appendChild(row);
   });
@@ -1775,6 +1984,98 @@ function memoryStatus(text, isError) {
   const box = $("#mem-status");
   box.className = "hint" + (isError ? " error" : "");
   box.textContent = text || "";
+}
+
+function workingStatus(text, isError) {
+  const box = $("#mem-work-status");
+  box.className = "hint" + (isError ? " error" : "");
+  box.textContent = text || "";
+}
+
+// ── рабочая память правится руками ──
+//
+// Тем же набором, каким правится долговременная, и по тем же правилам: род
+// обязателен и без умолчания, список пополняется **ответом ручки** (номер
+// выдаёт база, текст по дороге чистит `redact()`), перечитывать слой для
+// этого незачем. Второй способ на той же странице читался бы как другое
+// действие, и слои разъехались бы на первой правке.
+const workingUrl = (seq) => {
+  const id = state.current && state.current.id;
+  return "/api/agents/" + id + "/working" + (seq === undefined ? "" : "/" + seq);
+};
+
+async function addWorking(kind, content) {
+  const text = (content || "").trim();
+  if (!text) {
+    workingStatus("Текст записи пуст: записывать нечего.", true);
+    return false;
+  }
+  if (!(state.current && state.current.id)) {
+    workingStatus("Чат ещё не открыт: рабочая память живёт в разговоре.", true);
+    return false;
+  }
+  try {
+    const record = await api(workingUrl(), json("POST", { kind, content: text }));
+    const working = state.memory && state.memory.working;
+    if (working) working.records = [...(working.records || []), record];
+    renderMemory();
+    workingStatus("Записано: " + workingKindLabel(record.kind) + ".");
+    return true;
+  } catch (err) {
+    workingStatus(String(err.message || err), true);
+    return false;
+  }
+}
+
+// Правка метит запись человеком — это делает сервер, и ответ приходит уже
+// с новым автором. Подставь клиент своё «human» — экран говорил бы о записи
+// то, чего в базе нет.
+async function editWorking(record, content) {
+  try {
+    const updated = await api(workingUrl(record.seq), json("PATCH", { content }));
+    agentRecordGone(record, "w:" + record.seq);
+    const working = state.memory && state.memory.working;
+    if (working) {
+      working.records = (working.records || [])
+        .map((item) => (item.seq === updated.seq ? updated : item));
+    }
+    workingStatus("Запись поправлена: с этой минуты она ваша.");
+  } catch (err) {
+    workingStatus(String(err.message || err), true);
+  }
+}
+
+async function dropWorking(record) {
+  try {
+    await api(workingUrl(record.seq), { method: "DELETE" });
+  } catch (err) {
+    workingStatus(String(err.message || err), true);
+    return;
+  }
+  agentRecordGone(record, "w:" + record.seq);
+  const working = state.memory && state.memory.working;
+  if (working) {
+    working.records = (working.records || []).filter((item) => item.seq !== record.seq);
+  }
+  renderMemory();
+  workingStatus("Запись убрана.");
+}
+
+// Правка долговременной записи — тот же путь и тот же ответ: с этой минуты
+// запись человека, и служебный вызов её не перепишет.
+async function editMemory(record, content) {
+  try {
+    const updated = await api("/api/memory/" + record.seq, json("PATCH", { content }));
+    agentRecordGone(record, "l:" + record.seq);
+    const long = state.memory && state.memory.long_term;
+    if (long) {
+      long.records = (long.records || [])
+        .map((item) => (item.seq === updated.seq ? updated : item));
+    }
+    memoryStatus("Запись поправлена: с этой минуты она ваша.");
+  } catch (err) {
+    memoryStatus(String(err.message || err), true);
+  }
 }
 
 // Новая запись долговременной памяти. Список пополняется **записанным
@@ -1803,15 +2104,16 @@ async function remember(kind, content) {
   }
 }
 
-async function forget(seq) {
+async function forget(record) {
   try {
-    await api("/api/memory/" + seq, { method: "DELETE" });
+    await api("/api/memory/" + record.seq, { method: "DELETE" });
   } catch (err) {
     memoryStatus(String(err.message || err), true);
     return;
   }
+  agentRecordGone(record, "l:" + record.seq);
   const long = state.memory && state.memory.long_term;
-  if (long) long.records = (long.records || []).filter((record) => record.seq !== seq);
+  if (long) long.records = (long.records || []).filter((item) => item.seq !== record.seq);
   renderMemory();
   memoryStatus("Запись забыта.");
 }
@@ -1832,6 +2134,20 @@ async function addFromForm() {
   if (saved) field.value = "";
 }
 
+// Та же форма для рабочего слоя: род обязателен и здесь, и умолчания
+// у него нет — слои устроены одинаково, и второе правило на втором слое
+// разошлось бы с первым молча.
+async function addWorkingFromForm() {
+  const kind = $("#mem-work-kind").value;
+  if (!kind) {
+    workingStatus("Род записи не выбран: цель, ограничение, решение или открытый вопрос.", true);
+    return;
+  }
+  const field = $("#mem-work-content");
+  const saved = await addWorking(kind, field.value);
+  if (saved) field.value = "";
+}
+
 // Опции дропдауна — из той же карты, что и подписи в списке.
 //
 // Первым пунктом — пустой: **умолчания у рода нет и в форме**, ровно как
@@ -1840,13 +2156,14 @@ async function addFromForm() {
 // его, запишет «профиль», ничего не выбрав: сервер за него не выбирает, а
 // форма выбрала бы. День про явный выбор, и выбор обязан быть нажатием
 // человека в обоих местах.
-function fillKinds() {
-  const select = $("#mem-kind");
+// Список родов — параметром: формы две, а правило одно, и вторая копия
+// правила разошлась бы с первой на первой же правке.
+function fillKinds(select, kinds) {
   select.innerHTML = "";
   const blank = el("option", "", "— выберите род —");
   blank.value = "";
   select.appendChild(blank);
-  MEMORY_KINDS.forEach(([token, label]) => {
+  kinds.forEach(([token, label]) => {
     const option = el("option", "", label);
     option.value = token;
     select.appendChild(option);
@@ -2095,7 +2412,10 @@ function init() {
       PANEL_TABS.forEach((name) => $("#tab-" + name).classList.toggle("hidden", name !== which));
       // Память запрашивается здесь и только здесь: лениво, на открытие
       // вкладки. Отрисовка своего запроса не делает — см. `loadMemory`.
-      if (which === "memory") loadMemory();
+      // Открытие вкладки — ещё и отметка «показано»: счётчик новых записей
+      // с этой минуты считает заново. Обмен и смена чата читают слои без
+      // отметки, иначе считать было бы нечего.
+      if (which === "memory") loadMemory(true);
     };
   });
 
@@ -2113,8 +2433,10 @@ function init() {
   });
   $("#composer").addEventListener("submit", (ev) => { ev.preventDefault(); send(); });
 
-  fillKinds();
+  fillKinds($("#mem-kind"), MEMORY_KINDS);
+  fillKinds($("#mem-work-kind"), WORKING_KINDS);
   $("#mem-add").onclick = () => addFromForm();
+  $("#mem-work-add").onclick = () => addWorkingFromForm();
 
   setBusy(false);
   renderTiles();

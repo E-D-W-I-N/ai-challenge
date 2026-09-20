@@ -999,6 +999,20 @@ class Store:
             ).fetchall()
         return [_memory_row(row) for row in rows]
 
+    def count_memory_by(self, author: str) -> int:
+        """Сколько записей долговременной памяти сделал этот автор.
+
+        Число, а не список: спрашивают его на каждый просмотр чата, чтобы
+        сказать «сколько нового завёл агент», и вычитывать ради одного числа
+        весь слой незачем. Второго источника самих записей здесь тоже нет
+        нарочно — список отдаёт `list_memory`, и разойтись им не на чем.
+        """
+        with self.reading() as conn:
+            row = conn.execute(
+                "SELECT count(*) AS n FROM memory WHERE author = ?", (author,)
+            ).fetchone()
+        return int(row["n"])
+
     def delete_memory(self, seq: int) -> bool:
         """Стирает одну запись памяти. False — записи с таким номером не было.
 
