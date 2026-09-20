@@ -1147,7 +1147,7 @@ async function routeChecks() {
   // считай он слоты сам — подписал бы памятью факты ровно тогда, когда
   // врезок больше одной.
   {
-    const MEMORY = "[долговременная память]\nпрофиль: пишу на Kotlin\n[конец долговременной памяти]";
+    const MEMORY = "[долговременная память]\nо собеседнике: пишу на Kotlin\n[конец долговременной памяти]";
     const FACTS = "[факты о разговоре]\nцель: собрать ТЗ\n[конец фактов о разговоре]";
     const SUM = "[пересказ начала разговора, свёрнуто сообщений: 2]\nбыло то-то";
     const { client, server, $, settle, Evt } = freshClient({
@@ -1445,7 +1445,7 @@ async function routeChecks() {
   // сих пор факты и сводки можно было разглядеть только в просмотре промпта,
   // а долговременной памяти не было вовсе. Проверяется весь круг: вкладка
   // открылась, в каждом разделе своё, факт продвинут в долговременный слой
-  // нажатием, запись заведена формой с явно выбранным родом и удалена по
+  // нажатием, запись заведена формой с явно выбранным типом и удалена по
   // номеру — и всё это на один поход за слоями, а не на каждую отрисовку.
   //
   // Чатов в посеве четыре, по одной на каждую ветвь формулы «уезжает
@@ -1553,77 +1553,103 @@ async function routeChecks() {
     check("и сказано, куда делось начало: отброшено окном, и ровно по прочитанному",
       /Остальные 2 — отброшено окном\./.test(shown("#mem-short")), shown("#mem-short"));
 
-    // Рабочая: записи строками «вид: содержимое» — в той же форме, в какой
+    // Рабочая: записи строками «тип: содержимое» — в той же форме, в какой
     // они уезжают в промпт, и сводка со своей границей. Запись человека
     // показана наравне с агентской: слой один, и врезка не различает, кто
     // его наполнил.
-    check("записи рабочего слоя показаны строками «вид: содержимое»",
+    check("записи рабочего слоя показаны строками «тип: содержимое»",
       texts("#mem-working").slice(0, 2).join(" | ") === "цель: собрать ТЗ | ограничение: только Kotlin",
       JSON.stringify(texts("#mem-working")));
     check("и сводка этого чата видна там же, со своей границей",
       texts("#mem-working").includes("говорили про ТЗ и сроки") &&
         /вместо первых 4 сообщений/.test(shown("#mem-working")), shown("#mem-working"));
 
-    // Долговременная: общий список с подписью рода по-русски — и строка
+    // Долговременная: общий список с подписью типа по-русски — и строка
     // о том, что с этими записями будет в промпте **этого** чата.
-    check("в долговременной — запись с подписью рода",
+    check("в долговременной — запись с подписью типа",
       texts("#mem-long").join(" | ") === "пишу на Kotlin" &&
-        $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|") === "профиль",
+        $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|") === "о собеседнике",
       shown("#mem-long"));
     check("и сказано, что у этого чата записи в промпт едут",
       /Записи едут врезкой в промпт этого чата при любой обрезке\./.test(shown("#mem-long")),
       shown("#mem-long"));
 
-    // ── «Запомнить надолго»: факт переезжает в долговременный слой ──
+    // ── форма: тип не предвыбран с самой первой отрисовки ──
+    //
+    // Умолчания у типа нет ни на сервере, ни в форме: список открывается
+    // на пустом пункте. Предвыбери форма первый настоящий тип — «явно
+    // выбирал» из задания стало бы «форма выбрала за него», ровно то, чего
+    // `_kind_field` не даёт сделать серверу.
+    check("до выбора тип не подставлен: список стоит на пустом пункте",
+      $("#mem-kind").value === "", JSON.stringify($("#mem-kind").value));
+
+    // ── «Запомнить надолго»: запись переезжает в долговременный слой,
+    //    и тип у неё спрашивают ──
+    //
+    // Это единственное место, где запись меняет слой, и до сих пор
+    // единственное, где тип выбирал код: в кнопке стояло `knowledge`. Против
+    // собственного правила — и наугад: переносимой записи «о собеседнике»
+    // подходит ничуть не реже. Теперь кнопка кладёт строку в ту же форму,
+    // которой слой пополняют руками, и ждёт выбора.
     const promote = $("#mem-working").querySelectorAll(".mem-btn")
       .find((b) => b.title === "Запомнить надолго");
-    if (!promote) check("у факта есть кнопка «Запомнить надолго»", false, "кнопки нет");
+    if (!promote) check("у записи есть кнопка «Запомнить надолго»", false, "кнопки нет");
     else {
       promote.dispatchEvent(new Evt("click"));
       await settle(40);
-      check("«Запомнить надолго» шлёт добавление с родом «знание»",
+      check("«Запомнить надолго» сама ничего не записывает: тип ещё не выбран",
+        posts().length === 0, JSON.stringify(posts().map((r) => r.body)));
+      check("а кладёт запись в форму слоя, в той же форме «тип: содержимое», и без типа",
+        $("#mem-content").value === "цель: собрать ТЗ" && $("#mem-kind").value === "",
+        JSON.stringify([$("#mem-content").value, $("#mem-kind").value]));
+      check("и сказано, чего ждут: при переносе тип выбирает человек",
+        /при переносе тип выбирает человек/.test($("#mem-status").textContent),
+        $("#mem-status").textContent);
+
+      // Правила у переноса те же, что у добавления руками: форма одна.
+      $("#mem-add").dispatchEvent(new Evt("click"));
+      await settle(40);
+      check("без выбранного типа перенос не уходит вовсе",
+        posts().length === 0, JSON.stringify(posts().map((r) => r.body)));
+      check("и форма говорит, чего не хватает",
+        /Тип записи не выбран/.test($("#mem-status").textContent), $("#mem-status").textContent);
+
+      $("#mem-kind").value = "knowledge";
+      $("#mem-kind").dispatchEvent(new Evt("change"));
+      $("#mem-add").dispatchEvent(new Evt("click"));
+      await settle(40);
+      check("с выбранным типом перенос уходит добавлением — и типом человека",
         posts().length === 1 && posts()[0].path === "/api/memory" && posts()[0].body.kind === "knowledge",
         JSON.stringify(posts().map((r) => r.body)));
-      check("и текстом самой записи, в той же форме «вид: содержимое»",
+      check("и текстом самой записи, в той же форме «тип: содержимое»",
         posts().length === 1 && posts()[0].body.content === "цель: собрать ТЗ",
         JSON.stringify(posts().map((r) => r.body && r.body.content)));
       check("запись появилась в долговременном списке тут же",
         texts("#mem-long").join(" | ") === "пишу на Kotlin | цель: собрать ТЗ", shown("#mem-long"));
-      check("и рядом с ней подпись рода — «знание»",
+      check("и рядом с ней подпись типа — «факт», тот, что выбрали",
         $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|") ===
-          "профиль|знание",
+          "о собеседнике|факт",
         $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent).join("|"));
+      check("поле формы после переноса пусто — второй клик не заведёт ту же запись молча",
+        $("#mem-content").value === "", $("#mem-content").value);
     }
 
-    // ── форма: род выбирает человек, и до выбора не уходит ничего ──
+    // ── форма: тип выбран, текста нет ──
     //
-    // Умолчания у рода нет ни на сервере, ни в форме: список открывается
-    // на пустом пункте. Предвыбери форма первый настоящий род — «явно
-    // выбирал» из задания стало бы «форма выбрала за него», ровно то, чего
-    // `_kind_field` не даёт сделать серверу.
-    const beforeForm = posts().length;
-    check("до выбора род не подставлен: список стоит на пустом пункте",
-      $("#mem-kind").value === "", JSON.stringify($("#mem-kind").value));
-    $("#mem-add").dispatchEvent(new Evt("click"));
-    await settle(40);
-    check("без выбранного рода добавление не уходит вовсе",
-      posts().length === beforeForm, JSON.stringify(posts().slice(beforeForm).map((r) => r.body)));
-    check("и форма говорит, чего не хватает",
-      /Род записи не выбран/.test($("#mem-status").textContent), $("#mem-status").textContent);
-
-    // Род выбран, текста нет: пустая запись уехала бы в промпт строкой
-    // «решение: » и заняла бы место врезки, ничего не сказав.
-    // Выбор рода — не правка конфига чата. Пролив панели слушает `change`
+    // Пустая запись уехала бы в промпт строкой «решение: » и заняла бы место
+    // врезки, ничего не сказав.
+    // Выбор типа — не правка конфига чата. Пролив панели слушает `change`
     // на всей панели разом, и поле памяти, попавшее в его сито, уезжало бы
     // PATCH'ем ни о чём. Слепок снимается **до** выбора: обмен выше свой
     // PATCH уже сделал, и считается прирост, а не общее число.
+    const beforeForm = posts().length;
     const patchesBeforeKind = patches().length;
     $("#mem-kind").value = "decision";
     $("#mem-kind").dispatchEvent(new Evt("change"));
     await settle(40);
     $("#mem-add").dispatchEvent(new Evt("click"));
     await settle(40);
-    check("с пустым текстом добавление тоже не уходит",
+    check("с пустым текстом добавление не уходит",
       posts().length === beforeForm, JSON.stringify(posts().slice(beforeForm).map((r) => r.body)));
     check("и причина названа: записывать нечего",
       /Текст записи пуст/.test($("#mem-status").textContent), $("#mem-status").textContent);
@@ -1632,7 +1658,7 @@ async function routeChecks() {
     $("#mem-add").dispatchEvent(new Evt("click"));
     await settle(40);
     const added = posts().slice(-1)[0];
-    check("форма шлёт тот род, что выбран в списке",
+    check("форма шлёт тот тип, что выбран в списке",
       Boolean(added) && added.body.kind === "decision" && added.body.content === "оплата только картой",
       JSON.stringify(added && added.body));
     check("и запись встала в список третьей",
@@ -1640,7 +1666,7 @@ async function routeChecks() {
       shown("#mem-long"));
     check("поле ввода после успеха пусто — второй клик не заведёт ту же запись молча",
       $("#mem-content").value === "", $("#mem-content").value);
-    check("выбор рода записи конфиг чата не трогает: PATCH'ей не прибавилось",
+    check("выбор типа записи конфиг чата не трогает: PATCH'ей не прибавилось",
       patches().length === patchesBeforeKind,
       JSON.stringify(patches().slice(patchesBeforeKind).map((r) => r.body)));
 
@@ -1765,7 +1791,7 @@ async function routeChecks() {
   // видел записи агента и не мог ни поправить их, ни удалить, ни добавить
   // свою — ручки были, кнопок не было. Здесь проверяется весь круг: автор
   // виден словами, правка и удаление уходят с номером **этой** записи, форма
-  // без выбранного рода не шлёт ничего, а число новых записей агента стоит
+  // без выбранного типа не шлёт ничего, а число новых записей агента стоит
   // на самой вкладке и обнуляется её открытием.
   //
   // Записи агента приезжают не посевом, а обменом: ведение памяти зовётся
@@ -1910,22 +1936,61 @@ async function routeChecks() {
       });
       check("Enter и уход фокуса за ним — одна правка, а не две",
         patchCount() === beforeTwice + 1, patchCount() + " против " + (beforeTwice + 1));
+
+      // ── тип записи правится тем же движением, что и текст ──
+      //
+      // Агент кладёт запись не того типа не реже, чем не с той формулировкой,
+      // и до сих пор второе чинилось правкой, а первое — только удалением
+      // с заведением заново. Ручка оба поля принимала с самого начала: дыра
+      // была ровно посередине «явного выбора», ради которого день и делался.
+      const beforeKind = patchCount();
+      rows()[0].querySelectorAll(".mini").find((b) => b.title === "Поправить запись")
+        .dispatchEvent(new Evt("click"));
+      await settle(20);
+      const kindBox = $("#mem-working").querySelector(".mem-edit-kind");
+      if (!kindBox) check("правка открывает и список типов, а не одно поле текста", false, "списка нет");
+      else {
+        check("правка открывает и список типов, а не одно поле текста", true, "");
+        check("и он открыт пустым: умолчания у типа нет и в правке",
+          kindBox.value === "", JSON.stringify(kindBox.value));
+
+        // Щелчок по списку — не конец правки, хотя фокус с поля и ушёл.
+        // Сохраняй мы по `blur` самого поля, список типов исчезал бы
+        // из-под курсора ровно в тот момент, когда к нему потянулись.
+        $("#mem-working").querySelector(".mem-edit").blur(kindBox);
+        await settle(20);
+        check("уход фокуса с поля на список правку не заканчивает",
+          patchCount() === beforeKind && Boolean($("#mem-working").querySelector(".mem-edit-kind")),
+          patchCount() + " | " + Boolean($("#mem-working").querySelector(".mem-edit-kind")));
+
+        kindBox.value = "decision";
+        kindBox.blur();
+        await settle(40);
+        const kindPatch = requests("PATCH", /\/working\//).slice(-1)[0];
+        check("выбранный тип уезжает правкой — и один, без текста, которого не трогали",
+          patchCount() === beforeKind + 1 &&
+            JSON.stringify(kindPatch.body) === JSON.stringify({ kind: "decision" }),
+          patchCount() + " | " + JSON.stringify(kindPatch && kindPatch.body));
+        check("и в списке у записи новая подпись типа",
+          texts("#mem-working")[0] === "решение: собрать ТЗ к июню",
+          JSON.stringify(texts("#mem-working")));
+      }
     }
 
-    // ── форма: род выбирает человек, и до выбора не уходит ничего ──
+    // ── форма: тип выбирает человек, и до выбора не уходит ничего ──
     const adds = () => requests("POST", /\/working$/);
-    check("род в форме рабочей памяти не предвыбран",
+    check("тип в форме рабочей памяти не предвыбран",
       $("#mem-work-kind").value === "", JSON.stringify($("#mem-work-kind").value));
     $("#mem-work-content").value = "срок — конец мая";
     $("#mem-work-add").dispatchEvent(new Evt("click"));
     await settle(40);
-    check("без выбранного рода запись не уходит вовсе",
+    check("без выбранного типа запись не уходит вовсе",
       adds().length === 0, JSON.stringify(adds().map((r) => r.body)));
     check("и форма говорит, чего не хватает",
-      /Род записи не выбран/.test($("#mem-work-status").textContent),
+      /Тип записи не выбран/.test($("#mem-work-status").textContent),
       $("#mem-work-status").textContent);
 
-    // Род выбран, текста нет: пустая запись уехала бы в промпт строкой
+    // Тип выбран, текста нет: пустая запись уехала бы в промпт строкой
     // «ограничение: » и заняла бы место врезки, ничего не сказав. У формы
     // долговременного слоя этот отказ уже стережётся — слои устроены
     // одинаково, и второй отказ обязан стеречься наравне с первым.
@@ -1945,13 +2010,13 @@ async function routeChecks() {
     $("#mem-work-kind").value = "limit";
     $("#mem-work-kind").dispatchEvent(new Evt("change"));
     await settle(40);
-    check("выбор рода записи конфиг чата не трогает: PATCH'ей не прибавилось",
+    check("выбор типа записи конфиг чата не трогает: PATCH'ей не прибавилось",
       requests("PATCH", /^\/api\/agents\/[^/]+$/).length === patchesBefore,
       JSON.stringify(requests("PATCH", /^\/api\/agents\/[^/]+$/).slice(patchesBefore).map((r) => r.body)));
 
     $("#mem-work-add").dispatchEvent(new Evt("click"));
     await settle(40);
-    check("с выбранным родом запись уходит под чат, телом «род и текст»",
+    check("с выбранным типом запись уходит под чат, телом «тип и текст»",
       adds().length === 1 && adds()[0].path === "/api/agents/" + client.state.current.id + "/working" &&
         JSON.stringify(adds()[0].body) === JSON.stringify({ kind: "limit", content: "срок — конец мая" }),
       JSON.stringify(adds().map((r) => [r.path, r.body])));
@@ -2074,6 +2139,33 @@ async function routeChecks() {
         texts("#mem-long").slice(-1)[0] === "оплата только картой" &&
           who("#mem-long").slice(-1)[0] === "записали вы",
         JSON.stringify([texts("#mem-long"), who("#mem-long")]));
+
+      // И тип — здесь тоже, и тем же движением: слои устроены одинаково,
+      // и правка, работающая в одном из двух, разъехалась бы с соседним
+      // на первом же исправлении.
+      const kinds = () =>
+        $("#mem-long").querySelectorAll(".mem-kind").map((n) => n.textContent);
+      const wasKind = kinds().slice(-1)[0];
+      $("#mem-long").querySelectorAll(".mem-item").slice(-1)[0]
+        .querySelectorAll(".mini").find((b) => b.title === "Поправить запись")
+        .dispatchEvent(new Evt("click"));
+      await settle(20);
+      const longKind = $("#mem-long").querySelector(".mem-edit-kind");
+      if (!longKind) check("у долговременной правки тоже есть список типов", false, "списка нет");
+      else {
+        check("у долговременной правки тоже есть список типов, и тоже пустой",
+          longKind.value === "", JSON.stringify(longKind.value));
+        longKind.value = "decision";
+        longKind.blur();
+        await settle(40);
+        const typed = requests("PATCH", /^\/api\/memory\//).slice(-1)[0];
+        check("тип долговременной записи правится её номером и одним полем",
+          JSON.stringify(typed.body) === JSON.stringify({ kind: "decision" }),
+          JSON.stringify(typed && [typed.path, typed.body]));
+        check("и подпись типа в списке сменилась на выбранную",
+          wasKind === "факт" && kinds().slice(-1)[0] === "решение",
+          JSON.stringify([wasKind, kinds()]));
+      }
     }
 
     // Поправленную человек уже увидел, и с правкой она стала его: из новых

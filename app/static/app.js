@@ -1586,23 +1586,23 @@ function applySettings() {
 // память обновилась). И то и другое — события, а не отрисовки, и оба молчат,
 // пока вкладка закрыта.
 
-// Роды записей: токен для сервера и русская подпись. Одна карта на список
+// Типы записей: токен для сервера и русская подпись. Одна карта на список
 // записей и на дропдаун формы — его опции строятся отсюда же (`fillKinds`).
 // Второй таблицей подписи разъехались бы молча: в списке стояло бы одно
 // слово, а в форме другое. Слова те же, что в `MEMORY_LABELS` на сервере, —
 // ими же память подписана и в промпте.
 const MEMORY_KINDS = [
-  ["profile", "профиль"],
+  ["profile", "о собеседнике"],
   ["decision", "решение"],
-  ["knowledge", "знание"],
+  ["knowledge", "факт"],
 ];
 
 const memoryKindLabel = (kind) =>
   (MEMORY_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
 
-// Роды записей рабочей памяти — состояние задачи. Список свой, а не общий
+// Типы записей рабочей памяти — состояние задачи. Список свой, а не общий
 // с долговременной: слои разные, и «цель» в одном не значит того же, что
-// «профиль» в другом. Слова те же, что в `WORKING_LABELS` на сервере, — ими
+// «о собеседнике» в другом. Слова те же, что в `WORKING_LABELS` на сервере, — ими
 // же запись подписана и в промпте.
 const WORKING_KINDS = [
   ["goal", "цель"],
@@ -1641,11 +1641,29 @@ function memMarks(record, key) {
 // Правка записи прямо в списке: Enter сохраняет, Escape отменяет, потеря
 // фокуса — тоже сохраняет. Идиом тот же, что у переименования чата слева:
 // второй способ правки на той же странице читался бы как другое действие.
-function startRecordEdit(row, record, commit) {
+//
+// Правится и текст, и **тип**: агент кладёт запись не в тот слой и не того
+// типа примерно с той же частотой, и до сих пор второе чинилось только
+// удалением с заведением заново — дырой ровно посреди «явного выбора»,
+// ради которого день и делался. Ручка оба поля принимала с самого начала,
+// не спрашивал их только экран.
+//
+// Список типов открывается **пустым**, как и в форме добавления: умолчания
+// у типа нет нигде, и «оставить прежний» — это не выбор, а его отсутствие.
+// Предвыбери мы здесь нынешний тип, правка текста молча пересылала бы его
+// обратно — и запись, которой тип поправили в соседней вкладке, вернулась бы
+// к старому.
+function startRecordEdit(row, record, kinds, commit) {
   const shown = row.querySelector(".mem-text");
+  // Поле и список — в одном блоке: уход фокуса с поля на список это не конец
+  // правки, а её продолжение, и различить их можно только на общем родителе.
+  const box = el("div", "mem-edit-box");
   const input = el("input", "mem-edit");
   input.value = record.content;
-  row.replaceChild(input, shown);
+  const kind = el("select", "mem-edit-kind control");
+  fillKinds(kind, kinds, "— оставить тип —");
+  box.append(input, kind);
+  row.replaceChild(box, shown);
   input.focus();
   input.select();
 
@@ -1654,17 +1672,29 @@ function startRecordEdit(row, record, commit) {
     if (settled) return;
     settled = true;
     const text = (input.value || "").trim();
+    const patch = {};
     // Пустой текст — не правка, а потеря записи: удаление здесь рядом,
-    // и делать его вслепую очисткой поля нельзя.
-    if (save && text && text !== record.content) await commit(text);
+    // и делать его вслепую очисткой поля нельзя. Текст слово в слово прежний
+    // и невыбранный тип тоже не едут: ручке нечего было бы делать.
+    if (text && text !== record.content) patch.content = text;
+    if (kind.value && kind.value !== record.kind) patch.kind = kind.value;
+    if (save && Object.keys(patch).length) await commit(patch);
     renderMemory();
   };
 
-  input.onkeydown = (ev) => {
+  const keys = (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
     if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(false); }
   };
-  input.onblur = () => finish(true);
+  input.onkeydown = keys;
+  kind.onkeydown = keys;
+  // `focusout` всплывает, `blur` — нет: слушаем блок и смотрим, куда фокус
+  // ушёл. Остался внутри — правка продолжается; ушёл наружу — сохраняем,
+  // ровно как раньше сохранял уход фокуса с поля. Вешай мы это на само поле,
+  // щелчок по списку типов убрал бы список прямо из-под курсора.
+  box.onfocusout = (ev) => {
+    if (!box.contains(ev.relatedTarget)) finish(true);
+  };
 }
 
 function memoryTabOpen() {
@@ -1915,7 +1945,7 @@ function renderWorking(box) {
     const btn = el("button", "mem-btn", "Запомнить надолго");
     btn.type = "button";
     btn.title = "Запомнить надолго";
-    btn.onclick = () => remember("knowledge", line);
+    btn.onclick = () => promote(line);
     row.append(
       el("div", "mem-text", line),
       ...memMarks(record, "w:" + record.seq),
@@ -1926,7 +1956,8 @@ function renderWorking(box) {
       // закрыто на сервере: правка метит запись человеком, и с этой минуты
       // служебный вызов её не трогает.
       iconButton("pencil", "Поправить запись",
-        () => startRecordEdit(row, record, (text) => editWorking(record, text)), "mini"),
+        () => startRecordEdit(row, record, WORKING_KINDS,
+          (patch) => editWorking(record, patch)), "mini"),
       iconButton("trash", "Удалить запись", () => dropWorking(record), "mini danger")
     );
     box.appendChild(row);
@@ -1973,7 +2004,8 @@ function renderLongTerm(box) {
       // что о ней надо знать.
       ...memMarks(record, "l:" + record.seq),
       iconButton("pencil", "Поправить запись",
-        () => startRecordEdit(row, record, (text) => editMemory(record, text)), "mini"),
+        () => startRecordEdit(row, record, MEMORY_KINDS,
+          (patch) => editMemory(record, patch)), "mini"),
       iconButton("trash", "Забыть запись", () => forget(record), "mini danger")
     );
     box.appendChild(row);
@@ -1994,7 +2026,7 @@ function workingStatus(text, isError) {
 
 // ── рабочая память правится руками ──
 //
-// Тем же набором, каким правится долговременная, и по тем же правилам: род
+// Тем же набором, каким правится долговременная, и по тем же правилам: тип
 // обязателен и без умолчания, список пополняется **ответом ручки** (номер
 // выдаёт база, текст по дороге чистит `redact()`), перечитывать слой для
 // этого незачем. Второй способ на той же странице читался бы как другое
@@ -2030,9 +2062,9 @@ async function addWorking(kind, content) {
 // Правка метит запись человеком — это делает сервер, и ответ приходит уже
 // с новым автором. Подставь клиент своё «human» — экран говорил бы о записи
 // то, чего в базе нет.
-async function editWorking(record, content) {
+async function editWorking(record, patch) {
   try {
-    const updated = await api(workingUrl(record.seq), json("PATCH", { content }));
+    const updated = await api(workingUrl(record.seq), json("PATCH", patch));
     agentRecordGone(record, "w:" + record.seq);
     const working = state.memory && state.memory.working;
     if (working) {
@@ -2063,9 +2095,9 @@ async function dropWorking(record) {
 
 // Правка долговременной записи — тот же путь и тот же ответ: с этой минуты
 // запись человека, и служебный вызов её не перепишет.
-async function editMemory(record, content) {
+async function editMemory(record, patch) {
   try {
-    const updated = await api("/api/memory/" + record.seq, json("PATCH", { content }));
+    const updated = await api("/api/memory/" + record.seq, json("PATCH", patch));
     agentRecordGone(record, "l:" + record.seq);
     const long = state.memory && state.memory.long_term;
     if (long) {
@@ -2118,15 +2150,34 @@ async function forget(record) {
   memoryStatus("Запись забыта.");
 }
 
-// Род записи уезжает тот, что выбран в списке: умолчания у него нет ни здесь,
+// «Запомнить надолго»: перенос записи через границу слоёв — единственное
+// место, где запись меняет слой, и до сих пор единственное, где тип выбирал
+// не человек. В коде стояло `knowledge`, и это прямо против нашего же
+// правила: умолчания у типа нет ни в форме, ни на сервере. Мало того, что
+// выбрано за человека, — выбрано ещё и наугад: «о собеседнике» подходит
+// переносимой записи ничуть не реже.
+//
+// Поэтому кнопка не записывает, а **спрашивает**: кладёт строку в ту же
+// форму, которой долговременный слой пополняют руками, и снимает выбор типа.
+// Форма одна и та же — второго способа записать в этот слой не заводим, —
+// а значит и правила у переноса те же: без выбранного типа не уходит ничего.
+function promote(line) {
+  $("#mem-content").value = line;
+  const kind = $("#mem-kind");
+  kind.value = "";
+  kind.focus();
+  memoryStatus("Выберите тип записи и нажмите «Запомнить»: при переносе тип выбирает человек.");
+}
+
+// Тип записи уезжает тот, что выбран в списке: умолчания у него нет ни здесь,
 // ни на сервере — `_kind_field` отказывает и отсутствию ключа тоже.
 async function addFromForm() {
   const kind = $("#mem-kind").value;
-  // Род не выбран — не шлём вовсе: ручка ответит 400, и незачем спрашивать
+  // Тип не выбран — не шлём вовсе: ручка ответит 400, и незачем спрашивать
   // сервер о том, что видно здесь. Отказ при этом тот же по смыслу —
-  // «род записи выбирает человек».
+  // «тип записи выбирает человек».
   if (!kind) {
-    memoryStatus("Род записи не выбран: профиль, решение или знание.", true);
+    memoryStatus("Тип записи не выбран: о собеседнике, решение или факт.", true);
     return;
   }
   const field = $("#mem-content");
@@ -2134,13 +2185,13 @@ async function addFromForm() {
   if (saved) field.value = "";
 }
 
-// Та же форма для рабочего слоя: род обязателен и здесь, и умолчания
+// Та же форма для рабочего слоя: тип обязателен и здесь, и умолчания
 // у него нет — слои устроены одинаково, и второе правило на втором слое
 // разошлось бы с первым молча.
 async function addWorkingFromForm() {
   const kind = $("#mem-work-kind").value;
   if (!kind) {
-    workingStatus("Род записи не выбран: цель, ограничение, решение или открытый вопрос.", true);
+    workingStatus("Тип записи не выбран: цель, ограничение, решение или открытый вопрос.", true);
     return;
   }
   const field = $("#mem-work-content");
@@ -2150,17 +2201,17 @@ async function addWorkingFromForm() {
 
 // Опции дропдауна — из той же карты, что и подписи в списке.
 //
-// Первым пунктом — пустой: **умолчания у рода нет и в форме**, ровно как
+// Первым пунктом — пустой: **умолчания у типа нет и в форме**, ровно как
 // на сервере, где `_kind_field` отказывает и отсутствующему ключу. Уберём
 // пустой пункт — список возьмёт первый настоящий, и пользователь, не тронувший
-// его, запишет «профиль», ничего не выбрав: сервер за него не выбирает, а
+// его, запишет «о собеседнике», ничего не выбрав: сервер за него не выбирает, а
 // форма выбрала бы. День про явный выбор, и выбор обязан быть нажатием
 // человека в обоих местах.
-// Список родов — параметром: формы две, а правило одно, и вторая копия
+// Список типов — параметром: формы две, а правило одно, и вторая копия
 // правила разошлась бы с первой на первой же правке.
-function fillKinds(select, kinds) {
+function fillKinds(select, kinds, blankLabel) {
   select.innerHTML = "";
-  const blank = el("option", "", "— выберите род —");
+  const blank = el("option", "", blankLabel || "— выберите тип —");
   blank.value = "";
   select.appendChild(blank);
   kinds.forEach(([token, label]) => {
@@ -2395,7 +2446,7 @@ function init() {
   $("#panel-body").addEventListener("change", (ev) => {
     // Пролив панели — про конфиг чата, и поля его носят приставку `f-`.
     // Поля вкладки «Память» её не носят: у памяти свои ручки, и PATCH чата
-    // при выборе рода записи был бы запросом ни о чём.
+    // при выборе типа записи был бы запросом ни о чём.
     if (!String(ev.target.id || "").startsWith("f-")) return;
     if (ev.target.id === "f-response_format_kind") syncResponseFormat();
     // Показ полей меняется на самом выборе, а не после сохранения: пролив
