@@ -469,8 +469,12 @@ function buildServer(options) {
     // Записи долговременной памяти: список на всю базу, как на сервере, и
     // не привязанный ни к одному чату. Врезка выше — уже готовая строка,
     // а это то, что вкладка «Память» показывает, добавляет и удаляет.
+    // Автор по умолчанию — человек: другого пути в этот слой до сих пор
+    // не было, и той же умолчальной пометкой миграция метит старые записи
+    // живой базы. Заданный в посеве не трогаем: им проверяется счётчик
+    // новых записей агента.
     records: ((options && options.records) || []).map((seed, i) => ({
-      seq: i + 1, at: i, ...seed,
+      seq: i + 1, author: "human", at: i, ...seed,
     })),
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
@@ -479,11 +483,19 @@ function buildServer(options) {
     // ответом ручки, а не присланным телом» через интерфейс ненаблюдаема:
     // присланное и записанное совпадали бы посимвольно.
     secret: (options && options.secret) || "",
+    // Ручка трёх слоёв отвечает отказом: так проверяется, что вкладка говорит
+    // причину, а не показывает пустые разделы.
+    failLayers: Boolean(options && options.failLayers),
     // Рабочий слой чата: записи о состоянии задачи и сводки. Лежит отдельно
     // от самого чата —
     // ровно как на сервере, где у них свои таблицы, а не колонка в `sessions`.
     // Ключ — имя чата: чаты стенд и так заводит по именам.
-    working: (options && options.working) || {},
+    //
+    // Записи материализуются один раз, при сборке, и дальше **живут**: их
+    // правит и удаляет вкладка, и ответ ручки обязан показывать записанное.
+    // Собери стенд их заново в каждом ответе — правка исчезала бы к следующему
+    // чтению, и проверка правки прошла бы на подложном равенстве.
+    working: {},
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -534,6 +546,41 @@ function buildServer(options) {
   // не ту запись, и проверка этого не заметила бы.
   let issuedMemory = state.records.length;
   const MEMORY_KINDS = ["profile", "decision", "knowledge"];
+  const WORKING_KINDS = ["goal", "limit", "decision", "question"];
+
+  // Номера рабочих записей — один счётчик на всю базу, как на сервере:
+  // у `working_memory` первичный ключ AUTOINCREMENT, а чат в ней колонкой.
+  let issuedWorking = 0;
+  Object.entries((options && options.working) || {}).forEach(([label, seed]) => {
+    state.working[label] = {
+      // Автор по умолчанию — агент: пока писал только он, и посев без автора
+      // значит «эту завёл служебный вызов». Заданный в посеве не трогаем:
+      // им проверяется, что запись человека видна наравне с агентской.
+      records: (seed.records || []).map((record, i) => ({
+        seq: (issuedWorking += 1), author: "agent", at: i, ...record,
+      })),
+      upto: seed.upto || 0,
+      summaries: seed.summaries || [],
+      // Что агент запишет на очередном обмене: по записи за обмен, как на
+      // сервере, где ведение памяти зовётся на каждом. Пусто — значит этот
+      // чат ничего не ведёт, и счётчики прежних проверок не поедут.
+      //
+      // Очередей две, потому что слоя два: **один** служебный вызов ведёт
+      // и рабочую память, и долговременную, и «что приехало нового» без
+      // второго слоя проверялось бы наполовину.
+      writes: (seed.writes || []).map((record) => ({ ...record })),
+      remembers: (seed.remembers || []).map((record) => ({ ...record })),
+    };
+  });
+
+  // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
+  // пустой — ровно как на сервере.
+  const workingOf = (agent) => {
+    const have = state.working[agent.label];
+    if (have) return have;
+    state.working[agent.label] = { records: [], upto: 0, summaries: [], writes: [], remembers: [] };
+    return state.working[agent.label];
+  };
 
   // Итог по чату считает сервер, и стенд считает его теми же правилами:
   // реплика без метрик и поле `null` пропускаются, а чат без чисел даёт `null`,
@@ -581,6 +628,43 @@ function buildServer(options) {
     status: 200,
     json: async () => JSON.parse(JSON.stringify(data)),
   });
+
+  const fail = (status, detail) => ({ ok: false, status, json: async () => ({ detail }) });
+
+  // Секрет сервер вырезает из всего, что уезжает в базу (`redact`), и ручка
+  // отдаёт записанное, а не присланное. Стенд чистит тем же способом.
+  const clean = (text) =>
+    (state.secret ? text.trim().split(state.secret).join("***") : text.trim());
+
+  // Разбор тела записи — один на оба слоя, как `_record_body` на сервере:
+  // лишние поля 400, род обязателен и **без умолчания**, текст непустой,
+  // пустое тело правки 400. Вторая копия правил на втором слое разошлась бы
+  // с первой молча, а слой с разбором щедрее серверного прятал бы дыру:
+  // форма осталась бы зелёной, получая в браузере 400.
+  function recordBody(body, kinds, patch) {
+    const keys = Object.keys(body || {});
+    const unknown = keys.filter((k) => k !== "kind" && k !== "content");
+    if (unknown.length) return { error: fail(400, "лишние поля: " + unknown.join(", ")) };
+    if (patch && !keys.length) {
+      return { error: fail(400, "тело правки пустое: назовите kind, content или оба") };
+    }
+    const out = {};
+    if (!patch || keys.includes("kind")) {
+      const kind = body && body.kind;
+      if (typeof kind !== "string" || !kinds.includes(kind)) {
+        return { error: fail(400, "kind: одно из " + kinds.join(", ")) };
+      }
+      out.kind = kind;
+    }
+    if (!patch || keys.includes("content")) {
+      const content = body && body.content;
+      if (typeof content !== "string" || !content.trim()) {
+        return { error: fail(400, "content: непустая строка") };
+      }
+      out.content = clean(content);
+    }
+    return { value: out };
+  }
 
   // Промпт в том же порядке, в каком его собирает сервер: системный промпт,
   // врезка долговременной памяти, врезка вместо начала разговора, непокрытый
@@ -671,6 +755,29 @@ function buildServer(options) {
     });
     agent.history_len = agent.transcript.length;
     agent.usage_total = sumUsage(agent.transcript);
+
+    // Ведение памяти: агент дописывает свою запись — по одной за обмен, как
+    // на сервере, где служебный вызов идёт на каждом. Записи человека он
+    // не трогает ни правкой, ни удалением, и стенд их тоже не трогает.
+    // Чат без посева `writes` не ведёт ничего: счётчики прежних проверок
+    // от этого не едут.
+    const written = workingOf(agent);
+    if (agent.memory !== "off" && written.writes.length) {
+      const next = written.writes.shift();
+      written.records.push({
+        seq: (issuedWorking += 1), author: "agent",
+        at: written.records.length, ...next,
+      });
+    }
+    // Тот же вызов кладёт запись и в долговременный слой — он глобальный,
+    // и чат ему не владелец, а писатель наравне с человеком.
+    if (agent.memory !== "off" && written.remembers.length) {
+      const next = written.remembers.shift();
+      state.records.push({
+        seq: (issuedMemory += 1), author: "agent",
+        at: state.records.length, ...next,
+      });
+    }
 
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
@@ -771,28 +878,27 @@ function buildServer(options) {
       return json({ total: state.records.length, records: state.records });
     }
     if (path === "/api/memory" && method === "POST") {
-      const unknown = Object.keys(body || {}).filter((k) => k !== "kind" && k !== "content");
-      if (unknown.length) {
-        return { ok: false, status: 400,
-                 json: async () => ({ detail: "лишние поля: " + unknown.join(", ") }) };
-      }
-      const kind = body && body.kind;
-      if (typeof kind !== "string" || !MEMORY_KINDS.includes(kind)) {
-        return { ok: false, status: 400,
-                 json: async () => ({ detail: "kind: одно из " + MEMORY_KINDS.join(", ") }) };
-      }
-      const content = body && body.content;
-      if (typeof content !== "string" || !content.trim()) {
-        return { ok: false, status: 400, json: async () => ({ detail: "content: непустая строка" }) };
-      }
-      const clean = state.secret
-        ? content.trim().split(state.secret).join("***")
-        : content.trim();
-      const record = { seq: (issuedMemory += 1), kind, content: clean, at: state.records.length };
+      const parsed = recordBody(body, MEMORY_KINDS, false);
+      if (parsed.error) return parsed.error;
+      // Автор в теле не спрашивается и прийти оттуда не может: его ставит
+      // путь, которым запись попала в память. Ручка человека — человеком.
+      const record = { seq: (issuedMemory += 1), ...parsed.value,
+                       author: "human", at: state.records.length };
       state.records.push(record);
       return json(record);
     }
     const memoryMatch = /^\/api\/memory\/(\d+)$/.exec(path);
+    // Правка долговременной записи: номер не меняется — он и есть её
+    // идентичность, — а автором становится человек, как на сервере.
+    if (memoryMatch && method === "PATCH") {
+      const seq = Number(memoryMatch[1]);
+      const record = state.records.find((r) => r.seq === seq);
+      if (!record) return fail(404, "записи памяти " + seq + " нет");
+      const parsed = recordBody(body, MEMORY_KINDS, true);
+      if (parsed.error) return parsed.error;
+      Object.assign(record, parsed.value, { author: "human" });
+      return json(record);
+    }
     if (memoryMatch && method === "DELETE") {
       const seq = Number(memoryMatch[1]);
       const i = state.records.findIndex((r) => r.seq === seq);
@@ -837,18 +943,60 @@ function buildServer(options) {
     // Записи приходят с номером и автором, как у сервера: номер — ключ, по
     // которому запись правят, автор — кто её сделал.
     if (tail === "/memory" && method === "GET") {
-      const working = state.working[agent.label] || {};
+      // Ручка умеет и отказать — занятая база отвечает 503, — и без этого
+      // ветка «слои не доехали» через интерфейс ненаблюдаема: вкладке тогда
+      // нечего показывать и некуда записывать.
+      if (state.failLayers) return fail(503, "база занята: попробуйте ещё раз");
+      const working = workingOf(agent);
       return json({
         short_term: { messages: agent.history_len },
         working: {
-          records: (working.records || []).map((seed, i) => ({
-            seq: i + 1, author: "agent", at: i, ...seed,
-          })),
+          records: working.records,
           upto: working.upto || 0,
           summaries: working.summaries || [],
         },
         long_term: { enabled: agent.memory !== "off", records: state.records },
       });
+    }
+    // ── рабочая память: ручки под чатом, набор тот же, что у долговременной ──
+    //
+    // Границы те же, что на сервере, и разбор тела — общий с долговременным
+    // слоем: род обязателен и без умолчания, текст непустой, лишние поля 400,
+    // пустое тело правки 400, чужой номер 404.
+    if (tail === "/working" && method === "GET") {
+      const working = workingOf(agent);
+      return json({ total: working.records.length, records: working.records,
+                    upto: working.upto || 0 });
+    }
+    if (tail === "/working" && method === "POST") {
+      const parsed = recordBody(body, WORKING_KINDS, false);
+      if (parsed.error) return parsed.error;
+      const working = workingOf(agent);
+      const record = { seq: (issuedWorking += 1), ...parsed.value,
+                       author: "human", at: working.records.length };
+      working.records.push(record);
+      return json(record);
+    }
+    const workingMatch = /^\/working\/(\d+)$/.exec(tail);
+    if (workingMatch && method === "PATCH") {
+      const seq = Number(workingMatch[1]);
+      const working = workingOf(agent);
+      const record = working.records.find((r) => r.seq === seq);
+      if (!record) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
+      const parsed = recordBody(body, WORKING_KINDS, true);
+      if (parsed.error) return parsed.error;
+      // Правка руками метит запись человеком, даже если завёл её служебный
+      // вызов: с этой минуты он её не трогает.
+      Object.assign(record, parsed.value, { author: "human" });
+      return json(record);
+    }
+    if (workingMatch && method === "DELETE") {
+      const seq = Number(workingMatch[1]);
+      const working = workingOf(agent);
+      const i = working.records.findIndex((r) => r.seq === seq);
+      if (i < 0) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
+      working.records.splice(i, 1);
+      return json({ deleted: seq });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(agent);
