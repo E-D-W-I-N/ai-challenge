@@ -130,6 +130,22 @@ def _working_edit(messages, line: str, mark: str = None) -> str:
     return f"{mark} {first.group(1)} {line}" if first else f"{mark} + {line}"
 
 
+def _echo_listing(messages) -> str:
+    """Ответ-эхо: те же строки, что вызову и показали, слово в слово.
+
+    Самое естественное, что сделает модель, которой показали список и
+    попросили поправить его «если надо»: она его повторит. Разбором такое
+    не отбивается — строка правильная во всём, слой назван, номер и вид
+    на месте, — и отличается от настоящей правки ровно одним: менять ей
+    нечего.
+    """
+    shown = messages[-1].get("content", "")
+    marks = (agent_module.TASK_MARK + " ", agent_module.KEEP_MARK + " ")
+    return "\n".join(
+        line.strip() for line in shown.splitlines() if line.strip().startswith(marks)
+    )
+
+
 def _service_aware(messages, index):
     """Ответ заглушки, по которому видно, чем был вызов: сводка узнаётся
     в промпте следующего обмена по слову СВОДКА, ведение памяти — правкой
@@ -1227,6 +1243,15 @@ def check_working_memory():
             return "задача + цель: собрать ТЗ и смету"
         if mode["reply"] == "удаление":
             return "задача - 2\nзадача + решение: платим картой"
+        if mode["reply"] == "эхо":
+            # Повтор показанного списка слово в слово — обоих списков сразу.
+            return _echo_listing(messages)
+        if mode["reply"] == "молчание":
+            # **Настоящая** пустая строка, а не неразборчивый текст: ровно
+            # это возвращает модель, которой в промпте велели «менять
+            # нечего — не пиши ничего». Ведёт себя она иначе, и потому
+            # проверяется отдельно от «непонятно».
+            return ""
         return "никаких правок здесь нет\nи здесь тоже"
 
     # Счётчик вызовов с нуля: дальше проверяется, что за обмен вызов **один**,
@@ -1375,8 +1400,14 @@ def check_working_memory():
     assert store.list_working(tolerant.id) == tolerant.working["items"], store.list_working(tolerant.id)
 
     # --- 3. Провал ведения обмен не роняет и не даёт срезать непрочитанное --
+    #
+    # «Сколько правок приехало» и «докуда вызов прочитал разговор» — два
+    # разных вопроса, и исходов поэтому три: вызов оборвался (прочитать
+    # не успел), ответил непонятным (не поняли), ответил пустым (прочитал
+    # и сказал «менять нечего»). Границу не двигают первые два; третий
+    # двигает, и в живом чате он самый частый.
     _stub.install(reply=replies)
-    mode["reply"] = "пусто"
+    mode["reply"] = "непонятно"
     before = [dict(r) for r in tolerant.working["items"]]
     upto_before = tolerant.working["upto"]
     events = asyncio.run(drain(tolerant.ask("шестой вопрос")))
@@ -1433,6 +1464,77 @@ def check_working_memory():
     assert tolerant.working["upto"] == 18, tolerant.working["upto"]
     assert tolerant.context_cut()[0] == 18, tolerant.context_cut()[0]
     assert len(tolerant.history) == 20, len(tolerant.history)
+
+    # --- эхо: повтор показанного списка правкой не считается ----------------
+    #
+    # Вызову показывают оба списка с номерами, и модель, которой менять
+    # нечего, скорее всего их повторит. Строки при этом правильные во всём:
+    # слой назван, номер на месте, вид разобран, — разбор их пропускает.
+    # Засчитай мы их правками — вызов двинул бы границу прочитанного,
+    # не прочитав ничего нового, и окно за ней выбросило бы начало
+    # разговора: «эхо» стало бы разрешением резать. Правило одно на оба
+    # слоя (`Agent._changes`), и в ответе ниже повторены оба списка.
+    mode["reply"] = "эхо"
+    echoed = [dict(r) for r in tolerant.working["items"]]
+    remembered = [dict(r) for r in store.list_memory()]
+    assert [r["author"] for r in echoed] == ["human", "human", "agent"], echoed
+    assert [r["author"] for r in remembered] == ["agent", "agent", "human"], remembered
+    asyncio.run(drain(tolerant.ask("девятый вопрос")))
+    assert tolerant.working["items"] == echoed, tolerant.working["items"]
+    assert store.list_memory() == remembered, store.list_memory()
+    assert tolerant.working["upto"] == 18, tolerant.working["upto"]
+    assert len(tolerant.history) == 22, len(tolerant.history)
+
+    # --- пустой ответ: «менять нечего» — это прочитано, а не провалено ------
+    #
+    # В промпте вызова прямо написано: менять нечего — не пиши ничего.
+    # Модель это и исполняет, и ответ приходит пустой. Считай мы его
+    # провалом — граница стояла бы на месте вечно, а окно, зажатое ею,
+    # молча перестало бы резать: человек выбрал бы «последние две реплики»
+    # и получал бы всю историю, растущую без предела, и под ответом об этом
+    # не было бы ни слова.
+    mode["reply"] = "молчание"
+    asyncio.run(drain(tolerant.ask("десятый вопрос")))
+    assert tolerant.working["items"] == echoed, tolerant.working["items"]
+    assert store.list_memory() == remembered, store.list_memory()
+    # Граница **дошла** до истории: вызов прочитал её целиком, и сказать
+    # ему было нечего — это разные вещи.
+    assert tolerant.working["upto"] == 22, tolerant.working["upto"]
+    assert len(tolerant.history) == 24, len(tolerant.history)
+    # И окно отбросило ровно просимое: зажим по прочитанному его больше
+    # не держит, хвост длиной в `keep_last`, как и выбрали. Две врезки
+    # плюс две реплики плюс вопрос.
+    assert tolerant.context_cut()[0] == 22, tolerant.context_cut()
+    assert len(tolerant.build_prompt("ещё")) == 2 + 2 + 1, tolerant.build_prompt("ещё")
+
+    # --- а поток, кончившийся без `done`, — всё-таки обрыв ------------------
+    #
+    # Так выглядит соединение, оборванное на середине ответа: ни `done`,
+    # ни `error`, и текста нет. Пустого ответа здесь нет — нет ответа
+    # вовсе, и прочитать разговор вызову было нечем. По одному тексту эти
+    # два случая не различить: он пуст в обоих.
+    def cut_off(spec, *, prompt_override=None, context_length=None):
+        if _service_kind(prompt_override) != "facts":
+            return real_stream(
+                spec, prompt_override=prompt_override, context_length=context_length
+            )
+
+        async def broken():
+            yield {"type": "delta", "text": "задача + цель: ", "metrics": {}}
+
+        return broken()
+
+    agent_module.stream_completion = cut_off
+    try:
+        events = asyncio.run(drain(tolerant.ask("одиннадцатый вопрос")))
+    finally:
+        agent_module.stream_completion = real_stream
+    done = [e for e in events if e["type"] == "done"][-1]
+    assert done["committed"] and done["text"], done
+    assert tolerant.working["items"] == echoed, tolerant.working["items"]
+    assert tolerant.working["upto"] == 22, tolerant.working["upto"]
+    assert len(tolerant.history) == 26, len(tolerant.history)
+    assert tolerant.context_cut()[0] == 22, tolerant.context_cut()
     store.close()
 
     # --- 4. Файл: перезапуск переживают, чистку — нет -----------------------
@@ -2158,6 +2260,19 @@ def check_long_term_memory():
         assert len(_service_calls("facts")) == 1, _service_calls("facts")
         assert len(_service_calls("summary")) == 1, _service_calls("summary")
 
+        # И порядок у них один, а не «какой получится»: сперва память, потом
+        # сжатие. Память первична — сжатие пересказывает то, что она уже
+        # прочитала; поменяй их местами, и в пересказ уехал бы обмен, про
+        # который память ещё не знает. Решает порядок один код
+        # (`Agent.service_plan`), он же вызовы и зовёт, и он же называет их
+        # в событиях `compressing`: обещание строки состояния и сам порядок
+        # разойтись не могут, потому что источник у них один. Поэтому
+        # спрашиваем и о том, и о другом — и ждём одного ответа.
+        went = [_service_kind(call["messages"]) for call in _stub.CALLS]
+        assert went == ["facts", "summary", None], went
+        promised = [e["strategy"] for e in frames if e["event"] == "compressing"]
+        assert promised == ["facts", "summary"], promised
+
         # Вот здесь инвариант и расщепляется. **Ведение долговременную память
         # получает** — иначе оно не обновит запись и на каждом обмене заводило
         # бы вторую такую же: оно же не видит, что уже записано.
@@ -2192,6 +2307,29 @@ def check_long_term_memory():
         # И вызов на ведение не пошёл: выключатель гасит и запись, и показ.
         assert _service_calls("facts") == [], "выключенная память всё равно ведётся"
         assert client.patch(f"/api/agents/{both}", json={"memory": "on"}).status_code == 200
+
+        # А незнакомое значение читается как «ведёт» — зеркало того, как
+        # незнакомая стратегия читается как `full`. Ручка чужого не
+        # пропустит (400 выше), но конфиг мог записать сервер другой версии,
+        # и молча гасить от этого целый слой нельзя: чат остался бы без
+        # памяти, не сказав об этом ни слова. Спрашиваем поведением, а не
+        # `keeps_memory`: гасит память не одно место, а три — служебный
+        # вызов и обе врезки.
+        odd_store = Store(":memory:").init()
+        odd_store.add_memory("profile", "пишу на Kotlin", "human")
+        odd = Agent(
+            AgentSpec(label="из чужой версии", model="stub/model", memory="когда-нибудь"),
+            store=odd_store,
+        )
+        _stub.reset()
+        _stub.install(reply=_service_aware)
+        asyncio.run(drain(odd.ask("а память-то ведётся?")))
+        assert len(_service_calls("facts")) == 1, "незнакомое значение отменило ведение"
+        assert odd.working["items"], "ведение прошло, а записи не легли"
+        heads = [m["content"][:32] for m in odd.build_prompt("ещё")[:2]]
+        assert heads[0].startswith("[долговременная память]"), heads
+        assert heads[1].startswith("[факты о разговоре]"), heads
+        odd_store.close()
 
         # Выключатель на чат, а не на базу: соседний чат память по-прежнему
         # видит — иначе сравнить «с памятью» и «без» было бы не с чем.
@@ -2267,6 +2405,19 @@ def check_long_term_memory():
                                 "author": "human", "at": fixed.json()["at"]}, fixed.json()
         assert client.patch(f"/api/memory/{was_agent['seq']}", json={}).status_code == 400
         assert client.patch(f"/api/memory/{was_agent['seq']}", json={"kind": "х"}).status_code == 400
+        # Лишнее поле в правке — 400 тем же `_record_body`, что и при
+        # добавлении: номер, автора и время выдаёт сервер, и запросу,
+        # который их присылает, ручка делает не то, о чём он просит.
+        # Автор здесь не случайное лишнее поле, а самое опасное: пройди
+        # он — и «запись человека служебный вызов не трогает» отменялось
+        # бы одним запросом.
+        assert client.patch(
+            f"/api/memory/{was_agent['seq']}",
+            json={"content": "х", "author": "agent"},
+        ).status_code == 400
+        assert client.patch(
+            f"/api/memory/{was_agent['seq']}", json={"seq": 5}
+        ).status_code == 400
         assert client.patch("/api/memory/9999", json={"content": "нет такой"}).status_code == 404
         assert client.delete(f"/api/memory/{was_agent['seq']}").status_code == 200
         assert client.delete(f"/api/memory/{mine['seq']}").status_code == 200
@@ -2298,12 +2449,22 @@ def check_long_term_memory():
 
         # Ветвление память не копирует и копировать не должно: слой глобальный,
         # и ветка видит его через то же хранилище — не свою копию.
+        #
+        # «Видна ли ветке запись» — вопрос не тот: дубли видны ровно так же.
+        # Поэтому считаем **число** записей до и после, и считаем его
+        # на непустом списке: скопируй ветвление слой себе, total удвоился бы,
+        # а врезка в промпте ветки сказала бы всё дважды.
+        before_fork = client.get("/api/memory").json()["total"]
+        assert before_fork, "память пуста — копировать нечего, проверять тоже"
         branch = client.post(f"/api/agents/{plain}/fork", json={"at": 2}).json()["agents"][0]["id"]
         _stub.reset()
         client.post(f"/api/agents/{branch}/messages", json={"text": "вопрос ветки"})
         assert any(
             "профиль: пишу на Kotlin" in m["content"] for m in _stub.CALLS[-1]["messages"]
         ), _stub.CALLS[-1]["messages"]
+        assert client.get("/api/memory").json()["total"] == before_fork, (
+            "ветвление завело копии записей долговременной памяти"
+        )
 
     # --- 9. Файл: чат уходит, память остаётся; clear() замыкает круг ---------
     #
