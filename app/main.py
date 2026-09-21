@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm
-from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
+from .agent import SAMPLING_FIELDS, Agent, AgentBusyError, task_view
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
@@ -869,13 +869,17 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     не трогаются: вторая вкладка, правящая «ожидается», иначе затирала бы
     шаг, набранный в первой.
 
-    Разрешённых переходов здесь нет: этап ставят любой. Запрет перепрыгивать
-    обещанием этого дня не был, а проверка, которой никто не обещал, — это
-    отказ на ровном месте.
+    Карта разрешённых переходов (`TASK_MOVES`) здесь намеренно не спрашивается:
+    она заведена для служебного вызова, который полосы этапов не видит.
+    Человек её видит, кнопку жмёт сам и вправе перехватить этап в любой
+    момент — хоть вернуть закрытую задачу в работу. Отказать ему значило бы
+    отнять ручное управление ровно тогда, когда автомат ошибся.
 
     Ответ — состояние целиком и уже **записанное**: текст по дороге чистит
     `redact()`, и показывать присланное вместо записанного значило бы
-    соврать ровно там, где в поле попал ключ.
+    соврать ровно там, где в поле попал ключ. Вместе с ним едут строки
+    блока задачи (`lines`) — те самые, что уедут в промпт: под полосой
+    этапов стоит ровно то, что видит модель.
     """
     agent = _agent(agent_id)
     _record_body(payload, TASK_FIELDS)
@@ -887,7 +891,7 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     values = {name: _profile_field(payload, name) for name in payload if name in TASK_TEXT_FIELDS}
     if "stage" in payload:
         values["stage"] = _choice_field(payload, "stage", TASK_STAGES, TASK_STAGE_DEFAULT)
-    return {"task": agent.set_task(values)}
+    return {"task": task_view(agent.set_task(values))}
 
 
 # --- каталог моделей ----------------------------------------------------------

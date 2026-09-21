@@ -481,6 +481,12 @@ function buildServer(options) {
     // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
+    // Ведение этапа: токен этапа или функция (номер обмена) → токен. Задано
+    // — обмен идёт так, как на сервере идёт обмен со служебным вызовом
+    // на этап: сперва кадр `compressing` со словом `task`, потом `start`,
+    // в котором состояние задачи уже **новое**. Что решит вызов, задаёт
+    // сцена: стенд не модель и судить о разговоре не умеет.
+    taskMove: (options && options.taskMove) || null,
     // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
     // `service`, потому что и на сервере она своя: записи вписывает человек,
     // и едут они при любом варианте обрезки, а не по заказу стратегии.
@@ -555,6 +561,9 @@ function buildServer(options) {
     // этапов рисуется тем же ответом, что и лента. У чата, которого
     // не трогали, здесь умолчание, а не `null`: этап есть всегда.
     task: { stage: "planning", step: "", expecting: "" },
+    // Журнал этапа: строка на переход, и приезжает он с самим чатом —
+    // отдельной ручки у него нет, ровно как у состояния.
+    task_log: [],
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
     ...CONTEXT,
   });
@@ -571,6 +580,50 @@ function buildServer(options) {
   let issuedMemory = state.records.length;
   const TASK_STAGES = ["planning", "execution", "validation", "done"];
   const TASK_FIELDS = ["stage", "step", "expecting"];
+  // Зашитый смысл этапа — своя копия, как и весь стенд: он нарочно
+  // независим от сервера. Копия внутри стенда при этом **одна**: строки
+  // блока собирает `taskLines`, и её ответом живут и ручка, и кадр `start`.
+  const TASK_PLAN = {
+    planning: {
+      step: "собрать требования и предложить план",
+      expecting: "ваше подтверждение плана",
+      guide: "не приступай к работе, пока план не утверждён",
+    },
+    execution: {
+      step: "выполнять утверждённый план",
+      expecting: "результат работы",
+      guide: "держись утверждённого плана, не меняй решений молча",
+    },
+    validation: {
+      step: "проверить сделанное",
+      expecting: "вердикт",
+      guide: "первой строкой ответа напиши «проверка пройдена» или «найдены проблемы: …»",
+    },
+    done: { step: "задача закрыта", expecting: "", guide: "" },
+  };
+  const TASK_STAGE_LABELS = {
+    planning: "планирование",
+    execution: "работа",
+    validation: "проверка",
+    done: "готово",
+  };
+  const TASK_LINE_LABELS = { step: "сейчас", expecting: "ожидается", guide: "инструкция" };
+
+  // Строки блока задачи — набранное человеком поверх зашитого, ровно как
+  // на сервере: тронутое поле говорит своё, нетронутое — то, что говорит
+  // этап. Пустая строка в блок не едет вовсе.
+  const taskLines = (task) => {
+    const stage = (task && task.stage) || "planning";
+    const plan = TASK_PLAN[stage] || {};
+    const lines = ["этап: " + (TASK_STAGE_LABELS[stage] || stage)];
+    ["step", "expecting", "guide"].forEach((name) => {
+      const value = (name !== "guide" && task && task[name]) || plan[name] || "";
+      if (value) lines.push(TASK_LINE_LABELS[name] + ": " + value);
+    });
+    return lines;
+  };
+
+  const taskView = (task) => ({ ...task, lines: taskLines(task) });
   const MEMORY_KINDS = ["profile", "decision", "knowledge"];
   const WORKING_KINDS = ["goal", "limit", "decision", "question"];
 
@@ -586,8 +639,10 @@ function buildServer(options) {
     };
   });
 
-  // Чат так, как его отдаёт сервер.
-  const view = (agent) => ({ ...agent });
+  // Чат так, как его отдаёт сервер: состояние задачи со строками блока —
+  // их собирает сервер, а не клиент, и под полосой обязано стоять ровно то,
+  // что видит модель.
+  const view = (agent) => ({ ...agent, task: taskView(agent.task) });
 
   // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
   // пустой — ровно как на сервере.
@@ -756,7 +811,32 @@ function buildServer(options) {
       resolved_messages: resolved,
       ...promptHead(agent, service).slots,
       strategy: service ? serviceStrategy(service) : agent.strategy,
+      // Состояние задачи уезжает тем же кадром и уже **новое**: служебный
+      // вызов на сервере отрабатывает до сборки промпта, и полоса в шапке
+      // переезжает раньше первого токена ответа.
+      task: taskView(agent.task),
     };
+  }
+
+  // Служебный вызов, который двигает этап, — со стороны клиента это кадр
+  // `compressing` со словом `task` и новый этап в кадре `start`. Что именно
+  // он решит, задаёт сцена: стенд не модель и судить о разговоре не умеет.
+  function moveStage(agent, index) {
+    const want = typeof state.taskMove === "function" ? state.taskMove(index) : state.taskMove;
+    if (!want || want === agent.task.stage) return false;
+    const was = agent.task.stage;
+    agent.task = { ...agent.task, stage: want };
+    agent.task_log = [
+      ...agent.task_log,
+      {
+        seq: agent.task_log.length + 1,
+        stage_from: was,
+        stage_to: want,
+        who: "agent",
+        at: 1700000000 + agent.task_log.length * 60,
+      },
+    ];
+    return true;
   }
 
   function sse(agent, text) {
@@ -765,6 +845,9 @@ function buildServer(options) {
     state.sent.push({ id: agent.id, text, config: config(agent) });
     const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
     const service = typeof state.service === "function" ? state.service(index) : state.service;
+    // Ведение этапа идёт **до** сборки промпта, как на сервере: этот же
+    // обмен уедет уже с новым этапом, и блок задачи в промпте — новый.
+    const moved = moveStage(agent, index);
     // Промпт собирается до записи обмена в стенограмму: в модель уехало то,
     // что было в истории **до** этого вопроса.
     const resolved = resolvedPrompt(agent, text, service);
@@ -772,7 +855,7 @@ function buildServer(options) {
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, service, resolved);
+    if (failed) return errorStream(agent, text, failed, service, resolved, moved);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -789,8 +872,10 @@ function buildServer(options) {
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
       // Место врезки в промпте и чем она занята называет сервер — клиент не
-      // разбирает текст сообщений. Кадр `compressing` приходит только
-      // на сворачивание: служебный вызов на обмене остался один.
+      // разбирает текст сообщений. Кадр `compressing` приходит на каждый
+      // служебный вызов обмена и полем `strategy` называет, какой идёт:
+      // ведение этапа — `task`, сворачивание — `summary`.
+      ...(moved ? [{ event: "compressing", agent: agent.id, strategy: "task" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "delta", text: state.reply, metrics: null },
@@ -803,7 +888,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, service, resolved) {
+  function errorStream(agent, text, failed, service, resolved, moved) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -819,6 +904,7 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
+      ...(moved ? [{ event: "compressing", agent: agent.id, strategy: "task" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "error", agent: agent.id, message: failed.message, metrics },
@@ -1021,7 +1107,7 @@ function buildServer(options) {
       keys.forEach((name) => {
         agent.task[name] = name === "stage" ? body[name] : clean(String(body[name]));
       });
-      return json({ task: { ...agent.task } });
+      return json({ task: taskView(agent.task) });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(view(agent));

@@ -170,6 +170,40 @@ CREATE TABLE IF NOT EXISTS task_state (
     at         REAL NOT NULL
 );
 
+-- Журнал этапа: что с ним случилось на каждом обмене и кто это сделал.
+-- Строка на решение, а не на чат: решений много, и у каждого своё время.
+--
+-- Своя таблица рядом с `task_state`, а не колонка в ней: состояние — где
+-- задача **сейчас**, журнал — как она сюда пришла. Ключ сквозной и
+-- AUTOINCREMENT, как у обоих слоёв памяти: строка здесь имеет идентичность,
+-- никогда не переписывается и номер удалённой заново не выдаётся.
+--
+-- `stage_from` и `stage_to` равны, когда служебный вызов решил оставить этап
+-- как был. Такая строка в журнале переходов на экране не показывается —
+-- переход это новость, а оставленный этап нет, — но в таблице стоит, и
+-- стоит не зря: в ней лежат **метрики вызова**, который это решил. Правило
+-- то же, что у сводок: числа служебного вызова живут там же, где его
+-- результат, и вызов, чья цена нигде не записана, сделал бы экономию
+-- чата враньём.
+--
+-- У строки человека метрик нет вовсе (`NULL`): нажатие кнопки ничего
+-- не стоит.
+--
+-- Каскада нет, FK не объявлены — чистится вместе с состоянием, на всех трёх
+-- путях и одним методом (`clear_task`): журнал переходов забытого разговора
+-- рассказывал бы про задачу, которой уже нет.
+CREATE TABLE IF NOT EXISTS task_log (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    stage_from TEXT NOT NULL,
+    stage_to   TEXT NOT NULL,
+    who        TEXT NOT NULL,
+    metrics    TEXT,
+    at         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS task_log_by_session ON task_log(session_id);
+
 -- Происхождение чата: чей он потомок и сколько первых сообщений унёс.
 -- Ветка — обычный чат, отдельная строка в `sessions` с копией истории до
 -- точки ветвления; схему `messages` ветвление не трогает вовсе, изоляция
@@ -310,6 +344,20 @@ def _task_row(row) -> dict:
     for name in TASK_FIELDS:
         task[name] = row[name]
     return task
+
+
+def _task_move_row(row) -> dict:
+    """Строка журнала этапа в том виде, в каком её ждут и вкладка, и счёт
+    стоимости: откуда, куда, кто и когда — плюс метрики вызова, если решал
+    вызов. Одна форма на оба чтения, довод тот же, что у `_task_row`."""
+    return {
+        "seq": row["seq"],
+        "stage_from": row["stage_from"],
+        "stage_to": row["stage_to"],
+        "who": row["who"],
+        "metrics": _loads(row["metrics"], None) if row["metrics"] else None,
+        "at": row["at"],
+    }
 
 
 def _memory_row(row: sqlite3.Row) -> dict:
@@ -658,9 +706,9 @@ class Store:
         и не было.
 
         Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`,
-        `working_memory`, `task_state` и `branches` руками — сводка,
-        цели, этап и происхождение удалённого разговора достанутся чату
-        с тем же id.
+        `working_memory`, `task_state`, `task_log` и `branches` руками — сводка,
+        цели, этап, его журнал и происхождение удалённого разговора достанутся
+        чату с тем же id.
 
         Долговременная память (`memory`) здесь не трогается намеренно: чат ей
         не владелец, а читатель, и слой переживает и удаление чата, и `forget()`.
@@ -676,6 +724,7 @@ class Store:
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_log WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
@@ -699,6 +748,7 @@ class Store:
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM working_memory")
             conn.execute("DELETE FROM task_state")
+            conn.execute("DELETE FROM task_log")
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM profile")
@@ -957,13 +1007,69 @@ class Store:
             ).fetchone()
         return _task_row(saved)
 
+    def add_task_move(
+        self,
+        session_id: str,
+        *,
+        stage_from: str,
+        stage_to: str,
+        who: str,
+        metrics: dict | None = None,
+        at: float | None = None,
+    ) -> dict:
+        """Дописывает строку журнала этапа и отдаёт её целиком.
+
+        Только дописывает: строки журнала не правятся и не перенумеровываются
+        никогда — это летопись, а не состояние. Номер выдаёт база.
+
+        `stage_from == stage_to` — законный случай: служебный вызов решил
+        оставить этап как был, и строка стоит здесь ради его метрик.
+        """
+        stamp = time.time() if at is None else at
+        with self.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO task_log (session_id, stage_from, stage_to, who, metrics, at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    stage_from,
+                    stage_to,
+                    who,
+                    _dumps(metrics) if metrics else None,
+                    stamp,
+                ),
+            )
+            seq = cur.lastrowid
+            row = conn.execute(
+                "SELECT seq, stage_from, stage_to, who, metrics, at FROM task_log "
+                "WHERE seq = ?",
+                (seq,),
+            ).fetchone()
+        return _task_move_row(row)
+
+    def list_task_log(self, session_id: str) -> list[dict]:
+        """Журнал этапа этого чата по порядку номеров — от первого решения
+        к последнему."""
+        with self.reading() as conn:
+            rows = conn.execute(
+                "SELECT seq, stage_from, stage_to, who, metrics, at FROM task_log "
+                "WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        return [_task_move_row(row) for row in rows]
+
     def clear_task(self, session_id: str) -> None:
         """Возвращает чату умолчание: строки не стало, и задача снова
-        на планировании. Забытый разговор не вправе оставить следующему свой
-        этап — врезка блока задачи зажима по длине истории не имеет, ровно
-        как у рабочей памяти."""
+        на планировании. Журнал уносится тем же методом и той же
+        транзакцией: летопись переходов без самой задачи рассказывала бы
+        про разговор, которого уже нет.
+
+        Забытый разговор не вправе оставить следующему свой этап — врезка
+        блока задачи зажима по длине истории не имеет, ровно как у рабочей
+        памяти."""
         with self.tx() as conn:
             conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_log WHERE session_id = ?", (session_id,))
 
     # --- происхождение чата ---------------------------------------------------
 
