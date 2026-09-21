@@ -54,6 +54,37 @@ def _usage_number(value) -> int | float | None:
     return value
 
 
+def _add_usage(totals: dict | None, metrics: dict | None) -> dict | None:
+    """Метрики второго оборота поверх первого: числа складываются, остальное
+    берётся от последнего.
+
+    Складывать надо ровно `USAGE_FIELDS` — вход, выход, всего и цену: оборот
+    с вызовом инструмента стоит денег наравне с ответом, и отчёт, назвавший
+    только второй, соврал бы о цене инструмента вдвое. А время до первого
+    токена, скорость и `finish_reason` — про **один** вызов, и сумма из них
+    ничего не значит: у них побеждает последний оборот, тот, чей текст
+    и увидел собеседник.
+
+    Первый оборот (`totals is None`) отдаёт метрики как есть: складывать
+    ещё не с чем.
+    """
+    if not isinstance(metrics, dict):
+        return totals
+    if not isinstance(totals, dict):
+        return metrics
+    merged = {**totals, **metrics}
+    for name in USAGE_FIELDS:
+        was, now = _usage_number(totals.get(name)), _usage_number(metrics.get(name))
+        if was is not None and now is not None:
+            merged[name] = was + now
+        elif was is not None:
+            merged[name] = was
+    if isinstance(merged.get("cost_usd"), float):
+        # Копейки от сложения float'ов — там же, где их округляет итог чата.
+        merged["cost_usd"] = round(merged["cost_usd"], 8)
+    return merged
+
+
 COMPRESS_SYSTEM = (
     "Ты сворачиваешь начало разговора в сжатый пересказ. Не отвечай на сообщения "
     "и не обращайся к собеседнику: твой ответ целиком — пересказ, и он встанет "
@@ -204,6 +235,148 @@ def task_view(task: dict) -> dict:
         "lines": task_lines(task),
         "moves": list(TASK_MOVES.get(stage, ())),
     }
+
+
+TASK_TOOL_NAME = "update_stage"
+
+TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": TASK_TOOL_NAME,
+        "description": (
+            "Обнови этап задачи. Вызывай, когда продвинулся: план готов "
+            "и утверждён, работа сделана, проверка проведена. "
+            "Не вызывай, если ничего не изменилось."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stage": {
+                    "type": "string",
+                    "enum": list(TASK_STAGES),
+                    "description": "Этап, на который переходит задача.",
+                }
+            },
+            "required": ["stage"],
+            "additionalProperties": False,
+        },
+    },
+}
+"""Единственный инструмент чата: модель сама говорит, что задача продвинулась.
+
+Так это делают все, и не из моды. Служебный вызов, который спрашивал об
+этапе после **каждого** обмена, стоил лишнего обращения к модели на каждом
+обмене и разбирался в ответе текстом; инструмент обходится лишним оборотом
+только при настоящей смене этапа — три раза за задачу вместо двадцати, —
+и решение приезжает **формой**, которую держит провайдер: аргументом
+из закрытого списка. Разбирать текст ответа больше не нужно нигде.
+
+Описание — с условием вызова, а не только с назначением: «что он делает»
+модель прочтёт здесь, а «когда пора» — в блоке задачи, строкой инструкции
+этапа (`TASK_STAGE_PLAN`, app/schema.py). Одного описания мало: у модели,
+у которой есть кнопка и нет повода, кнопка так и останется ненажатой.
+
+Просит инструмент **этап**, а не «закончено ли»: на оценку модель склонна
+отвечать «да», и проверка стала бы штампом. Здесь она называет место,
+и карта переходов проверяет, можно ли туда."""
+
+TASK_TOOL_FROM = ("execution", "validation")
+"""Этапы, на которых инструмент **объявляется**: те, с которых ему есть что
+двигать.
+
+Планирования здесь нет намеренно: выход оттуда один — кнопка «Утвердить
+план», и «план утверждён» это явное действие человека. Инструмент, объявленный
+там, предлагал бы модели дверь, которой у неё нет, и кончалось бы это
+отказом на каждый обмен. «Готова» нет по другому доводу: карта с него
+не ведёт никуда, и звать инструмент не за чем.
+
+Отсюда же и дешевизна пустого чата: задачу не начинали — в теле запроса
+нет и лишнего объявления."""
+
+TASK_TOOL_ROUNDS = 2
+"""Сколько оборотов «вызов → результат → продолжение» обмен делает подряд.
+
+Предел, а не доверие: модель, упёршаяся в отказ, вправе попробовать ещё
+раз — но на третий это уже круг, и уводить в него обмен нельзя.
+
+Упёрлись в предел — инструмент на последнем обороте **не объявляем** вовсе,
+и продолжение приходит обычным ответом. Оставь мы объявление, упрямая модель
+позвала бы снова, мы бы снова прервались на предел, и собеседник остался бы
+вовсе без ответа: ход, кончившийся вызовом, текста не отдаёт."""
+
+
+def tool_reply(outcome: str, stage: str, target: str) -> str:
+    """Что инструмент отвечает **модели**. Ответ читает она и на нём
+    продолжает, поэтому он по существу, а не «ок» и не «ошибка»: получив
+    отказ с доводом, модель поймёт, что делать дальше, а получив «ошибку» —
+    повторит то же самое.
+
+    Этапы здесь названы токенами, а не по-русски: токенами модель и просит,
+    и отказ, называющий вслух то, что можно передать аргументом, — это
+    подсказка, которой можно воспользоваться сразу.
+    """
+    if outcome == "moved":
+        return f"готово, этап теперь: {target}"
+    if outcome == "same":
+        return f"этап уже такой: {stage}, менять нечего"
+    if outcome == "unknown":
+        return (
+            f"нет такого этапа. Допустимые: {', '.join(TASK_STAGES)}"
+        )
+    if stage == TASK_STAGE_DEFAULT:
+        return (
+            "нельзя: из planning задачу выпускает только человек, кнопкой "
+            "«Утвердить план». Дождись её"
+        )
+    allowed = TASK_MOVES.get(stage, ())
+    if not allowed:
+        return f"нельзя: {stage} — конечный этап, уйти с него нельзя"
+    return f"нельзя: из {stage} можно только в {' или '.join(allowed)}"
+
+
+def deny_note(stage: str, target: str) -> str:
+    """То же самое **человеку** — строкой под ответом, и потому русскими
+    подписями этапов (`TASK_STAGE_LABELS`), теми же, какими они стоят
+    на полосе.
+
+    Молчать нельзя: модель попросила переход, его не дали, и без строки
+    это выглядело бы так, будто она ничего и не просила. Два текста на
+    один отказ — не две таблицы: аудитории разные, а карта одна.
+    """
+    label = TASK_STAGE_LABELS.get(target, target)
+    if stage == TASK_STAGE_DEFAULT:
+        reason = "план утверждает человек"
+    else:
+        allowed = TASK_MOVES.get(stage, ())
+        if not allowed:
+            reason = "задача уже закрыта"
+        elif len(allowed) == 1:
+            reason = f"сначала {TASK_STAGE_LABELS.get(allowed[0], allowed[0])}"
+        else:
+            reason = "можно только в " + " или ".join(
+                TASK_STAGE_LABELS.get(name, name) for name in allowed
+            )
+    return f"переход в «{label}» отклонён: {reason}"
+
+
+def read_stage_argument(arguments: str) -> str | None:
+    """Этап из аргументов вызова — или `None`, если его там нет.
+
+    Разбирается ровно json и ровно поле `stage`: это форма, которую держит
+    провайдер, и ничего, кроме неё, здесь не читается. Текста мы не
+    разбираем нигде и больше не будем: на нём трижды обожглись.
+
+    Кривой json, не объект, поля нет, значение не строка — всё это одно
+    и то же «этап не назван», и отвечает на него один ответ.
+    """
+    try:
+        loaded = json.loads(arguments or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    stage = loaded.get("stage")
+    return stage if isinstance(stage, str) else None
 
 
 def working_lines(items: list[dict]) -> str:
@@ -786,6 +959,62 @@ class Agent:
             self.task["stage"] = target
         self._log_move(stage, target, who, ok=True)
         return "moved"
+
+    def task_tools(self, task=None) -> list[dict] | None:
+        """Объявление инструментов этого обмена — или `None`, если объявлять
+        нечего.
+
+        Условие одно: этап из тех, с которых инструменту есть что двигать
+        (`TASK_TOOL_FROM`). `None`, а не пустой список: незаданное поле
+        в тело запроса не едет вовсе, и чат на планировании уходит в модель
+        ровно таким же, каким уходил бы без инструментов вообще.
+
+        `task` — уже прочитанное состояние: обмен читает его **один раз**
+        и передаёт сюда и в промпт, ровно как память и профиль. Внутри
+        обмена оно перечитывается заново — этап мог переехать этим же
+        вызовом, и второго объявления с «готова» быть не должно.
+        """
+        task = self.task if task is None else task
+        stage = task.get("stage", TASK_STAGE_DEFAULT)
+        return [TASK_TOOL] if stage in TASK_TOOL_FROM else None
+
+    def run_tool(self, call: dict) -> tuple[str, str | None]:
+        """Исполняет вызов инструмента: `(что ответить модели, что показать
+        человеку)`. Вторым — только отказ; удавшийся переход виден полосой
+        и строкой журнала, и приписывать его ещё и под ответом незачем.
+
+        **Модель просит — код решает.** Проверка перехода стоит ровно там,
+        где стояла: в `move_stage`, у карты. Здесь только две вещи, которых
+        карта не знает.
+
+        Первая — чужое имя инструмента: объявляли мы один, и отвечать на
+        выдуманный «ок» значило бы соглашаться неизвестно с чем.
+
+        Вторая — планирование. Карта ребро `planning → execution` разрешает,
+        потому что по нему ходит кнопка, а инструменту туда нельзя:
+        «план утверждён» это решение человека. Объявления на планировании
+        у инструмента и нет, но упрямая модель вправе позвать необъявленное,
+        и отказ обязан быть здесь, а не надеждой на её вежливость. Строка
+        журнала у такого отказа своя, как и у всякого другого: попытка была,
+        и её видно.
+        """
+        if call.get("name") != TASK_TOOL_NAME:
+            return f"нет такого инструмента: {call.get('name')!r}", None
+
+        stage = self.task.get("stage", TASK_STAGE_DEFAULT)
+        target = read_stage_argument(call.get("arguments", ""))
+        if target is None or target not in TASK_STAGES:
+            # Этапа не назвали — переходом это не было, и в журнал не идёт:
+            # рисовать в летописи стрелку в никуда значило бы врать.
+            return tool_reply("unknown", stage, target or ""), None
+
+        if stage == TASK_STAGE_DEFAULT and target != stage:
+            self._log_move(stage, target, "agent", ok=False)
+            return tool_reply("denied", stage, target), deny_note(stage, target)
+
+        outcome = self.move_stage(target, "agent")
+        note = deny_note(stage, target) if outcome == "denied" else None
+        return tool_reply(outcome, stage, target), note
 
     def context_cut(self, spec: AgentSpec | None = None) -> tuple[int, dict | None]:
         """Что стратегия делает с началом истории: сколько первых реплик не
@@ -1396,11 +1625,18 @@ class Agent:
             # слева: в списке он никому не нужен, а растёт он с каждым
             # обменом. Своей ручки у него нет по тому же доводу, что
             # и у самого состояния, — он приезжает с чатом.
-            data["task_log"] = [
-                {name: item[name] for name in ("seq", "stage_from", "stage_to", "who", "ok", "at")}
-                for item in self.task_log
-            ]
+            data["task_log"] = self.task_log_view()
         return data
+
+    def task_log_view(self) -> list[dict]:
+        """Журнал этапа так, как его ждёт экран. Одной формой на оба пути
+        наружу — и на сам чат, и на кадр `done` обмена: две сборки одного
+        списка разошлись бы молча, и после обмена на экране стояло бы одно,
+        а после перезагрузки другое."""
+        return [
+            {name: item[name] for name in ("seq", "stage_from", "stage_to", "who", "ok", "at")}
+            for item in self.task_log
+        ]
 
     # --- обмен ---------------------------------------------------------------
 
@@ -1516,33 +1752,112 @@ class Agent:
             final_metrics: dict | None = None
             failure: str | None = None
             cancelled = False
+            notes: list[str] = []
+            """Отказы инструмента — по строке на каждый. Молчать о них нельзя:
+            модель попросила переход, его не дали, и без строки под ответом
+            это выглядело бы так, будто она ничего и не просила."""
+
+            # Оборот обмена: получили вызов инструмента → исполнили → дописали
+            # результат в сообщения → пошли за продолжением. Продолжение
+            # стримится собеседнику как обычный ответ — он и есть обычный
+            # ответ, просто модель успела по дороге сходить за кнопкой.
+            #
+            # Сообщения растут копией, а не правкой `prompt`: кадр `start`
+            # уже уехал с промптом, и дописать в него задним числом значило бы
+            # показать в просмотре запроса не то, что уехало первым ходом.
+            talk = list(prompt)
+            tools = self.task_tools(task)
+            rounds = 0
 
             try:
-                stream = stream_completion(
-                    spec, prompt_override=prompt, context_length=context_length
-                )
-                async with contextlib.aclosing(stream):
-                    async for chunk in stream:
-                        kind = chunk["type"]
-                        if kind == "delta":
-                            text += chunk["text"]
-                            yield chunk
-                        elif kind == "reasoning":
-                            reasoning += chunk["text"]
-                            yield chunk
-                        elif kind == "metrics":
-                            yield chunk
-                        elif kind == "error":
-                            failure = chunk["message"]
-                            final_metrics = chunk["metrics"]
-                            yield chunk
-                        elif kind == "done":
-                            text = chunk["text"]
-                            reasoning = chunk.get("reasoning") or reasoning
-                            final_metrics = chunk["metrics"]
-                        if cancel.is_set():
-                            cancelled = True
-                            break
+                while True:
+                    round_text = ""
+                    calls: list[dict] = []
+                    stream = stream_completion(
+                        spec,
+                        prompt_override=talk,
+                        context_length=context_length,
+                        tools=tools,
+                    )
+                    async with contextlib.aclosing(stream):
+                        async for chunk in stream:
+                            kind = chunk["type"]
+                            if kind == "delta":
+                                round_text += chunk["text"]
+                                yield chunk
+                            elif kind == "reasoning":
+                                reasoning += chunk["text"]
+                                yield chunk
+                            elif kind == "metrics":
+                                yield chunk
+                            elif kind == "error":
+                                failure = chunk["message"]
+                                final_metrics = _add_usage(final_metrics, chunk["metrics"])
+                                yield chunk
+                            elif kind == "done":
+                                round_text = chunk["text"]
+                                reasoning = chunk.get("reasoning") or reasoning
+                                calls = chunk.get("tool_calls") or []
+                                # Метрики **обоих** оборотов складываются:
+                                # инструмент стоит второго обращения к модели,
+                                # и отчёт, забывший его цену, — враньё. Числа
+                                # складываются, остальное берётся от последнего
+                                # оборота: время до первого токена и скорость
+                                # про один вызов, и складывать их бессмысленно.
+                                final_metrics = _add_usage(final_metrics, chunk["metrics"])
+                            if cancel.is_set():
+                                cancelled = True
+                                break
+                    text += round_text
+
+                    # Ход кончился не вызовом — значит это и был ответ.
+                    # Упёрлись в предел оборотов — отвечаем тем, что есть:
+                    # упрямая модель иначе увела бы обмен в круг.
+                    if not calls or cancelled or failure or rounds >= TASK_TOOL_ROUNDS:
+                        break
+                    rounds += 1
+
+                    # Ответ модели с вызовом и результат каждого вызова —
+                    # в сообщения, тем же порядком, каким их ждёт провайдер.
+                    talk.append(
+                        {
+                            "role": "assistant",
+                            "content": round_text,
+                            "tool_calls": [
+                                {
+                                    "id": call["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": call["name"],
+                                        "arguments": call["arguments"],
+                                    },
+                                }
+                                for call in calls
+                            ],
+                        }
+                    )
+                    for call in calls:
+                        answer, note = self.run_tool(call)
+                        if note:
+                            notes.append(note)
+                        talk.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": answer,
+                            }
+                        )
+                    # Этап мог переехать только что: объявление пересобираем
+                    # по **новому** состоянию, и с «готова» инструмента уже
+                    # не будет. Предлагать дверь, которой нет, — тот же
+                    # отказ, только оплаченный.
+                    #
+                    # А на последнем обороте инструмента нет вовсе, каким бы
+                    # ни был этап: предел упёрся, и оставить кнопку значило бы
+                    # звать в тот самый круг, ради которого предел и заведён.
+                    # Собеседник обязан получить ответ словами — снятое
+                    # объявление его и обеспечивает.
+                    tools = self.task_tools() if rounds < TASK_TOOL_ROUNDS else None
             except MissingKeyError as exc:
                 failure = str(exc)
                 yield {"type": "error", "message": failure, "metrics": None}
@@ -1570,6 +1885,14 @@ class Agent:
             if cut and isinstance(final_metrics, dict):
                 final_metrics = {**final_metrics, CUT_METRIC[spec.strategy]: cut}
 
+            # Отказ инструменту — тем же путём, что и срезанное начало:
+            # приписка к числам обмена. Место ей там, потому что она про
+            # **этот** обмен и обязана его пережить — строка под ответом
+            # стоит и после перезагрузки страницы, а числа обмена лежат
+            # в истории. В суммы по чату ключ не идёт: их считает USAGE_FIELDS.
+            if notes and isinstance(final_metrics, dict):
+                final_metrics = {**final_metrics, "stage_note": "; ".join(notes)}
+
             committed = self._commit(user_text, text, failure, reasoning, final_metrics)
 
             done: dict = {
@@ -1580,6 +1903,12 @@ class Agent:
                 "cancelled": cancelled,
                 "error": failure,
                 "committed": committed,
+                # Состояние задачи — **после** обмена: этап двигает инструмент
+                # по ходу ответа, и кадр `start` знать о переходе не мог.
+                # Полоса в шапке переезжает по этому кадру, то есть сразу
+                # после ответа и без единого лишнего запроса.
+                "task": task_view(self.task),
+                "task_log": self.task_log_view(),
             }
             if not committed:
                 # Обмена не было: вопрос нельзя оставлять в ленте клиента —

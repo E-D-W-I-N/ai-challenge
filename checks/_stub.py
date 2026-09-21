@@ -40,6 +40,7 @@ def make(
     delay: float = 0.0,
     reasoning: str = "",
     usage: Callable[[int], dict] | dict | None = None,
+    tool_calls: Callable[[list[dict], int, list | None], list | None] | list | None = None,
 ):
     """Собирает заглушку `stream_completion`.
 
@@ -51,12 +52,26 @@ def make(
         (номер вызова) → словарь. Без него у каждого ответа одни и те же
         числа, и сумма по чату сошлась бы на любом коде. `None` в поле —
         законное значение: так провайдер молчит о цифре.
+    tool_calls — вызовы инструмента, которые «сделает модель»: список
+        `[{"name": ..., "arguments": ...}]` или функция (messages, номер
+        вызова, объявленные инструменты) → список. Функцией заглушка отвечает
+        **на запрос**, то есть видит ровно то, что увидела бы модель: и промпт,
+        и объявление. Сцена, зовущая инструмент только когда его объявили,
+        пишется поэтому честно — и так же честно пишется сцена, где упрямая
+        модель зовёт необъявленный.
+        Вызов уезжает в событии `done` полем `tool_calls`, и `finish_reason`
+        у такого хода — `tool_calls`: ход, кончившийся вызовом, кончается им
+        и для нас. Сборку кусков заглушка не изображает — это работа
+        настоящего `stream_completion`, и проверяется она на нём самом,
+        через настоящий SSE.
     """
     from app.llm import Metrics, build_payload
 
     known = {f.name for f in dataclass_fields(Metrics)}
 
-    async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
+    async def fake_stream_completion(
+        session, *, prompt_override=None, context_length=None, tools=None
+    ):
         messages = list(prompt_override or [])
         index = len(CALLS)
         CALLS.append(
@@ -64,9 +79,17 @@ def make(
                 "model": session.model,
                 "label": session.label,
                 "messages": [dict(m) for m in messages],
-                "payload": build_payload(session, prompt_override),
+                # Тело собирается настоящим `build_payload` и **с теми же
+                # инструментами**: проверка «инструмент объявлен там, где есть
+                # что двигать» обязана смотреть на то самое тело, которое
+                # ушло бы в OpenRouter, а не на аргумент по дороге.
+                "payload": build_payload(session, prompt_override, tools),
+                "tools": tools,
             }
         )
+
+        wanted = tool_calls(messages, index, tools) if callable(tool_calls) else tool_calls
+        wanted = list(wanted or [])
 
         if callable(reply):
             text = reply(messages, index)
@@ -90,7 +113,7 @@ def make(
             completion_tokens=tokens,
             total_tokens=100,
             cost_usd=0.000123,
-            finish_reason="stop",
+            finish_reason="tool_calls" if wanted else "stop",
             model=session.model,
             provider="stub",
             context_length=context_length,
@@ -121,13 +144,34 @@ def make(
             if reasoning:
                 yield {"type": "reasoning", "text": reasoning, "metrics": metrics}
 
-            size = max(1, len(text) // max(1, chunks))
-            for start in range(0, len(text), size):
+            # Ход, кончившийся вызовом инструмента, текста собеседнику
+            # не отдаёт: модель нажала кнопку и ждёт результата. Настоящий
+            # поток выглядит так же.
+            if not wanted:
+                size = max(1, len(text) // max(1, chunks))
+                for start in range(0, len(text), size):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
+            else:
+                text = ""
                 if delay:
                     await asyncio.sleep(delay)
-                yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
             yield {"type": "metrics", "metrics": metrics}
-            yield {"type": "done", "text": text, "reasoning": reasoning, "metrics": metrics}
+            yield {
+                "type": "done",
+                "text": text,
+                "reasoning": reasoning,
+                "tool_calls": [
+                    {
+                        "id": call.get("id", f"call_{index}_{i}"),
+                        "name": call.get("name", "update_stage"),
+                        "arguments": call.get("arguments", ""),
+                    }
+                    for i, call in enumerate(wanted)
+                ],
+                "metrics": metrics,
+            }
             finished = True
         finally:
             ACTIVE["now"] -= 1

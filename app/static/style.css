@@ -352,7 +352,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* Строка под полосой: чем заняты, чего ждут и что велено модели. Ровно то,
    что уезжает в блок задачи, — поэтому не прячется и переносится, а не
-   обрезается многоточием. */
+   обрезается многоточием. Два поля из трёх правятся щелчком, и это видно
+   пунктиром: инструкция этапа зашита и не правится. */
 .stage-note {
   margin: 4px 0 0;
   color: var(--muted);
@@ -360,9 +361,37 @@ button, input, select, textarea { font: inherit; color: inherit; }
   line-height: 1.45;
 }
 .stage-note:empty { display: none; }
+.stage-dot { color: var(--faint); }
+.stage-line.editable { cursor: text; border-bottom: 1px dashed var(--line); }
+.stage-line.editable:hover { color: var(--text); }
+.stage-edit {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  min-width: 220px;
+}
+
+/* Журнал переходов — свёрнутой строкой: летопись, а не состояние, и место
+   в шапке отдано тому, где задача сейчас. */
+.moves-box { margin-top: 4px; }
+.moves-toggle {
+  border: 0;
+  border-radius: 6px;
+  padding: 2px 6px;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.moves-toggle:hover { background: var(--bg-soft); color: var(--muted); }
 
 /* Журнал переходов: строка на переход, без абзацев. */
-.moves { display: flex; flex-direction: column; gap: 4px; }
+.moves { display: flex; flex-direction: column; gap: 4px; padding: 4px 6px 0; }
 .move {
   display: flex;
   align-items: baseline;
@@ -455,6 +484,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   overflow-wrap: anywhere;
 }
 .usage-how { margin-top: 2px; opacity: .85; }
+/* Отказ инструменту: модель просила перевести задачу, её не пустили.
+   Стоит первой строкой и заметнее чисел — это новость, а числа нет. */
+.usage-stage { margin-bottom: 3px; color: var(--warn, #b4540a); font-weight: 600; }
 .card.failed { border-color: var(--danger); }
 .card-error {
   margin: 0 16px 14px;

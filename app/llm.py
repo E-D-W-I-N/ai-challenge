@@ -198,11 +198,22 @@ def merge_plugins(ours: list[dict], theirs: list) -> list:
     return [*kept, *theirs]
 
 
-def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
+def build_payload(
+    session: AgentSpec,
+    messages: list[dict] | None = None,
+    tools: list[dict] | None = None,
+) -> dict:
     """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
     контекста — на каждом вызове.
 
     Промпт приходит снаружи: собирает его агент, из слепка конфига.
+
+    `tools` — объявление инструментов, и незаданное **не отправляется вовсе**:
+    идиом тот же, что у параметров сэмплирования. Пустой список это не
+    «инструментов нет», а другой запрос — с `provider.require_parameters=true`
+    ещё и с другим списком провайдеров, потому что поддержку инструментов
+    умеет не всякий. Объявлять инструмент там, где двигать нечем, значит
+    предлагать модели кнопку без повода: нажмёт — придётся отказывать.
     """
     payload: dict = {
         "model": session.model,
@@ -225,6 +236,8 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
         payload["stop"] = session.stop
     if session.response_format is not None:
         payload["response_format"] = session.response_format
+    if tools:
+        payload["tools"] = tools
 
     for key, value in (session.extra_body or {}).items():
         if key == "provider" and isinstance(value, dict):
@@ -245,16 +258,24 @@ async def stream_completion(
     *,
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
+    tools: list[dict] | None = None,
 ) -> AsyncIterator[dict]:
     """События {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}: метрики
-    обновляются по мере генерации, финальный usage приходит последним чанком."""
+    обновляются по мере генерации, финальный usage приходит последним чанком.
+
+    Вызовы инструментов приходят **кусками** и собираются по `index` (см.
+    `_collect_tool_call`); готовыми они уезжают в событии `done` полем
+    `tool_calls`. Ход, кончившийся вызовом, кончается им и для нас:
+    `finish_reason` у такого чанка — `tool_calls`, текста в нём может
+    не быть вовсе, и ждать его после — значит ждать чанка, которого
+    не будет."""
     key = api_key()
     if key is None:
         raise MissingKeyError(
             "OPENROUTER_API_KEY не найден. Скопируйте .env.example в .env и впишите ключ."
         )
 
-    payload = build_payload(session, prompt_override)
+    payload = build_payload(session, prompt_override, tools)
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -266,6 +287,9 @@ async def stream_completion(
     started = time.monotonic()
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    calls: dict[int, dict] = {}
+    """Вызовы инструментов, собираемые по `index`: провайдер шлёт их по частям,
+    и `arguments` дописывается посимвольно, кусок за куском."""
 
     try:
         # Клиент общий на процесс, а семафор держится на всё время стрима:
@@ -341,6 +365,9 @@ async def stream_completion(
                                 "text": piece,
                                 "metrics": metrics.as_dict(),
                             }
+                        for piece_call in delta.get("tool_calls") or []:
+                            _collect_tool_call(calls, piece_call)
+
                         if choice.get("finish_reason"):
                             metrics.finish_reason = choice["finish_reason"]
 
@@ -360,8 +387,39 @@ async def stream_completion(
         "type": "done",
         "text": "".join(text_parts),
         "reasoning": "".join(reasoning_parts),
+        # Порядок — по `index`, а не по приходу: куски разных вызовов идут
+        # вперемешку, и собранный список обязан лежать так, как его задумал
+        # провайдер. Вызовов не было — пустой список, а не `None`: «модель
+        # инструмент не звала» отличать от «поля не было» не от чего.
+        "tool_calls": [calls[index] for index in sorted(calls)],
         "metrics": metrics.as_dict(),
     }
+
+
+def _collect_tool_call(calls: dict[int, dict], piece: dict) -> None:
+    """Дописывает кусок вызова инструмента в копилку по его `index`.
+
+    Вызов приезжает не целиком: имя и id приходят в первом куске, а
+    `arguments` — строкой, растущей от куска к куску, ровно как обычный
+    текст ответа. Ключ — `index`, потому что вызовов на одном ходу бывает
+    несколько и куски их идут вперемешку; по имени их не различить —
+    один и тот же инструмент модель вправе позвать дважды.
+
+    Кусок без `index` — это кусок первого вызова: поле необязательное,
+    и провайдер, приславший один вызов, вправе о нём смолчать.
+    """
+    index = piece.get("index")
+    if not isinstance(index, int):
+        index = 0
+    call = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+    if piece.get("id"):
+        call["id"] = piece["id"]
+    function = piece.get("function") or {}
+    if function.get("name"):
+        call["name"] = function["name"]
+    # `arguments` дописывается, а не присваивается: в нём приезжает json
+    # по кускам, и присвоенный последний кусок оставил бы от объекта хвост.
+    call["arguments"] += function.get("arguments") or ""
 
 
 def _apply_usage(metrics: Metrics, usage: dict) -> None:

@@ -19,6 +19,8 @@ import subprocess
 import sys
 from unittest.mock import patch
 
+import httpx
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -31,6 +33,7 @@ _stub.install_offline()
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
+import app.llm as llm_module  # noqa: E402
 from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import AgentSpec, blank_task  # noqa: E402
@@ -1627,6 +1630,375 @@ def check_task_stage():
         "отбит и записан в журнал отклонённым, тот же этап и незнакомый "
         "в журнал не идут вовсе; пять строк журнала пережили переоткрытие "
         "файла, этап и шаг тоже — и уехали в ветку целиком"
+    )
+
+
+@check("этап двигает инструмент модели: карта решает, предел держит, цена в итоге")
+def check_stage_tool():
+    """Главное дня: этап двигает **модель, вызвав инструмент**, а не служебный
+    вызов после каждого обмена.
+
+    Разница не в моде. Вопрос после каждого обмена стоил лишнего обращения
+    к модели **на каждом обмене** и решался разбором её ответа; инструмент
+    обходится лишним оборотом только при настоящей смене этапа и приезжает
+    **формой**, которую держит провайдер, — аргументом из закрытого списка.
+    Текста здесь не разбирается нигде.
+
+    И главное правило: **модель просит — код решает**. Карта переходов стоит
+    ровно там, где стояла, и отказ у неё осмысленный: модель читает его
+    и продолжает на нём, а человек видит строку под ответом.
+    """
+    from app.agent import Agent, TASK_TOOL_NAME
+
+    def _tool(stage: str):
+        """Вызов инструмента с этим этапом — в том виде, в каком его отдаёт
+        разбор потока."""
+        return [{"name": TASK_TOOL_NAME, "arguments": json.dumps({"stage": stage})}]
+
+    def _once(calls):
+        """Инструмент зовётся на первом обороте обмена и только на нём:
+        второй оборот — это уже продолжение, и вызывать в нём снова значило бы
+        проверять предел вместо перехода. Различаются обороты по сообщению
+        роли `tool` в промпте: его дописывает сам обмен."""
+        def ask(messages, index, tools):
+            if any(m.get("role") == "tool" for m in messages):
+                return None
+            return calls
+        return ask
+
+    def _whenever(calls):
+        """Модель, зовущая инструмент на каждом обороте, где он объявлен.
+        Честно: необъявленного настоящая модель не зовёт, и заглушка,
+        зовущая его всегда, оставила бы зелёным круг, которого в жизни
+        не случилось бы."""
+        return lambda messages, index, tools: (calls if tools else None)
+
+    # --- 1. Объявление: только там, где есть что двигать --------------------
+    #
+    # Инструмент уезжает в **теле запроса**, и смотрим мы именно туда: это
+    # то самое тело, которое ушло бы в OpenRouter.
+    path = _temp_db("tool-declared")
+    store = Store(path).init()
+    _stub.install(reply="понял")
+    declared = Agent(AgentSpec(label="объявление", model="stub/model"), store=store)
+
+    _ask(declared, 1)
+    assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].get("tools")
+
+    declared.approve_plan()
+    _ask(declared, 1)
+    tools = _stub.CALLS[-1]["payload"]["tools"]
+    assert [t["function"]["name"] for t in tools] == [TASK_TOOL_NAME], tools
+    # Описание — с условием вызова, а не только с назначением: «что он делает»
+    # модель читает здесь, а «когда пора» — строкой инструкции в блоке задачи.
+    said = tools[0]["function"]["description"]
+    assert "Вызывай, когда продвинулся" in said and "Не вызывай" in said, said
+    # Аргумент — закрытый список, тот же, что у полосы: решение приезжает
+    # формой, а не фразой, и выдумать этап модель не сможет.
+    assert tools[0]["function"]["parameters"]["properties"]["stage"]["enum"] == [
+        "planning", "execution", "validation", "done"
+    ], tools[0]
+
+    declared.move_stage("validation")
+    _ask(declared, 1)
+    assert "tools" in _stub.CALLS[-1]["payload"], "на проверке инструмента нет"
+    declared.move_stage("done")
+    _ask(declared, 1)
+    # С «готова» карта не ведёт никуда: объявлять инструмент значило бы
+    # предлагать дверь, которой нет.
+    assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].get("tools")
+
+    # --- 2. Разрешённый переход применяется, и журнал помечает «агент» ------
+    _stub.reset()
+    _stub.install(reply="сделал", tool_calls=_once(_tool("validation")))
+    moved = Agent(AgentSpec(label="работа сделана", model="stub/model"), store=store)
+    moved.approve_plan()
+    _ask(moved, 1)
+    assert moved.task["stage"] == "validation", moved.task
+    assert store.load_task(moved.id)["stage"] == "validation", store.load_task(moved.id)
+    assert (moved.task_log[-1]["stage_from"], moved.task_log[-1]["stage_to"],
+            moved.task_log[-1]["who"], moved.task_log[-1]["ok"]) == (
+        "execution", "validation", "agent", True), moved.task_log
+    # Обмен пошёл за продолжением: второй оборот виден и по числу вызовов,
+    # и по промпту — в нём ответ модели с вызовом и результат вызова.
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    second = _stub.CALLS[-1]["messages"]
+    assert second[-2]["role"] == "assistant" and second[-2]["tool_calls"], second[-2]
+    # Результат инструмента — **осмысленный**: модель на нём продолжает,
+    # и «ок» ей ничего бы не сказало.
+    assert second[-1] == {
+        "role": "tool",
+        "tool_call_id": second[-2]["tool_calls"][0]["id"],
+        "content": "готово, этап теперь: validation",
+    }, second[-1]
+    # Продолжение стримится собеседнику как обычный ответ — им и записывается.
+    assert moved.history[-1].content == "сделал", moved.transcript()
+    # А блок задачи второго оборота — **прежний**, и это намеренно: промпт
+    # собран один раз на обмен, и кадр `start` уже уехал с ним. Новый этап
+    # модель узнаёт из результата инструмента, и узнаёт дословно — за тем он
+    # и осмысленный. Пересобери мы блок посреди обмена, просмотр запроса
+    # показывал бы не то, что уехало первым ходом.
+    block = next(m for m in second if "[факты о разговоре]" in m["content"])
+    assert "этап: работа" in block["content"], block
+
+    # Обратное ребро `проверка → работа` — главное в карте: проверка,
+    # нашедшая проблемы, обязана возвращать задачу в работу, иначе «проверка»
+    # слово, а не момент. Решает его сама модель, вызвав инструмент.
+    _stub.reset()
+    _stub.install(reply="нашёл дыру в оплате", tool_calls=_once(_tool("execution")))
+    back = Agent(AgentSpec(label="проверка нашла", model="stub/model"), store=store)
+    back.approve_plan()
+    back.move_stage("validation")
+    _ask(back, 1)
+    assert back.task["stage"] == "execution", back.task
+    assert (back.task_log[-1]["stage_from"], back.task_log[-1]["stage_to"],
+            back.task_log[-1]["ok"]) == ("validation", "execution", True), back.task_log
+    # И вперёд с проверки она тоже вправе — выходов из неё два, и какой
+    # из них, решает модель.
+    _stub.reset()
+    _stub.install(reply="всё чисто", tool_calls=_once(_tool("done")))
+    back.move_stage("validation")
+    _ask(back, 1)
+    assert back.task["stage"] == "done", back.task
+
+    # --- 3. Запрещённый переход не применяется ------------------------------
+    #
+    # Модель просит — код решает. Состояние прежнее, а модель получает
+    # объяснение, на котором может продолжить.
+    _stub.reset()
+    _stub.install(reply="закрываю", tool_calls=_once(_tool("done")))
+    jump = Agent(AgentSpec(label="через проверку", model="stub/model"), store=store)
+    jump.approve_plan()
+    _ask(jump, 1)
+    assert jump.task["stage"] == "execution", jump.task
+    assert store.load_task(jump.id)["stage"] == "execution", store.load_task(jump.id)
+    told = _stub.CALLS[-1]["messages"][-1]
+    assert told["content"] == "нельзя: из execution можно только в validation", told
+    # Отклонённая попытка **в журнале**: он обязан показывать не только то,
+    # что переходы случаются, но и то, что запрещённые не случаются.
+    assert (jump.task_log[-1]["stage_to"], jump.task_log[-1]["ok"]) == ("done", False), jump.task_log
+    # И человеку об этом говорит строка под ответом — русскими подписями
+    # этапов, теми же, что на полосе. Молчать нельзя: модель просила переход,
+    # его не дали.
+    assert jump.history[-1].metrics["stage_note"] == (
+        "переход в «готово» отклонён: сначала проверка"
+    ), jump.history[-1].metrics.get("stage_note")
+
+    # --- 4. Из планирования инструмент не выпускает -------------------------
+    #
+    # Карта ребро `planning → execution` разрешает — по нему ходит кнопка, —
+    # а инструменту туда нельзя. Объявления там у него и нет, но упрямая
+    # модель вправе позвать необъявленное, и отказ обязан быть в коде.
+    _stub.reset()
+    _stub.install(reply="приступаю", tool_calls=_once(_tool("execution")))
+    early = Agent(AgentSpec(label="сам себе утвердил", model="stub/model"), store=store)
+    _ask(early, 1)
+    assert early.task["stage"] == "planning", early.task
+    told = _stub.CALLS[-1]["messages"][-1]["content"]
+    assert "только человек" in told and "Утвердить план" in told, told
+    assert (early.task_log[-1]["stage_to"], early.task_log[-1]["ok"]) == ("execution", False), early.task_log
+    assert early.history[-1].metrics["stage_note"] == (
+        "переход в «работа» отклонён: план утверждает человек"
+    ), early.history[-1].metrics.get("stage_note")
+
+    # --- 5. Не позвала, позвала с кривым, позвала тем же --------------------
+    #
+    # Три случая, и все три значат «ничего не произошло». Журнал при этом
+    # молчит: переходом ни один из них не был.
+    _stub.reset()
+    _stub.install(reply="просто отвечаю")
+    quiet = Agent(AgentSpec(label="без вызова", model="stub/model"), store=store)
+    quiet.approve_plan()
+    rows = len(quiet.task_log)
+    _ask(quiet, 1)
+    assert quiet.task["stage"] == "execution", quiet.task
+    assert len(quiet.task_log) == rows, quiet.task_log
+    # Один обмен — одно обращение к модели: без вызова второго оборота нет.
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+
+    for broken in ('{"stage": "выполняется"}', "{не json", '{"этап": "done"}', ""):
+        _stub.reset()
+        _stub.install(
+            reply="ответ",
+            tool_calls=_once([{"name": TASK_TOOL_NAME, "arguments": broken}]),
+        )
+        _ask(quiet, 1)
+        assert quiet.task["stage"] == "execution", (broken, quiet.task)
+        assert len(quiet.task_log) == rows, (broken, quiet.task_log)
+        assert "Допустимые" in _stub.CALLS[-1]["messages"][-1]["content"], broken
+        assert quiet.history[-1].metrics.get("stage_note") is None, broken
+
+    # И на планировании — тоже ничего: этап там не назван, а значит, попытки
+    # перехода не было вовсе. Рисовать в летописи стрелку в никуда значило бы
+    # врать, и отказ «из planning выпускает человек» здесь не при чём —
+    # отвечать на него нечему.
+    _stub.reset()
+    _stub.install(
+        reply="ответ",
+        tool_calls=_once([{"name": TASK_TOOL_NAME, "arguments": '{"stage": "выполняется"}'}]),
+    )
+    fresh = Agent(AgentSpec(label="кривой на планировании", model="stub/model"), store=store)
+    _ask(fresh, 1)
+    assert fresh.task["stage"] == "planning", fresh.task
+    assert fresh.task_log == [], fresh.task_log
+    assert "Допустимые" in _stub.CALLS[-1]["messages"][-1]["content"], _stub.CALLS[-1]["messages"][-1]
+
+    # Тот же этап — **не** ошибка и не переход: ничего не пишем, модели
+    # отвечаем спокойно. Иначе журнал зарос бы строками ни о чём, а модель
+    # решила бы, что сделала что-то не так, и принялась исправляться.
+    _stub.reset()
+    _stub.install(reply="ответ", tool_calls=_once(_tool("execution")))
+    _ask(quiet, 1)
+    assert quiet.task["stage"] == "execution", quiet.task
+    assert len(quiet.task_log) == rows, quiet.task_log
+    assert _stub.CALLS[-1]["messages"][-1]["content"] == (
+        "этап уже такой: execution, менять нечего"
+    ), _stub.CALLS[-1]["messages"][-1]
+    assert quiet.history[-1].metrics.get("stage_note") is None, quiet.history[-1].metrics
+
+    # --- 6. Предел оборотов держит ------------------------------------------
+    #
+    # Упрямая модель, зовущая инструмент на каждом обороте, увела бы обмен
+    # в круг. Предел — два оборота подряд; упёрлись — отвечаем тем, что есть.
+    _stub.reset()
+    _stub.install(reply="и снова", tool_calls=_whenever(_tool("done")))
+    stubborn = Agent(AgentSpec(label="упрямая", model="stub/model"), store=store)
+    stubborn.approve_plan()
+    _ask(stubborn, 1)
+    # Три обращения: первый ход и два оборота. Четвёртого нет.
+    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
+    assert stubborn.task["stage"] == "execution", stubborn.task
+    # И на последнем обороте инструмента уже не объявляли: оставь мы его,
+    # упрямая модель позвала бы снова, а ход, кончившийся вызовом, текста
+    # не отдаёт — собеседник остался бы вовсе без ответа.
+    assert [("tools" in c["payload"]) for c in _stub.CALLS] == [True, True, False], [
+        c["payload"].get("tools") for c in _stub.CALLS
+    ]
+    assert stubborn.history[-1].content == "и снова", stubborn.transcript()
+    # Оба отказа названы человеку: строка обещает не «был отказ», а все.
+    assert stubborn.history[-1].metrics["stage_note"].count("отклонён") == 2, (
+        stubborn.history[-1].metrics["stage_note"]
+    )
+
+    # --- 7. Метрики обоих оборотов — в итоге по чату ------------------------
+    #
+    # Оборот с вызовом стоит денег наравне с ответом, и отчёт, назвавший
+    # только второй, соврал бы о цене инструмента вдвое.
+    _stub.reset()
+    _stub.install(
+        reply="сделал",
+        tool_calls=_once(_tool("validation")),
+        usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "cost_usd": 0.001},
+    )
+    paid = Agent(AgentSpec(label="цена оборота", model="stub/model"), store=store)
+    paid.approve_plan()
+    _ask(paid, 1)
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert paid.usage_summary() == {
+        "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "cost_usd": 0.002
+    }, paid.usage_summary()
+    # А число сообщений оборот не растит: обмен остался одним обменом.
+    assert len(paid.history) == 2, paid.transcript()
+    store.close()
+
+    # --- 8. Новое состояние уезжает кадром `done` ----------------------------
+    #
+    # Не `start`: этап двигает инструмент **по ходу ответа**, и в кадре
+    # `start` он ещё прежний. Полоса в шапке переезжает по `done`, то есть
+    # сразу после ответа и без единого лишнего запроса, — и журнал приезжает
+    # тем же кадром.
+    _stub.reset()
+    _stub.install(reply="сделал", tool_calls=_once(_tool("validation")))
+    with TestClient(main.app) as client:
+        moving = new_agent(client, label="полоса едет по done")
+        client.post(f"/api/agents/{moving}/task/approve")
+        frames = _frames(client, moving, "закончил")
+        assert _frame(frames, "start")["task"]["stage"] == "execution", _frame(frames, "start")["task"]
+        finished = _frame(frames, "done")
+        assert finished["task"]["stage"] == "validation", finished["task"]
+        # И строки блока с ним — те самые, что уедут в промпт следующего
+        # обмена: полоса и строки под ней рисуются одним ответом.
+        assert finished["task"]["lines"][0] == "этап: проверка", finished["task"]["lines"]
+        assert [(m["stage_to"], m["who"]) for m in finished["task_log"]] == [
+            ("execution", "human"), ("validation", "agent")
+        ], finished["task_log"]
+
+    # --- 9. Вызов собирается из настоящего потока, кусками -------------------
+    #
+    # Здесь работает **настоящий** `stream_completion` поверх подменённого
+    # транспорта: заглушка отдаёт события готовыми и сборку кусков изобразить
+    # не может, а провайдер шлёт вызов именно по кускам — имя в первом,
+    # аргументы по буквам следом, вперемешку с соседним вызовом.
+    from app.llm import stream_completion
+
+    pieces = [
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "function": {"name": "update_stage", "arguments": '{"sta'}},
+            {"index": 1, "id": "call_b", "function": {"name": "другой", "arguments": "{"}},
+        ]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "function": {"arguments": '"x": 1}'}},
+            {"index": 0, "function": {"arguments": 'ge": "va'}},
+        ]}}]},
+        {"choices": [{"delta": {"content": "пишу"}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": 'lidation"}'}},
+        ]}, "finish_reason": "tool_calls"}]},
+        {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+    ]
+    body = ("".join(f"data: {json.dumps(p)}\n\n" for p in pieces) + "data: [DONE]\n\n").encode()
+
+    sent: dict = {}
+
+    def transport(request):
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    async def collect():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        with patch.object(llm_module, "shared_client", lambda: client), \
+             patch.object(llm_module, "api_key", lambda: "sk-test-key"):
+            try:
+                return [
+                    event
+                    async for event in stream_completion(
+                        AgentSpec(label="кусками", model="stub/model"),
+                        prompt_override=[{"role": "user", "content": "давай"}],
+                        tools=[agent_module.TASK_TOOL],
+                    )
+                ]
+            finally:
+                await client.aclose()
+
+    events = asyncio.run(collect())
+    finish = next(e for e in events if e["type"] == "done")
+    # Собрано по `index`, а не по приходу и не по имени: куски двух вызовов
+    # шли вперемешку, и один и тот же инструмент модель вправе позвать дважды.
+    assert finish["tool_calls"] == [
+        {"id": "call_a", "name": "update_stage", "arguments": '{"stage": "validation"}'},
+        {"id": "call_b", "name": "другой", "arguments": '{"x": 1}'},
+    ], finish["tool_calls"]
+    # Ход, кончившийся вызовом, назван так и провайдером.
+    assert finish["metrics"]["finish_reason"] == "tool_calls", finish["metrics"]
+    # Текст, пришедший вперемешку с вызовом, не потерян.
+    assert finish["text"] == "пишу", finish["text"]
+    # И объявление уехало в теле запроса тем же ключом, каким его ждёт
+    # OpenRouter, — вместе с тремя правилами тела.
+    assert [t["function"]["name"] for t in sent["tools"]] == [TASK_TOOL_NAME], sent.get("tools")
+    assert not _body_rules(sent), _body_rules(sent)
+
+    return (
+        "инструмент объявлен на работе и проверке и не объявлен на планировании "
+        "и готове; разрешённый переход применён, записан в базу и помечен "
+        "«агент»; запрещённый не применён — состояние прежнее, модель получила "
+        "довод, журнал строку «отклонено», человек строку под ответом; из "
+        "планирования инструмент не выпустил; не позвала, позвала с кривым "
+        "аргументом и позвала тем же этапом — не произошло ничего и журнал "
+        "молчит; предел удержал обмен на трёх обращениях; 7 токенов двух "
+        "оборотов сложились в 14 при двух сообщениях; вызов из настоящего "
+        "потока собрался по index из шести кусков двух вызовов; проверка "
+        "вернула задачу в работу и она же её закрыла; новое состояние "
+        "и журнал уехали кадром done, а в start стоял прежний этап"
     )
 
 
