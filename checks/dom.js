@@ -486,6 +486,19 @@ function buildServer(options) {
     // вызов, и план в нём уже новый — как на сервере, где `plan_view()`
     // читается прямо на месте правки.
     tools: (options && options.tools) || null,
+    // Сколько миллисекунд ручка думает, прежде чем ответить: число или
+    // функция (метод, путь) → число. Ноль по умолчанию — ни одна прежняя
+    // проверка от этого не меняется.
+    //
+    // Функцией задают **разную** задержку разным ручкам, и без этого окно
+    // «ответ ручки пришёл, когда человек уже в другом чате» проверялось бы
+    // на гонке двух одинаковых задержек, а не на устройстве.
+    //
+    // Нужен для окон: между запросом и ответом человек вправе открыть другой
+    // чат, и без задержки такое окно через интерфейс ненаблюдаемо — стенд
+    // отвечает в микрозадаче, и «переключили посреди отправки» проверялось бы
+    // на гонке, а не на устройстве.
+    lag: (options && options.lag) || 0,
     // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
     // `service`, потому что и на сервере она своя: записи вписывает человек,
     // и едут они при любом варианте обрезки, а не по заказу стратегии.
@@ -873,7 +886,7 @@ function buildServer(options) {
     });
   }
 
-  function sse(agent, text) {
+  function sse(agent, text, signal) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     const index = state.sent.length;
     state.sent.push({ id: agent.id, text, config: config(agent) });
@@ -892,11 +905,14 @@ function buildServer(options) {
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, service, start, toolFrames);
+    if (failed) return errorStream(agent, text, failed, service, start, toolFrames, signal);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
     const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
+    // Длина истории до записи: по ней откатываем обмен, оборванный «Стопом»
+    // раньше первого куска текста.
+    const before = agent.transcript.length;
     agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
       role: "assistant", content: state.reply, error: null, reasoning: "",
@@ -907,7 +923,7 @@ function buildServer(options) {
 
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
-    const frames = [
+    const events = [
       // Место врезки в промпте и чем она занята называет сервер — клиент не
       // разбирает текст сообщений. Кадр `compressing` приходит только
       // на сворачивание: служебный вызов на обмене остался один.
@@ -919,14 +935,26 @@ function buildServer(options) {
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
-    ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
+    ];
+    // Где в потоке первый кусок текста. Обмен, оборванный до него, сервер
+    // в историю не пишет; оборванный после — пишет начатое, и оно оплачено.
+    // Кадры вызовов при этом **не** откатываются никогда: исполненный вызов
+    // задним числом не отменяется — так решено на сервере, и стенд не вправе
+    // обещать иного.
+    const textAt = events.findIndex((e) => e.event === "delta");
+    const frames = events.map((e) => "data: " + JSON.stringify(e) + "\n\n");
 
-    return streamOf(frames);
+    return streamOf(frames, signal, (delivered) => {
+      if (delivered > textAt) return;
+      agent.transcript.length = before;
+      agent.history_len = agent.transcript.length;
+      agent.usage_total = sumUsage(agent.transcript);
+    });
   }
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, service, start, toolFrames) {
+  function errorStream(agent, text, failed, service, start, toolFrames, signal) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -956,10 +984,18 @@ function buildServer(options) {
             error: failed.message, committed: false, question: text,
           }]),
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
-    return streamOf(frames);
+    return streamOf(frames, signal);
   }
 
-  function streamOf(frames) {
+  // `signal` — тот самый, что клиент даёт `fetch`. Оборванный поток в браузере
+  // роняет ждущее чтение отказом `AbortError`, и стенд обязан делать то же:
+  // проглоти он отмену, клиент дочитал бы поток до конца, и «Стоп» проверялся
+  // бы на потоке, который никто не рвал.
+  //
+  // `onAbort` получает, сколько кадров успело уехать: обмен, у которого
+  // не было ни куска текста, сервер в историю не пишет (`_commit` пустой
+  // ответ не пишет), и стенд обязан откатить то, что записал наперёд.
+  function streamOf(frames, signal, onAbort) {
     let i = 0;
     const pause = (options && options.delay) || 0;
     return {
@@ -969,6 +1005,12 @@ function buildServer(options) {
         getReader: () => ({
           read: async () => {
             if (pause) await new Promise((r) => setTimeout(r, pause));
+            if (signal && signal.aborted) {
+              if (onAbort) onAbort(i);
+              const err = new Error("поток оборван");
+              err.name = "AbortError";
+              throw err;
+            }
             return i < frames.length
               ? { done: false, value: encoder.encode(frames[i++]) }
               : { done: true, value: undefined };
@@ -982,6 +1024,10 @@ function buildServer(options) {
     const method = ((init && init.method) || "GET").toUpperCase();
     const body = init && init.body ? JSON.parse(init.body) : null;
     state.requests.push({ method, path, body });
+    // Запрос записан сразу, а ответ — после задержки: в браузере порядок
+    // ровно такой, и проверка окна опирается на него.
+    const lag = typeof state.lag === "function" ? state.lag(method, path) : state.lag;
+    if (lag) await new Promise((r) => setTimeout(r, lag));
 
     if (path.startsWith("/api/models")) return json({ total: state.models.length, models: state.models });
 
@@ -1047,8 +1093,10 @@ function buildServer(options) {
     if (!agent) return { ok: false, status: 404, json: async () => ({ detail: "агента нет" }) };
     const tail = match[2] || "";
 
-    if (tail === "/messages" && method === "POST") return sse(agent, body.text);
-    if (tail === "/regenerate" && method === "POST") return sse(agent, "перегенерация");
+    if (tail === "/messages" && method === "POST") return sse(agent, body.text, init && init.signal);
+    if (tail === "/regenerate" && method === "POST") {
+      return sse(agent, "перегенерация", init && init.signal);
+    }
     // Ветвление: новый чат с копией начала истории и копией конфига — ровно
     // то, что делает сервер. Ответ в том же виде, что у создания: ветка и
     // есть обычный чат.

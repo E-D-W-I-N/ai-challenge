@@ -15,6 +15,7 @@ const state = {
   abort: null,         // AbortController активного потока
   lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
   applying: null,      // незавершённое применение настроек панели
+  planMoving: false,   // переход по кнопке шапки уже летит
   panelDirty: false,   // правка панели не доехала до агента
   stick: true,         // лента примотана к низу — доматывать новые ответы
   baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
@@ -933,6 +934,12 @@ const STAGE_LABELS = {
 // есть, но вторым признаком, а не единственным.
 const STEP_MARKS = { done: "✓", in_progress: "▶", pending: "○" };
 
+// На паузе текущий шаг помечен иначе — работа стоит, и значок обязан
+// говорить то же, что кнопка «Продолжить». Иначе остановленный шаг
+// нарисован ровно как работающий: зритель записи поверит глазам, а не
+// подписи в двенадцать пикселей, и решит, что пауза не сработала.
+const PAUSED_MARK = "‖";
+
 // Кнопки шапки: по одной на **переход**, а не на этап.
 //
 // `stages` — этапы, где кнопка уместна; `null` значит «всегда, пока рабочий
@@ -1002,11 +1009,18 @@ function renderTask(agent) {
   const box = $("#task");
   box.innerHTML = "";
   const on = planOn(agent);
-  box.classList.toggle("hidden", !on);
-  if (!on) return;
+  if (!on) {
+    box.className = "task hidden";
+    return;
+  }
 
   const plan = agent.plan || {};
   const steps = plan.steps || [];
+  // Этап — классом на самой шапке, и оформление висит на нём. Иначе этап
+  // виден одной подписью, а список выглядит одинаково на работе и на паузе:
+  // «Продолжить» осталась бы единственным свидетельством того, что работа
+  // стоит, — а это ровно то, что у нас записано правилом про невидимое.
+  box.className = "task stage-" + (plan.stage || "unknown");
 
   // «Задача · работа, шаг 3 из 5». Номер текущего шага называет сервер
   // (`current`, с нуля), и приписка появляется только при непустом списке:
@@ -1029,7 +1043,7 @@ function renderTask(agent) {
     // живым, и утверждение посреди него дало бы промпт одного этапа
     // с правилом другого. Кнопка поэтому гаснет, а не молчит в ответ на
     // нажатие: молчаливый отказ читается как поломка.
-    btn.disabled = state.busy;
+    btn.disabled = state.busy || state.planMoving;
     btn.onclick = () => planMove(entry);
     actions.appendChild(btn);
   });
@@ -1044,8 +1058,10 @@ function renderTask(agent) {
   steps.forEach((step, index) => {
     const row = el("li", "task-step " + (step.status || "pending") +
       (index === plan.current ? " current" : ""));
+    const paused = plan.stage === "paused" && index === plan.current;
     row.append(
-      el("span", "task-mark", STEP_MARKS[step.status] || STEP_MARKS.pending),
+      el("span", "task-mark",
+        paused ? PAUSED_MARK : (STEP_MARKS[step.status] || STEP_MARKS.pending)),
       el("span", "task-step-title", step.title || "")
     );
     list.appendChild(row);
@@ -1088,8 +1104,31 @@ function mergeAgent(id, fresh) {
 // кнопка делает сверх неё. Отправь она обмен раньше — запрос уехал бы
 // с правилом прошлого этапа в системном сообщении и с прошлым блоком задачи.
 async function planMove(entry) {
-  if (state.busy || !state.current) return;
+  // Замок «переход уже летит». Кнопки шапки перерисовываются на каждый кадр,
+  // и второй щелчок попадает уже по новой кнопке — локальным признаком его
+  // не удержать, а `state.busy` в окне между щелчком и ответом ручки ещё
+  // ложь. Без замка два щелчка дают два запроса: первый утверждает план
+  // и начинает обмен, второй получает 409, и его ветка отказа перечитывает
+  // чат **посреди** потока — лента перерисовывается, вопрос и набежавший
+  // текст уходят с экрана, а остальные куски капают в отцепленный узел.
+  // Образец рядом: замок `settled` у правки записей памяти.
+  if (state.busy || state.planMoving || !state.current) return;
   const id = state.current.id;
+  state.planMoving = true;
+  // Перерисовка не украшение: замок обязан быть виден, иначе кнопка молчит
+  // в ответ на нажатие, а молчание читается как поломка.
+  renderTask(state.current);
+  try {
+    return await planMoved(entry, id);
+  } finally {
+    state.planMoving = false;
+    renderTask(state.current);
+  }
+}
+
+// Сам переход. Вынесен из `planMove` затем, чтобы замок снимался в `finally`
+// ровно одного места, а выходов у перехода четыре.
+async function planMoved(entry, id) {
   let moved;
   try {
     moved = await api("/api/agents/" + id + "/plan/" + entry.action, { method: "POST" });
@@ -1101,11 +1140,21 @@ async function planMove(entry) {
       return;
     }
     // 409 — тело такого отказа написано для модели, и человеку едет наш
-    // текст. Перечитываем **прежде**, чем говорить: фраза строится из свежего
-    // этапа, а сказанная до перечитывания опиралась бы ровно на то состояние,
+    // текст. Но и текст, и перечитывание — только если открыт всё тот же чат:
+    // `refreshCurrent` перечитывает **текущий**, каким бы он ни был, и, уйди
+    // человек в соседний, пока летел POST, фраза назвала бы этап соседа —
+    // враньё ровно того рода, ради которого `planDenial` и заведён.
+    if (!state.current || state.current.id !== id) return;
+    // Перечитываем **прежде**, чем говорить: фраза строится из свежего этапа,
+    // а сказанная до перечитывания опиралась бы ровно на то состояние,
     // которое только что оказалось неверным. Заодно уходит с экрана кнопка,
     // которая только что отказала.
-    await refreshCurrent(null);
+    //
+    // Посреди обмена не перечитываем вовсе: перерисовка уносит с экрана
+    // вопрос и набежавший текст, а ждать нечего — обмен кончится тем же
+    // `refreshCurrent` сам. Фраза при этом честна: этап не менялся, значит
+    // и причину она не называет.
+    if (!state.busy) await refreshCurrent(null);
     hint(planDenial(entry, state.current && state.current.plan), true);
     return;
   }
@@ -1129,7 +1178,7 @@ async function planMove(entry) {
   }
 
   if (entry.say) {
-    await exchange("/api/agents/" + id + "/messages", { text: entry.say }, entry.say);
+    await exchange("/api/agents/" + id + "/messages", { text: entry.say }, entry.say, false, id);
   }
 }
 
@@ -1180,7 +1229,8 @@ async function startTask(description) {
   }
   mergeAgent(agent.id, updated);
   renderTask(state.current);
-  await exchange("/api/agents/" + agent.id + "/messages", { text: description }, description, true);
+  await exchange("/api/agents/" + agent.id + "/messages",
+    { text: description }, description, true, agent.id);
 }
 
 // ─────────────────────── отправка сообщения ───────────────────
@@ -1242,12 +1292,14 @@ async function send() {
   const described = taskCommand(text);
   if (described !== null) return startTask(described);
 
-  await exchange("/api/agents/" + state.current.id + "/messages", { text }, text, true);
+  const id = state.current.id;
+  await exchange("/api/agents/" + id + "/messages", { text }, text, true, id);
 }
 
 async function regenerate() {
   if (state.busy || !state.current || !state.hasKey) return;
-  await exchange("/api/agents/" + state.current.id + "/regenerate", null, null);
+  const id = state.current.id;
+  await exchange("/api/agents/" + id + "/regenerate", null, null, false, id);
 }
 
 // Один обмен: рисуем пузырь вопроса, карточку ответа и стримим в неё.
@@ -1263,9 +1315,15 @@ async function regenerate() {
 // и «Утвердить план» стирало бы недописанный вопрос. Отсюда же и возврат
 // текста в поле у упавшего обмена: вернуть туда можно только то, что оттуда
 // и взяли.
-async function exchange(path, body, questionText, fromInput = false) {
+// `agentId` — чат, **для которого** этот обмен. Не `state.current`: между
+// входом сюда и первой отрисовкой лежат два ожидания — незавершённое
+// применение панели и её пролив, — а у `/task` перед ними ещё и PATCH.
+// Пункт списка слева в это время ничем не заблокирован, `state.busy` ещё
+// ложь, и человек вправе открыть другой чат. Уедь обмен как ни в чём
+// не бывало — неправда встала бы сразу в трёх местах: пузырь и поток
+// в чужой ленте, шапка чужого чата про покинутый, а запись в покинутый.
+async function exchange(path, body, questionText, fromInput = false, agentId = null) {
   const feed = $("#feed");
-  const agent = state.current;
 
   // Инвариант живёт здесь, а не у вызывающих: через `exchange` проходит
   // всякая отправка, и третий путь к нему не сможет его обойти.
@@ -1274,6 +1332,14 @@ async function exchange(path, body, questionText, fromInput = false) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
     return false;
   }
+  // Тот же довод, что и у ожидания выше: проверка стоит там, где через неё
+  // ходят все. Место её — после ожиданий и **до** первой правки экрана:
+  // поле ввода ещё не тронуто, и набранное остаётся у человека.
+  if (agentId && (!state.current || state.current.id !== agentId)) {
+    hint("Открыт другой чат — сообщение не отправлено.", true);
+    return false;
+  }
+  const agent = state.current;
   // Поле чистим только теперь: до этой строки отправка могла не состояться.
   // И только если текст пришёл из него — обмен, затеянный кнопкой шапки,
   // чужого черновика не касается.
@@ -1310,6 +1376,11 @@ async function exchange(path, body, questionText, fromInput = false) {
   let reasoning = "";
   let thinking = null;
   let failure = null;
+  let cancelled = false;
+  // Был ли исполнен хоть один вызов инструмента. Нужен ровно для отмены:
+  // сказать «отметки плана остались» можно только там, где их правда
+  // успели поставить.
+  let toolRan = false;
   let status = null;
   let prompt = null;
   let committed = false;
@@ -1375,6 +1446,7 @@ async function exchange(path, body, questionText, fromInput = false) {
             // видит шаги в тот же момент, что и модель, и столько раз, сколько
             // было правок. План в кадре уже новый: считать его заново нечем
             // и незачем.
+            toolRan = true;
             if (e.plan && state.current && state.current.id === agent.id) {
               state.current.plan = e.plan;
               renderTask(state.current);
@@ -1437,12 +1509,48 @@ async function exchange(path, body, questionText, fromInput = false) {
       controller.signal
     );
   } catch (err) {
-    if (err.name !== "AbortError") failure = String(err.message || err);
+    if (err.name === "AbortError") cancelled = true;
+    else failure = String(err.message || err);
   }
 
   card.classList.remove("busy");
   state.abort = null;
   setBusy(false);
+
+  // Отмена — **отдельный исход**, а не «ничего не было». Раньше «до первого
+  // токена» длилось доли секунды; в нашем дне это целая фаза: пока идут
+  // обороты инструментов, текста нет по устройству, и строка состояния прямо
+  // обещает паузу. «Стоп» жмут именно тогда — и молча получали пустую ленту,
+  // пустое поле и ни слова о случившемся.
+  //
+  // Про отметки плана сказано только там, где вызов правда исполнился:
+  // исполненный задним числом не откатывается — так решено, — и человек
+  // обязан знать, что сдвинувшиеся у него на глазах галочки остались.
+  // Обещать это на обмене без единого вызова значило бы врать в обратную
+  // сторону.
+  if (cancelled) {
+    const kept = toolRan
+      ? " Отметки плана, которые модель успела поставить, остались."
+      : "";
+    if (answer) {
+      // Модель успела заговорить: начатый ответ агент записывает, и он
+      // приедет перерисовкой по серверу.
+      hint("Остановлено: начатый ответ записан." + kept);
+    } else {
+      // Текста не было вовсе — обмен не записан, и в ленте ему места нет.
+      // Вопрос возвращается в поле: набирать его заново незачем.
+      if (questionText !== null) {
+        const bubbles = feed.querySelectorAll(".msg-user");
+        if (bubbles.length) bubbles[bubbles.length - 1].remove();
+      }
+      card.remove();
+      if (fromInput) {
+        const input = $("#input");
+        if (!input.value) { input.value = questionText; autoGrow(input); }
+      }
+      hint("Остановлено: ответ не записан, вопрос вернулся в поле." + kept);
+    }
+  }
 
   if (failure) {
     card.classList.add("failed");

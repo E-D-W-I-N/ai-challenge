@@ -2028,9 +2028,13 @@ async function routeChecks() {
     execution: { steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "in_progress"),
                          STEP("сверить с заказчиком", "pending")],
                  approved: true, finished: false, paused: false },
-    validation: { steps: [STEP("собрать требования", "done")],
+    // У проверки и завершения шагов **больше одного** и все они `done`:
+    // текущего шага здесь нет вовсе, и приписка «шаг k из n» была бы
+    // выдумкой. На плане из одного шага правда и враньё неотличимы —
+    // «шаг 1 из 1» выглядит правдоподобно при любой ошибке.
+    validation: { steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "done")],
                   approved: true, finished: false, paused: false },
-    done: { steps: [STEP("собрать требования", "done")],
+    done: { steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "done")],
             approved: true, finished: true, paused: false },
     paused: { steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "pending")],
               approved: true, finished: false, paused: true },
@@ -2182,21 +2186,36 @@ async function routeChecks() {
       done: ["Переоткрыть", EXIT],
       paused: ["Продолжить", EXIT],
     };
+    // Заголовок сверяется **целиком**, и одним утверждением на все шесть:
+    // «назван словами» проверяло лишь то, что он вообще нарисовался, — а это
+    // и так видно по кнопкам рядом. Английское имя этапа в шапке не поймало
+    // бы ничто, как и «шаг 1 из 2» там, где текущего шага нет.
+    const HEADS = {
+      planning: "Задача · план",
+      approval: "Задача · утверждение, шаг 1 из 1",
+      execution: "Задача · работа, шаг 2 из 3",
+      validation: "Задача · проверка",
+      done: "Задача · готово",
+      paused: "Задача · пауза, шаг 2 из 2",
+    };
     const stages = Object.keys(EXPECTED);
     const { client, $, settle, Evt } = freshClient({
       chats: stages.map((stage) => withPlan("этап " + stage, stage)),
     });
     client.init();
     await settle(30);
+    const heads = [];
     for (let i = 0; i < stages.length; i += 1) {
       $("#agent-list").querySelectorAll(".item-open")[i + 2].dispatchEvent(new Evt("click"));
       await settle(40);
-      check(`этап ${stages[i]}: назван словами`,
-        taskStage($).startsWith("Задача · "), taskStage($));
+      heads.push(taskStage($));
       check(`этап ${stages[i]}: кнопки ровно уместные`,
         JSON.stringify(taskButtons($)) === JSON.stringify(EXPECTED[stages[i]]),
         JSON.stringify(taskButtons($)));
     }
+    check("заголовок шапки назван целиком на всех шести этапах",
+      JSON.stringify(heads) === JSON.stringify(stages.map((x) => HEADS[x])),
+      JSON.stringify(heads));
   }
 
   // ── «Утвердить план»: ручка, затем обмен своей константой ──
@@ -2346,9 +2365,12 @@ async function routeChecks() {
       "было " + started + ", стало " + JSON.stringify(taskMarks($)));
     check("кадр tool: и этап на экране пересчитан",
       taskStage($) === "Задача · работа, шаг 2 из 2", taskStage($));
-    check("кадр tool: карточка говорит, чем занята пауза",
-      Boolean($("#feed").querySelector(".card-status")),
-      "строки состояния нет");
+    // Дословно: это единственное, что видит человек в те секунды, пока модель
+    // правит план, а текста ещё нет. Проверка на «узел есть» стерегла бы
+    // разметку, а не обещание.
+    check("кадр tool: карточка говорит дословно, чем занята пауза",
+      usageText($("#feed"), ".card-status-text") === "Модель работает по плану…",
+      usageText($("#feed"), ".card-status-text"));
     // Пока идёт ответ, переходы отказаны и на сервере (занятый агент — 409).
     // Кнопка обязана гаснуть, а не молчать в ответ на нажатие: молчаливый
     // отказ читается как поломка.
@@ -2536,6 +2558,267 @@ async function routeChecks() {
     check("а обычный обмен об оборотах молчит",
       !usageText(cards[1], ".usage-how").includes("оборотов"),
       usageText(cards[1], ".usage-how"));
+  }
+
+  // ── /task без пробела командой не является ──
+  //
+  // Сторож в `taskCommand` был, а прикрыт не был: сними его — и сообщение
+  // «/taskbar не открывается» перестаёт быть сообщением. Уходит PATCH
+  // `workflow: "plan"`, а описанием задачи становится «bar не открывается».
+  {
+    const { client, server, $, settle } = freshClient();
+    client.init();
+    await settle(30);
+    $("#input").value = "/taskbar не открывается";
+    $("#composer").requestSubmit();
+    await settle(150);
+    check("/taskbar командой не является: процесс не включался",
+      patchedWorkflow(server, "plan") < 0,
+      JSON.stringify(server.state.requests.map((r) => r.method + " " + r.path)));
+    check("и уехал весь ввод целиком, вместе со слешем",
+      server.state.sent[0] && server.state.sent[0].text === "/taskbar не открывается",
+      JSON.stringify(server.state.sent[0] && server.state.sent[0].text));
+  }
+
+  // ── чат переключили посреди отправки: не уезжает ничего ──
+  //
+  // Между PATCH команды и обменом лежит ответ ручки, пункт списка слева ничем
+  // не заблокирован, а `state.busy` в это время ложь. Уедь обмен как ни в чём
+  // не бывало — неправда встала бы сразу в трёх местах: пузырь и поток в чужой
+  // ленте, шапка чужого чата про покинутый, а запись в покинутый. К концу
+  // обмена всё перерисуется и следов не останется — человек решит, что
+  // сообщение потерялось, и наберёт его снова, теперь уже не туда.
+  {
+    const { client, server, $, settle, Evt } = freshClient({ lag: 60, delay: 40 });
+    client.init();
+    await settle(500);
+    const left = server.state.agents[0].id;
+    $("#input").value = "/task собрать ТЗ";
+    $("#composer").requestSubmit();
+    // Уходим в соседний чат, не дожидаясь ответа ручки.
+    $("#agent-list").querySelectorAll(".item-open")[1].dispatchEvent(new Evt("click"));
+
+    // Смотрим в чужую ленту **посреди** обмена, а не после него: к концу
+    // всё перерисуется по серверу, и следов не останется ни в том мире,
+    // ни в этом — утверждение после было бы зелёным всегда.
+    await settle(220);
+    check("чат и правда сменился, пока летел запрос",
+      client.state.current && client.state.current.id === server.state.agents[1].id,
+      client.state.current && client.state.current.id);
+    check("и в чужой ленте не появилось ни пузыря, ни карточки",
+      $("#feed").querySelectorAll(".msg-user").length === 0 &&
+        $("#feed").querySelectorAll(".card").length === 0,
+      $("#feed").querySelectorAll(".msg-user").length + " пузырей, " +
+        $("#feed").querySelectorAll(".card").length + " карточек");
+
+    await settle(600);
+    check("обмен не ушёл вовсе", server.state.sent.length === 0,
+      JSON.stringify(server.state.sent.map((x) => x.id + ":" + x.text)));
+    check("и сказано, почему сообщение не ушло",
+      $("#composer-hint").textContent.includes("Открыт другой чат"),
+      $("#composer-hint").textContent);
+    // Обратная половина: PATCH-то доехал, и режим остался включённым там,
+    // где команду набрали, — в том чате появилась шапка. Это честный остаток,
+    // а не потеря: человек видит его глазами и вправе повторить.
+    check("режим задачи остался включённым в том чате, где команду набрали",
+      server.state.agents.find((a) => a.id === left).workflow === "plan",
+      server.state.agents.find((a) => a.id === left).workflow);
+  }
+
+  // ── отказ кнопки не называет этап чужого чата ──
+  //
+  // `refreshCurrent` перечитывает **текущий** чат, каким бы он ни был. Ушёл
+  // человек в соседний обычный, пока летел POST, — и получал бы красную
+  // строку про этап чата, у которого задачи нет вовсе. Ровно то враньё,
+  // ради которого `planDenial` и заведён.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      // Отказ приходит заведомо позже открытия соседнего чата: иначе окно
+      // ловилось бы гонкой двух одинаковых задержек, а не устройством.
+      lag: (method, path) => (path.endsWith("/plan/approve") ? 160 : 20),
+      chats: [withPlan("на утверждении", "approval")],
+    });
+    client.init();
+    await settle(300);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(150);
+    // Вторая вкладка успела утвердить план раньше: наш POST получит 409.
+    server.state.agents[2].plan.approved = true;
+    taskButton($, "Утвердить план").dispatchEvent(new Evt("click"));
+    // И, не дожидаясь отказа, уходим в обычный чат.
+    $("#agent-list").querySelectorAll(".item-open")[0].dispatchEvent(new Evt("click"));
+    await settle(500);
+
+    check("успели уйти в соседний чат до отказа",
+      client.state.current && client.state.current.id === server.state.agents[0].id,
+      client.state.current && client.state.current.id);
+    check("у соседа шапки нет — задачи у него нет вовсе", taskHidden($), taskStage($));
+    check("и про этап ему не сказано ни слова",
+      !$("#composer-hint").textContent.includes("этап"),
+      $("#composer-hint").textContent);
+  }
+
+  // ── два щелчка по кнопке дают один переход ──
+  //
+  // Без замка второй щелчок успевает в окно, пока летит первый POST: первый
+  // утверждает план и начинает обмен, второй получает 409, и его ветка отказа
+  // перечитывает чат посреди потока.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      lag: 60,
+      chats: [withPlan("на утверждении", "approval")],
+    });
+    client.init();
+    await settle(400);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(200);
+    const btn = taskButton($, "Утвердить план");
+    btn.dispatchEvent(new Evt("click"));
+    btn.dispatchEvent(new Evt("click"));
+    await settle(700);
+
+    const approves = server.state.requests.filter((r) => r.path.endsWith("/plan/approve"));
+    check("два щелчка дали один запрос на утверждение", approves.length === 1,
+      "запросов: " + approves.length);
+    check("и один обмен, а не два", server.state.sent.length === 1,
+      JSON.stringify(server.state.sent.map((x) => x.text)));
+  }
+
+  // ── отказ посреди обмена ленту не рвёт ──
+  //
+  // Из нашего интерфейса сюда не попасть — замок не даст, — а от второй
+  // вкладки запросто: переход ушёл раньше, чем начался обмен, и ответил
+  // после. Перечитывание в этот момент уносит с экрана вопрос и набежавший
+  // текст, а остальные куски капают в отцепленный узел и вернутся разом
+  // в конце. На живой модели это секунды и десятки секунд.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      delay: 60,
+      lag: (method, path) => (path.endsWith("/plan/pause") ? 120 : 10),
+      chats: [withPlan("в работе", "execution")],
+    });
+    client.init();
+    await settle(200);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(100);
+    // Вторая вкладка уже приостановила задачу сама: наш «Пауза» получит 409.
+    server.state.agents[2].plan.paused = true;
+    taskButton($, "Пауза").dispatchEvent(new Evt("click"));
+    // И сразу, не дожидаясь ответа, — обычное сообщение.
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(170);
+
+    check("отказ прилетел, пока обмен ещё идёт", client.state.busy === true,
+      "обмен уже кончился — окно поймано не то");
+    check("лента не перерисована: живая карточка на месте",
+      $("#feed").querySelectorAll(".busy").length === 1,
+      "живых карточек: " + $("#feed").querySelectorAll(".busy").length);
+    // Сказано при этом всё равно, и названа кнопка. Какими именно словами —
+    // стерегут две сцены отказа рядом; здесь проверяется, что молчания нет.
+    check("но сказано всё равно, и названа кнопка",
+      $("#composer-hint").textContent.includes("Пауза") &&
+        $("#composer-hint").classList.contains("error"),
+      $("#composer-hint").textContent);
+  }
+
+  // ── «Стоп» в фазе без текста: сказано, что остановлено ──
+  //
+  // Раньше «до первого токена» длилось доли секунды. В нашем дне это целая
+  // фаза: пока идут обороты инструментов, текста нет по устройству, и строка
+  // состояния прямо обещает паузу. «Стоп» жмут именно тогда — и получали
+  // пустую ленту, пустое поле и ни слова о случившемся, при том что галочки
+  // в шапке уже сдвинулись.
+  {
+    const BEFORE = [STEP("собрать требования", "pending"), STEP("накидать структуру", "pending")];
+    const AFTER = [STEP("собрать требования", "done"), STEP("накидать структуру", "in_progress")];
+    const { client, server, $, settle, Evt } = freshClient({
+      delay: 60,
+      chats: [{ label: "с задачей", workflow: "plan",
+                plan: { steps: BEFORE, approved: true, finished: false, paused: false } }],
+      tools: [{ name: "update_plan", ok: true, message: "План записан.",
+                plan: { steps: AFTER, approved: true, finished: false, paused: false } }],
+    });
+    client.init();
+    await settle(40);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(60);
+    $("#input").value = "делай";
+    $("#composer").requestSubmit();
+    await settle(170);
+    check("«Стоп» жмут в фазе, где текста нет по устройству",
+      client.state.busy === true && !$("#feed").querySelector(".card-body").textContent,
+      "окно поймано не то");
+    // Кнопка отправки стала «Стоп»: та же форма, тот же submit.
+    $("#composer").requestSubmit();
+    await settle(500);
+
+    const said = $("#composer-hint").textContent;
+    check("отмена названа словами, а не пустой лентой", said.includes("Остановлено"), said);
+    check("сказано, что ответ не записан", said.includes("не записан"), said);
+    check("и что отметки плана остались", said.includes("Отметки плана"), said);
+    check("вопрос вернулся в поле ввода", $("#input").value === "делай",
+      JSON.stringify($("#input").value));
+    check("в ленте обмена нет: агент его не запомнил",
+      $("#feed").querySelectorAll(".msg-user").length === 0 &&
+        $("#feed").querySelectorAll(".card").length === 0,
+      $("#feed").querySelectorAll(".msg-user").length + " пузырей, " +
+        $("#feed").querySelectorAll(".card").length + " карточек");
+    // А вот галочки остались, и это не недочёт: исполненный вызов задним
+    // числом не откатывается — так решено на сервере, и отмена этого
+    // не меняет.
+    check("галочки, поставленные до отмены, остались",
+      JSON.stringify(taskMarks($)) === JSON.stringify(["✓", "▶"]),
+      JSON.stringify(taskMarks($)));
+  }
+
+  // ── «Стоп» на обычном чате про отметки плана молчит ──
+  //
+  // Обратная половина: обещать «отметки остались» там, где ни одного вызова
+  // не было, значит врать в другую сторону.
+  {
+    const { client, $, settle } = freshClient({ delay: 60 });
+    client.init();
+    await settle(40);
+    $("#input").value = "обычный вопрос";
+    $("#composer").requestSubmit();
+    await settle(40);
+    $("#composer").requestSubmit();
+    await settle(400);
+    const said = $("#composer-hint").textContent;
+    check("отмена обычного обмена тоже названа словами", said.includes("Остановлено"), said);
+    check("а про отметки плана в ней ни слова", !said.includes("Отметки плана"), said);
+  }
+
+  // ── пауза видна самим видом списка ──
+  //
+  // Остановленный шаг рисовался ровно как работающий: тот же значок, тот же
+  // жирный, тот же акцент. На записи экрана зритель увидит, что ничего
+  // не изменилось, и поверит глазам, а не подписи в двенадцать пикселей.
+  // Оформление висит на классе этапа — его и проверяем: цвета стенду
+  // не видны, а класс, которого нет, не подкрасит ничего.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      chats: [withPlan("в работе", "execution"), withPlan("на паузе", "paused")],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    const working = taskMarks($)[1];
+    check("в работе шапка помечена своим этапом, а текущий шаг — значком работы",
+      $("#task").classList.contains("stage-execution") && working === "▶",
+      $("#task").className + " / " + working);
+
+    $("#agent-list").querySelectorAll(".item-open")[3].dispatchEvent(new Evt("click"));
+    await settle(40);
+    const paused = taskMarks($)[1];
+    check("на паузе шапка помечена паузой",
+      $("#task").classList.contains("stage-paused") &&
+        !$("#task").classList.contains("stage-execution"),
+      $("#task").className);
+    check("и значок остановленного шага не такой, как у работающего",
+      paused !== working && paused === "‖", JSON.stringify([working, paused]));
   }
 }
 
