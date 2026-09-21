@@ -260,7 +260,7 @@ def _restarted(store, agent_id: str):
 
 ALL_TABLES = (
     "sessions", "messages", "meta", "summaries", "branches", "memory",
-    "working_memory", "profile",
+    "working_memory", "task_state", "task_steps", "profile",
 )
 """Все таблицы схемы: перебор идёт по ним целиком и по всем колонкам каждой,
 чтобы ключ искался и в колонках, которых ещё не придумали."""
@@ -308,12 +308,18 @@ CLEANUP_TABLE = {
     # слой              forget delete_session clear
     "summaries":       (True,  True,  True),
     "working":         (True,  True,  True),
+    "task":            (True,  True,  True),
     "branches":        (False, True,  True),
     "long_term":       (False, False, True),
     "profile":         (False, False, True),
 }
 """Чего после какого пути очистки не остаётся. Каждый `True` — место, где
 `DELETE` обязан стоять руками: каскада нет, внешние ключи не объявлены.
+
+Состояние задачи уносится со всех трёх путей, как сводка и рабочая память:
+план — содержимое разговора, и забытый разговор, оставивший свои шаги
+следующему, врал бы про этап с первого же сообщения — правило этапа поехало
+бы в системное сообщение, а работы за ним никакой.
 
 `False` — не пробелы в таблице, а вторая её половина, и такая же
 обязательная. Родство переживает `forget()`: это не содержимое разговора,
@@ -331,22 +337,30 @@ CLEANUP_TABLE = {
 
 
 def _filled_chat(store, label: str):
-    """Чат, у которого непусты **все пять** слоёв сразу: сводка, рабочая
-    память, родство, долговременная память и профиль.
+    """Чат, у которого непусты **все шесть** слоёв сразу: сводка, рабочая
+    память, состояние задачи, родство, долговременная память и профиль.
 
     Обменов три: порог сжатия при `keep_last=2` и `compress_every=2`
     набирается только на третьем. Запись рабочей памяти кладётся руками —
-    других записей в этом слое не бывает. Родство пишется прямо
-    в хранилище: ветвить настоящего родителя ради одной строки незачем,
-    а `parent_id` тут и не разглядывается.
+    других записей в этом слое не бывает. План кладётся вызовом инструмента
+    и **утверждается**: пустой план и не записался бы в базу вовсе, а
+    «после очистки плана нет» на чате без плана держалось бы само собой —
+    это ровно та дыра, которой дважды была закрыта чистка рабочей памяти.
+    Родство пишется прямо в хранилище: ветвить настоящего родителя ради одной
+    строки незачем, а `parent_id` тут и не разглядывается.
     """
     chat = agent_module.Agent(
         AgentSpec(label=label, model="stub/model", strategy="summary",
-                  keep_last=2, compress_every=2),
+                  keep_last=2, compress_every=2, workflow="plan"),
         store=store,
     )
     _ask(chat, 3, label + " {i}")
     chat.add_working_record("goal", f"цель чата {label}")
+    chat.run_tool("update_plan", json.dumps({"steps": [
+        {"title": f"шаг чата {label}", "status": "in_progress"},
+        {"title": "второй шаг", "status": "pending"},
+    ]}, ensure_ascii=False))
+    chat.approve_plan()
     store.save_branch(chat.id, parent_id="ag_00001", forked_at=2)
     store.add_memory("knowledge", f"запись рядом с чатом {label}")
     store.save_profile({"style": f"кратко, рядом с чатом {label}"})
@@ -358,6 +372,7 @@ def _leftovers(store, session_id: str) -> dict:
     return {
         "summaries": store.load_summaries(session_id),
         "working": store.list_working(session_id),
+        "task": store.load_plan(session_id),
         "branches": store.load_branch(session_id),
         "long_term": store.list_memory(),
         "profile": store.load_profile(),
@@ -989,7 +1004,7 @@ def check_summary_apart_and_cleanup():
     в таблицу (`CLEANUP_TABLE`), там же записано, почему одни клетки
     уносят, а другие **оставляют**. Раньше клетки проверялись врозь, по одной
     в четырёх проверках; здесь они проходятся разом и на чате, у которого
-    непусты все пять слоёв, — утверждение об очистке обязано стоять
+    непусты все шесть слоёв, — утверждение об очистке обязано стоять
     на непустом значении, иначе оно показывает покрытие, которого нет.
     """
     from app.agent import Agent
@@ -997,9 +1012,10 @@ def check_summary_apart_and_cleanup():
     _stub.install(reply=_service_aware)
     path = _temp_db("summary-restart")
     store = Store(path).init()
-    # Память выключена: первая половина про сводку, и врезка рабочей памяти
-    # стояла бы в промпте перед ней, сдвигая всё, на что проверка смотрит
-    # по номеру. У чатов второй половины она включена — им нужен непустой слой.
+    # Память и рабочий процесс выключены: первая половина про сводку, и врезки
+    # рабочей памяти с состоянием задачи стояли бы в промпте перед ней, сдвигая
+    # всё, на что проверка смотрит по номеру. У чатов второй половины они есть —
+    # им нужны непустые слои.
     spec = AgentSpec(
         label="сжатый", model="stub/model", strategy="summary",
         keep_last=KEEP, compress_every=EVERY,
@@ -1041,7 +1057,7 @@ def check_summary_apart_and_cleanup():
         for column, (path_name, wipe) in enumerate(CLEANUP_PATHS.items()):
             chat = _filled_chat(again, path_name)
             full = _leftovers(again, chat.id)
-            # Сцена непуста во всех пяти слоях: без этого «после очистки
+            # Сцена непуста во всех шести слоях: без этого «после очистки
             # пусто» держалось бы само собой и стерегло бы воздух.
             assert all(full.values()), (path_name, full)
             wipe(again, chat)
@@ -2868,7 +2884,10 @@ def check_tool_calls_transport():
     списка шагов, а список ведёт сама модель вызовами инструментов. Значит
     первое, что обязано быть настоящим, — разбор потока с вызовами, и проверка
     гоняет настоящий `stream_completion` на кусках той формы, что описана
-    в машинной схеме OpenRouter, а не в их прозе.
+    в машинной схеме OpenRouter, а не в их прозе. Последним разделом — сцена
+    на **живом** ответе `openai/gpt-4o-mini`: форму кусков сперва взяли
+    из схемы, живого ответа тогда не видели, а теперь он есть, и в нём
+    оказалось то, чего схема не обещает, — вызов без единого символа текста.
 
     Пять свойств этой формы, каждое из которых ломает наивный разбор:
 
@@ -3039,6 +3058,156 @@ def check_tool_calls_transport():
         broke = True
     assert broke, torn_call["arguments"]
 
+    # --- живой ответ gpt-4o-mini: 118 кусков, склеенные аргументы -------------
+    #
+    # Сцена на **настоящих** данных: до этого форма кусков была взята
+    # из машинной схемы OpenRouter, живого ответа исполнитель транспорта
+    # не видел. Теперь он есть, и главное его открытие — последнее
+    # утверждение этого раздела: модель вернула **только вызов и ни слова
+    # текста**, хотя её прямо просили «кратко перечисли шаги».
+    #
+    # Прореживать куски нельзя: обрывок `arguments` несут 116 из 118, и
+    # склеиваются они в одну строку — выбрось хоть один, и `json.loads`
+    # упадёт. Поэтому склеенная строка взята из живого ответа целиком
+    # и дословно, а на обрывки режется здесь же, теми же размерами, какими
+    # их прислал провайдер. Выброшены только конверты SSE (`id`, `model`,
+    # `provider`, `system_fingerprint`, одинаковые в каждом куске) — это
+    # они давали 43 КБ.
+    REAL_ARGUMENTS = (
+        '{"steps":[{"title":"Создать дизайн экрана оплаты с формой для вв'
+        'ода данных карты","status":"pending"},{"title":"Реализовать вали'
+        'дацию полей формы (номер карты, дата истечения, CVV)","status":"'
+        'pending"},{"title":"Настроить взаимодействие с бэкендом для отпр'
+        'авки данных","status":"pending"},{"title":"Обработать ответ от б'
+        'экенда и отобразить пользователю результат","status":"pending"},'
+        '{"title":"Провести тестирование экрана оплаты","status":"pending'
+        '"}]}'
+    )
+    REAL_SIZES = (3, 2, 5, 7, 4, 6, 1, 8, 13, 10)
+    """Размеры обрывков, какими их резал провайдер: в живом ответе их
+    от 1 до 13 символов, чаще всего 3. Режем по кругу — важна не
+    последовательность длин, а то, что границы обрывков рвут и ключи, и
+    русские слова в значениях."""
+
+    def real_fragments(text):
+        """Строка аргументов, нарезанная на обрывки, — как их присылает
+        провайдер. Сцену ставит, ничего не утверждает."""
+        out, at, step = [], 0, 0
+        while at < len(text):
+            size = REAL_SIZES[step % len(REAL_SIZES)]
+            out.append(text[at : at + size])
+            at, step = at + size, step + 1
+        return out
+
+    real_pieces = real_fragments(REAL_ARGUMENTS)
+    real, _ = _streamed(
+        _sse_chunks(
+            # Первый кусок — настоящий: `id`, `type`, имя и **пустые**
+            # аргументы, а `content` в нём `null`, а не строка.
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": None,
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_CQLQ35QeDwFtj0og6Cg1AJ2C",
+                                    "type": "function",
+                                    "function": {"name": "update_plan", "arguments": ""},
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                        "native_finish_reason": None,
+                    }
+                ]
+            },
+            *(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": None,
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {"index": 0, "function": {"arguments": piece}}
+                                ],
+                            },
+                            "finish_reason": None,
+                            "native_finish_reason": None,
+                        }
+                    ]
+                }
+                for piece in real_pieces
+            ),
+            # Предпоследний и последний — тоже настоящие: причина приезжает
+            # дважды, и во второй раз вместе с usage.
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "", "role": "assistant"},
+                        "finish_reason": "tool_calls",
+                        "native_finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "", "role": "assistant"},
+                        "finish_reason": "tool_calls",
+                        "native_finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 341,
+                    "completion_tokens": 123,
+                    "total_tokens": 464,
+                    "cost": 0.00012495,
+                    "is_byok": False,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0, "cache_write_tokens": 0,
+                        "audio_tokens": 0, "video_tokens": 0,
+                    },
+                    "cost_details": {
+                        "upstream_inference_cost": 0.00012495,
+                        "upstream_inference_prompt_cost": 5.115e-05,
+                        "upstream_inference_completions_cost": 7.38e-05,
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 0, "image_tokens": 0, "audio_tokens": 0,
+                    },
+                },
+            },
+        )
+    )
+    real_kinds = [e["type"] for e in real]
+    assert real_kinds.count("tool_calls") == 1, real_kinds
+    real_call = real[real_kinds.index("tool_calls")]["calls"]
+    assert len(real_call) == 1 and real_call[0]["name"] == "update_plan", real_call
+    assert real_call[0]["id"] == "call_CQLQ35QeDwFtj0og6Cg1AJ2C", real_call[0]
+    # Аргументы склеились в разбираемый JSON: обрывки рвали и ключи,
+    # и русские слова — потеряй разбор хоть один, `json.loads` упал бы.
+    real_args = json.loads(real_call[0]["arguments"])
+    assert [step["status"] for step in real_args["steps"]] == ["pending"] * 5, real_args
+    assert real_args["steps"][0]["title"].startswith("Создать дизайн"), real_args
+    real_done = real[-1]
+    assert real_done["type"] == "done", real_kinds
+    assert real_done["metrics"]["prompt_tokens"] == 341, real_done["metrics"]
+    assert real_done["metrics"]["completion_tokens"] == 123, real_done["metrics"]
+    # И **главное открытие живого прогона**: текста в ответе нет ни одного
+    # символа. Модель просили «кратко перечисли шаги» — она вернула только
+    # вызов. Отсюда растёт весь следующий дифф: без второго оборота человек
+    # не увидит ни слова.
+    assert real_done["text"] == "", repr(real_done["text"])
+    assert real_kinds.count("delta") == 0, real_kinds
+
     # --- объявление инструментов в теле запроса ------------------------------
     plan_tool = {
         "type": "function",
@@ -3104,9 +3273,416 @@ def check_tool_calls_transport():
     return (
         "два вызова собраны из обрывков вперемешку, событие одно на две причины "
         "и раньше done; текст и вызов вместе; страховка на «stop»; id без "
-        "провайдера — call_{index}; битый JSON отдан строкой; tools объявлены, "
+        "провайдера — call_{index}; битый JSON отдан строкой; живой ответ "
+        f"gpt-4o-mini собрался из {len(real_pieces)} обрывков в план на 5 шагов "
+        "и не принёс ни символа текста; tools объявлены, "
         "а без них ключа в теле нет и extra_body их перебивает; обмен "
         "переживает незнакомый тип события и записывается"
+    )
+
+
+@check("состояние задачи: этап вычисляется из плана, переходы решает один код")
+def check_task_state_machine():
+    """Задание дня: «состояние задачи как конечный автомат — этап задачи,
+    текущий шаг, ожидаемое действие; проверьте паузу на любом этапе
+    и продолжение без повторных объяснений».
+
+    Устройство здесь одно и оно же ответ на все три поля: **план и есть
+    состояние**. Хранится список шагов со статусами и три флажка, а этап,
+    текущий шаг и ожидаемое действие из них **вычисляются** (`stage_of`).
+    Ничего не хранится дважды — ярлык этапа рядом с работой расходился бы
+    с работой молча, и двигать его модели пришлось бы наугад.
+
+    Отсюда разделы:
+
+    * **этап и текущий шаг** — шесть этапов на шести планах, и разбор
+      упорядоченный: план неутверждённый, но со всеми шагами `done` подходит
+      сразу под две строки таблицы, и дать он обязан `approval` — иначе
+      кнопка «Утвердить» отвечала бы 409 там, где человек обязан мочь
+      утвердить;
+    * **выключено по умолчанию** — при `workflow: "off"` в промпте
+      не меняется ни слова;
+    * **включено** — правило этапа едет **системным** сообщением
+      (распоряжение), а список шагов — `user` (сведения), и блок едет даже
+      с пустым списком: без него модель не знает, что план вообще ведётся;
+    * **переходы** — один `plan.apply` на инструмент модели и на кнопку
+      человека, и отказ у него — блокирующая директива, а не код ошибки:
+      модель, получившая «ошибка», объявляет успех и идёт дальше;
+    * **пауза** — распоряжение человека, и держится она **кодом**: оба
+      инструмента на ней отказаны. Снятие паузы возвращает тот же этап,
+      что был до неё, сам собой — этап вычисляется из списка, а список
+      не менялся. Это и есть «продолжение без повторных объяснений»;
+    * **рамка этого диффа** — обмен инструменты не объявляет: `tools`
+      в теле запроса нет.
+    """
+    from app import plan as taskplan
+    from app.agent import Agent
+
+    def steps(*pairs):
+        return [{"title": title, "status": status} for title, status in pairs]
+
+    def plan_of(step_list, **flags):
+        return {**taskplan.empty(), "steps": step_list, **flags}
+
+    def prompt_parts(chat):
+        """Системное сообщение и блок задачи — по номеру слота, который
+        назвал сам агент. Ставит сцену, не измеряет её: и номер, и содержимое
+        сверяет проверка."""
+        messages, slots, _ = chat.prompt_head()
+        return messages[0]["content"], messages[slots["plan_at"]]["content"]
+
+    THREE = steps(("собрать требования", "pending"), ("схема базы", "pending"),
+                  ("экран оплаты", "pending"))
+
+    # --- этап и текущий шаг: шесть планов, шесть этапов --------------------
+    ladder = {
+        "planning": (plan_of([]), None),
+        "approval": (plan_of(THREE), 0),
+        "execution": (
+            plan_of(steps(("раз", "done"), ("два", "in_progress"), ("три", "pending")),
+                    approved=True),
+            1,
+        ),
+        "validation": (
+            plan_of(steps(("раз", "done"), ("два", "done")), approved=True), None
+        ),
+        "done": (
+            plan_of(steps(("раз", "done"), ("два", "done")), approved=True, finished=True),
+            None,
+        ),
+        "paused": (
+            plan_of(steps(("раз", "done"), ("два", "in_progress")), approved=True, paused=True),
+            1,
+        ),
+    }
+    read = {name: taskplan.stage_of(plan) for name, (plan, _) in ladder.items()}
+    assert read == {name: (name, current) for name, (_, current) in ladder.items()}, read
+    # Все шесть этапов продукта прошли через разбор: этап, до которого
+    # не дотянулась ни одна строка, вычислялся бы как попало.
+    assert set(read) == set(taskplan.STAGES), (set(read), set(taskplan.STAGES))
+
+    # Текущий — тот, что `in_progress`, даже если перед ним есть `pending`;
+    # его нет — первый не-`done`.
+    running = plan_of(steps(("раз", "pending"), ("два", "in_progress"), ("три", "pending")),
+                      approved=True)
+    assert taskplan.stage_of(running) == ("execution", 1), taskplan.stage_of(running)
+    idle = plan_of(steps(("раз", "done"), ("два", "pending"), ("три", "pending")), approved=True)
+    assert taskplan.stage_of(idle) == ("execution", 1), taskplan.stage_of(idle)
+
+    # Разбор **упорядоченный**: этот план подходит и под `approval`, и под
+    # `validation` сразу — модель прислала план и, не дожидаясь кнопки,
+    # вторым вызовом отметила шаги. Дай он `validation`, правило велело бы
+    # звать `finish_task`, а тот при неутверждённом плане отказан — и кнопка
+    # «Утвердить» ответила бы 409 там, где утвердить обязаны дать.
+    both = plan_of(steps(("раз", "done"), ("два", "done")))
+    assert taskplan.stage_of(both) == ("approval", None), taskplan.stage_of(both)
+    approved_both, _ = taskplan.apply(both, "approve")
+    assert taskplan.stage_of(approved_both)[0] == "validation", approved_both
+
+    # Пауза ложится поверх **любого** этапа, и проверяется это на двух
+    # разных — работа в разгаре и все шаги сделаны: на одном состоянии
+    # «пауза при любом списке» держалось бы на нём одном. Снятие паузы
+    # возвращает тот же этап само собой: он вычисляется из списка,
+    # а список не менялся, и помнить, куда возвращаться, негде.
+    for stage in ("execution", "validation"):
+        was, current = ladder[stage]
+        held, _ = taskplan.apply(was, "pause")
+        assert taskplan.stage_of(held) == ("paused", current), (stage, held)
+        back, _ = taskplan.apply(held, "resume")
+        assert taskplan.stage_of(back) == (stage, current), (stage, back)
+
+    # --- выключено по умолчанию: в промпте не меняется ни слова -------------
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        plain = new_agent(client, system="СИС")
+        body = client.get(f"/api/agents/{plain}").json()
+        assert body["workflow"] == "off", body["workflow"]
+        # Ключ `plan` есть и у чата, которого никто не трогал: `workflow`
+        # и `plan` — два поля одного механизма, и разъехаться внутри одного
+        # тела они не вправе.
+        assert body["plan"]["stage"] == "planning", body["plan"]
+        start = _frame(_frames(client, plain, "вопрос"), "start")
+        assert [m["role"] for m in start["resolved_messages"]] == ["system", "user"], start
+        assert start["resolved_messages"][0]["content"] == "СИС", start["resolved_messages"][0]
+        assert all(start[name] is None for name in agent_module.PROMPT_SLOTS), start
+        assert not any("[задача]" in m["content"] for m in start["resolved_messages"]), start
+
+        # --- ручка: своё значение принимается, чужое — 400 ------------------
+        turned = client.patch(f"/api/agents/{plain}", json={"workflow": "plan"})
+        assert turned.status_code == 200 and turned.json()["workflow"] == "plan", turned.text
+        assert client.get(f"/api/agents/{plain}").json()["workflow"] == "plan", "не сохранилось"
+        wrong = client.patch(f"/api/agents/{plain}", json={"workflow": "ведение"})
+        assert wrong.status_code == 400, wrong.text
+        assert "off" in wrong.text and "plan" in wrong.text, wrong.text
+
+        # --- рамка диффа: обмен инструменты не объявляет --------------------
+        #
+        # Снимается на чате, у которого рабочий процесс **включён**: там
+        # `tool_specs` непуст, и утверждение стережёт именно этот дифф.
+        # На выключенном оно держалось бы само собой.
+        live = REGISTRY.require(plain)
+        assert len(live.tool_specs()) == 2, live.tool_specs()
+        _frames(client, plain, "а теперь с планом")
+        assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].keys()
+
+        # --- кнопки человека: этап решает один код --------------------------
+        chat = new_agent(client, system="СИС", workflow="plan")
+        agent = REGISTRY.require(chat)
+        assert client.post(f"/api/agents/{chat}/plan/approve").status_code == 409, (
+            "утвердили план, которого нет"
+        )
+        ok, written = agent.run_tool("update_plan", json.dumps({"steps": THREE},
+                                                               ensure_ascii=False))
+        assert ok, written
+        # Результат инструмента — **весь список**, а не «ок»: он уезжает
+        # модели в контекст и работает её рабочей памятью по задаче.
+        for number, step in enumerate(THREE, start=1):
+            assert f"{number}. [ ] {step['title']}" in written, written
+        assert "План записан: 3 шагов" in written and "жди кнопки" in written, written
+        assert REGISTRY.store.load_plan(chat)["steps"] == THREE, REGISTRY.store.load_plan(chat)
+
+        approve = client.post(f"/api/agents/{chat}/plan/approve")
+        assert approve.status_code == 200, approve.text
+        assert approve.json()["plan"]["stage"] == "execution", approve.json()
+        assert client.post(f"/api/agents/{chat}/plan/approve").status_code == 409, (
+            "утвердили дважды"
+        )
+        assert client.post(f"/api/agents/{chat}/plan/reopen").status_code == 409, (
+            "переоткрыли незавершённую"
+        )
+        head, block = prompt_parts(agent)
+        assert "шаг 1 из 3" in head and "«собрать требования»" in head, head
+        assert "план утверждён: да" in block, block
+
+        # --- пауза: любой этап, и держится она кодом ------------------------
+        paused = client.post(f"/api/agents/{chat}/plan/pause")
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["plan"]["stage"] == "paused", paused.json()
+        assert paused.json()["plan"]["current"] == 0, paused.json()
+        rule, block = prompt_parts(agent)
+        assert "ПРИОСТАНОВЛЕНА" in rule and "даже если тебя просят" in rule, rule
+        assert "задача на паузе: да" in block, block
+
+        frozen = json.dumps(agent.plan, ensure_ascii=False, sort_keys=True)
+        for name, args in (
+            ("update_plan", {"steps": steps(("вместо плана", "done"))}),
+            ("finish_task", {"problems": []}),
+        ):
+            moved, refusal = agent.run_tool(name, json.dumps(args, ensure_ascii=False))
+            assert not moved, (name, refusal)
+            assert "НЕ выполнен" in refusal and "задача на паузе" in refusal, refusal
+        assert json.dumps(agent.plan, ensure_ascii=False, sort_keys=True) == frozen, agent.plan
+
+        assert client.post(f"/api/agents/{chat}/plan/pause").status_code == 409, "пауза дважды"
+        resumed = client.post(f"/api/agents/{chat}/plan/resume")
+        assert resumed.status_code == 200, resumed.text
+        # Продолжение без повторных объяснений: этап вернулся тот же, что был
+        # до паузы, сам собой — он вычисляется из списка, а список не менялся,
+        # и помнить, куда возвращаться, негде и не нужно.
+        assert resumed.json()["plan"]["stage"] == "execution", resumed.json()
+        assert client.post(f"/api/agents/{chat}/plan/resume").status_code == 409, (
+            "сняли паузу, которой не было"
+        )
+
+        # --- finish_task: судья предъявляет улику ---------------------------
+        moved, refusal = agent.run_tool("finish_task", json.dumps({"problems": []}))
+        assert not moved, refusal
+        assert "НЕ выполнен" in refusal and "НЕ утверждай" in refusal, refusal
+        assert agent.plan["finished"] is False, agent.plan
+
+        done_all = json.dumps({"steps": [{**step, "status": "done"} for step in THREE]},
+                              ensure_ascii=False)
+        assert agent.run_tool("update_plan", done_all)[0], "план не записался"
+        assert agent.plan_view()["stage"] == "validation", agent.plan_view()
+        # Непустой перечень проблем задачу **не** завершает: это и есть улика
+        # вместо вердикта.
+        moved, verdict = agent.run_tool(
+            "finish_task", json.dumps({"problems": ["нет валидации карты", "нет теста оплаты"]},
+                                      ensure_ascii=False)
+        )
+        assert moved, verdict
+        assert "Записано проблем: 2" in verdict and "Задача НЕ завершена" in verdict, verdict
+        assert agent.plan["finished"] is False, agent.plan
+        assert agent.plan_view()["stage"] == "validation", agent.plan_view()
+
+        assert agent.run_tool("finish_task", json.dumps({"problems": []}))[0], "не завершилась"
+        assert agent.plan_view()["stage"] == "done", agent.plan_view()
+        rule, block = prompt_parts(agent)
+        # Правило этапа `done` непустое: прошлый раз завершённая задача
+        # оставалась без распоряжения вовсе, и модель продолжала править план.
+        assert "План менять нельзя" in rule, rule
+        assert "задача завершена: да" in block, block
+        # Пауза при завершённой задаче отказана: приостанавливать нечего.
+        assert client.post(f"/api/agents/{chat}/plan/pause").status_code == 409, (
+            "приостановили завершённую"
+        )
+        moved, refusal = agent.run_tool("update_plan", json.dumps({"steps": THREE},
+                                                                  ensure_ascii=False))
+        assert not moved and "уже завершена" in refusal, refusal
+        assert [s["status"] for s in agent.plan["steps"]] == ["done"] * 3, agent.plan
+
+        reopened = client.post(f"/api/agents/{chat}/plan/reopen")
+        assert reopened.status_code == 200, reopened.text
+        # Шаги остаются сделанными: переоткрыли не для того, чтобы делать
+        # всё заново, а потому что в сделанном что-то не так.
+        assert reopened.json()["plan"]["stage"] == "validation", reopened.json()
+        assert [s["status"] for s in reopened.json()["plan"]["steps"]] == ["done"] * 3, (
+            reopened.json()
+        )
+
+        # --- сброс: на непустом плане с поднятыми флажками ------------------
+        assert agent.run_tool("update_plan", done_all)[0], "план не записался"
+        client.post(f"/api/agents/{chat}/plan/pause")
+        assert agent.plan["approved"] and agent.plan["paused"] and agent.plan["steps"], agent.plan
+        reset = client.post(f"/api/agents/{chat}/plan/reset")
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["plan"] == {
+            "steps": [], "approved": False, "finished": False, "paused": False,
+            "stage": "planning", "current": None,
+        }, reset.json()["plan"]
+        assert REGISTRY.store.load_plan(chat) is None, REGISTRY.store.load_plan(chat)
+
+        # --- отказы: у каждой причины свой текст ----------------------------
+        rejected: dict = {}
+        for reason, name, args in (
+            ("пусто", "update_plan", {"steps": []}),
+            ("двое в работе", "update_plan",
+             {"steps": steps(("раз", "in_progress"), ("два", "in_progress"))}),
+            ("чужой статус", "update_plan", {"steps": [{"title": "раз", "status": "готово"}]}),
+            ("без заголовка", "update_plan", {"steps": [{"title": "", "status": "pending"}]}),
+            ("чужое имя", "плана_нет", {"steps": THREE}),
+        ):
+            moved, text = agent.run_tool(name, json.dumps(args, ensure_ascii=False))
+            assert not moved, (reason, text)
+            assert "НЕ выполнен" in text and "НЕ утверждай" in text, (reason, text)
+            assert agent.plan["steps"] == [], (reason, agent.plan)
+            rejected[reason] = text
+        # Причины называют себя по-разному: схлопни любую ветку в общую —
+        # и модель правила бы наугад, не зная, что именно не подошло.
+        assert len(set(rejected.values())) == len(rejected), rejected
+
+        # Аргументы, которые не разобрались: исключения наружу нет, план цел.
+        moved, torn = agent.run_tool("update_plan", '{"steps": [{"title": "раз"')
+        assert not moved and "НЕ выполнен" in torn, torn
+        assert agent.plan == taskplan.empty(), agent.plan
+
+        # --- список слева: ключ `plan` есть и у выгруженного чата ------------
+        #
+        # Список строится двумя ветвями кода: живой чат описывает себя сам,
+        # выгруженный — строкой из базы, мимо `Agent`. Не проверь холодную —
+        # и сразу после перезапуска сервера весь список приезжал бы
+        # с `workflow: "plan"` и **без** всякого `plan`: два поля одного
+        # механизма разъехались бы внутри одного тела.
+        assert agent.run_tool("update_plan", json.dumps({"steps": THREE},
+                                                        ensure_ascii=False))[0]
+        assert REGISTRY._unload(chat) is True, "чат не был живым"
+        cold = {entry["id"]: entry for entry in client.get("/api/agents").json()["agents"]}
+        assert cold[chat]["workflow"] == "plan", cold[chat]
+        assert "plan" in cold[chat] and cold[chat]["plan"] is None, cold[chat]
+        # А открытый чат поднимает план из базы — тем же путём, каким
+        # поднимает историю.
+        opened = client.get(f"/api/agents/{chat}").json()
+        assert opened["plan"]["steps"] == THREE, opened["plan"]
+        assert opened["plan"]["stage"] == "approval", opened["plan"]
+
+    # --- четыре врезки разом: блок задачи стоит между памятью и сводкой -----
+    _stub.install(reply=_service_aware)
+    path = _temp_db("task-slots")
+    store = Store(path).init()
+    store.add_memory("knowledge", "человек пишет на Kotlin")
+    full = Agent(
+        AgentSpec(label="задача", model="stub/model", system="СИС", workflow="plan",
+                  strategy="summary", keep_last=2, compress_every=2),
+        store=store,
+    )
+    full.add_working_record("goal", "собрать ТЗ")
+    _ask(full, 3)
+    assert full.summaries, "сводка не собралась — сцена без четвёртой врезки"
+
+    frames = asyncio.run(drain(full.ask("а теперь вопрос")))
+    start = next(event for event in frames if event["type"] == "start")
+    prompt = start["resolved_messages"]
+    slots = {name: start[name] for name in agent_module.PROMPT_SLOTS}
+    assert slots == {"memory_at": 1, "working_at": 2, "plan_at": 3, "summary_at": 4}, slots
+    # Номер каждой врезки сходится с промптом: врезка, чей слот посчитали
+    # суммой предыдущих вместо длины собранного начала, подписала бы чужое
+    # сообщение — и заметить это было бы неоткуда.
+    assert "[долговременная память]" in prompt[slots["memory_at"]]["content"], prompt
+    assert "[факты о разговоре]" in prompt[slots["working_at"]]["content"], prompt
+    assert prompt[slots["plan_at"]]["content"].startswith("[задача]"), prompt
+    assert "пересказ начала разговора" in prompt[slots["summary_at"]]["content"], prompt
+    # Блок едет **даже с пустым списком**: для модели это самая нужная
+    # новость — без него она не знает, что план вообще ведётся.
+    assert "шагов ещё нет" in prompt[slots["plan_at"]]["content"], prompt[slots["plan_at"]]
+    assert prompt[slots["plan_at"]]["role"] == "user", prompt[slots["plan_at"]]
+    # Правило этапа — в **системном** сообщении, и второго системного нет:
+    # правило это распоряжение, а список шагов — сведения.
+    assert [m["role"] for m in prompt].count("system") == 1, [m["role"] for m in prompt]
+    assert prompt[0]["role"] == "system" and "Этап: планирование" in prompt[0]["content"], prompt[0]
+    assert prompt[0]["content"].startswith("СИС\n\n"), prompt[0]["content"]
+
+    # --- план переживает перезапуск процесса --------------------------------
+    assert full.run_tool("update_plan", json.dumps({"steps": THREE}, ensure_ascii=False))[0]
+    full.approve_plan()
+    full.pause_plan()
+    before = full.plan_view()
+    agent_id = full.id
+    with _restarted(store, agent_id) as (again, revived):
+        assert revived.plan_view() == before, (before, revived.plan_view())
+        assert revived.spec.workflow == "plan", revived.spec.workflow
+        rule, block = prompt_parts(revived)
+        assert "ПРИОСТАНОВЛЕНА" in rule, rule
+        assert "задача на паузе: да" in block, block
+        revived.resume_plan()
+
+        # --- ветка уносит план целиком, с флажками -------------------------
+        branch = Agent(AgentSpec(label="ветка", model="stub/model"), store=again)
+        branch.take_branch(revived.carry_off(2), parent_id=revived.id, forked_at=2)
+        assert branch.plan_view()["steps"] == THREE, branch.plan_view()
+        assert branch.plan_view()["approved"] is True, branch.plan_view()
+        assert branch.plan_view()["stage"] == "execution", branch.plan_view()
+        # Копия глубокая: общий список шагов сделал бы два чата одним —
+        # отметка у родителя переставила бы шаг и у ветки. Утверждение
+        # здесь двоякое, и это сказано прямо: **поведением** сейчас видно
+        # только одно — правка у родителя ветку не трогает (её `apply`
+        # собирает новый список, поэтому общий объект сегодня не протёк бы
+        # ни в одном сценарии); второе утверждение — про сам объект,
+        # и стоит оно затем, чтобы первая же правка на месте не сделала
+        # два чата одним молча.
+        assert branch.plan["steps"] is not revived.plan["steps"], "список шагов общий"
+        assert revived.run_tool(
+            "update_plan",
+            json.dumps({"steps": [{**step, "status": "done"} for step in THREE]},
+                       ensure_ascii=False),
+        )[0]
+        assert branch.plan_view()["steps"] == THREE, branch.plan_view()
+        assert again.load_plan(branch.id)["steps"] == THREE, again.load_plan(branch.id)
+
+        # --- незнакомое значение из базы читается как `off` ----------------
+        alien = dict(again.load_session(agent_id)["config"], workflow="ведение")
+        again.save_session(agent_id, label="чужое", config=alien,
+                           created_at=revived.created_at)
+    with _reopened(path) as reread:
+        stranger = Agent(AgentSpec(label="пусто", model="x/y"), agent_id=agent_id, store=reread)
+        # Значение сохранилось как есть — терять диалог из-за чужого поля
+        # нельзя, — а читается оно как «процесса нет»: вести план по значению,
+        # смысла которого мы не знаем, так же нельзя, как резать историю
+        # по незнакомой стратегии.
+        assert stranger.spec.workflow == "ведение", stranger.spec.workflow
+        assert stranger.plan_on() is False, "незнакомое значение включило процесс"
+        assert stranger.tool_specs() == [], stranger.tool_specs()
+        talk = stranger.build_prompt("вопрос")
+        assert not any("[задача]" in m["content"] for m in talk), talk
+        assert "Этап" not in talk[0]["content"], talk[0]
+
+    return (
+        f"шесть этапов вычислены из шести планов, {len(taskplan.STAGES)} без ярлыка "
+        "в базе; пересечение approval и validation разобрано порядком; при "
+        "выключенном процессе промпт слово в слово прежний, при включённом "
+        "блок едет и с пустым списком, а правило этапа — системным; четыре "
+        "врезки на слотах 1—4; пауза отказала оба инструмента и вернула тот же "
+        "этап; сброс снял все три флажка; план и пауза пережили перезапуск "
+        "и уехали в ветку; обмен ушёл без ключа tools"
     )
 
 

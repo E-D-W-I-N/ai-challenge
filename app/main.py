@@ -26,6 +26,7 @@ from . import catalog, llm
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
+from .plan import PlanError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import (
     CONTEXT_FIELDS,
@@ -33,6 +34,7 @@ from .schema import (
     MEMORY_KINDS,
     PROFILE_FIELDS,
     STRATEGIES,
+    WORKFLOWS,
     WORKING_KINDS,
     AgentSpec,
 )
@@ -248,7 +250,7 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
 
 
 def _context_fields(payload: dict, where: str = "") -> dict:
-    """Стратегия, окно памяти и порог сжатия.
+    """Стратегия, рабочий процесс, окно памяти и порог сжатия.
 
     Числа разбираются как параметры сэмплирования: `keep_last = null` значит
     «резать нечем» и в модель уезжает вся история — это не то же самое, что
@@ -262,6 +264,12 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     """
     values: dict = {
         "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
+        # Рабочий процесс — рядом со стратегией и тем же разбором, но пунктом
+        # её переключателя не является: обрезка решает, сколько реплик уедет
+        # дословно, а рабочий процесс — ведёт ли агент план задачи. Чужое
+        # значение отсекается здесь, на границе, чтобы дальше по стеку
+        # его не встретить.
+        "workflow": _choice_field(payload, "workflow", WORKFLOWS, "off", where),
     }
     for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
@@ -598,6 +606,80 @@ async def fork_agent(agent_id: str, payload: dict = Body(default=None)) -> dict:
         "live": len(REGISTRY),
         "agents": [branch.as_dict()],
     }
+
+
+# --- состояние задачи: кнопки человека ----------------------------------------
+#
+# Переходы у них те же, что у инструментов модели (`plan.apply`): второй
+# проверки переходов в продукте нет, и это ровно то, из-за чего кнопка
+# не вправе разрешить то, что инструменту запрещено.
+#
+# `PlanError` — **409**, а не 400: тело здесь пустое и кривым быть не может,
+# а «не тот этап» это состояние. 400 сказал бы клиенту «исправь запрос»,
+# тогда как исправлять надо не запрос, а этап.
+
+
+def _plan_move(agent: Agent, move: Callable[[], dict]) -> dict:
+    """Один переход по кнопке: занятость — 409, не тот этап — тоже 409.
+
+    Занятого агента не двигаем: обмен идёт на слепке конфига, но план
+    он читает живой, и утверждение посреди обмена дало бы промпт одного
+    этапа с правилом другого.
+    """
+    if agent.busy:
+        raise HTTPException(
+            status_code=409,
+            detail=f"агент {agent.id} уже занят: дождитесь текущего ответа",
+        )
+    try:
+        return move()
+    except PlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/agents/{agent_id}/plan/approve")
+async def approve_plan(agent_id: str) -> dict:
+    """Кнопка «Утвердить план». Только на этапе `approval`: повторное
+    утверждение отказано — «утверждено дважды» неотличимо от «утверждено
+    не то»."""
+    agent = _agent(agent_id)
+    return {"plan": _plan_move(agent, agent.approve_plan)}
+
+
+@app.post("/api/agents/{agent_id}/plan/reopen")
+async def reopen_plan(agent_id: str) -> dict:
+    """Кнопка «Переоткрыть задачу». Только у завершённой: флаг снимается,
+    шаги остаются `done`, этап становится `validation`. Обмен при этом
+    **не отправляется** — что именно не так, человек пишет сам."""
+    agent = _agent(agent_id)
+    return {"plan": _plan_move(agent, agent.reopen_plan)}
+
+
+@app.post("/api/agents/{agent_id}/plan/pause")
+async def pause_plan(agent_id: str) -> dict:
+    """Кнопка «Пауза»: работа приостановлена на **любом** этапе, кроме
+    завершённого. Ставит её только человек, и держится она не на правиле
+    в промпте, а на отказе обоих инструментов модели."""
+    agent = _agent(agent_id)
+    return {"plan": _plan_move(agent, agent.pause_plan)}
+
+
+@app.post("/api/agents/{agent_id}/plan/resume")
+async def resume_plan(agent_id: str) -> dict:
+    """Кнопка «Продолжить»: снимает паузу. Этап возвращается тот же, что был
+    до неё, — он вычисляется из списка, а список не менялся, и помнить,
+    куда возвращаться, не нужно."""
+    agent = _agent(agent_id)
+    return {"plan": _plan_move(agent, agent.resume_plan)}
+
+
+@app.post("/api/agents/{agent_id}/plan/reset")
+async def reset_plan(agent_id: str) -> dict:
+    """Кнопка «Сбросить задачу»: пустой список и все три флажка сняты.
+    Законна всегда — на ней держится и «начать другую задачу», и «вернуться
+    в обычный чат»."""
+    agent = _agent(agent_id)
+    return {"plan": _plan_move(agent, agent.reset_plan)}
 
 
 @app.post("/api/agents/{agent_id}/cancel")
