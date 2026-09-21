@@ -550,6 +550,11 @@ function buildServer(options) {
     // как на сервере. У ветки — `{parent_id, forked_at}`, и имени родителя
     // в нём нет: клиент находит его сам по id.
     branch: null,
+    // Состояние задачи: этап, текущий шаг и ожидаемое действие. Едет
+    // с чатом, а не своей ручкой, — ровно как на сервере, где полоса
+    // этапов рисуется тем же ответом, что и лента. У чата, которого
+    // не трогали, здесь умолчание, а не `null`: этап есть всегда.
+    task: { stage: "planning", step: "", expecting: "" },
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
     ...CONTEXT,
   });
@@ -564,6 +569,8 @@ function buildServer(options) {
   // номер удалённой заново не выдаётся — иначе вторая вкладка удалила бы
   // не ту запись, и проверка этого не заметила бы.
   let issuedMemory = state.records.length;
+  const TASK_STAGES = ["planning", "execution", "validation", "done"];
+  const TASK_FIELDS = ["stage", "step", "expecting"];
   const MEMORY_KINDS = ["profile", "decision", "knowledge"];
   const WORKING_KINDS = ["goal", "limit", "decision", "question"];
 
@@ -933,6 +940,9 @@ function buildServer(options) {
       child.history_len = child.transcript.length;
       child.usage_total = sumUsage(child.transcript);
       child.branch = { parent_id: agent.id, forked_at: at };
+      // Состояние задачи ветка уносит целиком, как на сервере: задача у неё
+      // та же, и этап её не заменяет собой ни одной реплики.
+      child.task = { ...agent.task };
       state.agents.push(child);
       return json({ created: 1, live: state.agents.length, agents: [view(child)] });
     }
@@ -991,6 +1001,27 @@ function buildServer(options) {
       if (i < 0) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
       working.records.splice(i, 1);
       return json({ deleted: seq });
+    }
+    // ── состояние задачи: ручка под чатом, одна на все три поля ──
+    //
+    // Границы те же, что на сервере: лишние поля 400, пустое тело 400,
+    // чужой этап 400 с перечислением допустимых, пустая строка поле снимает.
+    // Стенд, принимающий то, чего не принимает сервер, оставляет зелёной
+    // полосу, которая в браузере получает 400.
+    if (tail === "/task" && method === "PATCH") {
+      const keys = Object.keys(body || {});
+      const unknown = keys.filter((k) => !TASK_FIELDS.includes(k));
+      if (unknown.length) return fail(400, "лишние поля: " + unknown.join(", "));
+      if (!keys.length) {
+        return fail(400, "тело правки пустое: назовите " + TASK_FIELDS.join(", ") + " или часть");
+      }
+      if (keys.includes("stage") && !TASK_STAGES.includes(body.stage)) {
+        return fail(400, "stage: одно из " + TASK_STAGES.join(", ") + ", а не " + body.stage);
+      }
+      keys.forEach((name) => {
+        agent.task[name] = name === "stage" ? body[name] : clean(String(body[name]));
+      });
+      return json({ task: { ...agent.task } });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(view(agent));

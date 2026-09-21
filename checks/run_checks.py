@@ -33,7 +33,7 @@ import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
 from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
-from app.schema import AgentSpec  # noqa: E402
+from app.schema import AgentSpec, blank_task  # noqa: E402
 from app.store import Store  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -260,7 +260,7 @@ def _restarted(store, agent_id: str):
 
 ALL_TABLES = (
     "sessions", "messages", "meta", "summaries", "branches", "memory",
-    "working_memory", "profile",
+    "working_memory", "task_state", "profile",
 )
 """Все таблицы схемы: перебор идёт по ним целиком и по всем колонкам каждой,
 чтобы ключ искался и в колонках, которых ещё не придумали."""
@@ -308,12 +308,18 @@ CLEANUP_TABLE = {
     # слой              forget delete_session clear
     "summaries":       (True,  True,  True),
     "working":         (True,  True,  True),
+    "task":            (True,  True,  True),
     "branches":        (False, True,  True),
     "long_term":       (False, False, True),
     "profile":         (False, False, True),
 }
 """Чего после какого пути очистки не остаётся. Каждый `True` — место, где
 `DELETE` обязан стоять руками: каскада нет, внешние ключи не объявлены.
+
+Состояние задачи идёт строкой рабочей памяти и теми же тремя `True`:
+область у него та же — разговор, — и зажима по длине истории у блока задачи
+нет вовсе. Забытый разговор, оставивший «этап: проверка», врал бы следующему
+первой же строкой блока.
 
 `False` — не пробелы в таблице, а вторая её половина, и такая же
 обязательная. Родство переживает `forget()`: это не содержимое разговора,
@@ -331,8 +337,8 @@ CLEANUP_TABLE = {
 
 
 def _filled_chat(store, label: str):
-    """Чат, у которого непусты **все пять** слоёв сразу: сводка, рабочая
-    память, родство, долговременная память и профиль.
+    """Чат, у которого непусты **все шесть** слоёв сразу: сводка, рабочая
+    память, состояние задачи, родство, долговременная память и профиль.
 
     Обменов три: порог сжатия при `keep_last=2` и `compress_every=2`
     набирается только на третьем. Запись рабочей памяти кладётся руками —
@@ -347,6 +353,9 @@ def _filled_chat(store, label: str):
     )
     _ask(chat, 3, label + " {i}")
     chat.add_working_record("goal", f"цель чата {label}")
+    # Этап переключён с умолчания: слой обязан быть непустым и здесь, иначе
+    # «после очистки снова планирование» держалось бы само собой.
+    chat.set_task({"stage": "validation", "step": f"шаг чата {label}"})
     store.save_branch(chat.id, parent_id="ag_00001", forked_at=2)
     store.add_memory("knowledge", f"запись рядом с чатом {label}")
     store.save_profile({"style": f"кратко, рядом с чатом {label}"})
@@ -358,6 +367,10 @@ def _leftovers(store, session_id: str) -> dict:
     return {
         "summaries": store.load_summaries(session_id),
         "working": store.list_working(session_id),
+        # Пустое значение слоя — это умолчание, а не пустой словарь: этап
+        # у задачи есть всегда, и «слой унесён» здесь значит «снова
+        # планирование, и поля пусты».
+        "task": {} if store.load_task(session_id) == blank_task() else store.load_task(session_id),
         "branches": store.load_branch(session_id),
         "long_term": store.list_memory(),
         "profile": store.load_profile(),
@@ -607,8 +620,12 @@ def check_cut_only_where_chosen():
         # Врезка рабочей памяти, две последние реплики и вопрос. Начало
         # разговора отброшено — его в промпте нет вовсе, — а цель на месте.
         assert [m["role"] for m in sent] == ["user", "user", "assistant", "user"], sent
+        # Блок задачи целиком: этап первой строкой — всегда, пока блок есть,
+        # — и записи за ним. Этап здесь умолчанию равен, и это не делает
+        # строку лишней: где задача, модель не обязана угадывать.
         assert sent[0]["content"] == (
-            "[факты о разговоре]\nцель: собрать ТЗ\n[конец фактов о разговоре]"
+            "[факты о разговоре]\nэтап: планирование\n"
+            "цель: собрать ТЗ\n[конец фактов о разговоре]"
         ), sent[0]
         assert sent[1]["content"] == "вопрос 3", sent[1]
         assert not any("вопрос 0" in m["content"] for m in sent), sent
@@ -1153,6 +1170,7 @@ def check_working_memory():
             "role": "user",
             "content": (
                 "[факты о разговоре]\n"
+                "этап: планирование\n"
                 "решение: берём Kotlin\n"
                 "[конец фактов о разговоре]"
             ),
@@ -1354,6 +1372,149 @@ def check_working_memory():
         "не выдаётся, автора у записи нет; окно отбросило 16 реплик, а вписанная "
         "руками цель уехала в модель; номера пережили перезапуск, три пути "
         "очистки — нет, чужой чат не тронуть"
+    )
+
+
+@check("этап задачи: первой строкой блока, переживает паузу, чужого не принимает")
+def check_task_stage():
+    """Состояние задачи — конечный автомат чата: этап, текущий шаг и то,
+    какого действия ждут.
+
+    Едет оно в **тот же** блок, что рабочая память, и первыми его строками:
+    и этап, и записи про одну и ту же текущую задачу, оба живут в чате
+    и умирают с ним, и второй блок на ту же тему был бы лишним разделением
+    промпта. Отсюда и главное здешнее утверждение — про **первую строку**:
+    где задача стоит, модель не должна выискивать.
+
+    «Пауза на любом этапе и продолжение без повторных объяснений» из задания
+    проверяется буквально: настоящее переоткрытие файла базы и подъём чата
+    из него. Даром это не достаётся — достаётся записью в свою таблицу,
+    и стеречь это надо так же, как всё остальное, что переживает перезапуск.
+    """
+    from app.agent import Agent
+
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        # --- 1. Пустой чат: блока нет вовсе -----------------------------------
+        #
+        # Этап у задачи есть всегда, но умолчание само по себе не новость:
+        # чат стоит на планировании ровно потому, что его завели. Врезка
+        # на пустом месте сдвинула бы каждую последовательность ролей,
+        # на которую смотрит любая проверка, — довод тот же, что у обоих
+        # слоёв памяти.
+        chat = new_agent(client, system="СИС")
+        _talk(client, chat, 1)
+        sent = _stub.CALLS[-1]["messages"]
+        assert [m["role"] for m in sent] == ["system", "user"], sent
+        assert not any("[факты о разговоре]" in m["content"] for m in sent), sent
+        assert REGISTRY.require(chat).prompt_slots()["working_at"] is None, "слот у пустого чата занят"
+
+        url = f"/api/agents/{chat}/task"
+
+        # --- 2. Переключили этап — блок появился, и этап в нём первый --------
+        switched = client.patch(url, json={"stage": "execution"})
+        assert switched.status_code == 200, switched.text
+        assert switched.json() == {
+            "task": {"stage": "execution", "step": "", "expecting": ""}
+        }, switched.json()
+
+        frames = _frames(client, chat, "вопрос 1")
+        start = _frame(frames, "start")
+        assert start["working_at"] == 1, start["working_at"]
+        block = start["resolved_messages"][start["working_at"]]
+        # Ролью `user` с подписью, а не системным сообщением: довод тот же,
+        # что у сводки и обоих слоёв памяти — системным едет распоряжение,
+        # а состояние задачи это сведения.
+        assert block["role"] == "user", block
+        assert block["content"] == (
+            "[факты о разговоре]\n"
+            "этап: работа\n"
+            "[конец фактов о разговоре]"
+        ), block
+        # Незаполненные поля в блок не попали: пустое уехало бы строкой
+        # «ожидается: » и заняло бы место, не сказав ничего.
+        assert "сейчас:" not in block["content"], block
+        assert "ожидается:" not in block["content"], block
+        # И системное сообщение по-прежнему ровно одно: блок задачи его
+        # не заводит и не раздваивает.
+        assert len([m for m in start["resolved_messages"] if m["role"] == "system"]) == 1, start
+
+        # --- 3. Оба поля — и оба своей строкой, после этапа ------------------
+        filled = client.patch(url, json={"step": "собрать требования", "expecting": "ваше «ок»"})
+        assert filled.status_code == 200, filled.text
+        # Правка **только названного**: этап никто не трогал, и он остался.
+        assert filled.json()["task"]["stage"] == "execution", filled.json()
+        client.post(
+            f"/api/agents/{chat}/working", json={"kind": "goal", "content": "приложение доставки"}
+        )
+        _talk(client, chat, range(2, 3))
+        lines = _stub.CALLS[-1]["messages"][1]["content"].splitlines()
+        assert lines == [
+            "[факты о разговоре]",
+            "этап: работа",
+            "сейчас: собрать требования",
+            "ожидается: ваше «ок»",
+            "цель: приложение доставки",
+            "[конец фактов о разговоре]",
+        ], lines
+
+
+        # --- 4. Граница: чужой этап не проходит ------------------------------
+        #
+        # Список закрытый, и отказ **называет** допустимые: молчаливая
+        # подмена умолчанием превратила бы «человек выбрал» в «сервер
+        # выбрал за него».
+        alien = client.patch(url, json={"stage": "выполняется"})
+        assert alien.status_code == 400, alien.text
+        assert all(name in alien.text for name in ("planning", "execution", "validation", "done")), alien.text
+        assert client.patch(url, json={"stage": True}).status_code == 400
+        assert client.patch(url, json={}).status_code == 400
+        assert client.patch(url, json={"stage": "done", "at": 1}).status_code == 400
+        assert client.patch(url, json={"step": None}).status_code == 400
+        # А своё значение проходит, и снятое поле снимается пустой строкой.
+        assert client.patch(url, json={"expecting": ""}).json()["task"]["expecting"] == "", "поле не снялось"
+
+    # --- 5. Пауза и продолжение: перезапуск процесса -------------------------
+    #
+    # То самое «продолжение без повторных объяснений»: закрыли файл, открыли
+    # заново, подняли чат — и этап, шаг и ожидаемое действие те же, а блок
+    # в промпте собирается прежним.
+    _stub.reset()
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    path = _temp_db("task-restart")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="на паузе", model="stub/model"), store=store)
+    _ask(agent, 2)
+    agent.set_task({"stage": "validation", "step": "гоняю тесты"})
+    paused = dict(agent.task)
+    agent_id = agent.id
+
+    with _restarted(store, agent_id) as (again, revived):
+        assert revived.task == paused, (paused, revived.task)
+        assert again.load_task(agent_id) == paused, again.load_task(agent_id)
+        head = revived.build_prompt("после паузы")[0]["content"]
+        assert head.startswith("[факты о разговоре]\nэтап: проверка\n"), head
+        assert "сейчас: гоняю тесты" in head, head
+
+        # Ветка уносит состояние целиком — по тому же правилу, что рабочую
+        # память, и по тому же доводу: этап не заменяет собой ни одной
+        # реплики, а задача у ветки та же. Границы по точке ветвления
+        # у него поэтому нет.
+        from app.registry import AgentRegistry
+
+        reg = AgentRegistry(store=again)
+        branch = reg.fork(revived, 2, label="ветка на проверке")
+        assert branch.task == paused, (paused, branch.task)
+        assert again.load_task(branch.id) == paused, again.load_task(branch.id)
+        assert branch.build_prompt("ещё")[0]["content"].startswith(
+            "[факты о разговоре]\nэтап: проверка\n"
+        ), branch.build_prompt("ещё")[0]
+
+    return (
+        "пустой чат уходит без блока задачи; переключённый этап встаёт его "
+        "первой строкой, незаполненные поля в блок не едут; чужой этап — 400 "
+        "с перечислением четырёх; этап и шаг пережили переоткрытие файла "
+        "и уехали в ветку целиком"
     )
 
 
@@ -3184,6 +3345,11 @@ def check_no_key_in_db():
         store.update_working(
             agent.id, poked["seq"], kind="limit", content=f"правка с ключом {key}"
         )
+
+        # И в состояние задачи — тем же явным путём: текущий шаг набирают
+        # руками в поле, и ключ попадает туда ровно так же, как в реплику, —
+        # перепутав окно. Таблица новая, а обещание то же.
+        store.save_task(agent.id, {"step": f"шаг с ключом {key}", "expecting": key})
 
         # И в долговременную память — тем же явным путём. Слой глобальный
         # и удаление чата его не чистит: утёкший сюда ключ пережил бы и сам

@@ -26,8 +26,13 @@ from .schema import (
     MEMORY_LABELS,
     PROFILE_FIELDS,
     PROFILE_LABELS,
+    TASK_LABELS,
+    TASK_STAGE_DEFAULT,
+    TASK_STAGE_LABELS,
+    TASK_TEXT_FIELDS,
     WORKING_LABELS,
     AgentSpec,
+    blank_task,
 )
 from .store import Store
 
@@ -91,6 +96,45 @@ def summary_message(content: str, covered: int) -> dict:
     }
 
 
+def task_spoken(task: dict) -> bool:
+    """Сказало ли состояние задачи хоть что-нибудь.
+
+    Этап есть всегда — у задачи нет состояния «этап не выбран», — но
+    умолчание само по себе не новость: чат, которого никто не трогал, стоит
+    на планировании ровно потому, что его завели. Поэтому блок задачи
+    заводит либо переключённый этап, либо заполненное поле, либо запись
+    рабочей памяти (её спрашивает `prompt_head` отдельно).
+
+    Пустой чат обязан уходить в модель **без блока вовсе**: пустая врезка
+    сдвинула бы каждую последовательность ролей, на которую смотрит любая
+    проверка. Довод и слова те же, что у `memory_items` и `working_items`.
+    """
+    return task.get("stage") != TASK_STAGE_DEFAULT or any(
+        task.get(name) for name in TASK_TEXT_FIELDS
+    )
+
+
+def task_lines(task: dict) -> list[str]:
+    """Состояние задачи строками «подпись поля: значение» — первыми строками
+    блока задачи.
+
+    Этап стоит первым и стоит **всегда**, пока блок есть: это то, где задача
+    находится, и блок с целями, умолчавший про этап, заставил бы модель его
+    угадывать. Уезжает он русской подписью и по одной карте с полосой этапов
+    в шапке (`TASK_STAGE_LABELS`) — второй таблицей модель читала бы одно
+    слово, а человек видел бы другое.
+
+    А «сейчас» и «ожидается» — только заполненные: пустое уехало бы строкой
+    «ожидается: » и заняло бы место, не сказав ничего. Довод тот же, что
+    у блока профиля.
+    """
+    lines = [f"{TASK_LABELS['stage']}: {TASK_STAGE_LABELS.get(task['stage'], task['stage'])}"]
+    lines += [
+        f"{TASK_LABELS[name]}: {task[name]}" for name in TASK_TEXT_FIELDS if task.get(name)
+    ]
+    return lines
+
+
 def working_lines(items: list[dict]) -> str:
     """Рабочая память строками «подпись типа: содержимое» — в том виде,
     в каком она уезжает в промпт разговора. Ни номеров, ни слова слоя здесь
@@ -107,12 +151,20 @@ def working_lines(items: list[dict]) -> str:
     )
 
 
-def working_message(items: list[dict]) -> dict:
-    """Рабочая память так, как она встаёт в промпт: роль `user` и явная
-    подпись, **не** `system`. Довод тот же, что у сводки: системный промпт
-    живёт ровно в одном месте — `spec.system`, — и голый чат обязан уходить
-    в модель без системной реплики. Без подписи модель приняла бы врезку
-    за реплику пользователя и стала бы отвечать на неё.
+def working_message(items: list[dict], task: dict) -> dict:
+    """Блок задачи так, как он встаёт в промпт: роль `user` и явная
+    подпись, **не** `system`.
+
+    Блок один на состояние задачи и на рабочую память, а не два соседних:
+    этап, текущий шаг и записи — про одно и то же, оба слоя живут в чате
+    и умирают с ним, и второй блок на ту же тему был бы ровно тем лишним
+    разделением промпта, которого лекция велит избегать. Состояние идёт
+    первым: сперва где задача, потом что про неё известно.
+
+    Роль `user` с подписью, а не `system`, — довод тот же, что у сводки:
+    системным сообщением едет распоряжение, а блок задачи это сведения,
+    на которые модель опирается. Без подписи она приняла бы врезку за реплику
+    пользователя и стала бы отвечать на неё.
 
     Подпись осталась прежней, хотя хранение сменилось дважды: врезка — это
     то, что видит модель, отвечающая собеседнику, и менять ей текст заодно
@@ -124,12 +176,11 @@ def working_message(items: list[dict]) -> dict:
     есть» соврало бы там, где врезок в промпте три. Довод тот же, по которому
     нейтральна скобка у долговременной памяти.
     """
+    lines = task_lines(task) + ([working_lines(items)] if items else [])
     return {
         "role": "user",
         "content": (
-            "[факты о разговоре]\n"
-            f"{working_lines(items)}\n"
-            "[конец фактов о разговоре]"
+            "[факты о разговоре]\n" + "\n".join(lines) + "\n[конец фактов о разговоре]"
         ),
     }
 
@@ -397,6 +448,18 @@ class Agent:
         некому, кроме собеседника.
         """
 
+        self.task: dict = blank_task()
+        """Состояние этой задачи: этап, текущий шаг и ожидаемое действие.
+
+        Держится в памяти, а не спрашивается у базы на каждый показ: полоса
+        этапов уезжает клиенту с самим чатом, и отдельный запрос под неё
+        превратил бы один поход на сервер в поток.
+
+        Заводит и переключает его **человек**, кнопкой и двумя полями: ни
+        одного метода, выводящего этап из разговора, у агента нет — довод
+        тот же, по которому он не пишет ни в один слой памяти.
+        """
+
         self._working_seq = 0
         """Последний выданный номер записи — на случай агента **без
         хранилища**. С хранилищем номера выдаёт база (AUTOINCREMENT), и здесь
@@ -457,6 +520,11 @@ class Agent:
                 self._working_seq = max(
                     (item["seq"] for item in self.working), default=0
                 )
+                # И состояние задачи — тем же порядком: пауза и продолжение
+                # разговора в том и состоят, что этап, шаг и ожидаемое
+                # действие поднимаются из файла такими же, какими их
+                # оставили. Строки может не быть вовсе — тогда умолчание.
+                self.task = store.load_task(self.id)
                 # И происхождение: ветка остаётся веткой и после перезапуска,
                 # и после вытеснения из памяти — пометка в списке и в панели
                 # берётся отсюда.
@@ -518,6 +586,37 @@ class Agent:
         Довод и форма те же, что у `memory_items`.
         """
         return list(self.working)
+
+    def task_items(self, task=None) -> dict:
+        """Состояние задачи, которое уедет в этот промпт, — всегда полный
+        словарь: этап у задачи есть всегда.
+
+        Пустым словарём ответить нельзя: блок задачи заводит не только
+        состояние, но и запись рабочей памяти, и тогда этап обязан встать
+        в нём первой строкой. Говорит ли состояние что-нибудь само по себе,
+        решает `task_spoken` — одним вопросом, а не двумя.
+
+        `task` — уже прочитанное состояние: обмен читает его **один раз**
+        и передаёт сюда и в слоты, ровно как память и профиль.
+        """
+        if task is not None:
+            return dict(task)
+        return dict(self.task)
+
+    def set_task(self, values: dict) -> dict:
+        """Переключает этап и правит поля — названные, остальные не трогает.
+
+        Пишет сюда только человек: кнопкой полосы этапов и двумя полями
+        вкладки. Разрешённых переходов здесь нет — этап ставят любой,
+        и запрет перепрыгивать обещанием этого дня не был.
+        """
+        if self.store is not None:
+            self.task = self.store.save_task(self.id, values)
+        else:
+            self.task.update(
+                {name: values[name] for name in self.task if name in values}
+            )
+        return dict(self.task)
 
     def context_cut(self, spec: AgentSpec | None = None) -> tuple[int, dict | None]:
         """Что стратегия делает с началом истории: сколько первых реплик не
@@ -607,7 +706,7 @@ class Agent:
         return self.store.load_profile()
 
     def prompt_head(
-        self, spec: AgentSpec | None = None, memory=None, profile=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, task=None
     ) -> tuple[list[dict], dict[str, int | None], int]:
         """Начало промпта разом: сообщения **до** истории, номер каждой врезки
         в них и срез, с которого история уезжает дальше.
@@ -648,10 +747,15 @@ class Agent:
             slots["memory_at"] = len(messages)
             messages.append(memory_message(records))
 
+        # Блок задачи — один на состояние и на записи о ней: и то и другое
+        # про текущую задачу, оба живут в чате и умирают с ним. Заводит его
+        # либо переключённый этап, либо заполненное поле, либо хоть одна
+        # запись; у пустого чата блока нет вовсе, и слот у него `None`.
         items = self.working_items(spec)
-        if items:
+        state = self.task_items(task)
+        if items or task_spoken(state):
             slots["working_at"] = len(messages)
-            messages.append(working_message(items))
+            messages.append(working_message(items, state))
 
         cut, insert = self.context_cut(spec)
         if insert is not None:
@@ -661,7 +765,8 @@ class Agent:
         return messages, slots, cut
 
     def build_prompt(
-        self, user_text: str, *, spec: AgentSpec | None = None, memory=None, profile=None
+        self, user_text: str, *, spec: AgentSpec | None = None, memory=None,
+        profile=None, task=None,
     ) -> list[dict]:
         """Системный промпт + долговременная память + рабочая память + начало
         истории по стратегии + хвост + вопрос.
@@ -680,13 +785,13 @@ class Agent:
         сообщения; `spec` передаёт обмен — он собирает промпт и тело запроса
         из одного слепка, и память читает один раз на обмен.
         """
-        messages, _, cut = self.prompt_head(spec, memory, profile)
+        messages, _, cut = self.prompt_head(spec, memory, profile, task)
         messages.extend(turn.as_message() for turn in self.history[cut:])
         messages.append({"role": "user", "content": user_text})
         return messages
 
     def prompt_slots(
-        self, spec: AgentSpec | None = None, memory=None, profile=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, task=None
     ) -> dict[str, int | None]:
         """Номера всех врезок промпта разом: `memory_at`, `working_at`,
         `summary_at`. `None` у любого — врезки в промпте нет вовсе.
@@ -696,7 +801,7 @@ class Agent:
         формулы, и разошлись бы они молча. Уезжают они тоже разом — одним
         кадром `start`, — и спрашивать их порознь было бы неоткуда.
         """
-        return self.prompt_head(spec, memory, profile)[1]
+        return self.prompt_head(spec, memory, profile, task)[1]
 
     def compress_plan(self, spec: AgentSpec) -> tuple[int, int] | None:
         """Что предстоит свернуть этим обменом: `(свёрнуто, новая граница)` —
@@ -944,6 +1049,13 @@ class Agent:
                 if isinstance(item.get("upto"), int) and item["upto"] <= at
             ],
             "working": [copy.deepcopy(item) for item in self.working],
+            # **И состояние задачи едет целиком** — по тому же правилу, что
+            # рабочая память, и по тому же доводу: этап не заменяет собой ни
+            # одной реплики, он про задачу, а задача у ветки та же. Границы
+            # по `at` у него поэтому нет: ветвиться посреди проверки и
+            # оказаться снова на планировании значило бы потерять то, что
+            # ветка как раз и продолжает.
+            "task": dict(self.task),
         }
 
     def take_branch(self, carried: dict, *, parent_id: str, forked_at: int) -> None:
@@ -963,6 +1075,7 @@ class Agent:
         # разговорах — ровно та путаница, из-за которой номера и стали
         # сквозными. Содержимое, тип и время у копий прежние.
         self.working = []
+        self.task = dict(carried["task"])
         if self.store is None:
             for item in carried["working"]:
                 self._working_add(item["kind"], item["content"], item["at"])
@@ -970,6 +1083,7 @@ class Agent:
         with self.store.tx():
             self.store.save_branch(self.id, parent_id=parent_id, forked_at=forked_at)
             self.store.save_summaries(self.id, self.summaries)
+            self.store.save_task(self.id, self.task)
             for item in carried["working"]:
                 self._working_add(item["kind"], item["content"], item["at"])
             self.persist()
@@ -1006,7 +1120,8 @@ class Agent:
         )
 
     def forget(self) -> None:
-        """Забывает разговор целиком — историю, сводки и рабочую память.
+        """Забывает разговор целиком — историю, сводки, рабочую память
+        и состояние задачи.
 
         Сводка заменяла начало истории; истории больше нет, и покрывать ей
         нечего. Оставленная, она накрыла бы собой начало **следующего**
@@ -1030,9 +1145,15 @@ class Agent:
         self.history.clear()
         self.summaries = []
         self.working = []
+        # И состояние задачи — тем же порядком и по тому же доводу, что
+        # рабочая память: зажима по длине истории у блока задачи нет, и
+        # забытый разговор оставил бы следующему «этап: проверка» первой же
+        # строкой. Задачи не стало — значит, снова планирование.
+        self.task = blank_task()
         if self.store is not None:
             self.store.save_summaries(self.id, [])
             self.store.clear_working(self.id)
+            self.store.clear_task(self.id)
         self.persist()
 
     def usage_summary(self) -> dict | None:
@@ -1101,6 +1222,7 @@ class Agent:
             last_used_at=self.last_used_at,
             busy=self.busy,
             branch=self.branch,
+            task=self.task,
         )
         if with_transcript:
             data["transcript"] = self.transcript()
@@ -1176,9 +1298,14 @@ class Agent:
             # заводит собой системное сообщение, и прочитанный дважды
             # развёл бы промпт с номерами сильнее любой врезки.
             profile = self.profile_items()
+            # И состояние задачи — тем же порядком и по тому же доводу:
+            # прочитано один раз на обмен и уезжает и в промпт, и в номер
+            # врезки. Соседняя вкладка вправе переключить этап посреди
+            # обмена, и прочитанное дважды развело бы промпт с кадром `start`.
+            task = self.task_items()
 
             prompt = self.build_prompt(
-                user_text, spec=spec, memory=memory, profile=profile
+                user_text, spec=spec, memory=memory, profile=profile, task=task
             )
 
             # `summary_at` — место врезки стратегии в промпте, `memory_at`
@@ -1198,7 +1325,7 @@ class Agent:
                 "type": "start",
                 "resolved_messages": prompt,
                 "question": user_text,
-                **self.prompt_slots(spec, memory, profile),
+                **self.prompt_slots(spec, memory, profile, task),
                 "strategy": spec.strategy,
             }
 
@@ -1341,6 +1468,7 @@ def spec_as_dict(
     busy: bool = False,
     usage_total: dict | None = None,
     branch: dict | None = None,
+    task: dict | None = None,
 ) -> dict:
     """Конфиг чата так, как его ждут список слева и панель справа.
 
@@ -1369,6 +1497,12 @@ def spec_as_dict(
         # имя по нему находит тот, кто рисует список, у него все чаты и так
         # на руках, и переименование родителя видно сразу.
         "branch": branch,
+        # Состояние задачи: этап, текущий шаг и ожидаемое действие. Едет
+        # с чатом, а не своей ручкой, — полоса этапов стоит в шапке и
+        # рисуется тем же ответом, каким рисуется сама лента. У чата,
+        # которого не трогали, здесь умолчание, а не `None`: этап есть
+        # у задачи всегда.
+        "task": blank_task() if task is None else dict(task),
         "created_at": created_at,
         "last_used_at": last_used_at,
     }

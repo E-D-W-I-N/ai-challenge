@@ -286,6 +286,54 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg);
   position: relative;
 }
+/* Шапка чата с полосой этапов. `flex: 0 0 auto` — она не сжимается и
+   не прокручивается вместе с лентой: состояние задачи обязано быть в кадре
+   постоянно, а не только пока лента у верхнего края. */
+.chat-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 28px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg);
+}
+.stages {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+/* Этап — кнопка: нажатие переключает. Текущий выделен, остальные приглушены;
+   кружок перед подписью — часть текста, а не картинка: из сети клиент
+   не тянет ничего, а рисовать заливку SVG'ом ради одного символа незачем. */
+.stage {
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 9px;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.stage:hover { background: var(--bg-soft); color: var(--muted); }
+.stage.current {
+  background: var(--bg-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.stage-arrow {
+  color: var(--line);
+  font-size: 11px;
+  letter-spacing: -.05em;
+  user-select: none;
+}
+
 /* `min-height: 0` стоит и на самой ленте: без него чат не даёт ей сжаться,
    и вместо прокрутки лента растягивает его, унося композер за край. */
 .feed {
@@ -593,17 +641,19 @@ button, input, select, textarea { font: inherit; color: inherit; }
   border-radius: 10px;
   background: var(--bg-soft);
 }
+/* Вкладок пять, и подписи у них русские: шаг разрядки и горизонтальные
+   поля ужаты ровно настолько, чтобы «ПРОФИЛЬ» помещался целиком. */
 .tab {
   position: relative;
   flex: 1 1 0;
-  padding: 6px 10px;
+  padding: 6px 4px;
   border: 0;
   border-radius: 8px;
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: .02em;
+  letter-spacing: 0;
   text-transform: uppercase;
   cursor: pointer;
   transition: background .12s ease, color .12s ease;
