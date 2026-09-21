@@ -31,6 +31,7 @@ from .schema import (
     CONTEXT_FIELDS,
     CONTEXT_NUMBERS,
     MEMORY_KINDS,
+    PROFILE_FIELDS,
     STRATEGIES,
     WORKING_KINDS,
     AgentSpec,
@@ -367,14 +368,14 @@ def _kind_field(payload: dict, kinds: tuple = MEMORY_KINDS) -> str:
 
 
 def _record_body(payload, allowed: tuple) -> dict:
-    """Тело запроса к записи памяти — любого из двух редактируемых слоёв:
-    объект и только известные поля.
+    """Тело запроса к записи памяти или к профилю: объект и только известные
+    поля, список полей — параметром.
 
-    Лишнее поле — 400, а не молчаливый пропуск: номер, автора и время
-    выдаёт сервер, и запрос, который их присылает, просит не то, что
-    ручка делает, — отвечать ему «ок» значило бы соврать.
+    Лишнее поле — 400, а не молчаливый пропуск: номер и время выдаёт сервер,
+    и запрос, который их присылает, просит не то, что ручка делает, —
+    отвечать ему «ок» значило бы соврать.
 
-    Валидатор один на оба слоя — по тому же доводу, по которому один
+    Валидатор один на все три слоя — по тому же доводу, по которому один
     `_kind_field`: правило у них общее, и вторая копия разошлась бы
     с первой ровно в том месте, ради которого её писали.
     """
@@ -387,8 +388,8 @@ def _record_body(payload, allowed: tuple) -> dict:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"тело записи памяти — только {', '.join(allowed)}: номер, "
-                f"автора и время выдаёт сервер. Лишние поля: {', '.join(sorted(unknown))}"
+                f"тело — только {', '.join(allowed)}: номер и время выдаёт "
+                f"сервер. Лишние поля: {', '.join(sorted(unknown))}"
             ),
         )
     return payload
@@ -404,6 +405,24 @@ def _content_field(payload: dict) -> str:
     if not isinstance(content, str) or not content.strip():
         raise HTTPException(status_code=400, detail="content: непустая строка")
     return content.strip()
+
+
+def _profile_field(payload: dict, name: str) -> str:
+    """Значение поля профиля: строка, можно пустая.
+
+    Пустая — здесь законное значение, в отличие от текста записи памяти:
+    ею поле **снимают**. Кнопки «очистить» у поля нет и не надо — стёр текст
+    и ушёл с поля, ровно как снимают системный промпт чата (`_text_field`).
+    А вот не-строка — 400: `null` пришёл бы от клиента, который путает
+    «снять» с «не трогать», и разница между ними здесь есть.
+    """
+    value = payload.get(name)
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name}: строка; пустая снимает поле, а не оставляет прежнее",
+        )
+    return value.strip()
 
 
 def _parse_spec(payload: dict, where: str) -> AgentSpec:
@@ -662,6 +681,46 @@ async def delete_memory(seq: int) -> dict:
             detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
         )
     return {"deleted": seq}
+
+
+# ── профиль: как отвечать именно этому человеку ───────────────────────────
+#
+# Ручки по образцу долговременной памяти: слой глобальный, `agent_id` в пути
+# нет — профиль один на всю базу. Пишет в него **только человек**, и другого
+# пути сюда нет: агент профиль не выводит из разговора, потому что профиль
+# это распоряжение, а не наблюдение.
+
+
+@app.get("/api/profile")
+async def get_profile() -> dict:
+    """Профиль целиком — только заполненные поля.
+
+    Пустых значений в ответе не бывает: снятое поле не хранится пустой
+    строкой, а удаляется. Вкладка показывает пустым то, чего в ответе нет.
+    """
+    return {"profile": REGISTRY.store.load_profile()}
+
+
+@app.patch("/api/profile")
+async def patch_profile(payload: dict = Body(...)) -> dict:
+    """Правка профиля: `{"style": "..."}`, любое подмножество трёх полей.
+
+    Разбор тела — общий с памятью (`_record_body`, список полей параметром):
+    лишнее поле 400, пустое тело 400. Названные поля записываются, неназванные
+    не трогаются, пустая строка поле снимает.
+
+    Ответ — профиль целиком, уже **записанный**: текст по дороге чистит
+    `redact()`, и показывать присланное вместо записанного значило бы соврать
+    ровно там, где в поле попал ключ.
+    """
+    _record_body(payload, PROFILE_FIELDS)
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail=f"тело правки пустое: назовите {', '.join(PROFILE_FIELDS)} или часть",
+        )
+    values = {name: _profile_field(payload, name) for name in payload}
+    return {"profile": REGISTRY.store.save_profile(values)}
 
 
 @app.get("/api/agents/{agent_id}/memory")

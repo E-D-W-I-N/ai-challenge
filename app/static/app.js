@@ -1150,7 +1150,7 @@ async function refreshCurrent(prompt) {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory"];
+const PANEL_TABS = ["model", "agent", "memory", "profile"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -2024,6 +2024,66 @@ function fillKinds(select, kinds, blankLabel) {
   });
 }
 
+// ─────────────────────────── профиль ──────────────────────────
+//
+// Профиль — про то, **как** с человеком разговаривать: стиль, формат
+// и контекст его работы. Он один на всю базу, как долговременная память,
+// и пишет в него только человек: профиль это распоряжение («отвечай кратко»),
+// а не наблюдение о собеседнике («пишет на Kotlin») — выводить распоряжения
+// из разговора агент не вправе.
+//
+// Запрашивается лениво, на открытие вкладки, ровно как слои памяти: панель
+// перерисовывается на каждый обмен, и запрос внутри отрисовки превратил бы
+// один поход на сервер в поток.
+
+// Поля — тем же списком, что `PROFILE_FIELDS` на сервере, и в том же порядке:
+// им же собран блок `[как отвечать]` в промпте.
+const PROFILE_FIELDS = ["style", "format", "context"];
+
+const profileInput = (name) => $("#profile-" + name);
+
+function profileStatus(text, isError) {
+  const box = $("#profile-status");
+  box.className = "hint" + (isError ? " error" : "");
+  box.textContent = text || "";
+}
+
+function showProfile(values) {
+  PROFILE_FIELDS.forEach((name) => {
+    profileInput(name).value = values[name] || "";
+  });
+}
+
+async function loadProfile() {
+  try {
+    const answer = await api("/api/profile");
+    showProfile(answer.profile || {});
+    profileStatus("");
+  } catch (err) {
+    profileStatus(String(err.message || err), true);
+  }
+}
+
+// Правка одного поля: уезжает **только тронутое**, остальные не называются
+// вовсе — иначе вторая вкладка, правящая формат, затирала бы стиль, набранный
+// в первой. Пустая строка поле снимает: отдельной кнопки «очистить» нет,
+// ровно как у системного промпта чата.
+async function saveProfile(name) {
+  const field = profileInput(name);
+  try {
+    const answer = await api("/api/profile", json("PATCH", { [name]: field.value }));
+    const values = answer.profile || {};
+    // Показываем **записанное**, а не набранное: текст по дороге чистит
+    // `redact()`, и поле обязано показывать то, что уедет в промпт.
+    showProfile(values);
+    profileStatus(PROFILE_FIELDS.some((key) => values[key])
+      ? "Профиль сохранён: он уезжает системным сообщением в каждый запрос."
+      : "Профиль пуст: к запросам не добавляется ничего.");
+  } catch (err) {
+    profileStatus(String(err.message || err), true);
+  }
+}
+
 // ─────────────────────────── плитки ───────────────────────────
 
 // Плитки справа — про весь диалог, а не про последний ответ: сколько всего
@@ -2248,14 +2308,19 @@ function init() {
   // у списков — выбор. Отдельной кнопки сохранения нет.
   $("#panel-body").addEventListener("change", (ev) => {
     // Пролив панели — про конфиг чата, и поля его носят приставку `f-`.
-    // Поля вкладки «Память» её не носят: у памяти свои ручки, и PATCH чата
-    // при выборе типа записи был бы запросом ни о чём.
-    if (!String(ev.target.id || "").startsWith("f-")) return;
-    if (ev.target.id === "f-response_format_kind") syncResponseFormat();
+    // Поля вкладок «Память» и «Профиль» её не носят: у обоих свои ручки,
+    // и PATCH чата при выборе типа записи или правке стиля был бы запросом
+    // ни о чём. Профиль при этом сохраняется тем же событием `change`,
+    // что и настройки: у поля ввода это потеря фокуса, отдельной кнопки
+    // сохранения нет нигде в панели.
+    const id = String(ev.target.id || "");
+    if (id.startsWith("profile-")) return saveProfile(id.slice("profile-".length));
+    if (!id.startsWith("f-")) return;
+    if (id === "f-response_format_kind") syncResponseFormat();
     // Показ полей меняется на самом выборе, а не после сохранения: пролив
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
     // которое уже ни на что не влияет, — значит снова обещать не то.
-    if (ev.target.id === "f-strategy") syncStrategyFields();
+    if (id === "f-strategy") syncStrategyFields();
     applySettings();
   });
 
@@ -2270,6 +2335,9 @@ function init() {
       // с этой минуты считает заново. Обмен и смена чата читают слои без
       // отметки, иначе считать было бы нечего.
       if (which === "memory") loadMemory();
+      // Профиль — тем же порядком и по тому же доводу: лениво, на открытие
+      // вкладки. Он глобальный, и перечитывать его на смену чата незачем.
+      if (which === "profile") loadProfile();
     };
   });
 
