@@ -481,6 +481,11 @@ function buildServer(options) {
     // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
+    // Вызовы инструментов на обмене: список или функция (номер обмена) →
+    // список `{name, ok, message, plan}`. Кадр приходит на **исполненный**
+    // вызов, и план в нём уже новый — как на сервере, где `plan_view()`
+    // читается прямо на месте правки.
+    tools: (options && options.tools) || null,
     // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
     // `service`, потому что и на сервере она своя: записи вписывает человек,
     // и едут они при любом варианте обрезки, а не по заказу стратегии.
@@ -532,7 +537,84 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
+  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null, workflow: "off" };
+
+  // ── состояние задачи ──
+  //
+  // План и есть состояние: список шагов и три флажка. Этап и текущий шаг
+  // не хранятся ни здесь, ни на сервере — они **вычисляются** (`plan.stage_of`),
+  // и стенд считает их теми же правилами и тем же порядком. Ярлык этапа,
+  // лежащий рядом с работой, расходится с работой молча.
+  const emptyPlan = () => ({ steps: [], approved: false, finished: false, paused: false });
+
+  // Текущий — тот, что `in_progress`; его нет — первый не-`done`. Одно место
+  // на оба правила, как на сервере.
+  function currentStep(plan) {
+    const steps = ((plan || {}).steps) || [];
+    const active = steps.findIndex((s) => s.status === "in_progress");
+    if (active >= 0) return active;
+    const undone = steps.findIndex((s) => s.status !== "done");
+    return undone >= 0 ? undone : null;
+  }
+
+  // Разбор упорядоченный, а не поиск по таблице: условия этапов пересекаются.
+  // План неутверждённый, но со всеми шагами `done` подходит и под `approval`,
+  // и под `validation` сразу, и порядок решает, какой из них правда.
+  function stageOf(plan) {
+    const steps = ((plan || {}).steps) || [];
+    const current = currentStep(plan);
+    if ((plan || {}).paused) return ["paused", current];
+    if ((plan || {}).finished) return ["done", current];
+    if (!steps.length) return ["planning", null];
+    if (!(plan || {}).approved) return ["approval", current];
+    if (steps.every((s) => s.status === "done")) return ["validation", current];
+    return ["execution", current];
+  }
+
+  const deepCopy = (value) => JSON.parse(JSON.stringify(value));
+
+  // План так, как его отдаёт сервер: сам список плюс вычисленные `stage`
+  // и `current`. Одна форма на тело чата, на ручки кнопок и на кадр `tool`.
+  function planView(plan) {
+    const [stage, current] = stageOf(plan);
+    return { ...deepCopy(plan || emptyPlan()), stage, current };
+  }
+
+  // Пять переходов человека — с теми же условиями, что у `plan.apply`, и тем же
+  // кодом отказа: стенд, отвечающий 200 на `approve` не на том этапе, оставил
+  // бы зелёной кнопку, которая в браузере краснеет.
+  //
+  // Текст отказа — серверный, директивой **для модели**: человеческий текст
+  // по коду 409 выбирает сам клиент, и подсунь ему стенд готовую человеческую
+  // строку, проверять было бы нечего.
+  function planApply(plan, action) {
+    const [stage] = stageOf(plan);
+    const deny = (why) => ({
+      error: action + " НЕ выполнен, состояние не изменилось: " + why +
+             " НЕ утверждай, что это сделано. Допустимо: …",
+    });
+    if (action === "approve") {
+      if (stage !== "approval") return deny("этап сейчас " + stage + ", а не approval.");
+      return { plan: { ...plan, approved: true } };
+    }
+    if (action === "reopen") {
+      if (!plan.finished) return deny("задача не завершена.");
+      return { plan: { ...plan, finished: false } };
+    }
+    if (action === "pause") {
+      if (plan.paused) return deny("задача уже на паузе.");
+      if (plan.finished) return deny("задача завершена, приостанавливать нечего.");
+      return { plan: { ...plan, paused: true } };
+    }
+    if (action === "resume") {
+      if (!plan.paused) return deny("задача не на паузе, снимать нечего.");
+      return { plan: { ...plan, paused: false } };
+    }
+    // `reset` законен всегда: на нём держится и «начать другую задачу»,
+    // и «вернуться в обычный чат».
+    return { plan: emptyPlan() };
+  }
+  const PLAN_MOVES = ["approve", "reopen", "pause", "resume", "reset"];
 
   const blank = (id, label) => ({
     id,
@@ -550,6 +632,10 @@ function buildServer(options) {
     // как на сервере. У ветки — `{parent_id, forked_at}`, и имени родителя
     // в нём нет: клиент находит его сам по id.
     branch: null,
+    // Состояние задачи: ключ есть у чата **всегда**, и у выключенного тоже —
+    // ровно как на сервере, где `workflow` и `plan` едут одним телом и
+    // разъехаться внутри него не вправе.
+    plan: emptyPlan(),
     ...Object.fromEntries(SAMPLING.map((n) => [n, null])),
     ...CONTEXT,
   });
@@ -579,8 +665,9 @@ function buildServer(options) {
     };
   });
 
-  // Чат так, как его отдаёт сервер.
-  const view = (agent) => ({ ...agent });
+  // Чат так, как его отдаёт сервер. План наружу едет вычисленным: `stage`
+  // и `current` — ответ правил, а не колонка.
+  const view = (agent) => ({ ...agent, plan: planView(agent.plan) });
 
   // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
   // пустой — ровно как на сервере.
@@ -686,6 +773,14 @@ function buildServer(options) {
 
   const factsInsert = () => state.facts;
 
+  // Блок задачи для промпта: список шагов со статусами. Форма своя — важен
+  // не текст, а то, что блок стоит в промпте на своём месте и подписан
+  // клиентом по номеру слота, а не по словам внутри.
+  const planInsert = (agent) =>
+    "[задача]\n" +
+    ((((agent.plan || {}).steps) || []).map((step, i) =>
+      (i + 1) + ". " + step.title + " — " + step.status).join("\n") || "плана ещё нет");
+
   // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
   // одним ответом. Формула слота здесь не считается, а берётся из длины уже
   // собранного начала: сервер делает так же (`Agent.prompt_head`), и по той же
@@ -693,12 +788,12 @@ function buildServer(options) {
   // молча. Стенд от сервера нарочно независим, но две копии формулы **внутри
   // стенда** независимостью не являются.
   //
-  // Порядок тот же, что на сервере: долговременная память, рабочая, врезка
-  // стратегии. От общего к частному — и обе памяти едут при любом варианте
-  // обрезки, ни одну из них не отменяя.
+  // Порядок тот же, что на сервере: долговременная память, рабочая, блок
+  // задачи, врезка стратегии. От общего к частному — и обе памяти с блоком
+  // задачи едут при любом варианте обрезки, ни одну из них не отменяя.
   function promptHead(agent, service) {
     const messages = [];
-    const slots = { memory_at: null, working_at: null, summary_at: null };
+    const slots = { memory_at: null, working_at: null, plan_at: null, summary_at: null };
     if (agent.system) messages.push({ role: "system", content: agent.system });
 
     const memory = memoryInsert();
@@ -710,6 +805,13 @@ function buildServer(options) {
     if (facts) {
       slots.working_at = messages.length;
       messages.push({ role: "user", content: facts });
+    }
+    // Блок задачи — при включённом рабочем процессе **всегда**, даже
+    // с пустым списком шагов: без него модель не знает, что план вообще
+    // ведётся. При выключенном слот пуст, и в промпте не меняется ни слова.
+    if (agent.workflow === "plan") {
+      slots.plan_at = messages.length;
+      messages.push({ role: "user", content: planInsert(agent) });
     }
     // Окно — единственная стратегия, которая режет **без** врезки: вместо
     // отброшенного начала не встаёт ничего, слот у неё пуст, и в промпте
@@ -752,6 +854,25 @@ function buildServer(options) {
     };
   }
 
+  // Кадры исполненных вызовов. План стенд **применяет** к агенту, а не
+  // подставляет в ответ: собери он его заново в каждом кадре, следующий GET
+  // вернул бы прежний, и утверждение «галочка сдвинулась» прошло бы
+  // на подложном равенстве.
+  function toolCalls(agent, index) {
+    const calls = typeof state.tools === "function" ? state.tools(index) : state.tools;
+    return (calls || []).map((call) => {
+      if (call.plan) agent.plan = deepCopy(call.plan);
+      return {
+        event: "tool",
+        agent: agent.id,
+        name: call.name,
+        ok: call.ok !== false,
+        message: call.message || "",
+        plan: planView(agent.plan),
+      };
+    });
+  }
+
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
     const index = state.sent.length;
@@ -761,11 +882,17 @@ function buildServer(options) {
     // Промпт собирается до записи обмена в стенограмму: в модель уехало то,
     // что было в истории **до** этого вопроса.
     const resolved = resolvedPrompt(agent, text, service);
+    // Кадр `start` собирается **до** вызовов инструментов: блок задачи в нём
+    // тот, что уехал в модель, а не тот, что получился после правок. Сервер
+    // ведёт себя так же — кадр `start` на обмене один, и промпт следующих
+    // оборотов не пересобирается.
+    const start = startFrame(agent, text, resolved, service);
+    const toolFrames = toolCalls(agent, index);
     // Упавший обмен получает те же кадры до места падения: сервер сворачивает
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, service, resolved);
+    if (failed) return errorStream(agent, text, failed, service, start, toolFrames);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -785,7 +912,10 @@ function buildServer(options) {
       // разбирает текст сообщений. Кадр `compressing` приходит только
       // на сворачивание: служебный вызов на обмене остался один.
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
-      startFrame(agent, text, resolved, service),
+      start,
+      // Кадры вызовов стоят **между** `start` и `delta`: вызов исполнен,
+      // результат уехал модели, и слово она скажет следующим оборотом.
+      ...toolFrames,
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
@@ -796,7 +926,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, service, resolved) {
+  function errorStream(agent, text, failed, service, start, toolFrames) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -813,7 +943,11 @@ function buildServer(options) {
     };
     const frames = [
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
-      startFrame(agent, text, resolved, service),
+      start,
+      // Вызов мог успеть исполниться и до падения: то, что исполнилось,
+      // остаётся исполненным — откат задним числом был бы враньём про то,
+      // что модель видела.
+      ...(toolFrames || []),
       { event: "error", agent: agent.id, message: failed.message, metrics },
       ...(failed.done === false
         ? []
@@ -933,6 +1067,9 @@ function buildServer(options) {
       child.history_len = child.transcript.length;
       child.usage_total = sumUsage(child.transcript);
       child.branch = { parent_id: agent.id, forked_at: at };
+      // План ветка уносит целиком, с флажками: задача у неё та же, и
+      // утверждённый план обязан остаться утверждённым.
+      child.plan = deepCopy(agent.plan);
       state.agents.push(child);
       return json({ created: 1, live: state.agents.length, agents: [view(child)] });
     }
@@ -991,6 +1128,18 @@ function buildServer(options) {
       if (i < 0) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
       working.records.splice(i, 1);
       return json({ deleted: seq });
+    }
+    // ── состояние задачи: пять кнопок человека ──
+    //
+    // Отказ — 409, ровно как на сервере: тело здесь пустое и кривым быть
+    // не может, а «не тот этап» это состояние, а не ошибка запроса.
+    const planMatch = /^\/plan\/([a-z]+)$/.exec(tail);
+    if (planMatch && method === "POST") {
+      if (!PLAN_MOVES.includes(planMatch[1])) return fail(404, "нет такой ручки плана");
+      const moved = planApply(agent.plan, planMatch[1]);
+      if (moved.error) return fail(409, moved.error);
+      agent.plan = moved.plan;
+      return json({ plan: planView(agent.plan) });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(view(agent));

@@ -337,7 +337,14 @@ function renderMarkdown(text) {
 
 async function api(path, options) {
   const res = await fetch(path, options);
-  if (!res.ok) throw new Error(await detail(res));
+  if (!res.ok) {
+    const err = new Error(await detail(res));
+    // Код ответа едет вместе с текстом: отказ ручки плана (409) несёт
+    // директиву, написанную **для модели**, и человеку её показывать нельзя —
+    // свой человеческий текст клиент выбирает по коду, а не по словам в теле.
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
@@ -540,6 +547,10 @@ async function openAgent(agentId) {
   resetMetrics(agent);
   renderList();
   renderFeed(agent);
+  // Шапка задачи — часть открытого чата, а не ленты: у одного она есть,
+  // у соседнего её нет вовсе, и оставленная от прошлого она показывала бы
+  // чужой план.
+  renderTask(agent);
   fillPanel(agent);
   renderTiles();
 
@@ -719,6 +730,12 @@ function cutNote(m) {
 const SERVICE_CALLS = {
   summary: { status: "Сворачиваю начало разговора…", role: "сводка начала разговора" },
   facts: { role: "факты о разговоре" },
+  // Работа по плану — третьей строкой того же индекса. Служебного вызова
+  // к модели за ней нет, как и за фактами: план правит сама модель вызовом
+  // инструмента посреди обмена. Но показов у неё те же два — строка
+  // состояния, пока идёт оборот, и подпись блока задачи в просмотре
+  // промпта, — и разъехаться им двумя таблицами незачем.
+  plan: { status: "Модель работает по плану…", role: "план задачи" },
 };
 
 function usageLine(turn) {
@@ -761,6 +778,12 @@ function usageLine(turn) {
   // заговорила вообще, а не когда домыслила и пошёл ответ.
   const first = has(m.first_token_ms) ? m.first_token_ms : m.ttft_ms;
   if (has(first)) how.push("первый токен " + fmt.sec(first) + " с");
+  // Оборотов больше одного — значит между вопросом и ответом модель звала
+  // инструменты, и вызовов к ней было столько же. Числа рядом — сумма по всем
+  // оборотам, и без их числа обмен из трёх вызовов выглядел бы одним
+  // непомерно дорогим. При одном обороте строки нет: «оборотов 1» — это
+  // обычный обмен, и называть в нём нечего.
+  if (m.turns > 1) how.push("оборотов " + m.turns);
   if (m.provider) how.push(m.provider);
 
   if (!tokens.length && !how.length) return null;
@@ -826,6 +849,12 @@ function promptRole(msg, index, prompt) {
   // обрезке, стратегией не заказывается и ни одну не отменяет. Подпись берётся
   // из того же индекса, что и строка состояния её вызова.
   if (index === prompt.workingAt) return SERVICE_CALLS.facts.role;
+  // Блок задачи — третьей врезкой, и ветка стоит третьей по тому же правилу:
+  // порядок веток здесь обязан повторять порядок сообщений в промпте. Едет он
+  // при включённом рабочем процессе **всегда**, даже с пустым списком шагов:
+  // без него модель не знает, что план вообще ведётся, — а при выключенном
+  // слот приходит пустым, и подписывать нечего.
+  if (index === prompt.planAt) return SERVICE_CALLS.plan.role;
   // Врезки стратегии может не быть вовсе — окно и «Вся история» не вставляют
   // ничего, и `summary_at` приходит пустым; память не едет, когда её нет или
   // выключатель чата в «выключено». Сравнение строгое именно поэтому:
@@ -882,6 +911,258 @@ function scrollFeed() {
   feed.scrollTop = feed.scrollHeight;
 }
 
+// ─────────────────────────── задача ───────────────────────────
+
+// Этапы задачи по-русски — одна карта на всё, что их называет. Сам этап
+// нигде не хранится и здесь не вычисляется: сервер выводит его из списка
+// шагов и трёх флажков (`plan.stage_of`, единственное место) и присылает
+// готовым полем `stage`. Клиент его только переводит — посчитай он этап
+// заново, у одного состояния стало бы два ответа, и расходились бы они молча.
+const STAGE_LABELS = {
+  planning: "план",
+  approval: "утверждение",
+  execution: "работа",
+  validation: "проверка",
+  done: "готово",
+  paused: "пауза",
+};
+
+// Значок шага — по статусу, и все три **разные**. Не цветом: цвет пропадает
+// и в чёрно-белом, и у дальтоника, и на записи экрана, а шаги обязаны
+// читаться с первого взгляда — это главный кадр всего дня. Цвет рядом тоже
+// есть, но вторым признаком, а не единственным.
+const STEP_MARKS = { done: "✓", in_progress: "▶", pending: "○" };
+
+// Кнопки шапки: по одной на **переход**, а не на этап.
+//
+// `stages` — этапы, где кнопка уместна; `null` значит «всегда, пока рабочий
+// процесс включён». Видны только уместные: кнопка, которой ручка ответит
+// 409, — обещание, которого интерфейс не держит.
+//
+// `say` — текст-константа, которую кнопка отправляет обменом **сама**.
+// Привязан он к переходу, а не к целевому этапу, и это не мелочь: и первый
+// шаг по утверждённому плану, и возврат из проверки в работу ведут в один
+// и тот же `execution`, но просить надо разного — одной константой на оба
+// модель заново делала бы работу вместо того, чтобы её исправить.
+// У «Переоткрыть» `say` нет вовсе: «утвердить» и «продолжить» значат «делай
+// дальше», и печатать человеку нечего, а «переоткрыть» значит «я не согласен»,
+// и почему именно — знает только он.
+//
+// `deny` — человеческий текст отказа. Ручка на 409 отдаёт директиву,
+// написанную **для модели** («…НЕ утверждай, что это сделано»), и совать её
+// в лицо человеку нельзя. Второй формулы отказа на сервере при этом
+// не заводим: клиент говорит своё, выбирая его по коду ответа.
+const PLAN_ACTIONS = [
+  {
+    action: "approve",
+    label: "Утвердить план",
+    stages: ["approval"],
+    say: "План утверждён, выполняй первый шаг",
+    deny: "Утвердить не вышло: план уже не ждёт утверждения.",
+  },
+  {
+    action: "pause",
+    label: "Пауза",
+    stages: ["planning", "approval", "execution", "validation"],
+    deny: "Пауза не вышла: приостановить можно только незавершённую работу.",
+  },
+  {
+    action: "resume",
+    label: "Продолжить",
+    stages: ["paused"],
+    say: "Пауза снята, продолжай с текущего шага",
+    deny: "Снять паузу не вышло: задача не на паузе.",
+  },
+  {
+    action: "reopen",
+    label: "Переоткрыть",
+    stages: ["done"],
+    deny: "Переоткрыть не вышло: задача не завершена.",
+  },
+  {
+    action: "reset",
+    label: "Выйти из режима задачи",
+    stages: null,
+    off: true,
+    deny: "Выйти не вышло: чат сейчас занят ответом.",
+  },
+];
+
+// Включён ли рабочий процесс — одно место на весь клиент. Менять `workflow`
+// можно ровно двумя путями, и оба названы: команда `/task` включает, кнопка
+// «Выйти из режима задачи» гасит. Органа управления в панели у него нет
+// намеренно — два способа на один переход расходятся молча.
+function planOn(agent) {
+  return Boolean(agent) && agent.workflow === "plan";
+}
+
+// Идёт ли задача прямо сейчас: процесс включён **и** план непуст. Команда
+// `/task` смотрит сюда: затереть чужой список шагов молча нельзя.
+function taskRunning(agent) {
+  return planOn(agent) && (((agent.plan || {}).steps) || []).length > 0;
+}
+
+// Шапка задачи: этап, шаги и кнопки. У обычного чата её нет вовсе — не пустая
+// и не свёрнутая, а её нет: обычный чат обязан остаться обычным.
+function renderTask(agent) {
+  const box = $("#task");
+  box.innerHTML = "";
+  const on = planOn(agent);
+  box.classList.toggle("hidden", !on);
+  if (!on) return;
+
+  const plan = agent.plan || {};
+  const steps = plan.steps || [];
+
+  // «Задача · работа, шаг 3 из 5». Номер текущего шага называет сервер
+  // (`current`, с нуля), и приписка появляется только при непустом списке:
+  // у плана, которого ещё нет, текущего шага нет тоже, и «шаг 1 из 0» было бы
+  // выдумкой на ровном месте.
+  let title = "Задача · " + (STAGE_LABELS[plan.stage] || plan.stage || "—");
+  if (steps.length && plan.current !== null && plan.current !== undefined) {
+    title += ", шаг " + (plan.current + 1) + " из " + steps.length;
+  }
+
+  const head = el("header", "task-head");
+  head.appendChild(el("span", "task-stage", title));
+
+  const actions = el("div", "task-actions");
+  PLAN_ACTIONS.forEach((entry) => {
+    if (entry.stages && !entry.stages.includes(plan.stage)) return;
+    const btn = el("button", "task-btn" + (entry.off ? " off" : ""), entry.label);
+    btn.type = "button";
+    // Пока идёт ответ, переходы запрещены и на сервере: обмен читает план
+    // живым, и утверждение посреди него дало бы промпт одного этапа
+    // с правилом другого. Кнопка поэтому гаснет, а не молчит в ответ на
+    // нажатие: молчаливый отказ читается как поломка.
+    btn.disabled = state.busy;
+    btn.onclick = () => planMove(entry);
+    actions.appendChild(btn);
+  });
+  head.appendChild(actions);
+  box.appendChild(head);
+
+  if (!steps.length) {
+    box.appendChild(el("p", "task-empty", "Плана ещё нет — модель составит его первым ответом."));
+    return;
+  }
+  const list = el("ol", "task-steps");
+  steps.forEach((step, index) => {
+    const row = el("li", "task-step " + (step.status || "pending") +
+      (index === plan.current ? " current" : ""));
+    row.append(
+      el("span", "task-mark", STEP_MARKS[step.status] || STEP_MARKS.pending),
+      el("span", "task-step-title", step.title || "")
+    );
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+}
+
+// Свежий чат от сервера — и в открытый, и в строку списка разом: тело у них
+// одно, и разъезжаться им не с чего.
+function mergeAgent(id, fresh) {
+  if (state.current && state.current.id === id) {
+    state.current = { ...state.current, ...fresh };
+  }
+  const listed = state.agents.find((a) => a.id === id);
+  if (listed) Object.assign(listed, fresh);
+}
+
+// Один переход по кнопке. Порядок строгий: сперва ручка плана, потом то, что
+// кнопка делает сверх неё. Отправь она обмен раньше — запрос уехал бы
+// с правилом прошлого этапа в системном сообщении и с прошлым блоком задачи.
+async function planMove(entry) {
+  if (state.busy || !state.current) return;
+  const id = state.current.id;
+  let moved;
+  try {
+    moved = await api("/api/agents/" + id + "/plan/" + entry.action, { method: "POST" });
+  } catch (err) {
+    // 409 — «не тот этап» или «чат занят»: тело такого отказа написано для
+    // модели, и человеку едет наш текст. Прочее (сети нет, чата нет) говорит
+    // само за себя, и переводить его не во что.
+    hint(err.status === 409 ? entry.deny : String(err.message || err), true);
+    // Раз этап под кнопкой оказался не тот, что на экране, — перечитываем
+    // чат: оставленная шапка показывала бы кнопку, которая только что
+    // отказала.
+    if (err.status === 409) await refreshCurrent(null);
+    return;
+  }
+  if (!state.current || state.current.id !== id) return;
+  state.current.plan = moved.plan;
+  renderTask(state.current);
+
+  // «Выйти из режима задачи»: план стёрт ручкой, процесс гасится следом.
+  // Подтверждений в этом продукте нет, но происшедшее обязано быть названо —
+  // исчезнувшая шапка сама по себе могла бы значить что угодно.
+  if (entry.off) {
+    try {
+      mergeAgent(id, await api("/api/agents/" + id, json("PATCH", { workflow: "off" })));
+    } catch (err) {
+      hint(String(err.message || err), true);
+      return;
+    }
+    renderTask(state.current);
+    hint("Задача сброшена: чат снова обычный.");
+    return;
+  }
+
+  if (entry.say) {
+    await exchange("/api/agents/" + id + "/messages", { text: entry.say }, entry.say);
+  }
+}
+
+// ── команда /task: единственный способ включить режим задачи ──
+//
+// Разбирается на клиенте, и на сервер уезжает обычный текст уже без команды:
+// у поля `text` ровно одно значение — это сообщение человека, и слеш в его
+// начале не обязан быть волшебным на каком-нибудь другом клиенте.
+const TASK_CMD = "/task";
+
+// Команда это или обычный текст. После имени обязан идти пробел или конец
+// строки: `/taskать` — это слово, а не команда. Пустая строка в ответе значит
+// «команда без описания», `null` — «не команда вовсе»; различать их надо,
+// потому что первое просит подсказки, а второе уезжает обменом как есть.
+function taskCommand(text) {
+  if (text === TASK_CMD) return "";
+  if (text.startsWith(TASK_CMD) && /\s/.test(text.charAt(TASK_CMD.length))) {
+    return text.slice(TASK_CMD.length).trim();
+  }
+  return null;
+}
+
+async function startTask(description) {
+  const agent = state.current;
+  // Пустое описание не отправляем вовсе: обмен из одной команды включил бы
+  // процесс и не сказал бы модели, чем заниматься. Форма памяти ведёт себя
+  // так же — пустой текст она не отпускает.
+  if (!description) {
+    hint("После /task напишите, что за задача — например: /task собрать ТЗ на приложение.", true);
+    return;
+  }
+  // Чужой план молча не затираем: сбросить его можно кнопкой в шапке, и
+  // сказано об этом там же, где отказали.
+  if (taskRunning(agent)) {
+    hint("Задача в этом чате уже идёт: нажмите «Выйти из режима задачи» в шапке или заведите новый чат.", true);
+    return;
+  }
+  // Процесс включается **раньше** обмена и строго последовательно. Уедь
+  // сообщение первым — промпт собрался бы без правила этапа, без блока задачи
+  // и без объявленных инструментов, и план модель завела бы в лучшем случае
+  // со второго раза.
+  let updated;
+  try {
+    updated = await api("/api/agents/" + agent.id, json("PATCH", { workflow: "plan" }));
+  } catch (err) {
+    hint(String(err.message || err), true);
+    return;
+  }
+  mergeAgent(agent.id, updated);
+  renderTask(state.current);
+  await exchange("/api/agents/" + agent.id + "/messages", { text: description }, description);
+}
+
 // ─────────────────────── отправка сообщения ───────────────────
 
 function hint(text, isError) {
@@ -904,6 +1185,10 @@ function setBusy(busy) {
   send.title = busy ? "Остановить" : "Отправить";
   send.disabled = !busy && !state.hasKey;
   $("#input").disabled = busy;
+  // Шапка задачи гаснет и оживает вместе с полем ввода: `setBusy` —
+  // единственное место, где занятость меняется, и второй такой заводить
+  // незачем.
+  renderTask(state.current);
   // Про ключ в интерфейсе не говорим и менять его отсюда нельзя: репозиторий
   // публичный, ключ живёт в .env и остаётся делом того, кто поднял сервер.
   if (!state.hasKey) hint("Стенд не настроен: нет .env — вызова к модели не будет.", true);
@@ -929,6 +1214,13 @@ async function send() {
   const input = $("#input");
   const text = (input.value || "").trim();
   if (!text || !state.current || !state.hasKey) return;
+
+  // `/task` — не сообщение, а команда: она включает режим задачи и только
+  // после успеха отправляет описание обменом. Разбор стоит здесь, а не
+  // в `exchange`: через него проходит и перегенерация, и обмены, которые
+  // шлют сами кнопки шапки, — команды среди них нет ни одной.
+  const described = taskCommand(text);
+  if (described !== null) return startTask(described);
 
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
@@ -1031,16 +1323,40 @@ async function exchange(path, body, questionText) {
             if (e.resolved_messages) {
               prompt = {
                 messages: e.resolved_messages,
-                // Слотов три: врезка долговременной памяти, врезка рабочей
-                // и врезка стратегии. Все три называет сервер, все три бывают
-                // пустыми, и в одном промпте они встречаются вместе — обе
-                // памяти едут при любой обрезке и ни одну не отменяют.
+                // Слотов четыре: врезка долговременной памяти, врезка
+                // рабочей, блок задачи и врезка стратегии. Все четыре называет
+                // сервер, все четыре бывают пустыми, и в одном промпте они
+                // встречаются вместе — обе памяти и блок задачи едут при любой
+                // обрезке и ни одну из них не отменяют.
                 memoryAt: e.memory_at,
                 workingAt: e.working_at,
+                planAt: e.plan_at,
                 summaryAt: e.summary_at,
                 strategy: e.strategy,
               };
             }
+            break;
+          case "tool":
+            // Кадр приходит на каждый **исполненный** вызов, и шапка двигается
+            // **тогда же**, а не после `done`: в этом весь смысл — человек
+            // видит шаги в тот же момент, что и модель, и столько раз, сколько
+            // было правок. План в кадре уже новый: считать его заново нечем
+            // и незачем.
+            if (e.plan && state.current && state.current.id === agent.id) {
+              state.current.plan = e.plan;
+              renderTask(state.current);
+            }
+            // Оборот продолжается, текста ещё нет — карточка обязана сказать,
+            // чем занята пауза. Текст берётся из того же индекса, что и подпись
+            // блока задачи в просмотре промпта: двумя таблицами они
+            // разъехались бы молча.
+            if (!status) {
+              status = cardStatus(SERVICE_CALLS.plan.status);
+              card.insertBefore(status, bodyEl);
+            } else {
+              status.querySelector(".card-status-text").textContent = SERVICE_CALLS.plan.status;
+            }
+            scrollFeed();
             break;
           case "reasoning":
             reasoning += e.text;
@@ -1053,6 +1369,10 @@ async function exchange(path, body, questionText) {
             scrollFeed();
             break;
           case "delta":
+            // Пошёл текст — обещать строке состояния больше нечего. Гасить её
+            // на одном `start`, как раньше, уже мало: после вызова инструмента
+            // оборот продолжается словами, а второго `start` на обмене нет.
+            if (status) { status.remove(); status = null; }
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
             if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
@@ -1133,6 +1453,9 @@ async function refreshCurrent(prompt) {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
+    // План приехал в том же теле, что история: обмен мог его подвинуть
+    // вызовом инструмента, а завершить задачу — и вовсе сменить этап.
+    renderTask(fresh);
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
     // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
@@ -1517,6 +1840,10 @@ function applySettings() {
       const updated = await api("/api/agents/" + id, json("PATCH", patch));
       if (state.current && state.current.id === id) {
         state.current = { ...state.current, ...updated };
+        // Ответ ручки — целый чат, и `plan` в нём есть всегда: правка панели
+        // его не меняет, но перерисовать шапку по свежему телу дешевле, чем
+        // держать в голове, какие правки её не задевают.
+        renderTask(state.current);
       }
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
@@ -2362,6 +2689,10 @@ function init() {
 
   setBusy(false);
   renderTiles();
+  // Чата ещё нет — значит нет и задачи: шапку прячем сразу, не дожидаясь
+  // списка. Разметка прячет её и сама, но полагаться на это нельзя: оттуда
+  // её однажды уберут, а `renderTask` останется.
+  renderTask(null);
   renderMemory();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
