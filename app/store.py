@@ -1,10 +1,12 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Восемь таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+Десять таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
 сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
 (счётчики, общие на всю базу), `summaries` (сводки начала разговора),
 `working_memory` (рабочая память чата — записи о состоянии задачи, которые
-вписал человек), `branches` (чей потомок этот чат и сколько сообщений он унёс),
+вписал человек), `task_state` и `task_steps` (план задачи со статусами шагов:
+план и есть её состояние), `branches` (чей потомок этот чат и сколько
+сообщений он унёс),
 `memory` (долговременная память) и `profile` (как отвечать этому человеку:
 стиль, формат и контекст, строка на поле). Последние две — **без**
 `session_id`: оба слоя общие на всю базу и переживают любой чат.
@@ -164,6 +166,53 @@ CREATE TABLE IF NOT EXISTS branches (
 );
 
 CREATE INDEX IF NOT EXISTS branches_by_parent ON branches(parent_id);
+
+-- Состояние задачи: **план и есть состояние**. Список шагов со статусами
+-- и три флажка рядом; этап задачи, текущий шаг и ожидаемое действие
+-- из этого списка **вычисляются** (`app/plan.py`), а не хранятся — ярлык
+-- этапа рядом с работой расходился бы с работой молча.
+--
+-- Таблиц две, а не одна с JSON-списком: флажки живут и у пустого списка.
+-- «План утверждён» обязано пережить возврат шага в `pending` — иначе одна
+-- найденная проверкой проблема откатывала бы задачу к утверждению плана.
+--
+-- Флажков три: утверждён, завершена, на паузе. Паузу ставит и снимает
+-- **только человек** — ни один инструмент модели её не трогает. Колонки
+-- «с какого этапа приостановлено» здесь нет намеренно: этап вычисляется
+-- из списка, и пауза ничего не затирает — сняли флажок, и этап восстановился
+-- сам. Хранись этап, пришлось бы помнить, куда возвращаться.
+--
+-- `seq` у шагов — номер от нуля без дыр, а не AUTOINCREMENT, и это отличие
+-- от `working_memory` и `memory`: те правятся **по одной записи и по номеру**,
+-- а список шагов приезжает от модели **целиком** и переписывается снимком.
+-- Значит и дисциплина та же, что у истории и сводок: `DELETE` плюс
+-- `executemany`, всё одной `tx()` (образец — `save_summaries`). Номер здесь
+-- порядок, а не идентичность.
+--
+-- Новая таблица накатывается на живую базу сама — прецедент `branches`, —
+-- и `_migrate` про неё ничего не знает: он про колонки.
+--
+-- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: удаление
+-- чата, очистка базы, `forget()`. План — содержимое разговора: забытый
+-- разговор, оставивший свои шаги следующему, врал бы про этап с первого же
+-- сообщения.
+CREATE TABLE IF NOT EXISTS task_state (
+    session_id TEXT PRIMARY KEY,
+    approved   INTEGER NOT NULL DEFAULT 0,
+    finished   INTEGER NOT NULL DEFAULT 0,
+    paused     INTEGER NOT NULL DEFAULT 0,
+    at         REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_steps (
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS task_steps_by_session ON task_steps(session_id);
 
 -- Долговременная память — третий слой модели памяти, и одна из двух таблиц
 -- **без** `session_id` (вторая — `profile`). В этом вся разница: краткосрочная память (`messages`)
@@ -601,12 +650,14 @@ class Store:
             return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def delete_session(self, session_id: str) -> bool:
-        """Стирает чат вместе с репликами, сводками и рабочей памятью, все
-        таблицы одной транзакцией. False — его и не было.
+        """Стирает чат вместе с репликами, сводками, рабочей памятью
+        и состоянием задачи, все таблицы одной транзакцией. False — его
+        и не было.
 
         Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`,
-        `working_memory` и `branches` руками — сводка,
-        цели и происхождение удалённого разговора достанутся чату с тем же id.
+        `working_memory`, `task_state`, `task_steps` и `branches` руками —
+        сводка, цели, шаги плана и происхождение удалённого разговора
+        достанутся чату с тем же id.
 
         Долговременная память (`memory`) здесь не трогается намеренно: чат ей
         не владелец, а читатель, и слой переживает и удаление чата, и `forget()`.
@@ -621,12 +672,14 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_steps WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta`, сводки, рабочую память, родство,
-        долговременную память и профиль. Нужно только проверкам: оставленный счётчик
+        """Стирает базу целиком, включая `meta`, сводки, рабочую память,
+        состояние задачи, родство, долговременную память и профиль. Нужно только проверкам: оставленный счётчик
         имён отдал бы следующей номер посередине, оставленная сводка — чужое
         начало разговора, а оставленная строка родства сделала бы свежий чат
         веткой мёртвого.
@@ -643,6 +696,8 @@ class Store:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM working_memory")
+            conn.execute("DELETE FROM task_state")
+            conn.execute("DELETE FROM task_steps")
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM profile")
@@ -844,6 +899,80 @@ class Store:
         в памяти есть хоть одна запись."""
         with self.tx() as conn:
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+
+    # --- состояние задачи: план со статусами ----------------------------------
+    #
+    # Список приезжает целиком — его переписывает модель одним вызовом, —
+    # поэтому здесь не четыре метода по операции, как у рабочей памяти,
+    # а два: записать снимок и прочитать его. Флажки в своей таблице: они
+    # живут и у пустого списка.
+
+    def save_plan(self, session_id: str, plan: dict | None) -> None:
+        """Переписывает состояние задачи целиком, одной транзакцией.
+
+        Дисциплина как у истории и сводок (`save_history`, `save_summaries`):
+        `DELETE` плюс `INSERT` заново с номерами от нуля — `seq` не получает
+        дыр, а оборванная запись откатывается вся.
+
+        `None` или пустой план без флажков — только `DELETE` из обеих таблиц:
+        это и есть очистка на `forget()` и на сбросе задачи. Пустой список
+        **с** флажком почти не бывает (утвердить нечего, пока шагов нет), но
+        строка флажков в таком случае сохранится: врать про этап план
+        не станет.
+
+        Всё через `tx()`, как любая запись: заголовок шага пишет модель,
+        и путь мимо обёртки был бы путём мимо `redact()`.
+        """
+        steps = (plan or {}).get("steps") or []
+        approved = bool((plan or {}).get("approved"))
+        finished = bool((plan or {}).get("finished"))
+        paused = bool((plan or {}).get("paused"))
+        rows = [
+            (session_id, seq, str(step.get("title") or ""), str(step.get("status") or ""))
+            for seq, step in enumerate(steps)
+            if isinstance(step, dict)
+        ]
+        with self.tx() as conn:
+            conn.execute("DELETE FROM task_steps WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
+            if plan is None or not (rows or approved or finished or paused):
+                return
+            conn.execute(
+                "INSERT INTO task_state (session_id, approved, finished, paused, at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, int(approved), int(finished), int(paused), time.time()),
+            )
+            if rows:
+                conn.executemany(
+                    "INSERT INTO task_steps (session_id, seq, title, status) "
+                    "VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+
+    def load_plan(self, session_id: str) -> dict | None:
+        """Состояние задачи чата — или `None`, если строки нет вовсе.
+
+        `None`, а не пустой план: «планом не занимались» и «план пустой» —
+        одно и то же для промпта, но не для подъёма из базы, и решает, чем
+        их считать, один вызывающий (`Agent`), а не два места по-своему.
+        """
+        with self.reading() as conn:
+            row = conn.execute(
+                "SELECT approved, finished, paused FROM task_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            steps = conn.execute(
+                "SELECT title, status FROM task_steps WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        return {
+            "steps": [{"title": s["title"], "status": s["status"]} for s in steps],
+            "approved": bool(row["approved"]),
+            "finished": bool(row["finished"]),
+            "paused": bool(row["paused"]),
+        }
 
     # --- происхождение чата ---------------------------------------------------
 
