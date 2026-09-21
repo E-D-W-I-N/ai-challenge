@@ -481,12 +481,15 @@ function buildServer(options) {
     // нему подписывает и строку состояния, и роль врезки в просмотре промпта.
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
-    // Ведение этапа: токен этапа или функция (номер обмена) → токен. Задано
-    // — обмен идёт так, как на сервере идёт обмен со служебным вызовом
-    // на этап: сперва кадр `compressing` со словом `task`, потом `start`,
-    // в котором состояние задачи уже **новое**. Что решит вызов, задаёт
-    // сцена: стенд не модель и судить о разговоре не умеет.
-    taskMove: (options && options.taskMove) || null,
+    // Вызов инструмента, которым модель двигает этап: токен этапа или
+    // функция (номер обмена) → токен. Задано — обмен идёт так, как он идёт
+    // на сервере, когда модель позвала `update_stage`: этап проверяется
+    // **картой стенда**, и она не щедрее серверной. Разрешено — состояние
+    // и журнал новые в кадре `done`; запрещено — состояние прежнее, строка
+    // журнала помечена отклонённой, а под ответом встаёт строка отказа.
+    // Что попросит модель, задаёт сцена: стенд не модель и судить
+    // о разговоре не умеет.
+    toolStage: (options && options.toolStage) || null,
     // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
     // `service`, потому что и на сервере она своя: записи вписывает человек,
     // и едут они при любом варианте обрезки, а не по заказу стратегии.
@@ -579,7 +582,18 @@ function buildServer(options) {
   // не ту запись, и проверка этого не заметила бы.
   let issuedMemory = state.records.length;
   const TASK_STAGES = ["planning", "execution", "validation", "done"];
-  const TASK_FIELDS = ["stage", "step", "expecting"];
+  // Правятся руками только тексты: этапа среди полей ручки нет и на сервере —
+  // у каждого перехода ровно один механизм, и правка текста им не является.
+  const TASK_FIELDS = ["step", "expecting"];
+  // Карта разрешённых переходов — своя копия, как и весь стенд: он нарочно
+  // независим от сервера. Но **не щедрее** его: и кнопка утверждения,
+  // и инструмент спрашивают именно её, и отказывает она там же, где сервер.
+  const TASK_MOVES = {
+    planning: ["execution"],
+    execution: ["validation"],
+    validation: ["done", "execution"],
+    done: [],
+  };
   // Зашитый смысл этапа — своя копия, как и весь стенд: он нарочно
   // независим от сервера. Копия внутри стенда при этом **одна**: строки
   // блока собирает `taskLines`, и её ответом живут и ручка, и кадр `start`.
@@ -587,17 +601,21 @@ function buildServer(options) {
     planning: {
       step: "собрать требования и предложить план",
       expecting: "ваше подтверждение плана",
-      guide: "не приступай к работе, пока план не утверждён",
+      guide: "не приступай к работе, пока человек не утвердит план кнопкой; "
+        + "менять этап тебе здесь нечем",
     },
     execution: {
       step: "выполнять утверждённый план",
       expecting: "результат работы",
-      guide: "держись утверждённого плана, не меняй решений молча",
+      guide: "держись утверждённого плана, не меняй решений молча; "
+        + 'работа сделана — вызови update_stage(stage="validation")',
     },
     validation: {
       step: "проверить сделанное",
       expecting: "вердикт",
-      guide: "первой строкой ответа напиши «проверка пройдена» или «найдены проблемы: …»",
+      guide: "проверь сделанное и назови вердикт первой строкой; "
+        + 'нашёл проблемы — вызови update_stage(stage="execution"), '
+        + 'не нашёл — update_stage(stage="done")',
     },
     done: { step: "задача закрыта", expecting: "", guide: "" },
   };
@@ -623,7 +641,14 @@ function buildServer(options) {
     return lines;
   };
 
-  const taskView = (task) => ({ ...task, lines: taskLines(task) });
+  const taskView = (task) => ({
+    ...task,
+    lines: taskLines(task),
+    // Куда отсюда можно — по той же карте, которой переход и разрешают.
+    // Полоса приглушает недостижимые, и считать их клиенту нечем: список
+    // приезжает готовым.
+    moves: [...(TASK_MOVES[(task && task.stage) || "planning"] || [])],
+  });
   const MEMORY_KINDS = ["profile", "decision", "knowledge"];
   const WORKING_KINDS = ["goal", "limit", "decision", "question"];
 
@@ -811,32 +836,48 @@ function buildServer(options) {
       resolved_messages: resolved,
       ...promptHead(agent, service).slots,
       strategy: service ? serviceStrategy(service) : agent.strategy,
-      // Состояние задачи уезжает тем же кадром и уже **новое**: служебный
-      // вызов на сервере отрабатывает до сборки промпта, и полоса в шапке
-      // переезжает раньше первого токена ответа.
+      // Состояние задачи уезжает тем же кадром — то, с которым обмен уехал
+      // в модель. Двигать его будет инструмент уже по ходу ответа.
       task: taskView(agent.task),
     };
   }
 
-  // Служебный вызов, который двигает этап, — со стороны клиента это кадр
-  // `compressing` со словом `task` и новый этап в кадре `start`. Что именно
-  // он решит, задаёт сцена: стенд не модель и судить о разговоре не умеет.
-  function moveStage(agent, index) {
-    const want = typeof state.taskMove === "function" ? state.taskMove(index) : state.taskMove;
-    if (!want || want === agent.task.stage) return false;
-    const was = agent.task.stage;
-    agent.task = { ...agent.task, stage: want };
+  // Единственная дверь всех переходов стенда — и карта в ней та же, что
+  // у сервера: стенд, пускающий туда, куда сервер не пускает, оставил бы
+  // зелёным запрет, сломанный в браузере. Исходы те же четыре, и «тот же
+  // этап» среди них — не ошибка и не переход: журнал о нём молчит.
+  function moveStage(agent, target, who) {
+    const stage = agent.task.stage;
+    if (TASK_STAGES.indexOf(target) < 0) return "unknown";
+    if (target === stage) return "same";
+    const ok = (TASK_MOVES[stage] || []).indexOf(target) >= 0;
+    if (ok) agent.task = { ...agent.task, stage: target };
     agent.task_log = [
       ...agent.task_log,
       {
         seq: agent.task_log.length + 1,
-        stage_from: was,
-        stage_to: want,
-        who: "agent",
+        stage_from: stage,
+        stage_to: target,
+        who,
+        ok,
         at: 1700000000 + agent.task_log.length * 60,
       },
     ];
-    return true;
+    return ok ? "moved" : "denied";
+  }
+
+  // Отказ человеку — русскими подписями этапов, теми же, что на полосе.
+  // Своя копия, как и весь стенд, и по той же карте: стенд, отказывающий
+  // не там, где сервер, оставил бы зелёным запрет, сломанный в браузере.
+  function denyNote(stage, target) {
+    const label = (name) => TASK_STAGE_LABELS[name] || name;
+    const allowed = TASK_MOVES[stage] || [];
+    let reason;
+    if (stage === "planning") reason = "план утверждает человек";
+    else if (!allowed.length) reason = "задача уже закрыта";
+    else if (allowed.length === 1) reason = "сначала " + label(allowed[0]);
+    else reason = "можно только в " + allowed.map(label).join(" или ");
+    return "переход в «" + label(target) + "» отклонён: " + reason;
   }
 
   function sse(agent, text) {
@@ -845,21 +886,29 @@ function buildServer(options) {
     state.sent.push({ id: agent.id, text, config: config(agent) });
     const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
     const service = typeof state.service === "function" ? state.service(index) : state.service;
-    // Ведение этапа идёт **до** сборки промпта, как на сервере: этот же
-    // обмен уедет уже с новым этапом, и блок задачи в промпте — новый.
-    const moved = moveStage(agent, index);
     // Промпт собирается до записи обмена в стенограмму: в модель уехало то,
     // что было в истории **до** этого вопроса.
     const resolved = resolvedPrompt(agent, text, service);
+    // Инструмент модель зовёт **по ходу ответа**, а не до промпта: в кадре
+    // `start` этап ещё прежний, новый приезжает кадром `done`.
+    const asked = typeof state.toolStage === "function"
+      ? state.toolStage(index)
+      : state.toolStage;
     // Упавший обмен получает те же кадры до места падения: сервер сворачивает
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, service, resolved, moved);
+    if (failed) return errorStream(agent, text, failed, service, resolved);
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
     const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
+    // Отказ приезжает приписькой к числам обмена — ровно как срезанное
+    // начало истории: он про этот обмен и обязан его пережить.
+    if (asked) {
+      const outcome = moveStage(agent, asked, "agent");
+      if (outcome === "denied") metrics.stage_note = denyNote(agent.task.stage, asked);
+    }
     agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
       role: "assistant", content: state.reply, error: null, reasoning: "",
@@ -872,15 +921,24 @@ function buildServer(options) {
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
       // Место врезки в промпте и чем она занята называет сервер — клиент не
-      // разбирает текст сообщений. Кадр `compressing` приходит на каждый
-      // служебный вызов обмена и полем `strategy` называет, какой идёт:
-      // ведение этапа — `task`, сворачивание — `summary`.
-      ...(moved ? [{ event: "compressing", agent: agent.id, strategy: "task" }] : []),
+      // разбирает текст сообщений. Кадр `compressing` приходит на служебный
+      // вызов обмена и полем `strategy` называет, какой идёт.
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
-      { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
+      {
+        event: "done", text: state.reply, reasoning: "",
+        // Метрики в кадре `done` есть и тогда, когда чисел не прислали:
+        // строку отказа несут они же, и погасив их целиком, стенд потерял бы
+        // её вместе с числами, которых и так нет.
+        metrics: (usage || metrics.stage_note) ? metrics : null,
+        committed: true,
+        // Состояние задачи и журнал — **после** обмена: этап двигает
+        // инструмент по ходу ответа, и кадр `start` знать о нём не мог.
+        task: taskView(agent.task),
+        task_log: agent.task_log,
+      },
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
 
     return streamOf(frames);
@@ -888,7 +946,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, service, resolved, moved) {
+  function errorStream(agent, text, failed, service, resolved) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -904,7 +962,6 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
-      ...(moved ? [{ event: "compressing", agent: agent.id, strategy: "task" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "error", agent: agent.id, message: failed.message, metrics },
@@ -1088,10 +1145,11 @@ function buildServer(options) {
       working.records.splice(i, 1);
       return json({ deleted: seq });
     }
-    // ── состояние задачи: ручка под чатом, одна на все три поля ──
+    // ── состояние задачи: ручка под чатом ──
     //
     // Границы те же, что на сервере: лишние поля 400, пустое тело 400,
-    // чужой этап 400 с перечислением допустимых, пустая строка поле снимает.
+    // пустая строка поле снимает. Этапа среди полей нет — и это тоже
+    // граница: `{"stage": ...}` здесь такое же лишнее поле, как на сервере.
     // Стенд, принимающий то, чего не принимает сервер, оставляет зелёной
     // полосу, которая в браузере получает 400.
     if (tail === "/task" && method === "PATCH") {
@@ -1101,12 +1159,16 @@ function buildServer(options) {
       if (!keys.length) {
         return fail(400, "тело правки пустое: назовите " + TASK_FIELDS.join(", ") + " или часть");
       }
-      if (keys.includes("stage") && !TASK_STAGES.includes(body.stage)) {
-        return fail(400, "stage: одно из " + TASK_STAGES.join(", ") + ", а не " + body.stage);
+      keys.forEach((name) => { agent.task[name] = clean(String(body[name])); });
+      return json({ task: taskView(agent.task) });
+    }
+    // Утверждение плана — единственный переход человека и единственный выход
+    // из планирования. Карту спрашивает та же, что и инструмент: дверей две,
+    // а карта одна. Не на планировании — 409, ровно как на сервере.
+    if (tail === "/task/approve" && method === "POST") {
+      if (moveStage(agent, "execution", "human") !== "moved") {
+        return fail(409, "утверждать нечего: задача не на планировании");
       }
-      keys.forEach((name) => {
-        agent.task[name] = name === "stage" ? body[name] : clean(String(body[name]));
-      });
       return json({ task: taskView(agent.task) });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
