@@ -2390,6 +2390,245 @@ async function routeChecks() {
       JSON.stringify($("#task").querySelectorAll(".task-btn").map((b) => b.disabled)));
   }
 
+  // ══════════════ цепочка этапов: один этап — один обмен ══════════════
+  //
+  // Живой прогон вскрыл две беды разом: модель проходила все этапы внутри
+  // одного сообщения, и посмотреть, как менялся её системный промпт, было
+  // нечем — кнопка промпта показывает промпт **первого** оборота. Сервер
+  // теперь кончает обмен на первой же смене этапа, и дальше ход клиента:
+  // следующий обмен он шлёт сам. Отсюда и главное — у каждого этапа своя
+  // карточка в ленте и своя кнопка «Показать промпт запроса».
+  //
+  // Тексты продолжений держим здесь отдельными значениями: утверждение
+  // «у переходов они разные» обязано стоять на сравнении двух строк,
+  // а не на честном слове.
+  const SAY_TO_VALIDATION =
+    "Все шаги отмечены сделанными — перечитай результат и проверь работу.";
+  const SAY_TO_EXECUTION =
+    "Проверка нашла проблемы — исправь их, начиная с возвращённого в работу шага.";
+
+  // Планы, которыми вызов инструмента двигает этап. Шагов в каждом два:
+  // на плане из одного шага «все сделаны» и «один в работе» неотличимы.
+  const WORKING = {
+    steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "in_progress")],
+    approved: true, finished: false, paused: false,
+  };
+  const CHECKED = {
+    steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "done")],
+    approved: true, finished: false, paused: false,
+  };
+  // Докуда стенд качает этап в сцене потолка. Вдвое выше самого потолка:
+  // цепочка обязана встать раньше, а снятый потолок обязан дать красное
+  // утверждение, а не бесконечный обмен.
+  const SWINGS = 12;
+  const copyPlan = (plan) => JSON.parse(JSON.stringify(plan));
+  const moveTo = (plan) =>
+    [{ name: "update_plan", ok: true, message: "План записан.", plan: copyPlan(plan) }];
+
+  // ── цепочка идёт сама, тексты по переходу, и встаёт на потолке ──
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "работа идёт", workflow: "plan", plan: copyPlan(WORKING) }],
+      // Этап качается: работа → проверка → работа → … Так выглядит модель,
+      // которая каждый раз находит проблемы. Ограничитель «этап не сменился»
+      // на таких кругах не срабатывает **никогда**, и упереться цепочка
+      // обязана в потолок — иначе она ходит кругами за счёт человека.
+      //
+      // Качается он не бесконечно, а до `SWINGS`, и это нужно **проверке**:
+      // со снятым потолком цепочка без дна не кончилась бы никогда, и мутация
+      // дала бы повисший node вместо красного утверждения. Предел здесь вдвое
+      // выше потолка — то есть на сам потолок не влияет, но снятый показывает
+      // числом, сколько обменов ушло без него.
+      tools: (i) => (i < SWINGS ? moveTo(i % 2 === 0 ? CHECKED : WORKING) : []),
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "доделывай";
+    $("#composer").requestSubmit();
+    await settle(900);
+
+    const said = server.state.sent.map((x) => x.text);
+    check("цепочка идёт сама: один обмен человека и четыре своих",
+      said.length === 5, JSON.stringify(said));
+    check("текст продолжения — на переход, а не на целевой этап",
+      JSON.stringify(said.slice(1)) === JSON.stringify(
+        [SAY_TO_VALIDATION, SAY_TO_EXECUTION, SAY_TO_VALIDATION, SAY_TO_EXECUTION]),
+      JSON.stringify(said));
+    check("у «в проверку» и «назад в работу» тексты разные",
+      SAY_TO_VALIDATION !== SAY_TO_EXECUTION, "константа одна на оба перехода");
+    check("потолок: цепочка встала",
+      client.state.busy === false && said.length === 5, "обмен всё ещё идёт");
+    check("и выход из потолка назван словами, а не молчанием",
+      $("#composer-hint").textContent.includes("дальше не иду"),
+      $("#composer-hint").textContent);
+    // Ровно то, чего не хватало на живом прогоне: этапов пять — карточек пять,
+    // и промпт у каждой свой. Одна карточка на всю задачу показывала бы промпт
+    // первого оборота и молчала бы про остальные.
+    const cards = $("#feed").querySelectorAll(".card");
+    const titles = (c) => c.querySelectorAll(".icon-btn").map((b) => b.title);
+    check("у каждого этапа своя карточка в ленте",
+      cards.length === 5, cards.length + " карточек");
+    check("и у каждой своя кнопка «Показать промпт запроса»",
+      cards.length === 5 &&
+        cards.every((c) => titles(c).includes("Показать промпт запроса")),
+      JSON.stringify(cards.map((c) => titles(c).join(","))));
+    // А блок задачи в показанном промпте подписан именно как блок задачи:
+    // подпись берётся из номера слота, а не из слов внутри сообщения.
+    cardButton(cards[cards.length - 1], "Показать промпт запроса")
+      .dispatchEvent(new Evt("click"));
+    await settle(20);
+    check("в промпте последней карточки врезка задачи подписана по слоту",
+      $("#feed").querySelectorAll(".prompt-role").map((r) => r.textContent)
+        .includes("план задачи"),
+      JSON.stringify($("#feed").querySelectorAll(".prompt-role").map((r) => r.textContent)));
+  }
+
+  // ── этапы, которые ждут человека, цепочку не продолжают ──
+  //
+  // Утверждение об отсутствии стоит там, где присутствие достижимо: четвёртый
+  // чат в этом же стенде уходит в `validation`, и продолжение у него есть.
+  // Не будь его рядом, «не продолжает» держалось бы и на клиенте, который
+  // не продолжает никогда.
+  {
+    const NEEDS_APPROVAL = {
+      steps: [STEP("собрать требования", "pending")],
+      approved: false, finished: false, paused: false,
+    };
+    const PAUSED = { ...copyPlan(WORKING), paused: true };
+    const FINISHED = { ...copyPlan(CHECKED), finished: true };
+    const TARGETS = [NEEDS_APPROVAL, PAUSED, FINISHED, CHECKED];
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [
+        { label: "в утверждение", workflow: "plan", plan: copyPlan(WORKING) },
+        { label: "на паузу", workflow: "plan", plan: copyPlan(WORKING) },
+        { label: "в готово", workflow: "plan", plan: copyPlan(CHECKED) },
+        { label: "в проверку", workflow: "plan", plan: copyPlan(WORKING) },
+      ],
+      // Продолжение (пятый обмен) вызовов уже не несёт: этап на нём
+      // не двигается, и цепочка встаёт сама — её ограничитель, а не потолок.
+      tools: (i) => (i < TARGETS.length ? moveTo(TARGETS[i]) : []),
+    });
+    client.init();
+    await settle(30);
+    for (let i = 0; i < TARGETS.length; i += 1) {
+      $("#agent-list").querySelectorAll(".item-open")[2 + i].dispatchEvent(new Evt("click"));
+      await settle(40);
+      $("#input").value = "двигай " + i;
+      $("#composer").requestSubmit();
+      await settle(300);
+    }
+
+    const said = server.state.sent.map((x) => x.text);
+    check("на approval, paused и done цепочка не продолжается вовсе",
+      JSON.stringify(said.slice(0, 3)) ===
+        JSON.stringify(["двигай 0", "двигай 1", "двигай 2"]),
+      JSON.stringify(said));
+    check("а на validation — продолжается, и тем же стендом",
+      said.length === 5 && said[3] === "двигай 3" && said[4] === SAY_TO_VALIDATION,
+      JSON.stringify(said));
+  }
+
+  // ── «Стоп» посреди цепочки её обрывает ──
+  //
+  // Цепочку рвут «Стоп», пауза, переключение чата и закрытая вкладка. Первое
+  // проверяется здесь, и проверяется в окне: обмен цепочки уже начался,
+  // а следующего ещё нет.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      delay: 40,
+      chats: [{ label: "качается", workflow: "plan", plan: copyPlan(WORKING) }],
+      tools: (i) => moveTo(i % 2 === 0 ? CHECKED : WORKING),
+    });
+    client.init();
+    await settle(40);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(60);
+    $("#input").value = "доделывай";
+    $("#composer").requestSubmit();
+    await settle(330);
+    check("«Стоп» жмут посреди второго обмена цепочки",
+      server.state.sent.length === 2 && client.state.busy === true,
+      server.state.sent.length + " обменов, идёт: " + client.state.busy);
+    $("#composer").requestSubmit();
+    await settle(600);
+    check("«Стоп» посреди цепочки её обрывает: третьего обмена нет",
+      server.state.sent.length === 2, JSON.stringify(server.state.sent.map((x) => x.text)));
+    check("и отмена названа словами",
+      $("#composer-hint").textContent.includes("Остановлено"),
+      $("#composer-hint").textContent);
+  }
+
+  // ── отмена, пришедшая кадром `done`, цепочку останавливает ──
+  //
+  // Отмену ставит не только наша кнопка: соседняя вкладка того же чата зовёт
+  // `/cancel`, и наш поток дочитывается до конца — кадром `done`, в котором
+  // сервер говорит `cancelled`. Своего признака отмены у клиента в этом случае
+  // нет вовсе (рвать ему было нечего), и не прочитай он слово сервера —
+  // цепочка отправила бы следующий обмен **сама**, уже после того, как человек
+  // попросил остановиться. Платит за него он же.
+  //
+  // Сцена собрана так, чтобы падать было на чём: этап сдвинут, значит
+  // продолжение здесь достижимо — соседний блок с теми же планами и без отмены
+  // его и делает.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "отменят снаружи", workflow: "plan", plan: copyPlan(WORKING) }],
+      tools: (i) => moveTo(CHECKED),
+      cancelled: true,
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "доделывай";
+    $("#composer").requestSubmit();
+    await settle(400);
+
+    check("отменённый снаружи обмен этап всё-таки сдвинул — сцена та",
+      taskStage($).startsWith("Задача · проверка"), taskStage($));
+    check("отмена приехала кадром done, а не обрывом: поток дочитан до конца",
+      client.state.busy === false && $("#feed").querySelectorAll(".card").length === 1,
+      "карточек: " + $("#feed").querySelectorAll(".card").length);
+    check("цепочка на отмене встала: продолжения нет",
+      server.state.sent.length === 1,
+      JSON.stringify(server.state.sent.map((x) => x.text)));
+    check("и человеку сказано, что остановлено, а не молча",
+      $("#composer-hint").textContent.includes("Остановлено"),
+      $("#composer-hint").textContent);
+  }
+
+  // ── упавший обмен цепочку не продолжает ──
+  //
+  // Вторая половина того же условия, что и «Стоп»: вызов успел исполниться
+  // и этап сдвинул, а ответа не случилось вовсе. Продолжить здесь значило бы
+  // просить модель проверить работу, которой она не делала, — и счёт за это
+  // пришёл бы человеку. Отмена рвёт цепочку иначе и раньше: оборванный поток
+  // кадра `done` не доносит вовсе, и продолжать не от чего.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "упадёт", workflow: "plan", plan: copyPlan(WORKING) }],
+      tools: (i) => moveTo(CHECKED),
+      fail: { message: "провайдер ответил 502" },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "доделывай";
+    $("#composer").requestSubmit();
+    await settle(400);
+
+    check("упавший обмен этап всё-таки сдвинул — сцена та",
+      taskStage($).startsWith("Задача · проверка"), taskStage($));
+    check("но цепочка на нём встала: продолжения нет",
+      server.state.sent.length === 1,
+      JSON.stringify(server.state.sent.map((x) => x.text)));
+    check("и человеку названа причина, а не продолжение",
+      $("#composer-hint").textContent.includes("502"), $("#composer-hint").textContent);
+  }
+
   // ── отказ ручки: человеку человеческое ──
   //
   // Ручка отказывает **блокирующей директивой, написанной для модели**, —

@@ -2104,86 +2104,6 @@ def check_long_term_memory():
     assert store.list_memory() == [kept], store.list_memory()
     assert "[долговременная память]" in agent.build_prompt("после forget")[0]["content"]
 
-    # --- 10. Миграция: живая база догоняет схему, записи целы ---------------
-    #
-    # `CREATE TABLE IF NOT EXISTS` ни колонку не добавит, ни лишнюю не снимет,
-    # а база у пользователя полна диалогов, и «удалите файл» здесь не ответ:
-    # в памяти лежит набранное руками. Поэтому проверка идёт по настоящей
-    # старой базе — со своими записями, с колонкой авторства и с двумя
-    # таблицами, в которые больше не ходит ни один путь кода.
-    import sqlite3
-
-    old_path = _temp_db("memory-old")
-    os.makedirs(os.path.dirname(old_path), exist_ok=True)
-    old = sqlite3.connect(old_path)
-    old.executescript(
-        """
-        CREATE TABLE memory (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
-            content TEXT NOT NULL, author TEXT NOT NULL DEFAULT 'human',
-            at REAL NOT NULL
-        );
-        INSERT INTO memory (kind, content, author, at)
-            VALUES ('profile', 'набрано руками', 'human', 1.0);
-        CREATE TABLE working_memory (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-            kind TEXT NOT NULL, content TEXT NOT NULL, author TEXT NOT NULL,
-            at REAL NOT NULL
-        );
-        INSERT INTO working_memory (session_id, kind, content, author, at)
-            VALUES ('ag_00001', 'goal', 'цель из вчерашней базы', 'agent', 1.0);
-        CREATE TABLE working_state (
-            session_id TEXT PRIMARY KEY, upto INTEGER NOT NULL, metrics TEXT,
-            at REAL NOT NULL
-        );
-        INSERT INTO working_state VALUES ('ag_00001', 4, NULL, 1.0);
-        CREATE TABLE facts (
-            session_id TEXT NOT NULL, seq INTEGER NOT NULL, key TEXT NOT NULL,
-            value TEXT NOT NULL, upto INTEGER NOT NULL, metrics TEXT, at REAL NOT NULL,
-            PRIMARY KEY (session_id, seq)
-        );
-        INSERT INTO facts VALUES ('ag_00001', 0, 'цель', 'снимок Дня 10', 2, NULL, 1.0);
-        """
-    )
-    old.commit()
-    old.close()
-
-    with _reopened(old_path) as migrated:
-        # Записи на месте и не потеряны — а колонки авторства у них больше
-        # нет: снимать её миграция обязана **без** переноса данных, иначе
-        # «удалите файл» вернулось бы другим словом.
-        assert migrated.list_memory() == [
-            {"seq": 1, "kind": "profile", "content": "набрано руками", "at": 1.0}
-        ], migrated.list_memory()
-        assert migrated.list_working("ag_00001") == [
-            {"seq": 1, "kind": "goal", "content": "цель из вчерашней базы", "at": 1.0}
-        ], migrated.list_working("ag_00001")
-        # И колонки в файле те же, что в схеме: чтение идёт по именам, и
-        # оставленная колонка через него не видна вовсе — а она осталась бы
-        # в базе, и следующая миграция спорила бы с этой.
-        for table, columns in (
-            ("memory", {"seq", "kind", "content", "at"}),
-            ("working_memory", {"seq", "session_id", "kind", "content", "at"}),
-        ):
-            left = {r["name"] for r in migrated.conn.execute(f"PRAGMA table_info({table})")}
-            assert left == columns, (table, left)
-        # Снимок Дня 10 и состояние ведения памяти снесены той же миграцией:
-        # ни один путь кода в них больше не ходит.
-        tables = {
-            row["name"]
-            for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        assert "facts" not in tables, tables
-        assert "working_state" not in tables, tables
-        assert {"memory", "working_memory"} <= tables, tables
-        # И повторный запуск на уже мигрированной базе ничего не делает:
-        # миграция идемпотентна, иначе второй старт сервера ронял бы его
-        # на «no such column».
-        assert migrated._migrate() == [], migrated._migrate()
-        # Новая запись рядом со старой ложится со своим номером.
-        fresh_row = migrated.add_memory("knowledge", "после миграции")
-        assert fresh_row["seq"] == 2, fresh_row
-
     with _restarted(store, agent.id) as (again, revived):
         assert again.list_memory() == [kept], again.list_memory()
         assert "[долговременная память]" in revived.build_prompt("после перезапуска")[0]["content"]
@@ -2210,9 +2130,7 @@ def check_long_term_memory():
         "шесть кривых тел дали 400; врезка ролью user с подписями, слот 1 "
         "с системным промптом и 0 без; врезок втроём — слоты 1, 2 и 3; сжатию "
         "память не досталась ни одна; за обмен она прочитана один раз; записи "
-        "пережили forget() и переоткрытие файла, а clear() — нет; миграция "
-        "сняла колонку авторства у обоих слоёв и снесла две мёртвые таблицы, "
-        "не потеряв записи"
+        "пережили forget() и переоткрытие файла, а clear() — нет"
     )
 
 
@@ -3893,6 +3811,21 @@ def _calls_on_first(*calls):
     return lambda messages, index: [dict(c) for c in calls] if _first_turn(messages) else None
 
 
+def _approved(steps=None) -> dict:
+    """План, уже утверждённый человеком, — задача на этапе `execution`.
+
+    Нужен сценам, где этап по ходу обмена меняться **не должен**: с пустого
+    плана первый же `update_plan` уводит задачу в `approval`, и проверять
+    на такой сцене что-нибудь кроме смены этапа нельзя.
+    """
+    return {
+        "steps": [dict(step) for step in (PLAN_STEPS if steps is None else steps)],
+        "approved": True,
+        "finished": False,
+        "paused": False,
+    }
+
+
 def _word_on_second(messages, index) -> str:
     """Ответ живой модели: на первом обороте ни символа текста, на втором —
     слова. Так ответила `openai/gpt-4o-mini` на живом прогоне, и ради этого
@@ -3921,17 +3854,23 @@ def check_tool_turn_loop():
       строкой, `type: "function"`) и **по одному** `{"role": "tool"}` на
       каждый вызов, с тем же `tool_call_id`. Один ответ на все вызовы
       провайдер отвергает;
-    * **промпт не пересобирается** — лента второго оборота начинается
-      сообщение в сообщение тем же промптом, что уехал кадром `start`:
-      память и профиль читаются один раз на обмен, и пересборка развела бы
-      запрос с номерами слотов;
+    * **промпт не пересобирается, а стареющее в нём переписано на месте** —
+      лента второго оборота той же длины и с теми же позициями, что промпт
+      кадра `start`, и отличается от него ровно в двух сообщениях: правило
+      этапа и блок задачи к этому обороту устарели. Всё остальное слово
+      в слово прежнее — память и профиль читаются один раз на обмен, а
+      пересборка развела бы запрос с номерами слотов. Свежесть этих двух
+      мест проверяется своей проверкой («один этап — один обмен»);
     * **два вызова в одном ответе** — исполнены оба, в порядке приезда;
     * **кадр `tool` раньше `done`**, и план в нём уже новый;
     * **отказ доезжает до модели** — блокирующей директивой, а не молчанием;
     * **битые аргументы** — план прежний, исключения нет, обмен записан;
     * **предел** — вызовов к модели ровно `MAX_TURNS`, и у последнего нет
       `tools`: объявить их и не дать исполнить значило бы кончить обмен
-      вызовом, то есть пустым ответом. Это первый сторож предела;
+      вызовом, то есть пустым ответом. Это первый сторож предела. Этап
+      в этой сцене не меняется ни разу — план утверждён, и `update_plan`
+      тем же списком оставляет задачу на `execution`: иначе обмен встал бы
+      на смене этапа и предела не увидел бы никто;
     * **второй сторож** — жёсткий выход по счётчику, и он не смотрит на
       `tools` вовсе. Проверить его можно только в мире, где первого нет:
       `turn_tools` подменён в самой проверке и объявляет инструменты на
@@ -3996,11 +3935,22 @@ def check_tool_turn_loop():
     assert answer["role"] == "tool" and answer["tool_call_id"] == "call_1", answer
     assert "План записан: 3 шагов" in answer["content"], answer["content"]
 
-    # --- промпт не пересобирается -------------------------------------------
+    # --- промпт не пересобирается, стареющее в нём переписано на месте -------
+    #
+    # Пересобирать промпт целиком нельзя: память, профиль и врезки читаются
+    # один раз на обмен, а номера врезок уже уехали кадром `start`. Но
+    # правило этапа и блок задачи к следующему обороту **устаревают**, и
+    # переписываются они **на месте** — длина ленты и позиции те же, дописано
+    # только два сообщения: ход ассистента и ответ инструмента.
     head = _stub.CALLS[0]["messages"]
-    assert sent[: len(head)] == head, (sent[: len(head)], head)
+    started = _frame(frames, "start")
+    assert started["resolved_messages"] == head, head
     assert len(sent) == len(head) + 2, (len(sent), len(head))
-    assert _frame(frames, "start")["resolved_messages"] == head, head
+    plan_at = started["plan_at"]
+    fresh = {0, plan_at}
+    assert [m for i, m in enumerate(sent[: len(head)]) if i not in fresh] == [
+        m for i, m in enumerate(head) if i not in fresh
+    ], (sent[: len(head)], head)
 
     # --- кадр `tool` раньше `done`, и план в нём новый -----------------------
     assert kinds.index("tool") < kinds.index("done"), kinds
@@ -4090,6 +4040,10 @@ def check_tool_turn_loop():
     # Заглушка просит вызов на **каждом** обороте — так выглядит зациклившаяся
     # модель. Упирается обмен не в тишину, а в слова: последний оборот идёт
     # без инструментов, модель отвечает текстом, и обмену есть что записать.
+    # Этап при этом не меняется ни разу, и сцена собрана так **нарочно**:
+    # план уже утверждён, а `update_plan` тем же списком оставляет задачу
+    # на `execution`. Иначе первый же оборот сменил бы этап, инструменты
+    # погасли бы на втором, и предела оборотов не увидел бы никто.
     _stub.reset()
     _stub.install(
         reply="ещё немного",
@@ -4097,18 +4051,19 @@ def check_tool_turn_loop():
             _call("update_plan", {"steps": PLAN_STEPS}, f"call_{index}")
         ],
     )
-    with TestClient(main.app) as client:
-        endless = new_agent(client, workflow="plan")
-        frames = _frames(client, endless, "крути")
-        told = [f for f in frames if f["event"] == "tool"]
+    endless = _bare("предел оборотов", workflow="plan")
+    endless.plan = _approved()
+    events = asyncio.run(drain(endless.ask("крути")))
+    told = [e for e in events if e["type"] == "tool"]
 
     limit = agent_module.MAX_TURNS
+    assert endless.plan_stage() == "execution", endless.plan_view()
     assert len(_stub.CALLS) == limit, len(_stub.CALLS)
     assert len(told) == limit - 1, len(told)
     assert "tools" not in _stub.CALLS[limit - 1]["payload"], _stub.CALLS[limit - 1]["payload"]
     assert "tools" in _stub.CALLS[limit - 2]["payload"], _stub.CALLS[limit - 2]["payload"]
-    assert frames[-1]["committed"] is True, frames[-1]
-    assert frames[-1]["metrics"]["turns"] == limit, frames[-1]["metrics"]
+    assert events[-1]["committed"] is True, events[-1]
+    assert events[-1]["metrics"]["turns"] == limit, events[-1]["metrics"]
 
     # --- предел держится счётчиком, а не отсутствием инструментов -----------
     #
@@ -4142,7 +4097,9 @@ def check_tool_turn_loop():
             return chat, None
 
     with patch.object(
-        agent_module.Agent, "turn_tools", lambda self, spec, turn: list(taskplan.TOOLS)
+        agent_module.Agent,
+        "turn_tools",
+        lambda self, spec, turn, stage=None: list(taskplan.TOOLS),
     ):
         spun, events = asyncio.run(bounded())
 
@@ -4302,12 +4259,196 @@ def check_tool_turn_loop():
         "обратно уехали ход с tool_calls и по ответу ролью tool на каждый вызов; "
         f"промпт не пересобран; кадр tool раньше done и с планом на этапе "
         f"approval; отказ и битые аргументы доехали директивой, план цел; "
-        f"предел {limit} оборотов, у последнего tools нет, а со снятым первым "
+        f"предел {limit} оборотов на неменяющемся этапе, у последнего tools нет, "
+        f"а со снятым первым "
         f"сторожем обмен всё равно кончился на {limit}-м; слова и рассуждение "
         f"обоих оборотов склеены; отмена на кадре tool "
         f"оставила план пустым при одном вызове; без текста обмен не записан "
         f"и причина названа; выключенному процессу ни tools, ни кадров; "
         f"сжатие ушло без инструментов (вызовов: {len(folded)})"
+    )
+
+
+@check("один этап — один обмен: правило свежее на каждом обороте, смена гасит вызовы")
+def check_stage_per_exchange():
+    """Живой прогон `openai/gpt-4o-mini` вскрыл две беды, и вторая хуже
+    первой.
+
+    Видимая — модель проходила все этапы внутри одного сообщения, и
+    посмотреть, как менялся её системный промпт, было нечем: кнопка
+    «Показать промпт запроса» показывает промпт **первого** оборота, а
+    других сервер клиенту не отдаёт.
+
+    Настоящая — **правило этапа протухало внутри обмена**. Промпт собирался
+    один раз, правило вычислялось тогда же, и модель, прошедшая за пять
+    оборотов работу и проверку, всё это время читала «Этап: выполнение,
+    шаг 1 из 5». Держалось всё на второй половине: свежий список приезжал
+    **результатом вызова**. Распоряжение вчерашнее, сведения свежие — ровно
+    та порода дефектов, на которой погибла первая попытка Дня 13.
+
+    Чиним обе разом: правило и блок задачи пересобираются перед **каждым**
+    оборотом (`Agent.restage`), а смена этапа гасит инструменты на следующем
+    (`Agent.turn_tools`) — модель договаривает словами, обмен кончается, и
+    следующий этап получает свой обмен, свою карточку и свой промпт.
+
+    Разделы:
+
+    * **свежее правило и свежий список** — на втором обороте системное
+      сообщение несёт правило **нынешнего** этапа, а блок `[задача]` —
+      нынешний список; оба сверены с тем, что сказал бы `app/plan.py`
+      про план, лежащий у агента сейчас;
+    * **переписано на месте** — системное сообщение по-прежнему **одно**,
+      длина ленты не выросла ни на сообщение сверх двух дописанных, и номера
+      врезок из кадра `start` показывают в промпте **любого** оборота на те
+      же врезки;
+    * **смена этапа гасит инструменты** — на обороте после неё `tools`
+      в теле нет вовсе, а обмен всё равно **записан** и текст в нём
+      непустой: обрывать цикл на месте нельзя, модель вернула бы вызов
+      и ни слова;
+    * **этап не сменился — цикл идёт дальше**: та же заглушка, тот же
+      инструмент, но план уже утверждён, и `update_plan` тем же списком
+      этап не двигает — `tools` на втором обороте объявлены. Утверждение
+      об отсутствии стоит там, где присутствие достижимо, и наоборот;
+    * **`execution` → `validation`** — тот самый переход живого прогона:
+      последний шаг отмечен сделанным, и дальше модель уже не работает,
+      а проверяет. Обмен на этом и кончается;
+    * **выключенный процесс** — `stage_from` и `stage_to` пусты оба: задачи
+      нет, двигаться нечему.
+    """
+    import app.plan as taskplan
+
+    # --- свежее правило, свежий список, переписанные на месте ---------------
+    #
+    # Сцена нарочно с врезками: и долговременная память, и рабочая, и блок
+    # задачи. Номера у них считаны один раз (`prompt_head`) и уехали кадром
+    # `start`; перепиши мы стареющее **дописыванием** — номера показывали бы
+    # на чужие сообщения начиная со второго оборота, а у чата завелось бы
+    # второе системное сообщение.
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    with TestClient(main.app) as client:
+        client.post("/api/memory", json={"kind": "profile", "content": "пишет на Kotlin"})
+        chat = new_agent(client, system="СИС", workflow="plan")
+        client.post(f"/api/agents/{chat}/working",
+                    json={"kind": "goal", "content": "собрать ТЗ"})
+        frames = _frames(client, chat, "спланируй работу")
+        history = client.get(f"/api/agents/{chat}").json()["transcript"]
+        after = REGISTRY.require(chat).plan
+
+    first, second = _stub.CALLS[0]["messages"], _stub.CALLS[1]["messages"]
+    started = _frame(frames, "start")
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+
+    # Правило этапа на первом обороте — про планирование, на втором — про
+    # утверждение, и оба **совпадают с тем, что сказал бы `app/plan.py`**
+    # про план на тот момент. Сверка с готовой строкой, а не с куском текста:
+    # правило, собранное вторым местом, разошлось бы с первым молча.
+    assert taskplan.stage_rule({}) in first[0]["content"], first[0]["content"]
+    assert taskplan.stage_rule(after) in second[0]["content"], second[0]["content"]
+    assert first[0]["content"] != second[0]["content"], first[0]["content"]
+    assert taskplan.stage_of(after)[0] == "approval", after
+
+    # Блок задачи — нынешний список, и собран он той же `task_message`, какой
+    # собран блок первого оборота: вторая форма того же списка разъехалась бы
+    # с первой молча.
+    plan_at = started["plan_at"]
+    assert "шагов ещё нет" in first[plan_at]["content"], first[plan_at]["content"]
+    assert second[plan_at]["content"] == agent_module.task_message(after)["content"], (
+        second[plan_at]["content"]
+    )
+    assert all(
+        step["title"] in second[plan_at]["content"] for step in PLAN_STEPS
+    ), second[plan_at]["content"]
+
+    # Системное сообщение по-прежнему одно — на **обоих** оборотах.
+    for sent in (first, second):
+        assert [m["role"] for m in sent].count("system") == 1, [m["role"] for m in sent]
+    # Лента выросла ровно на два дописанных сообщения: ход ассистента
+    # и ответ инструмента. Ни одно стареющее место не приросло третьим.
+    assert len(second) == len(first) + 2, (len(second), len(first))
+    # И номера врезок из кадра `start` показывают на те же врезки в промпте
+    # **любого** оборота: слоты уехали один раз и на оба оборота одни.
+    for sent in (first, second):
+        assert sent[started["memory_at"]]["content"].startswith("[долговременная память]"), sent
+        assert sent[started["working_at"]]["content"].startswith("[факты о разговоре]"), sent
+        assert sent[plan_at]["content"].startswith("[задача]"), sent[plan_at]
+
+    # --- смена этапа гасит инструменты, но обмен записан --------------------
+    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    done = frames[-1]
+    assert done["committed"] is True and done["error"] is None, done
+    assert done["text"] == "план готов, начинаю", done["text"]
+    assert [m["role"] for m in history] == ["user", "assistant"], history
+    assert history[-1]["content"], history[-1]
+    # Каким этап был и каким стал — данными, а не догадкой клиента.
+    assert (done["stage_from"], done["stage_to"]) == ("planning", "approval"), done
+
+    # --- этап не сменился — цикл идёт дальше --------------------------------
+    #
+    # Обратная половина, и стоит она рядом нарочно: та же заглушка и тот же
+    # инструмент только что погасили `tools` на втором обороте. Здесь план
+    # уже утверждён, `update_plan` тем же списком этап не двигает — и
+    # инструменты объявлены снова.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    steady = _bare("этап на месте", workflow="plan")
+    steady.plan = _approved()
+    events = asyncio.run(drain(steady.ask("работай")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert "tools" in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert events[-1]["committed"] is True, events[-1]
+    assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
+        "execution", "execution",
+    ), events[-1]
+
+    # --- `execution` → `validation`: переход живого прогона ------------------
+    #
+    # Последний шаг отмечен сделанным — и дальше модель уже не работает,
+    # а проверяет. Правило у этих двух этапов разное, и внутри одного обмена
+    # модель читала бы «шаг 1 из 1 — выполняй», делая вид, что проверяет.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(
+            _call("update_plan", {"steps": [{"title": "собрать требования", "status": "done"}]},
+                  "call_done")
+        ),
+    )
+    moved = _bare("работа кончилась", workflow="plan")
+    moved.plan = _approved([{"title": "собрать требования", "status": "pending"}])
+    events = asyncio.run(drain(moved.ask("доделывай")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert "Этап: выполнение" in _stub.CALLS[0]["messages"][0]["content"], _stub.CALLS[0]
+    assert "Этап: проверка" in _stub.CALLS[1]["messages"][0]["content"], _stub.CALLS[1]
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert events[-1]["committed"] is True, events[-1]
+    assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
+        "execution", "validation",
+    ), events[-1]
+    assert len(moved.history) == 2 and moved.history[-1].content, moved.history
+
+    # --- выключенный процесс: двигаться нечему ------------------------------
+    _stub.reset()
+    _stub.install(reply="обычный ответ")
+    plain = _bare("обычный чат")
+    events = asyncio.run(drain(plain.ask("просто вопрос")))
+    assert events[-1]["stage_from"] is None and events[-1]["stage_to"] is None, events[-1]
+
+    return (
+        "правило этапа и блок задачи пересобраны на каждом обороте: "
+        "planning → approval, системное сообщение осталось одно, лента "
+        "выросла ровно на два сообщения, слоты сошлись на обоих оборотах; "
+        "смена этапа погасила tools, обмен записан и текст непуст; этап "
+        "на месте — tools объявлены снова; execution → validation прошёл "
+        "сменой правила; у выключенного процесса оба этапа пусты"
     )
 
 
@@ -4845,7 +4986,8 @@ def check_every_write_path_redacts():
         # транзакцию, а не только не трогать соединение по известным именам.
         # Список запрещённых форм ловит те обходы, которые уже видели;
         # способов достать голое соединение больше, чем их в списке, и
-        # мутация «миграция идёт мимо tx()» прошла мимо него зелёной.
+        # однажды мутация прошла мимо него зелёной — путь записи открывал
+        # соединение формой, которой в списке не было.
         assert "self.tx()" in body, (
             f"Store.{name} меняет базу, не открывая tx() — значит мимо `_Writer` "
             "и мимо redact()"
