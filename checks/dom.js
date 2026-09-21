@@ -593,6 +593,11 @@ function buildServer(options) {
     return { ...deepCopy(plan || emptyPlan()), stage, current };
   }
 
+  // Этап чата прямо сейчас — или `null` у чата с выключенным рабочим
+  // процессом: задачи нет, и двигаться нечему. Одно место на оба конца кадра
+  // `done`, как `Agent.plan_stage` на сервере.
+  const stageNow = (agent) => (agent.workflow === "plan" ? stageOf(agent.plan)[0] : null);
+
   // Пять переходов человека — с теми же условиями, что у `plan.apply`, и тем же
   // кодом отказа: стенд, отвечающий 200 на `approve` не на том этапе, оставил
   // бы зелёной кнопку, которая в браузере краснеет.
@@ -900,12 +905,22 @@ function buildServer(options) {
     // ведёт себя так же — кадр `start` на обмене один, и промпт следующих
     // оборотов не пересобирается.
     const start = startFrame(agent, text, resolved, service);
+    // Этап до вызовов и после них. Сервер называет их в кадре `done`
+    // (`stage_from`, `stage_to`) — данными, а не догадкой клиента: продолжать
+    // цепочку решает он, и решение это про движение. Берутся они по обе
+    // стороны от исполнения вызовов, а не подставляются в ответ: подставь их
+    // стенд — и утверждение «клиент продолжил на смене этапа» стояло бы
+    // на числе, которое сам стенд и выдумал.
+    const stageFrom = stageNow(agent);
     const toolFrames = toolCalls(agent, index);
+    const stages = { stage_from: stageFrom, stage_to: stageNow(agent) };
     // Упавший обмен получает те же кадры до места падения: сервер сворачивает
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,
     // раздающий чужие промпты упавших обменов, остался бы зелёным.
-    if (failed) return errorStream(agent, text, failed, service, start, toolFrames, signal);
+    if (failed) {
+      return errorStream(agent, text, failed, service, start, toolFrames, stages, signal);
+    }
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
@@ -934,7 +949,8 @@ function buildServer(options) {
       ...toolFrames,
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
-      { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
+      { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null,
+        committed: true, ...stages },
     ];
     // Где в потоке первый кусок текста. Обмен, оборванный до него, сервер
     // в историю не пишет; оборванный после — пишет начатое, и оно оплачено.
@@ -954,7 +970,7 @@ function buildServer(options) {
 
   // Обмен, упавший на провайдере: в историю он не пишется — текста нет,
   // а `usage_total` и число обменов остаются прежними, как на сервере.
-  function errorStream(agent, text, failed, service, start, toolFrames, signal) {
+  function errorStream(agent, text, failed, service, start, toolFrames, stages, signal) {
     const metrics = {
       model: agent.model,
       provider: null,
@@ -981,7 +997,7 @@ function buildServer(options) {
         ? []
         : [{
             event: "done", text: "", reasoning: "", metrics,
-            error: failed.message, committed: false, question: text,
+            error: failed.message, committed: false, question: text, ...stages,
           }]),
     ].map((e) => "data: " + JSON.stringify(e) + "\n\n");
     return streamOf(frames, signal);
