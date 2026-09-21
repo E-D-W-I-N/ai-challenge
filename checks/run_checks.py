@@ -359,7 +359,7 @@ def _filled_chat(store, label: str):
     # Этап уведён с умолчания: слой обязан быть непустым и здесь, иначе
     # «после очистки снова планирование» держалось бы само собой. Теми же
     # переходами заводятся и строки журнала — второй половины этого слоя.
-    chat.approve_plan()
+    chat.move_stage("execution")
     chat.move_stage("validation")
     chat.set_task({"step": f"шаг чата {label}"})
     store.save_branch(chat.id, parent_id="ag_00001", forked_at=2)
@@ -656,8 +656,8 @@ def check_cut_only_where_chosen():
             "[факты о разговоре]\nэтап: планирование\n"
             "сейчас: собрать требования и предложить план\n"
             "ожидается: ваше подтверждение плана\n"
-            "инструкция: не приступай к работе, пока человек не утвердит "
-            "план кнопкой; менять этап тебе здесь нечем\n"
+            "инструкция: выдай сам план, списком шагов; не описывай процесс "
+            "и не сообщай о смене этапа — про этап говорит интерфейс\n"
             "цель: собрать ТЗ\n[конец фактов о разговоре]"
         ), sent[0]
         assert sent[1]["content"] == "вопрос 3", sent[1]
@@ -812,7 +812,7 @@ def check_cut_only_where_chosen():
     odd = _fill(
         _bare("нечёт", strategy="summary", keep_last=5, compress_every=EVERY), 20
     )
-    asyncio.run(drain(odd.compress(odd.spec)))
+    asyncio.run(odd.compress(odd.spec))
     odd_cover = odd.summary_cover()
     assert odd_cover == 14, odd_cover
     assert odd_cover % 2 == 0, f"граница разорвала пару: свёрнуто {odd_cover} реплик"
@@ -826,7 +826,7 @@ def check_cut_only_where_chosen():
         _bare("перегенерация", strategy="summary", keep_last=0, compress_every=EVERY,
 ), 10
     )
-    asyncio.run(drain(short.compress(short.spec)))
+    asyncio.run(short.compress(short.spec))
     assert short.summary_cover() == 10, short.summary_cover()
     assert short.take_last_exchange() is not None, "перегенерация не сняла пару"
     short_cover = short.summary_cover()
@@ -1227,8 +1227,9 @@ def check_working_memory():
                 "этап: планирование\n"
                 "сейчас: собрать требования и предложить план\n"
                 "ожидается: ваше подтверждение плана\n"
-                "инструкция: не приступай к работе, пока человек не утвердит "
-                "план кнопкой; менять этап тебе здесь нечем\n"
+                "инструкция: выдай сам план, списком шагов; не описывай "
+                "процесс и не сообщай о смене этапа — про этап говорит "
+                "интерфейс\n"
                 "решение: берём Kotlin\n"
                 "[конец фактов о разговоре]"
             ),
@@ -1410,8 +1411,8 @@ def check_working_memory():
             "[факты о разговоре]\nэтап: планирование\n"
             "сейчас: собрать требования и предложить план\n"
             "ожидается: ваше подтверждение плана\n"
-            "инструкция: не приступай к работе, пока человек не утвердит "
-            "план кнопкой; менять этап тебе здесь нечем\n"
+            "инструкция: выдай сам план, списком шагов; не описывай процесс "
+            "и не сообщай о смене этапа — про этап говорит интерфейс\n"
             "[конец фактов о разговоре]"
         ), fresh[0]
         assert not any("успеем ли к маю" in m["content"] for m in fresh), fresh
@@ -1444,26 +1445,25 @@ def check_working_memory():
     )
 
 
-@check("этап задачи: первой строкой блока, переживает паузу, кнопкой — только план")
+@check("этап задачи: переключается руками, карта не даёт прыгнуть, блок едет всегда")
 def check_task_stage():
     """Состояние задачи — конечный автомат чата: этап, текущий шаг и то,
     какого действия ждут.
 
-    Едет оно в **тот же** блок, что рабочая память, и первыми его строками:
-    и этап, и записи про одну и ту же текущую задачу, оба живут в чате
-    и умирают с ним, и второй блок на ту же тему был бы лишним разделением
-    промпта. Отсюда и главное здешнее утверждение — про **первую строку**:
-    где задача стоит, модель не должна выискивать.
+    Двигает его **человек**: полоса этапов в шапке — пульт, нажатие уходит
+    своей ручкой, и другого механизма перехода нет ни одного. Но нажать
+    можно не куда угодно: карта переходов держится **кодом**, а не тем,
+    что кнопку решили не рисовать, — запрос мимо полосы получает отказ
+    с внятным текстом, и отклонённая попытка ложится строкой в журнал.
+
+    Едет состояние в **тот же** блок, что рабочая память, и первыми его
+    строками: и этап, и записи про одну и ту же текущую задачу, оба живут
+    в чате и умирают с ним. Отсюда и главное здешнее утверждение — про
+    **первую строку**: где задача стоит, модель не должна выискивать.
 
     «Пауза на любом этапе и продолжение без повторных объяснений» из задания
     проверяется буквально: настоящее переоткрытие файла базы и подъём чата
     из него.
-
-    А главное здесь — что у каждого перехода **ровно один механизм**.
-    Из планирования выпускает кнопка «Утвердить план», и больше ничто:
-    полоса этапов стала показом, а ручка правки текста этапа не принимает
-    вовсе. Три остальных ребра проходит инструмент модели — про него своя
-    проверка, — и обе двери ведут в одну, `move_stage`, где стоит карта.
     """
     from app.agent import Agent
 
@@ -1475,27 +1475,21 @@ def check_task_stage():
         # с умолчания этапа, заполненного поля или записи — а умолчание
         # это и есть планирование. То есть весь этап планирования модель
         # работала вслепую: ни где задача, ни чего от неё ждут, ни того,
-        # что приступать рано, в промпте не стояло ни словом. Живой прогон
-        # это и показал — дальше модель путалась в собственном статусе
-        # и дёргала инструмент наугад.
-        #
-        # Довод «умолчание само по себе не новость» был про человека:
-        # он видит полосу этапов в шапке. Модель не видит ничего, кроме
-        # промпта, и для неё это самая нужная новость. Этап есть всегда —
-        # значит и блок есть всегда.
+        # что приступать рано, в промпте не стояло ни словом.
         chat = new_agent(client, system="СИС")
         _talk(client, chat, 1)
         sent = _stub.CALLS[-1]["messages"]
         assert [m["role"] for m in sent] == ["system", "user", "user"], sent
         # Блок стоит сразу за системным промптом и несёт этап первой строкой
-        # и инструкцию планирования — ту самую, которая запрещает приступать
-        # к работе до кнопки.
+        # и инструкцию планирования — ту, что просит сам план, а не рассказ
+        # о том, как он будет составляться.
         assert sent[1]["content"] == (
             "[факты о разговоре]\nэтап: планирование\n"
             "сейчас: собрать требования и предложить план\n"
             "ожидается: ваше подтверждение плана\n"
-            "инструкция: не приступай к работе, пока человек не утвердит "
-            "план кнопкой; менять этап тебе здесь нечем\n"
+            "инструкция: выдай сам план, списком шагов; "
+            "не описывай процесс и не сообщай о смене этапа — "
+            "про этап говорит интерфейс\n"
             "[конец фактов о разговоре]"
         ), sent[1]
         assert sent[2]["content"] == "вопрос 0", sent[2]
@@ -1503,38 +1497,51 @@ def check_task_stage():
 
         url = f"/api/agents/{chat}/task"
 
-        # --- 2. Кнопка «Утвердить план» — единственный переход человека ------
+        # --- 2. Этап переключает человек, своей ручкой -----------------------
         #
-        # И единственный выход из планирования: догадываться о том, что план
-        # утверждён, по тексту разговора нельзя, а полоса этапов нажатием
-        # больше ничего не меняет.
-        switched = client.post(url + "/approve")
+        # Единственный механизм перехода: полоса в шапке — пульт, и нажатие
+        # уходит сюда. Из планирования выпускает то же нажатие, и это явное
+        # действие человека: догадываться о том, что план утверждён,
+        # по тексту разговора нельзя.
+        switched = client.post(url + "/stage", json={"stage": "execution"})
         assert switched.status_code == 200, switched.text
-        # Ответ ручки — состояние, строки блока и список достижимых этапов:
-        # под полосой стоит ровно то, что уедет в промпт, а сама полоса
-        # приглушает то, куда карта не пускает. Собирает и то и другое
-        # сервер, а не клиент.
-        assert switched.json() == {
-            "task": {
-                "stage": "execution",
-                "step": "",
-                "expecting": "",
-                "lines": [
-                    "этап: работа",
-                    "сейчас: выполнять утверждённый план",
-                    "ожидается: результат работы",
-                    "инструкция: работай, а не обещай работать: выдавай "
-                    "результат сразу и разрешения на каждый шаг не "
-                    "спрашивай; держись утверждённого плана, не меняй "
-                    'решений молча; работа сделана — вызови '
-                    'update_stage(stage="validation")',
-                ],
-                "moves": ["validation"],
-            }
+        # Ответ ручки — состояние, строки блока, список достижимых этапов
+        # и журнал переходов: под полосой стоит ровно то, что уедет в промпт,
+        # сама полоса приглушает то, куда карта не пускает, а летопись
+        # приезжает тем же ответом — вторым походом она отстала бы от полосы.
+        assert switched.json()["task"] == {
+            "stage": "execution",
+            "step": "",
+            "expecting": "",
+            "lines": [
+                "этап: работа",
+                "сейчас: выполнять утверждённый план",
+                "ожидается: результат работы",
+                "инструкция: выдай сам результат: текст, код, описание; "
+                "не описывай процесс и не сообщай о смене этапа — "
+                "про этап говорит интерфейс",
+            ],
+            "moves": ["validation"],
         }, switched.json()
-        # Утверждать второй раз нечего: карта с «работы» на «работу» не ведёт,
-        # и кнопка честно говорит, что переход не состоялся.
-        assert client.post(url + "/approve").status_code == 409, "план утвердили дважды"
+        assert [(m["stage_from"], m["stage_to"], m["who"], m["ok"])
+                for m in switched.json()["task_log"]] == [
+            ("planning", "execution", "human", True)
+        ], switched.json()["task_log"]
+
+        # --- 3. Запрещённый переход не происходит — и мимо полосы тоже -------
+        #
+        # Полоса недостижимое не даёт нажать, но правило держится **кодом**:
+        # запрос из другой вкладки, из curl, от клиента другой версии обязан
+        # получить отказ, и отказ обязан объяснять, куда отсюда можно.
+        jump = client.post(url + "/stage", json={"stage": "done"})
+        assert jump.status_code == 409, jump.text
+        assert jump.json()["detail"] == "переход в «готово» отклонён: сначала проверка", jump.json()
+        assert REGISTRY.require(chat).task["stage"] == "execution", REGISTRY.require(chat).task
+        # Незнакомый этап — не запрет карты, а слово, которого в ней нет:
+        # 400 с перечнем допустимых, как у всякого закрытого списка.
+        assert client.post(url + "/stage", json={"stage": "выполняется"}).status_code == 400
+        assert client.post(url + "/stage", json={"stage": True}).status_code == 400
+        assert client.post(url + "/stage", json={"stage": "done", "at": 1}).status_code == 400
 
         frames = _frames(client, chat, "вопрос 1")
         start = _frame(frames, "start")
@@ -1552,22 +1559,16 @@ def check_task_stage():
             "этап: работа\n"
             "сейчас: выполнять утверждённый план\n"
             "ожидается: результат работы\n"
-            "инструкция: работай, а не обещай работать: выдавай результат "
-            "сразу и разрешения на каждый шаг не спрашивай; держись "
-            "утверждённого плана, не меняй решений молча; "
-            'работа сделана — вызови update_stage(stage="validation")\n'
+            "инструкция: выдай сам результат: текст, код, описание; "
+            "не описывай процесс и не сообщай о смене этапа — "
+            "про этап говорит интерфейс\n"
             "[конец фактов о разговоре]"
         ), block
-        # Инструкция этапа называет **повод позвать инструмент**, а не только
-        # манеру себя вести: объявление инструмента говорит, что он делает,
-        # а блок задачи — когда пора. Модель, у которой есть кнопка и нет
-        # повода, её не нажмёт.
-        assert "update_stage" in block["content"], block
         # И системное сообщение по-прежнему ровно одно: блок задачи его
         # не заводит и не раздваивает.
         assert len([m for m in start["resolved_messages"] if m["role"] == "system"]) == 1, start
 
-        # --- 3. Оба поля — и оба своей строкой, после этапа ------------------
+        # --- 4. Оба поля — и оба своей строкой, после этапа ------------------
         filled = client.patch(url, json={"step": "собрать требования", "expecting": "ваше «ок»"})
         assert filled.status_code == 200, filled.text
         # Правка **только названного**: этап никто не трогал, и он остался.
@@ -1586,19 +1587,17 @@ def check_task_stage():
             "этап: работа",
             "сейчас: собрать требования",
             "ожидается: ваше «ок»",
-            "инструкция: работай, а не обещай работать: выдавай результат "
-            "сразу и разрешения на каждый шаг не спрашивай; держись "
-            "утверждённого плана, не меняй решений молча; "
-            'работа сделана — вызови update_stage(stage="validation")',
+            "инструкция: выдай сам результат: текст, код, описание; "
+            "не описывай процесс и не сообщай о смене этапа — "
+            "про этап говорит интерфейс",
         ], lines
         assert lines[5:] == ["цель: приложение доставки", "[конец фактов о разговоре]"], lines
 
-        # --- 4. Граница: этап через правку текста не проходит ----------------
+        # --- 5. Граница: этап через правку текста не проходит ----------------
         #
-        # Главное в устройстве дня: у каждого перехода ровно один механизм.
-        # Ручка правки текста третьей дверью была бы — она карты не спрашивает
-        # и пускала бы куда угодно, — поэтому `stage` для неё просто лишнее
-        # поле, и отвечает на него общий разбор.
+        # У перехода ровно один механизм. Ручка правки текста второй дверью
+        # была бы — она карты не спрашивает и пускала бы куда угодно, —
+        # поэтому `stage` для неё просто лишнее поле.
         alien = client.patch(url, json={"stage": "validation"})
         assert alien.status_code == 400, alien.text
         assert client.patch(url, json={}).status_code == 400
@@ -1609,7 +1608,7 @@ def check_task_stage():
         # Этап от всего этого не сдвинулся ни разу.
         assert REGISTRY.require(chat).task["stage"] == "execution", REGISTRY.require(chat).task
 
-    # --- 5. Одна дверь на все переходы, и в ней карта ------------------------
+    # --- 6. Одна дверь на все переходы, и в ней карта ------------------------
     _stub.reset()
     path = _temp_db("task-moves")
     store = Store(path).init()
@@ -1622,12 +1621,11 @@ def check_task_stage():
     assert jumper.task["stage"] == "planning", jumper.task
     assert store.load_task(jumper.id) == blank_task(), store.load_task(jumper.id)
     assert [(m["stage_from"], m["stage_to"], m["who"], m["ok"]) for m in jumper.task_log] == [
-        ("planning", "validation", "agent", False)
+        ("planning", "validation", "human", False)
     ], jumper.task_log
 
     # Тот же этап — не ошибка и не переход: ничего не записывается, журнал
-    # молчит. Иначе он зарос бы строками ни о чём, а модель решила бы,
-    # что сделала что-то не так, и принялась бы исправляться.
+    # молчит. Иначе он зарос бы строками ни о чём.
     assert jumper.move_stage("planning") == "same", jumper.task
     assert len(jumper.task_log) == 1, jumper.task_log
 
@@ -1638,23 +1636,28 @@ def check_task_stage():
     assert len(jumper.task_log) == 1, jumper.task_log
 
     # А разрешённое ребро проходит, и подпись у него — того, кто попросил.
-    assert jumper.approve_plan() == "moved", jumper.task
+    assert jumper.move_stage("execution") == "moved", jumper.task
     assert jumper.task["stage"] == "execution", jumper.task
     assert store.load_task(jumper.id)["stage"] == "execution", store.load_task(jumper.id)
     assert jumper.task_log[-1]["who"] == "human" and jumper.task_log[-1]["ok"] is True, jumper.task_log
-    # Из «готова» не ведёт ни одно.
+    # Проверка возвращает задачу в работу — то самое обратное ребро, ради
+    # которого «проверка» момент, а не слово. Из «готова» не ведёт ни одно.
+    assert jumper.move_stage("validation") == "moved"
+    assert jumper.move_stage("execution") == "moved", jumper.task
     assert jumper.move_stage("validation") == "moved"
     assert jumper.move_stage("done") == "moved"
     assert jumper.move_stage("execution") == "denied", jumper.task
     assert jumper.task["stage"] == "done", jumper.task
 
-    # Закрытая задача — **тоже работа**: на «готове» модель обязана подвести
-    # итог, а не отмолчаться вежливостью. Пустая инструкция ровно это и
-    # стоила: этап переключался, а сказать модели, что на нём делать,
-    # оказывалось нечем. Поэтому утверждение двойное — ни у одного этапа
-    # пустой инструкции нет, и инструкция «готова» доезжает до промпта
-    # той же строкой блока, что и у остальных.
-    assert all(TASK_STAGE_PLAN[name]["guide"] for name in TASK_STAGES), TASK_STAGE_PLAN
+    # У каждого этапа своя инструкция, и все четыре — разные: этап, пришедший
+    # в промпт без неё, не говорит модели ничего, а одинаковая у всех не
+    # меняла бы поведения. Закрытая задача — **тоже работа**: на «готове»
+    # модель обязана подвести итог, а не отмолчаться вежливостью.
+    guides = [TASK_STAGE_PLAN[name]["guide"] for name in TASK_STAGES]
+    assert all(guides) and len(set(guides)) == len(TASK_STAGES), guides
+    # И общая строка — во всех четырёх: про этап говорит интерфейс, а модель
+    # отвечала рассказом о переходе вместо самого ответа.
+    assert all("не описывай процесс" in one for one in guides), guides
     closing = jumper.build_prompt("что в итоге")[0]["content"]
     assert closing.startswith("[факты о разговоре]\nэтап: готово\n"), closing
     assert "сейчас: подвести итог работы" in closing, closing
@@ -1663,11 +1666,11 @@ def check_task_stage():
     # Журнал переживает перезапуск целиком — вместе с отклонёнными строками.
     assert [(m["stage_to"], m["ok"]) for m in store.list_task_log(jumper.id)] == [
         ("validation", False), ("execution", True), ("validation", True),
-        ("done", True), ("execution", False),
+        ("execution", True), ("validation", True), ("done", True), ("execution", False),
     ], store.list_task_log(jumper.id)
     store.close()
 
-    # --- 6. Пауза и продолжение: перезапуск процесса -------------------------
+    # --- 7. Пауза и продолжение: перезапуск процесса -------------------------
     #
     # То самое «продолжение без повторных объяснений»: закрыли файл, открыли
     # заново, подняли чат — и этап, шаг и ожидаемое действие те же, а блок
@@ -1678,7 +1681,7 @@ def check_task_stage():
     store = Store(path).init()
     agent = Agent(AgentSpec(label="на паузе", model="stub/model"), store=store)
     _ask(agent, 2)
-    agent.approve_plan()
+    agent.move_stage("execution")
     agent.move_stage("validation")
     agent.set_task({"step": "гоняю тесты"})
     paused = dict(agent.task)
@@ -1690,6 +1693,8 @@ def check_task_stage():
         head = revived.build_prompt("после паузы")[0]["content"]
         assert head.startswith("[факты о разговоре]\nэтап: проверка\n"), head
         assert "сейчас: гоняю тесты" in head, head
+        # Инструкция у поднятого чата — своего этапа, а не первого попавшегося.
+        assert "инструкция: перечисли конкретные проблемы" in head, head
 
         # Ветка уносит состояние целиком — по тому же правилу, что рабочую
         # память, и по тому же доводу: этап не заменяет собой ни одной
@@ -1706,385 +1711,15 @@ def check_task_stage():
         ), branch.build_prompt("ещё")[0]
 
     return (
-        "пустой чат уходит без блока задачи; кнопка «Утвердить план» — "
-        "единственный переход человека и единственный выход из планирования, "
-        "второй раз 409; этап встаёт первой строкой блока, за ним инструкция "
-        "с поводом позвать инструмент, а набранное руками побеждает зашитое; "
-        "правка текста этапа не принимает — 400; запрещённый картой переход "
-        "отбит и записан в журнал отклонённым, тот же этап и незнакомый "
-        "в журнал не идут вовсе; пять строк журнала пережили переоткрытие "
-        "файла, этап и шаг тоже — и уехали в ветку целиком; инструкция "
-        "непуста у всех четырёх этапов, и «готово» просит итог прямо "
-        "в промпте"
-    )
-
-
-@check("этап двигает инструмент модели: карта решает, предел держит, цена в итоге")
-def check_stage_tool():
-    """Главное дня: этап двигает **модель, вызвав инструмент**, а не служебный
-    вызов после каждого обмена.
-
-    Разница не в моде. Вопрос после каждого обмена стоил лишнего обращения
-    к модели **на каждом обмене** и решался разбором её ответа; инструмент
-    обходится лишним оборотом только при настоящей смене этапа и приезжает
-    **формой**, которую держит провайдер, — аргументом из закрытого списка.
-    Текста здесь не разбирается нигде.
-
-    И главное правило: **модель просит — код решает**. Карта переходов стоит
-    ровно там, где стояла, и отказ у неё осмысленный: модель читает его
-    и продолжает на нём, а человек видит строку под ответом.
-    """
-    from app.agent import Agent, TASK_TOOL_NAME
-
-    def _tool(stage: str):
-        """Вызов инструмента с этим этапом — в том виде, в каком его отдаёт
-        разбор потока."""
-        return [{"name": TASK_TOOL_NAME, "arguments": json.dumps({"stage": stage})}]
-
-    def _once(calls):
-        """Инструмент зовётся на первом обороте обмена и только на нём:
-        второй оборот — это уже продолжение, и вызывать в нём снова значило бы
-        проверять предел вместо перехода. Различаются обороты по сообщению
-        роли `tool` в промпте: его дописывает сам обмен."""
-        def ask(messages, index, tools):
-            if any(m.get("role") == "tool" for m in messages):
-                return None
-            return calls
-        return ask
-
-    def _whenever(calls):
-        """Модель, зовущая инструмент на каждом обороте, где он объявлен.
-        Честно: необъявленного настоящая модель не зовёт, и заглушка,
-        зовущая его всегда, оставила бы зелёным круг, которого в жизни
-        не случилось бы."""
-        return lambda messages, index, tools: (calls if tools else None)
-
-    # --- 1. Объявление: только там, где есть что двигать --------------------
-    #
-    # Инструмент уезжает в **теле запроса**, и смотрим мы именно туда: это
-    # то самое тело, которое ушло бы в OpenRouter.
-    path = _temp_db("tool-declared")
-    store = Store(path).init()
-    _stub.install(reply="понял")
-    declared = Agent(AgentSpec(label="объявление", model="stub/model"), store=store)
-
-    _ask(declared, 1)
-    assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].get("tools")
-
-    declared.approve_plan()
-    _ask(declared, 1)
-    tools = _stub.CALLS[-1]["payload"]["tools"]
-    assert [t["function"]["name"] for t in tools] == [TASK_TOOL_NAME], tools
-    # Описание — с условием вызова, а не только с назначением: «что он делает»
-    # модель читает здесь, а «когда пора» — строкой инструкции в блоке задачи.
-    said = tools[0]["function"]["description"]
-    assert "Вызывай, когда продвинулся" in said and "Не вызывай" in said, said
-    # Аргумент — закрытый список, тот же, что у полосы: решение приезжает
-    # формой, а не фразой, и выдумать этап модель не сможет.
-    assert tools[0]["function"]["parameters"]["properties"]["stage"]["enum"] == [
-        "planning", "execution", "validation", "done"
-    ], tools[0]
-
-    declared.move_stage("validation")
-    _ask(declared, 1)
-    assert "tools" in _stub.CALLS[-1]["payload"], "на проверке инструмента нет"
-    declared.move_stage("done")
-    _ask(declared, 1)
-    # С «готова» карта не ведёт никуда: объявлять инструмент значило бы
-    # предлагать дверь, которой нет.
-    assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].get("tools")
-
-    # --- 2. Разрешённый переход применяется, и журнал помечает «агент» ------
-    _stub.reset()
-    _stub.install(reply="сделал", tool_calls=_once(_tool("validation")))
-    moved = Agent(AgentSpec(label="работа сделана", model="stub/model"), store=store)
-    moved.approve_plan()
-    _ask(moved, 1)
-    assert moved.task["stage"] == "validation", moved.task
-    assert store.load_task(moved.id)["stage"] == "validation", store.load_task(moved.id)
-    assert (moved.task_log[-1]["stage_from"], moved.task_log[-1]["stage_to"],
-            moved.task_log[-1]["who"], moved.task_log[-1]["ok"]) == (
-        "execution", "validation", "agent", True), moved.task_log
-    # Обмен пошёл за продолжением: второй оборот виден и по числу вызовов,
-    # и по промпту — в нём ответ модели с вызовом и результат вызова.
-    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-    second = _stub.CALLS[-1]["messages"]
-    assert second[-2]["role"] == "assistant" and second[-2]["tool_calls"], second[-2]
-    # Результат инструмента — **осмысленный**: модель на нём продолжает,
-    # и «ок» ей ничего бы не сказало.
-    assert second[-1] == {
-        "role": "tool",
-        "tool_call_id": second[-2]["tool_calls"][0]["id"],
-        "content": "готово, этап теперь: validation",
-    }, second[-1]
-    # Продолжение стримится собеседнику как обычный ответ — им и записывается.
-    assert moved.history[-1].content == "сделал", moved.transcript()
-    # А блок задачи второго оборота — **прежний**, и это намеренно: промпт
-    # собран один раз на обмен, и кадр `start` уже уехал с ним. Новый этап
-    # модель узнаёт из результата инструмента, и узнаёт дословно — за тем он
-    # и осмысленный. Пересобери мы блок посреди обмена, просмотр запроса
-    # показывал бы не то, что уехало первым ходом.
-    block = next(m for m in second if "[факты о разговоре]" in m["content"])
-    assert "этап: работа" in block["content"], block
-
-    # Обратное ребро `проверка → работа` — главное в карте: проверка,
-    # нашедшая проблемы, обязана возвращать задачу в работу, иначе «проверка»
-    # слово, а не момент. Решает его сама модель, вызвав инструмент.
-    _stub.reset()
-    _stub.install(reply="нашёл дыру в оплате", tool_calls=_once(_tool("execution")))
-    back = Agent(AgentSpec(label="проверка нашла", model="stub/model"), store=store)
-    back.approve_plan()
-    back.move_stage("validation")
-    _ask(back, 1)
-    assert back.task["stage"] == "execution", back.task
-    assert (back.task_log[-1]["stage_from"], back.task_log[-1]["stage_to"],
-            back.task_log[-1]["ok"]) == ("validation", "execution", True), back.task_log
-    # И вперёд с проверки она тоже вправе — выходов из неё два, и какой
-    # из них, решает модель.
-    _stub.reset()
-    _stub.install(reply="всё чисто", tool_calls=_once(_tool("done")))
-    back.move_stage("validation")
-    _ask(back, 1)
-    assert back.task["stage"] == "done", back.task
-
-    # --- 3. Запрещённый переход не применяется ------------------------------
-    #
-    # Модель просит — код решает. Состояние прежнее, а модель получает
-    # объяснение, на котором может продолжить.
-    _stub.reset()
-    _stub.install(reply="закрываю", tool_calls=_once(_tool("done")))
-    jump = Agent(AgentSpec(label="через проверку", model="stub/model"), store=store)
-    jump.approve_plan()
-    _ask(jump, 1)
-    assert jump.task["stage"] == "execution", jump.task
-    assert store.load_task(jump.id)["stage"] == "execution", store.load_task(jump.id)
-    told = _stub.CALLS[-1]["messages"][-1]
-    assert told["content"] == "нельзя: из execution можно только в validation", told
-    # Отклонённая попытка **в журнале**: он обязан показывать не только то,
-    # что переходы случаются, но и то, что запрещённые не случаются.
-    assert (jump.task_log[-1]["stage_to"], jump.task_log[-1]["ok"]) == ("done", False), jump.task_log
-    # И человеку об этом говорит строка под ответом — русскими подписями
-    # этапов, теми же, что на полосе. Молчать нельзя: модель просила переход,
-    # его не дали.
-    assert jump.history[-1].metrics["stage_note"] == (
-        "переход в «готово» отклонён: сначала проверка"
-    ), jump.history[-1].metrics.get("stage_note")
-
-    # --- 4. Из планирования инструмент не выпускает -------------------------
-    #
-    # Карта ребро `planning → execution` разрешает — по нему ходит кнопка, —
-    # а инструменту туда нельзя. Объявления там у него и нет, но упрямая
-    # модель вправе позвать необъявленное, и отказ обязан быть в коде.
-    _stub.reset()
-    _stub.install(reply="приступаю", tool_calls=_once(_tool("execution")))
-    early = Agent(AgentSpec(label="сам себе утвердил", model="stub/model"), store=store)
-    _ask(early, 1)
-    assert early.task["stage"] == "planning", early.task
-    told = _stub.CALLS[-1]["messages"][-1]["content"]
-    assert "только человек" in told and "Утвердить план" in told, told
-    assert (early.task_log[-1]["stage_to"], early.task_log[-1]["ok"]) == ("execution", False), early.task_log
-    assert early.history[-1].metrics["stage_note"] == (
-        "переход в «работа» отклонён: план утверждает человек"
-    ), early.history[-1].metrics.get("stage_note")
-
-    # --- 5. Не позвала, позвала с кривым, позвала тем же --------------------
-    #
-    # Три случая, и все три значат «ничего не произошло». Журнал при этом
-    # молчит: переходом ни один из них не был.
-    _stub.reset()
-    _stub.install(reply="просто отвечаю")
-    quiet = Agent(AgentSpec(label="без вызова", model="stub/model"), store=store)
-    quiet.approve_plan()
-    rows = len(quiet.task_log)
-    _ask(quiet, 1)
-    assert quiet.task["stage"] == "execution", quiet.task
-    assert len(quiet.task_log) == rows, quiet.task_log
-    # Один обмен — одно обращение к модели: без вызова второго оборота нет.
-    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
-
-    for broken in ('{"stage": "выполняется"}', "{не json", '{"этап": "done"}', ""):
-        _stub.reset()
-        _stub.install(
-            reply="ответ",
-            tool_calls=_once([{"name": TASK_TOOL_NAME, "arguments": broken}]),
-        )
-        _ask(quiet, 1)
-        assert quiet.task["stage"] == "execution", (broken, quiet.task)
-        assert len(quiet.task_log) == rows, (broken, quiet.task_log)
-        assert "Допустимые" in _stub.CALLS[-1]["messages"][-1]["content"], broken
-        assert quiet.history[-1].metrics.get("stage_note") is None, broken
-
-    # И на планировании — тоже ничего: этап там не назван, а значит, попытки
-    # перехода не было вовсе. Рисовать в летописи стрелку в никуда значило бы
-    # врать, и отказ «из planning выпускает человек» здесь не при чём —
-    # отвечать на него нечему.
-    _stub.reset()
-    _stub.install(
-        reply="ответ",
-        tool_calls=_once([{"name": TASK_TOOL_NAME, "arguments": '{"stage": "выполняется"}'}]),
-    )
-    fresh = Agent(AgentSpec(label="кривой на планировании", model="stub/model"), store=store)
-    _ask(fresh, 1)
-    assert fresh.task["stage"] == "planning", fresh.task
-    assert fresh.task_log == [], fresh.task_log
-    assert "Допустимые" in _stub.CALLS[-1]["messages"][-1]["content"], _stub.CALLS[-1]["messages"][-1]
-
-    # Тот же этап — **не** ошибка и не переход: ничего не пишем, модели
-    # отвечаем спокойно. Иначе журнал зарос бы строками ни о чём, а модель
-    # решила бы, что сделала что-то не так, и принялась исправляться.
-    _stub.reset()
-    _stub.install(reply="ответ", tool_calls=_once(_tool("execution")))
-    _ask(quiet, 1)
-    assert quiet.task["stage"] == "execution", quiet.task
-    assert len(quiet.task_log) == rows, quiet.task_log
-    assert _stub.CALLS[-1]["messages"][-1]["content"] == (
-        "этап уже такой: execution, менять нечего"
-    ), _stub.CALLS[-1]["messages"][-1]
-    assert quiet.history[-1].metrics.get("stage_note") is None, quiet.history[-1].metrics
-
-    # --- 6. Предел оборотов держит ------------------------------------------
-    #
-    # Упрямая модель, зовущая инструмент на каждом обороте, увела бы обмен
-    # в круг. Предел — два оборота подряд; упёрлись — отвечаем тем, что есть.
-    _stub.reset()
-    _stub.install(reply="и снова", tool_calls=_whenever(_tool("done")))
-    stubborn = Agent(AgentSpec(label="упрямая", model="stub/model"), store=store)
-    stubborn.approve_plan()
-    _ask(stubborn, 1)
-    # Три обращения: первый ход и два оборота. Четвёртого нет.
-    assert len(_stub.CALLS) == 3, len(_stub.CALLS)
-    assert stubborn.task["stage"] == "execution", stubborn.task
-    # И на последнем обороте инструмента уже не объявляли: оставь мы его,
-    # упрямая модель позвала бы снова, а ход, кончившийся вызовом, текста
-    # не отдаёт — собеседник остался бы вовсе без ответа.
-    assert [("tools" in c["payload"]) for c in _stub.CALLS] == [True, True, False], [
-        c["payload"].get("tools") for c in _stub.CALLS
-    ]
-    assert stubborn.history[-1].content == "и снова", stubborn.transcript()
-    # Оба отказа названы человеку: строка обещает не «был отказ», а все.
-    assert stubborn.history[-1].metrics["stage_note"].count("отклонён") == 2, (
-        stubborn.history[-1].metrics["stage_note"]
-    )
-
-    # --- 7. Метрики обоих оборотов — в итоге по чату ------------------------
-    #
-    # Оборот с вызовом стоит денег наравне с ответом, и отчёт, назвавший
-    # только второй, соврал бы о цене инструмента вдвое.
-    _stub.reset()
-    _stub.install(
-        reply="сделал",
-        tool_calls=_once(_tool("validation")),
-        usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "cost_usd": 0.001},
-    )
-    paid = Agent(AgentSpec(label="цена оборота", model="stub/model"), store=store)
-    paid.approve_plan()
-    _ask(paid, 1)
-    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-    assert paid.usage_summary() == {
-        "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "cost_usd": 0.002
-    }, paid.usage_summary()
-    # А число сообщений оборот не растит: обмен остался одним обменом.
-    assert len(paid.history) == 2, paid.transcript()
-    store.close()
-
-    # --- 8. Новое состояние уезжает кадром `done` ----------------------------
-    #
-    # Не `start`: этап двигает инструмент **по ходу ответа**, и в кадре
-    # `start` он ещё прежний. Полоса в шапке переезжает по `done`, то есть
-    # сразу после ответа и без единого лишнего запроса, — и журнал приезжает
-    # тем же кадром.
-    _stub.reset()
-    _stub.install(reply="сделал", tool_calls=_once(_tool("validation")))
-    with TestClient(main.app) as client:
-        moving = new_agent(client, label="полоса едет по done")
-        client.post(f"/api/agents/{moving}/task/approve")
-        frames = _frames(client, moving, "закончил")
-        assert _frame(frames, "start")["task"]["stage"] == "execution", _frame(frames, "start")["task"]
-        finished = _frame(frames, "done")
-        assert finished["task"]["stage"] == "validation", finished["task"]
-        # И строки блока с ним — те самые, что уедут в промпт следующего
-        # обмена: полоса и строки под ней рисуются одним ответом.
-        assert finished["task"]["lines"][0] == "этап: проверка", finished["task"]["lines"]
-        assert [(m["stage_to"], m["who"]) for m in finished["task_log"]] == [
-            ("execution", "human"), ("validation", "agent")
-        ], finished["task_log"]
-
-    # --- 9. Вызов собирается из настоящего потока, кусками -------------------
-    #
-    # Здесь работает **настоящий** `stream_completion` поверх подменённого
-    # транспорта: заглушка отдаёт события готовыми и сборку кусков изобразить
-    # не может, а провайдер шлёт вызов именно по кускам — имя в первом,
-    # аргументы по буквам следом, вперемешку с соседним вызовом.
-    from app.llm import stream_completion
-
-    pieces = [
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_a", "function": {"name": "update_stage", "arguments": '{"sta'}},
-            {"index": 1, "id": "call_b", "function": {"name": "другой", "arguments": "{"}},
-        ]}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 1, "function": {"arguments": '"x": 1}'}},
-            {"index": 0, "function": {"arguments": 'ge": "va'}},
-        ]}}]},
-        {"choices": [{"delta": {"content": "пишу"}}]},
-        {"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "function": {"arguments": 'lidation"}'}},
-        ]}, "finish_reason": "tool_calls"}]},
-        {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
-    ]
-    body = ("".join(f"data: {json.dumps(p)}\n\n" for p in pieces) + "data: [DONE]\n\n").encode()
-
-    sent: dict = {}
-
-    def transport(request):
-        sent.update(json.loads(request.content))
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
-
-    async def collect():
-        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
-        with patch.object(llm_module, "shared_client", lambda: client), \
-             patch.object(llm_module, "api_key", lambda: "sk-test-key"):
-            try:
-                return [
-                    event
-                    async for event in stream_completion(
-                        AgentSpec(label="кусками", model="stub/model"),
-                        prompt_override=[{"role": "user", "content": "давай"}],
-                        tools=[agent_module.TASK_TOOL],
-                    )
-                ]
-            finally:
-                await client.aclose()
-
-    events = asyncio.run(collect())
-    finish = next(e for e in events if e["type"] == "done")
-    # Собрано по `index`, а не по приходу и не по имени: куски двух вызовов
-    # шли вперемешку, и один и тот же инструмент модель вправе позвать дважды.
-    assert finish["tool_calls"] == [
-        {"id": "call_a", "name": "update_stage", "arguments": '{"stage": "validation"}'},
-        {"id": "call_b", "name": "другой", "arguments": '{"x": 1}'},
-    ], finish["tool_calls"]
-    # Ход, кончившийся вызовом, назван так и провайдером.
-    assert finish["metrics"]["finish_reason"] == "tool_calls", finish["metrics"]
-    # Текст, пришедший вперемешку с вызовом, не потерян.
-    assert finish["text"] == "пишу", finish["text"]
-    # И объявление уехало в теле запроса тем же ключом, каким его ждёт
-    # OpenRouter, — вместе с тремя правилами тела.
-    assert [t["function"]["name"] for t in sent["tools"]] == [TASK_TOOL_NAME], sent.get("tools")
-    assert not _body_rules(sent), _body_rules(sent)
-
-    return (
-        "инструмент объявлен на работе и проверке и не объявлен на планировании "
-        "и готове; разрешённый переход применён, записан в базу и помечен "
-        "«агент»; запрещённый не применён — состояние прежнее, модель получила "
-        "довод, журнал строку «отклонено», человек строку под ответом; из "
-        "планирования инструмент не выпустил; не позвала, позвала с кривым "
-        "аргументом и позвала тем же этапом — не произошло ничего и журнал "
-        "молчит; предел удержал обмен на трёх обращениях; 7 токенов двух "
-        "оборотов сложились в 14 при двух сообщениях; вызов из настоящего "
-        "потока собрался по index из шести кусков двух вызовов; проверка "
-        "вернула задачу в работу и она же её закрыла; новое состояние "
-        "и журнал уехали кадром done, а в start стоял прежний этап"
+        "блок задачи едет с первого обмена и на планировании тоже; этап "
+        "переключает человек своей ручкой, и она отдаёт состояние, строки "
+        "блока, достижимые этапы и журнал; прыжок через этап отбит 409 "
+        "с доводом и записан отклонённым, незнакомый этап — 400; правка "
+        "текста этапа не принимает — 400, а набранное руками побеждает "
+        "зашитое; проверка вернула задачу в работу, из «готова» выхода нет; "
+        "инструкции у четырёх этапов разные и все просят результат, а не "
+        "рассказ; семь строк журнала, этап и шаг пережили переоткрытие "
+        "файла и уехали в ветку целиком"
     )
 
 
