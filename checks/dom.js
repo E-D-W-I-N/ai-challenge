@@ -482,25 +482,20 @@ function buildServer(options) {
     // Не задана — сводка, с неё служебные вызовы начались.
     service: (options && options.service) || null,
     // Врезка рабочей памяти: готовая строка или null. Своя, а не часть
-    // `service`, потому что и на сервере она своя: её ведёт агент при любом
-    // варианте обрезки, а не заказывает стратегия. Задана — значит вызов
-    // на ведение памяти на этом обмене был, и кадр `compressing` про него
-    // приходит первым, ровно как у сервера.
+    // `service`, потому что и на сервере она своя: записи вписывает человек,
+    // и едут они при любом варианте обрезки, а не по заказу стратегии.
+    // Служебного вызова за ней нет — и кадра `compressing` про неё тоже.
     facts: (options && options.facts) || null,
     // Долговременная память: готовая врезка строкой или null. Слой глобальный
-    // и наполняется руками, поэтому у стенда он один на все чаты — а вот
-    // едет ли он в промпт, решает выключатель самого чата (`memory`), ровно
-    // как на сервере.
+    // и наполняется руками, поэтому у стенда он один на все чаты.
     memory: (options && options.memory) || null,
     // Записи долговременной памяти: список на всю базу, как на сервере, и
     // не привязанный ни к одному чату. Врезка выше — уже готовая строка,
     // а это то, что вкладка «Память» показывает, добавляет и удаляет.
-    // Автор по умолчанию — человек: другого пути в этот слой до сих пор
-    // не было, и той же умолчальной пометкой миграция метит старые записи
-    // живой базы. Заданный в посеве не трогаем: им проверяется счётчик
-    // новых записей агента.
+    // Автора у записи нет: пишет в этот слой только человек, и поле,
+    // у которого одно значение, не различало бы ничего.
     records: ((options && options.records) || []).map((seed, i) => ({
-      seq: i + 1, author: "human", at: i, ...seed,
+      seq: i + 1, at: i, ...seed,
     })),
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
@@ -537,9 +532,7 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  // Выключатель долговременной памяти живёт здесь же: наружу он едет тем же
-  // путём, что стратегия, и умолчание у него такое же непустое — «on».
-  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null, memory: "on" };
+  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
 
   const blank = (id, label) => ({
     id,
@@ -579,53 +572,22 @@ function buildServer(options) {
   let issuedWorking = 0;
   Object.entries((options && options.working) || {}).forEach(([label, seed]) => {
     state.working[label] = {
-      // Автор по умолчанию — агент: пока писал только он, и посев без автора
-      // значит «эту завёл служебный вызов». Заданный в посеве не трогаем:
-      // им проверяется, что запись человека видна наравне с агентской.
       records: (seed.records || []).map((record, i) => ({
-        seq: (issuedWorking += 1), author: "agent", at: i, ...record,
+        seq: (issuedWorking += 1), at: i, ...record,
       })),
-      upto: seed.upto || 0,
       summaries: seed.summaries || [],
-      // Что агент запишет на очередном обмене: по записи за обмен, как на
-      // сервере, где ведение памяти зовётся на каждом. Пусто — значит этот
-      // чат ничего не ведёт, и счётчики прежних проверок не поедут.
-      //
-      // Очередей две, потому что слоя два: **один** служебный вызов ведёт
-      // и рабочую память, и долговременную, и «что приехало нового» без
-      // второго слоя проверялось бы наполовину.
-      writes: (seed.writes || []).map((record) => ({ ...record })),
-      remembers: (seed.remembers || []).map((record) => ({ ...record })),
     };
   });
 
-  // Сколько записей обоих слоёв завёл служебный вызов — то же число, что
-  // считает `Agent.records_by_agent`: рабочие записи этого чата плюс
-  // долговременные, и только агентские. Едет он с самим чатом, а не отдельной
-  // ручкой, поэтому и здесь его отдаёт каждый ответ про чат: собери стенд это
-  // число в одном месте из трёх — вкладка получала бы его то с обмена, то нет.
-  // Числа два, а не одно: области слоёв разные — рабочая память живёт в чате,
-  // долговременная одна на всю базу, — и сложенное число вкладка не смогла бы
-  // разделить обратно.
-  const byAgent = (agent) => {
-    const working = state.working[agent.label];
-    const mine = ((working && working.records) || [])
-      .filter((record) => record.author === "agent").length;
-    return {
-      working: mine,
-      long_term: state.records.filter((record) => record.author === "agent").length,
-    };
-  };
-
-  // Чат так, как его отдаёт сервер: с числом агентских записей поверх конфига.
-  const view = (agent) => ({ ...agent, records_by_agent: byAgent(agent) });
+  // Чат так, как его отдаёт сервер.
+  const view = (agent) => ({ ...agent });
 
   // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
   // пустой — ровно как на сервере.
   const workingOf = (agent) => {
     const have = state.working[agent.label];
     if (have) return have;
-    state.working[agent.label] = { records: [], upto: 0, summaries: [], writes: [], remembers: [] };
+    state.working[agent.label] = { records: [], summaries: [] };
     return state.working[agent.label];
   };
 
@@ -720,9 +682,9 @@ function buildServer(options) {
   //
   // Врезка долговременной памяти этого чата — или null. Одно условие на три
   // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
-  const memoryInsert = (agent) => (agent.memory === "off" ? null : state.memory);
+  const memoryInsert = () => state.memory;
 
-  const factsInsert = (agent) => (agent.memory === "off" ? null : state.facts);
+  const factsInsert = () => state.facts;
 
   // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
   // одним ответом. Формула слота здесь не считается, а берётся из длины уже
@@ -739,12 +701,12 @@ function buildServer(options) {
     const slots = { memory_at: null, working_at: null, summary_at: null };
     if (agent.system) messages.push({ role: "system", content: agent.system });
 
-    const memory = memoryInsert(agent);
+    const memory = memoryInsert();
     if (memory) {
       slots.memory_at = messages.length;
       messages.push({ role: "user", content: memory });
     }
-    const facts = factsInsert(agent);
+    const facts = factsInsert();
     if (facts) {
       slots.working_at = messages.length;
       messages.push({ role: "user", content: facts });
@@ -816,35 +778,12 @@ function buildServer(options) {
     agent.history_len = agent.transcript.length;
     agent.usage_total = sumUsage(agent.transcript);
 
-    // Ведение памяти: агент дописывает свою запись — по одной за обмен, как
-    // на сервере, где служебный вызов идёт на каждом. Записи человека он
-    // не трогает ни правкой, ни удалением, и стенд их тоже не трогает.
-    // Чат без посева `writes` не ведёт ничего: счётчики прежних проверок
-    // от этого не едут.
-    const written = workingOf(agent);
-    if (agent.memory !== "off" && written.writes.length) {
-      const next = written.writes.shift();
-      written.records.push({
-        seq: (issuedWorking += 1), author: "agent",
-        at: written.records.length, ...next,
-      });
-    }
-    // Тот же вызов кладёт запись и в долговременный слой — он глобальный,
-    // и чат ему не владелец, а писатель наравне с человеком.
-    if (agent.memory !== "off" && written.remembers.length) {
-      const next = written.remembers.shift();
-      state.records.push({
-        seq: (issuedMemory += 1), author: "agent",
-        at: state.records.length, ...next,
-      });
-    }
-
     // Кадр `metrics` настоящий сервер шлёт только когда числа пришли:
     // пустого кадра с `metrics: null` там не бывает, и здесь его тоже нет.
     const frames = [
       // Место врезки в промпте и чем она занята называет сервер — клиент не
-      // разбирает текст сообщений.
-      ...(factsInsert(agent) ? [{ event: "compressing", agent: agent.id, strategy: "facts" }] : []),
+      // разбирает текст сообщений. Кадр `compressing` приходит только
+      // на сворачивание: служебный вызов на обмене остался один.
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "delta", text: state.reply, metrics: null },
@@ -873,7 +812,6 @@ function buildServer(options) {
       ...(failed.metrics || {}),
     };
     const frames = [
-      ...(factsInsert(agent) ? [{ event: "compressing", agent: agent.id, strategy: "facts" }] : []),
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
       { event: "error", agent: agent.id, message: failed.message, metrics },
@@ -943,7 +881,7 @@ function buildServer(options) {
       // Автор в теле не спрашивается и прийти оттуда не может: его ставит
       // путь, которым запись попала в память. Ручка человека — человеком.
       const record = { seq: (issuedMemory += 1), ...parsed.value,
-                       author: "human", at: state.records.length };
+                       at: state.records.length };
       state.records.push(record);
       return json(record);
     }
@@ -956,7 +894,7 @@ function buildServer(options) {
       if (!record) return fail(404, "записи памяти " + seq + " нет");
       const parsed = recordBody(body, MEMORY_KINDS, true);
       if (parsed.error) return parsed.error;
-      Object.assign(record, parsed.value, { author: "human" });
+      Object.assign(record, parsed.value);
       return json(record);
     }
     if (memoryMatch && method === "DELETE") {
@@ -998,10 +936,10 @@ function buildServer(options) {
       state.agents.push(child);
       return json({ created: 1, live: state.agents.length, agents: [view(child)] });
     }
-    // Три слоя разом — тем же составом, что у сервера: счётчик сообщений,
-    // записи и сводки этого чата без метрик, выключатель чата и общий список.
-    // Записи приходят с номером и автором, как у сервера: номер — ключ, по
-    // которому запись правят, автор — кто её сделал.
+    // Три слоя разом — тем же составом, что у сервера: счётчик сообщений
+    // и сводки этого чата, его записи о задаче и общий на всю базу список.
+    // Сводки едут с краткосрочным слоем, а не с рабочей памятью: сводка
+    // не запомненное, а чем заменено то, что не уехало дословно.
     if (tail === "/memory" && method === "GET") {
       // Ручка умеет и отказать — занятая база отвечает 503, — и без этого
       // ветка «слои не доехали» через интерфейс ненаблюдаема: вкладке тогда
@@ -1009,13 +947,12 @@ function buildServer(options) {
       if (state.failLayers) return fail(503, "база занята: попробуйте ещё раз");
       const working = workingOf(agent);
       return json({
-        short_term: { messages: agent.history_len },
-        working: {
-          records: working.records,
-          upto: working.upto || 0,
+        short_term: {
+          messages: agent.history_len,
           summaries: working.summaries || [],
         },
-        long_term: { enabled: agent.memory !== "off", records: state.records },
+        working: { records: working.records },
+        long_term: { records: state.records },
       });
     }
     // ── рабочая память: ручки под чатом, набор тот же, что у долговременной ──
@@ -1025,15 +962,14 @@ function buildServer(options) {
     // пустое тело правки 400, чужой номер 404.
     if (tail === "/working" && method === "GET") {
       const working = workingOf(agent);
-      return json({ total: working.records.length, records: working.records,
-                    upto: working.upto || 0 });
+      return json({ total: working.records.length, records: working.records });
     }
     if (tail === "/working" && method === "POST") {
       const parsed = recordBody(body, WORKING_KINDS, false);
       if (parsed.error) return parsed.error;
       const working = workingOf(agent);
       const record = { seq: (issuedWorking += 1), ...parsed.value,
-                       author: "human", at: working.records.length };
+                       at: working.records.length };
       working.records.push(record);
       return json(record);
     }
@@ -1045,9 +981,7 @@ function buildServer(options) {
       if (!record) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
       const parsed = recordBody(body, WORKING_KINDS, true);
       if (parsed.error) return parsed.error;
-      // Правка руками метит запись человеком, даже если завёл её служебный
-      // вызов: с этой минуты он её не трогает.
-      Object.assign(record, parsed.value, { author: "human" });
+      Object.assign(record, parsed.value);
       return json(record);
     }
     if (workingMatch && method === "DELETE") {

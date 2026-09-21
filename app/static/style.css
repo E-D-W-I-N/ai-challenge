@@ -609,19 +609,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
   transition: background .12s ease, color .12s ease;
 }
 .tab.active { background: var(--bg); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
-/* Сколько записей агент завёл с прошлого открытия вкладки «Память». Числом,
-   а не точкой: «что-то появилось» и «появилось три» — разные новости, и
-   вторая говорит, стоит ли открывать сейчас. */
-.tab-count {
-  margin-left: 5px;
-  padding: 0 5px;
-  border-radius: 7px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
 
 .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 14px 14px; }
 .tab-page { display: flex; flex-direction: column; gap: 12px; }
@@ -733,25 +720,6 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   letter-spacing: .05em;
   text-transform: uppercase;
   color: var(--faint);
-}
-/* Кто завёл запись — словами и мелко: строка важна, но читают её после самой
-   записи. Пометка «новая» стоит там же: число на вкладке говорит «сколько»,
-   а она — «какие именно». */
-.mem-who {
-  flex: 0 0 auto;
-  padding-top: 2px;
-  font-size: 10px;
-  letter-spacing: .03em;
-  color: var(--faint);
-}
-.mem-fresh {
-  margin-left: 5px;
-  padding: 0 4px;
-  border-radius: 6px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  color: var(--accent);
-  font-weight: 650;
 }
 /* Правка записи на месте: поле встаёт ровно туда, где стоял текст. */
 /* Поле текста и список типов — один блок на месте показанной строки: правится

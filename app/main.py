@@ -23,14 +23,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm
-from .agent import BY_HUMAN, SAMPLING_FIELDS, Agent, AgentBusyError
+from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .schema import (
     CONTEXT_FIELDS,
     CONTEXT_NUMBERS,
-    MEMORY_CHOICES,
     MEMORY_KINDS,
     STRATEGIES,
     WORKING_KINDS,
@@ -248,21 +247,20 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
 
 
 def _context_fields(payload: dict, where: str = "") -> dict:
-    """Стратегия, окно памяти, порог сжатия и выключатель долговременной памяти.
+    """Стратегия, окно памяти и порог сжатия.
 
     Числа разбираются как параметры сэмплирования: `keep_last = null` значит
     «резать нечем» и в модель уезжает вся история — это не то же самое, что
     `keep_last = 0` («не оставлять как есть ничего»), и разница обязана
     доезжать до агента целой. Стратегия — из списка: чужое значение
     отбрасывается здесь, на границе, чтобы дальше по стеку его не встретить.
+
+    Выключателя памяти здесь больше нет: память ведётся всегда. Поле,
+    присланное старым клиентом, отбрасывается молча — `_parse_spec` берёт
+    только то, что разобрано, а не всё тело.
     """
     values: dict = {
         "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
-        # Выключатель долговременной памяти разбирается тем же способом и
-        # здесь же: он часть того, что уедет в промпт, — просто решает это
-        # не про историю, а про слой поверх неё. Умолчание `on` безопасно:
-        # пустая память неотличима от отсутствующей.
-        "memory": _choice_field(payload, "memory", MEMORY_CHOICES, "on", where),
     }
     for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
@@ -611,18 +609,12 @@ async def add_memory(payload: dict = Body(...)) -> dict:
     `{"kind": ..., "content": "..."}` — оба поля обязательны, тип без
     умолчания (см. `_kind_field`).
 
-    Автор в теле не спрашивается и прийти оттуда не может: «кто записал» —
-    это про путь, которым запись попала в память, а не про то, кем назвался
-    запрос. Ручка человека метит человеком, служебный вызов — собой.
-
     Ответ — записанная строка целиком, с номером от базы: клиенту незачем
     перечитывать список, чтобы узнать, что у него получилось. И это именно
     записанное, а не присланное: `redact()` чистит текст по дороге в базу.
     """
     _record_body(payload, ("kind", "content"))
-    return REGISTRY.store.add_memory(
-        _kind_field(payload), _content_field(payload), BY_HUMAN
-    )
+    return REGISTRY.store.add_memory(_kind_field(payload), _content_field(payload))
 
 
 @app.patch("/api/memory/{seq}")
@@ -631,14 +623,6 @@ async def edit_memory(seq: int, payload: dict = Body(...)) -> dict:
     Разбор тела — общий с рабочей памятью (`_record_body`): пустое тело
     400, лишнее поле 400, тип без умолчания.
 
-    Правка руками метит запись человеком, даже если завёл её служебный вызов:
-    с этой минуты она не его, и переписать её обратно он не вправе — иначе
-    правка жила бы до ближайшего обмена.
-
-    Править и удалять человек может **любую** запись, в том числе агентскую:
-    иначе ошибку служебного вызова нечем было бы исправить, а список рос бы
-    записями, которые никто не вправе убрать. Ограничение здесь
-    одностороннее, и это не симметрия ради симметрии — это разные стороны.
     """
     _record_body(payload, ("kind", "content"))
     if not payload:
@@ -658,7 +642,6 @@ async def edit_memory(seq: int, payload: dict = Body(...)) -> dict:
         seq,
         kind=_kind_field(payload) if "kind" in payload else current["kind"],
         content=_content_field(payload) if "content" in payload else current["content"],
-        author=BY_HUMAN,
     )
     if record is None:
         raise HTTPException(
@@ -688,28 +671,31 @@ async def agent_memory(agent_id: str) -> dict:
 
     Краткосрочная отдаётся **счётчиком**, а не стенограммой: лента уже едет
     в `GET /api/agents/{id}`, и второй её источник разошёлся бы с первым.
-    Рабочая — записи и сводки без метрик: во что они обошлись, показывают
-    плитки, а здесь вопрос не «сколько стоило», а «что запомнено». Записи
-    целиком, с номером и автором: по номеру их правят, а автор говорит, чья
-    это запись — служебного вызова или своя.
-    Долговременная — выключатель этого чата и общий список: слой один на всю
-    базу, и одинаков он у всех чатов, кроме положения выключателя.
+    Сводки — здесь же, рядом с ней, и это не мелочь расположения: память —
+    то, что пропадёт, если её выключить, а сводка не пропадает никуда.
+    Выключи сворачивание — история цела и сводка соберётся заново; она не
+    запомненное, а **чем заменено** то, что не уехало дословно. Памятью
+    её делал только сосед по разделу.
+
+    Рабочая — записи целиком, с номером: по номеру их правят. Автора у них
+    нет и быть не может — вписывает их только человек, и других авторов
+    в этом слое не бывает.
+
+    Долговременная — общий список: слой один на всю базу и одинаков у всех
+    чатов. Выключателя у него больше нет, и `enabled` отсюда ушло вместе
+    с ним: врезка едет всегда, когда в слое что-то лежит.
     """
     agent = _agent(agent_id)
     return {
-        "short_term": {"messages": len(agent.history)},
-        "working": {
-            "records": list(agent.working["items"]),
-            "upto": agent.working["upto"],
+        "short_term": {
+            "messages": len(agent.history),
             "summaries": [
                 {"seq": i, "upto": item["upto"], "content": item["content"]}
                 for i, item in enumerate(agent.summaries)
             ],
         },
-        "long_term": {
-            "enabled": agent.keeps_memory(),
-            "records": REGISTRY.store.list_memory(),
-        },
+        "working": {"records": list(agent.working)},
+        "long_term": {"records": REGISTRY.store.list_memory()},
     }
 
 
@@ -717,8 +703,8 @@ async def agent_memory(agent_id: str) -> dict:
 #
 # Ручки под чатом, в отличие от долговременных: область рабочей памяти — сам
 # разговор, и она умирает вместе с ним. Набор тот же, каким правится
-# долговременная, плюс правка: запись здесь ведёт ещё и служебный вызов, и
-# поправить его формулировку — самое частое, что с ней делают.
+# долговременная: пишет в оба слоя один человек, и разной формой они
+# разъехались бы на первой правке.
 #
 # Разбор тела — общий с долговременной памятью: тип обязателен и без
 # умолчания (`_kind_field`), текст непустой (`_content_field`), лишние
@@ -727,26 +713,16 @@ async def agent_memory(agent_id: str) -> dict:
 
 @app.get("/api/agents/{agent_id}/working")
 async def list_working(agent_id: str) -> dict:
-    """Рабочая память этого чата целиком: записи и докуда их дочитало
-    извлечение.
-
-    `upto` едет рядом с записями, потому что вопрос «что запомнено» без него
-    неполон: он же зажимает срез промпта, и раздел, назвавший записи без
-    него, не смог бы сказать, сколько из истории они собой заменяют.
-    """
+    """Рабочая память этого чата целиком — записи о состоянии задачи."""
     agent = _agent(agent_id)
-    records = list(agent.working["items"])
-    return {"total": len(records), "records": records, "upto": agent.working["upto"]}
+    records = list(agent.working)
+    return {"total": len(records), "records": records}
 
 
 @app.post("/api/agents/{agent_id}/working")
 async def add_working(agent_id: str, payload: dict = Body(...)) -> dict:
     """Новая запись рабочей памяти, сделанная человеком. Тело:
     `{"kind": ..., "content": "..."}` — оба поля обязательны.
-
-    Автор в теле не спрашивается и прийти оттуда не может: «кто записал» —
-    это про путь, которым запись попала в память, а не про то, кем назвался
-    запрос. Ручка человека метит человеком, служебный вызов — собой.
 
     Ответ — записанная строка целиком, с номером от базы: номер и есть то,
     чем эту запись потом правят и удаляют.
@@ -766,8 +742,7 @@ async def edit_working(agent_id: str, seq: int, payload: dict = Body(...)) -> di
     неотличимо от сломанной кнопки. Названное поле проверяется тем же
     валидатором, что и при добавлении, — умолчаний у типа нет и здесь.
 
-    Номер не меняется: он и есть идентичность записи. Правка метит запись
-    человеком — с этой минуты служебный вызов её не трогает.
+    Номер не меняется: он и есть идентичность записи.
     """
     agent = _agent(agent_id)
     _record_body(payload, ("kind", "content"))

@@ -1,12 +1,12 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Восемь таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+Семь таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
 сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
 (счётчики, общие на всю базу), `summaries` (сводки начала разговора),
-`working_memory` (рабочая память чата — записи о состоянии задачи) и
-`working_state` (докуда её дочитало ведение и во что обошлось), `branches`
-(чей потомок этот чат и сколько сообщений он унёс) и `memory`
-(долговременная память — единственная таблица **без** `session_id`).
+`working_memory` (рабочая память чата — записи о состоянии задачи, которые
+вписал человек), `branches` (чей потомок этот чат и сколько сообщений он унёс)
+и `memory` (долговременная память — единственная таблица **без**
+`session_id`).
 Пять свойств, за которыми стоит следить:
 
 * **`session_id` в первичном ключе сообщений**: без него два чата из базы
@@ -118,9 +118,10 @@ CREATE INDEX IF NOT EXISTS summaries_by_session ON summaries(session_id);
 -- * `kind` — тип записи (`WORKING_KINDS`), колонкой по тому же доводу, что
 --   и у `memory`: по нему подписана строка врезки, и разбирать текст обратно
 --   пришлось бы и врезке, и вкладке;
--- * `author` — кто записал: служебный вызов или человек. Это не пометка для
---   красоты, а **инвариант**: извлечение правит только свои записи. Не будь
---   колонки, первая же правка руками исчезла бы на следующем обмене.
+-- Колонки `author` здесь нет: пишет в этот слой **только человек**, через
+-- ручки под чатом. Она появилась, когда список вёл ещё и служебный вызов,
+-- и стерегла «чужую запись он не трогает»; вызова не стало, сторон осталось
+-- одна, и поле перестало различать что бы то ни было. Снимает его миграция.
 --
 -- Индекс по `session_id` нужен, в отличие от `memory`: та читается целиком,
 -- а эта всегда одним чатом.
@@ -132,37 +133,10 @@ CREATE TABLE IF NOT EXISTS working_memory (
     session_id TEXT NOT NULL,
     kind       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    author     TEXT NOT NULL,
     at         REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS working_by_session ON working_memory(session_id);
-
--- Чем занято извлечение: докуда оно дочитало историю этого чата и во что
--- обошлись все его вызовы. Отдельной таблицей, а не колонками в
--- `working_memory`, и довод ровно тот, по которому записи перестали быть
--- снимком: это числа **про вызов**, а не про запись. У записи, набранной
--- руками, никакого `upto` нет и быть не может, а список, опустевший до нуля
--- записей, обязан помнить прочитанное — иначе следующее извлечение
--- перечитало бы разговор с начала, а зажим среза («резать не дальше
--- прочитанного») на пустом списке обнулился бы молча.
---
--- `upto` — сколько первых реплик истории уже прочитано извлечением. Он и
--- зажимает срез промпта (`Agent.working_cover`): срезано ровно то, что
--- память прочитала, а не то, что хотелось бы срезать. Он же говорит
--- извлечению, с какой реплики читать дальше.
---
--- `metrics` — **накопленные** числа всех вызовов на извлечение этого чата:
--- вызов идёт на каждом обмене, а итог по чату обязан считать их все.
---
--- Строка одна на чат, поэтому `session_id` первичным ключом. Чистится
--- вместе с записями, теми же тремя путями.
-CREATE TABLE IF NOT EXISTS working_state (
-    session_id TEXT PRIMARY KEY,
-    upto       INTEGER NOT NULL,
-    metrics    TEXT,
-    at         REAL NOT NULL
-);
 
 -- Происхождение чата: чей он потомок и сколько первых сообщений унёс.
 -- Ветка — обычный чат, отдельная строка в `sessions` с копией истории до
@@ -196,13 +170,11 @@ CREATE INDEX IF NOT EXISTS branches_by_parent ON branches(parent_id);
 -- а этот слой общий на всю базу и переживает и удаление чата, и `forget()`.
 -- Чистит его ровно один путь — `clear()`, служебная очистка базы.
 --
--- Наполняют её обе стороны: человек руками и служебный вызов, тот же самый,
--- что ведёт рабочую память. Отсюда и `author` — **инвариант**, а не пометка
--- для красоты: служебный вызов правит только свои записи, а запись человека
--- не трогает ни правкой, ни удалением. Не будь колонки, первая же правка
--- руками исчезла бы на ближайшем обмене. Колонка пришла на живую базу
--- миграцией (`_migrate`): у старых записей автор — человек, потому что
--- другого пути в этот слой до сих пор не было.
+-- Наполняет её **только человек**: он явно выбирает, что переживёт задачу.
+-- Колонки `author` здесь тоже нет — она прожила день, пока в слой писал ещё
+-- и служебный вызов, и ушла вместе с ним: когда пишущая сторона одна, «кто
+-- записал» не различает ничего. Снимает её миграция (`_migrate`), и записи
+-- при этом остаются на месте.
 --
 -- `seq` — AUTOINCREMENT, а не номера от нуля, как у истории и сводок.
 -- Те переписываются целиком (`DELETE` плюс `executemany`), потому что они
@@ -223,7 +195,6 @@ CREATE TABLE IF NOT EXISTS memory (
     seq     INTEGER PRIMARY KEY AUTOINCREMENT,
     kind    TEXT NOT NULL,
     content TEXT NOT NULL,
-    author  TEXT NOT NULL DEFAULT 'human',
     at      REAL NOT NULL
 );
 """
@@ -279,21 +250,19 @@ def _memory_row(row: sqlite3.Row) -> dict:
         "seq": row["seq"],
         "kind": row["kind"],
         "content": row["content"],
-        "author": row["author"],
         "at": row["at"],
     }
 
 
 def _working_row(row: sqlite3.Row) -> dict:
     """Запись рабочей памяти в том виде, в каком её ждут и ручка, и врезка
-    в промпт, и извлечение. Одна форма на все чтения — довод тот же, что
-    у `_memory_row`: разъедься они, вкладка показывала бы одно, а в модель
-    уезжало бы другое."""
+    в промпт. Одна форма на оба чтения — довод тот же, что у `_memory_row`:
+    разъедься они, вкладка показывала бы одно, а в модель уезжало бы
+    другое."""
     return {
         "seq": row["seq"],
         "kind": row["kind"],
         "content": row["content"],
-        "author": row["author"],
         "at": row["at"],
     }
 
@@ -427,38 +396,46 @@ class Store:
 
         `CREATE TABLE IF NOT EXISTS` заводит недостающие таблицы, но колонку
         в существующую не добавляет: первое же чтение упало бы на «no such
-        column: author», а удалить файл нельзя — в долговременной памяти лежит
-        набранное руками. Отсюда единственная здешняя обязанность: довести
-        старую базу до той схемы, которую описывает `SCHEMA`.
+        column», а удалить файл нельзя — в памяти лежит набранное руками.
+        Отсюда единственная здешняя обязанность: довести старую базу до той
+        схемы, которую описывает `SCHEMA`, — и убрать из неё то, чего в схеме
+        больше нет.
 
         Идёт через `tx()`, как любая запись, — и чтение состава колонок тоже:
         `ALTER` и `DROP` меняют файл наравне с `INSERT`, и путь записи мимо
         обёртки был бы путём мимо `redact()`.
 
-        Умолчание у нового автора — человек: другого пути в долговременную
-        память до сих пор не было, и назвать старые записи агентскими значило
-        бы разрешить служебному вызову переписать то, что человек набрал
-        руками.
+        Снимает она и лишнее: колонку авторства у обоих слоёв памяти
+        и таблицу состояния ведения. Отличать автора стало не от кого —
+        пишет в память только человек, — а вести её некому.
         """
         done: list[str] = []
         with self.tx() as conn:
-            columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(memory)").fetchall()
-            }
-            if columns and "author" not in columns:
-                conn.execute(
-                    "ALTER TABLE memory ADD COLUMN author TEXT NOT NULL DEFAULT 'human'"
-                )
-                done.append("memory.author")
-            # Снимок выписки Дня 10: рабочая память переехала в
-            # `working_memory` записями, и ни один путь кода сюда больше
-            # не ходит. Содержимое терять не жаль — снимок был производным
-            # от истории и собрался бы заново.
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'facts'"
-            ).fetchone():
-                conn.execute("DROP TABLE facts")
-                done.append("facts")
+            # Колонка авторства прожила один день — ровно тот, в который
+            # в оба слоя памяти писал ещё и служебный вызов. Вызова не стало,
+            # писать осталось некому, кроме человека, и поле перестало
+            # различать хоть что-нибудь. Снимаем — но **только колонку**:
+            # записи под ней набраны руками, и терять их нельзя.
+            for table in ("memory", "working_memory"):
+                columns = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if "author" in columns:
+                    conn.execute(f"ALTER TABLE {table} DROP COLUMN author")
+                    done.append(f"{table}.author")
+            # Две таблицы, в которые больше не ходит ни один путь кода:
+            # снимок выписки Дня 10 (`facts`) и состояние ведения памяти
+            # (`working_state`) — докуда служебный вызов дочитал историю и
+            # во что обошёлся. Вызова не стало; читать некому, платить не за
+            # что, и зажимать окно этим числом больше не надо. Содержимого
+            # не жаль: обе были производными от истории.
+            for table in ("facts", "working_state"):
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone():
+                    conn.execute(f"DROP TABLE {table}")
+                    done.append(table)
         return done
 
     def close(self) -> None:
@@ -604,7 +581,7 @@ class Store:
         таблицы одной транзакцией. False — его и не было.
 
         Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`,
-        `working_memory`, `working_state` и `branches` руками — сводка,
+        `working_memory` и `branches` руками — сводка,
         цели и происхождение удалённого разговора достанутся чату с тем же id.
 
         Долговременная память (`memory`) здесь не трогается намеренно: чат ей
@@ -620,7 +597,6 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM working_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
@@ -640,7 +616,6 @@ class Store:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM working_memory")
-            conn.execute("DELETE FROM working_state")
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM sessions")
@@ -764,14 +739,14 @@ class Store:
         """
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT seq, kind, content, author, at FROM working_memory "
+                "SELECT seq, kind, content, at FROM working_memory "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
         return [_working_row(row) for row in rows]
 
     def add_working(
-        self, session_id: str, kind: str, content: str, author: str, at: float | None = None
+        self, session_id: str, kind: str, content: str, at: float | None = None
     ) -> dict:
         """Добавляет запись и отдаёт её целиком — вместе с номером от базы.
 
@@ -786,15 +761,15 @@ class Store:
         stamp = time.time() if at is None else at
         with self.tx() as conn:
             row = conn.execute(
-                "INSERT INTO working_memory (session_id, kind, content, author, at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "RETURNING seq, kind, content, author, at",
-                (session_id, kind, content, author, stamp),
+                "INSERT INTO working_memory (session_id, kind, content, at) "
+                "VALUES (?, ?, ?, ?) "
+                "RETURNING seq, kind, content, at",
+                (session_id, kind, content, stamp),
             ).fetchone()
         return _working_row(row)
 
     def update_working(
-        self, session_id: str, seq: int, *, kind: str, content: str, author: str,
+        self, session_id: str, seq: int, *, kind: str, content: str,
         at: float | None = None,
     ) -> dict | None:
         """Переписывает одну запись по номеру. `None` — записи с таким номером
@@ -812,10 +787,10 @@ class Store:
         stamp = time.time() if at is None else at
         with self.tx() as conn:
             row = conn.execute(
-                "UPDATE working_memory SET kind = ?, content = ?, author = ?, at = ? "
+                "UPDATE working_memory SET kind = ?, content = ?, at = ? "
                 "WHERE seq = ? AND session_id = ? "
-                "RETURNING seq, kind, content, author, at",
-                (kind, content, author, stamp, int(seq), session_id),
+                "RETURNING seq, kind, content, at",
+                (kind, content, stamp, int(seq), session_id),
             ).fetchone()
         return None if row is None else _working_row(row)
 
@@ -835,60 +810,12 @@ class Store:
             )
             return bool(cursor.rowcount)
 
-    def load_working_state(self, session_id: str) -> dict:
-        """Докуда извлечение дочитало историю этого чата и во что обошлось.
-
-        Строки нет — состояние пустое, но не `None`: «ещё ни разу не
-        извлекали» это рабочее состояние, а не отсутствие данных, и звать
-        его надо так же, как свежий чат.
-        """
-        with self.reading() as conn:
-            row = conn.execute(
-                "SELECT upto, metrics, at FROM working_state WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return {"upto": 0, "metrics": None, "at": None}
-        return {
-            "upto": row["upto"],
-            "metrics": _loads(row["metrics"], None) if row["metrics"] else None,
-            "at": row["at"],
-        }
-
-    def save_working_state(self, session_id: str, *, upto: int, metrics=None, at=None) -> None:
-        """Записывает состояние извлечения. Строка на чат одна, поэтому
-        `ON CONFLICT`: у второго вызова обновлять, а не падать первичным
-        ключом."""
-        with self.tx() as conn:
-            conn.execute(
-                """
-                INSERT INTO working_state (session_id, upto, metrics, at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    upto    = excluded.upto,
-                    metrics = excluded.metrics,
-                    at      = excluded.at
-                """,
-                (
-                    session_id,
-                    int(upto),
-                    _dumps(metrics) if metrics else None,
-                    time.time() if at is None else at,
-                ),
-            )
-
     def clear_working(self, session_id: str) -> None:
-        """Стирает рабочую память чата целиком — и записи, и состояние
-        извлечения, одной транзакцией.
-
-        Обе таблицы разом, потому что забытый разговор не вправе оставить
-        ни того, ни другого: оставленные записи рассказали бы следующему
-        разговору его цели, а оставленный `upto` дал бы срезать начало,
-        которого память никогда не видела.
-        """
+        """Стирает рабочую память чата: забытый разговор не вправе оставить
+        следующему свои цели и ограничения — врезка встаёт в промпт, пока
+        в памяти есть хоть одна запись."""
         with self.tx() as conn:
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM working_state WHERE session_id = ?", (session_id,))
 
     # --- происхождение чата ---------------------------------------------------
 
@@ -942,7 +869,7 @@ class Store:
 
     # --- долговременная память ------------------------------------------------
 
-    def add_memory(self, kind: str, content: str, author: str, at: float | None = None) -> dict:
+    def add_memory(self, kind: str, content: str, at: float | None = None) -> dict:
         """Добавляет запись в долговременную память и отдаёт её целиком —
         вместе с номером, который выдала база.
 
@@ -957,14 +884,14 @@ class Store:
         stamp = time.time() if at is None else at
         with self.tx() as conn:
             row = conn.execute(
-                "INSERT INTO memory (kind, content, author, at) VALUES (?, ?, ?, ?) "
-                "RETURNING seq, kind, content, author, at",
-                (kind, content, author, stamp),
+                "INSERT INTO memory (kind, content, at) VALUES (?, ?, ?) "
+                "RETURNING seq, kind, content, at",
+                (kind, content, stamp),
             ).fetchone()
         return _memory_row(row)
 
     def update_memory(
-        self, seq: int, *, kind: str, content: str, author: str, at: float | None = None
+        self, seq: int, *, kind: str, content: str, at: float | None = None
     ) -> dict | None:
         """Переписывает одну запись памяти по номеру. `None` — записи с таким
         номером нет.
@@ -974,16 +901,13 @@ class Store:
         в запросе завёл бы второе место, где решается, чем пустое поле
         отличается от неназванного.
 
-        Кому можно переписывать чужое, решает не этот метод: запись человека
-        бережёт `Agent.apply_memory_edits`, а ручка правит любую — и метит
-        правку человеком.
         """
         stamp = time.time() if at is None else at
         with self.tx() as conn:
             row = conn.execute(
-                "UPDATE memory SET kind = ?, content = ?, author = ?, at = ? "
-                "WHERE seq = ? RETURNING seq, kind, content, author, at",
-                (kind, content, author, stamp, int(seq)),
+                "UPDATE memory SET kind = ?, content = ?, at = ? "
+                "WHERE seq = ? RETURNING seq, kind, content, at",
+                (kind, content, stamp, int(seq)),
             ).fetchone()
         return None if row is None else _memory_row(row)
 
@@ -995,23 +919,9 @@ class Store:
         """
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT seq, kind, content, author, at FROM memory ORDER BY seq"
+                "SELECT seq, kind, content, at FROM memory ORDER BY seq"
             ).fetchall()
         return [_memory_row(row) for row in rows]
-
-    def count_memory_by(self, author: str) -> int:
-        """Сколько записей долговременной памяти сделал этот автор.
-
-        Число, а не список: спрашивают его на каждый просмотр чата, чтобы
-        сказать «сколько нового завёл агент», и вычитывать ради одного числа
-        весь слой незачем. Второго источника самих записей здесь тоже нет
-        нарочно — список отдаёт `list_memory`, и разойтись им не на чем.
-        """
-        with self.reading() as conn:
-            row = conn.execute(
-                "SELECT count(*) AS n FROM memory WHERE author = ?", (author,)
-            ).fetchone()
-        return int(row["n"])
 
     def delete_memory(self, seq: int) -> bool:
         """Стирает одну запись памяти. False — записи с таким номером не было.
