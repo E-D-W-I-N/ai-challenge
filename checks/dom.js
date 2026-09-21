@@ -595,28 +595,33 @@ function buildServer(options) {
   // независим от сервера. Копия внутри стенда при этом **одна**: строки
   // блока собирает `taskLines`, и её ответом живут и ручка, и кадр `start`.
   const STAGE_RULE =
-    "не описывай процесс и не сообщай о смене этапа — про этап говорит интерфейс";
+    "Не описывай процесс и не сообщай о смене этапа — про этап говорит интерфейс.";
   const TASK_PLAN = {
     planning: {
       step: "собрать требования и предложить план",
       expecting: "ваше подтверждение плана",
-      guide: "выдай сам план, списком шагов; " + STAGE_RULE,
+      rule: "Сейчас этап планирования. Выдай план шагов списком. "
+        + "Не пиши код и не выполняй задачу, пока человек не переключит этап. "
+        + STAGE_RULE,
     },
     execution: {
       step: "выполнять утверждённый план",
       expecting: "результат работы",
-      guide: "выдай сам результат: текст, код, описание; " + STAGE_RULE,
+      rule: "Сейчас этап работы. План утверждён — выполняй его и выдавай сам "
+        + "результат: текст, код, описание. " + STAGE_RULE,
     },
     validation: {
       step: "проверить сделанное",
       expecting: "перечень проблем",
-      guide: "перечисли конкретные проблемы в сделанном выше, пунктами; "
-        + "нет проблем — так и скажи; " + STAGE_RULE,
+      rule: "Сейчас этап проверки. Перечисли конкретные проблемы в сделанном "
+        + "выше, пунктами; нет проблем — так и скажи. Новой работы не начинай. "
+        + STAGE_RULE,
     },
     done: {
       step: "подвести итог работы",
       expecting: "итог",
-      guide: "подведи итог: что сделано и что осталось за рамками; " + STAGE_RULE,
+      rule: "Сейчас этап «готово». Подведи итог: что сделано и что осталось "
+        + "за рамками. Новой работы не начинай. " + STAGE_RULE,
     },
   };
   const TASK_STAGE_LABELS = {
@@ -625,25 +630,32 @@ function buildServer(options) {
     validation: "проверка",
     done: "готово",
   };
-  const TASK_LINE_LABELS = { step: "сейчас", expecting: "ожидается", guide: "инструкция" };
+  const TASK_LINE_LABELS = { step: "сейчас", expecting: "ожидается" };
 
   // Строки блока задачи — набранное человеком поверх зашитого, ровно как
   // на сервере: тронутое поле говорит своё, нетронутое — то, что говорит
-  // этап. Пустая строка в блок не едет вовсе.
+  // этап. Пустая строка в блок не едет вовсе. Правила этапа здесь нет:
+  // оно распоряжение и едет системным сообщением, а не блоком сведений.
   const taskLines = (task) => {
     const stage = (task && task.stage) || "planning";
     const plan = TASK_PLAN[stage] || {};
     const lines = ["этап: " + (TASK_STAGE_LABELS[stage] || stage)];
-    ["step", "expecting", "guide"].forEach((name) => {
-      const value = (name !== "guide" && task && task[name]) || plan[name] || "";
+    TASK_FIELDS.forEach((name) => {
+      const value = (task && task[name]) || plan[name] || "";
       if (value) lines.push(TASK_LINE_LABELS[name] + ": " + value);
     });
     return lines;
   };
 
+  // Правило этапа — то, что уедет системным сообщением: что на этом этапе
+  // можно и нельзя. Пусто у чата, который задачу не ведёт.
+  const taskRule = (task) =>
+    (TASK_PLAN[(task && task.stage) || "planning"] || {}).rule || "";
+
   const taskView = (task) => ({
     ...task,
     lines: taskLines(task),
+    rule: taskRule(task),
     // Куда отсюда можно — по той же карте, которой переход и разрешают.
     // Полоса приглушает недостижимые, и считать их клиенту нечем: список
     // приезжает готовым.
@@ -801,7 +813,14 @@ function buildServer(options) {
   function promptHead(agent, service) {
     const messages = [];
     const slots = { memory_at: null, working_at: null, summary_at: null };
-    if (agent.system) messages.push({ role: "system", content: agent.system });
+    // Системное сообщение — то, что задал человек: системный промпт чата
+    // и правило этапа, если чат ведёт задачу. Правило дописывается в то же
+    // сообщение через пустую строку, ровно как на сервере, и заводит его
+    // даже у чата **без** системного промпта: номера врезок берутся
+    // из длины собранного начала, и сдвиг тут молчаливый.
+    const rule = agent.workflow === "on" ? taskRule(agent.task) : "";
+    const head = [agent.system, rule].filter(Boolean).join("\n\n");
+    if (head) messages.push({ role: "system", content: head });
 
     const memory = memoryInsert();
     if (memory) {
