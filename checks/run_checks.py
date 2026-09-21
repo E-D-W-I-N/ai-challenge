@@ -368,11 +368,28 @@ def _filled_chat(store, label: str):
 
 
 def _leftovers(store, session_id: str) -> dict:
-    """Что осталось от чата в каждом слое: пустое значение — слой унесён."""
+    """Что осталось от чата в каждом слое: пустое значение — слой унесён.
+
+    Состояние задачи читается **двумя** запросами, и не для красоты:
+    `load_plan` отдаёт `None`, как только исчезла строка `task_state`, —
+    в `task_steps` он не заглядывает вовсе, и клетка таблицы очистки
+    стерегла бы половину слоя. Забытый `DELETE FROM task_steps` проходил
+    зелёным на обоих путях, а `clear()` сносит заодно `meta`, то есть
+    счётчик имён, — осиротевшие шаги достались бы чату с тем же id. Этой
+    самой дырой в этом файле дважды была закрыта чистка рабочей памяти.
+
+    Сырые строки, а не разобранный план: слой пуст тогда, когда пусты обе
+    таблицы, и одно значение на клетку обязано это выражать.
+    """
+    with store.reading() as conn:
+        steps = conn.execute(
+            "SELECT * FROM task_steps WHERE session_id = ? ORDER BY seq", (session_id,)
+        ).fetchall()
+    plan = store.load_plan(session_id)
     return {
         "summaries": store.load_summaries(session_id),
         "working": store.list_working(session_id),
-        "task": store.load_plan(session_id),
+        "task": ([plan] if plan else []) + [tuple(row) for row in steps],
         "branches": store.load_branch(session_id),
         "long_term": store.list_memory(),
         "profile": store.load_profile(),
@@ -3379,6 +3396,36 @@ def check_task_state_machine():
     approved_both, _ = taskplan.apply(both, "approve")
     assert taskplan.stage_of(approved_both)[0] == "validation", approved_both
 
+    # `finish_task` на **неутверждённом** плане: сцена та же — все шаги
+    # `done`, а кнопки не было. Одним вызовом модель закрыла бы задачу,
+    # которую человек не утверждал, и сторож у этого один.
+    try:
+        taskplan.apply(both, "finish_task", {"problems": []})
+        raise AssertionError("finish_task прошёл на неутверждённом плане")
+    except taskplan.PlanError as exc:
+        assert "план ещё не утверждён" in str(exc), str(exc)
+    assert both["finished"] is False, both
+
+    # Незнакомое действие отказано и в самом `apply`: ворота стоят
+    # в `run_tool` (там имена берутся из объявления), но источник истины
+    # переходов обязан отвечать за себя сам — звать его будет не только
+    # обмен, а и каждая новая кнопка.
+    try:
+        taskplan.apply(plan_of(THREE), "плана_нет", {})
+        raise AssertionError("незнакомое действие прошло через apply")
+    except taskplan.PlanError as exc:
+        assert "такого инструмента нет" in str(exc), str(exc)
+
+    # Метки шагов — то, чем план **выглядит** и в промпте, и в ответе каждого
+    # вызова: одной `plan_lines` построены оба. Сотри их, и в каждом промпте
+    # всё выглядело бы несделанным, а текущий шаг не назывался бы вовсе.
+    assert taskplan.plan_lines(ladder["execution"][0]).splitlines() == [
+        "план утверждён: да",
+        "1. [x] раз",
+        "2. [>] два ← в работе",
+        "3. [ ] три",
+    ], taskplan.plan_lines(ladder["execution"][0])
+
     # Пауза ложится поверх **любого** этапа, и проверяется это на двух
     # разных — работа в разгаре и все шаги сделаны: на одном состоянии
     # «пауза при любом списке» держалось бы на нём одном. Снятие паузы
@@ -3441,6 +3488,33 @@ def check_task_state_machine():
         assert "План записан: 3 шагов" in written and "жди кнопки" in written, written
         assert REGISTRY.store.load_plan(chat)["steps"] == THREE, REGISTRY.store.load_plan(chat)
 
+        # --- ворота: пять человеческих действий модели не объявлены ---------
+        #
+        # Сцена выбрана так, чтобы отказ **стерёг**: план ждёт кнопки, и
+        # пройди `approve` через инструмент — модель утвердила бы себе план
+        # сама, а увидеть это было бы неоткуда. На пустом плане тот же вызов
+        # отказали бы по этапу, и утверждение держалось бы на чужом сторожe.
+        assert agent.plan_view()["stage"] == "approval", agent.plan_view()
+        untouched = json.dumps(agent.plan, ensure_ascii=False, sort_keys=True)
+        for human in ("approve", "reopen", "pause", "resume", "reset"):
+            moved, refused = agent.run_tool(human, "{}")
+            assert not moved, (human, refused)
+            assert "это не инструмент модели, а кнопка человека" in refused, refused
+            assert json.dumps(agent.plan, ensure_ascii=False, sort_keys=True) == untouched, (
+                human, agent.plan
+            )
+        assert agent.plan_view()["stage"] == "approval", agent.plan_view()
+
+        # И второй сторож рядом: чату с выключенным процессом инструмент
+        # плана не пишет. Записанный молча, план достался бы чату, который
+        # о нём не спрашивал и в промпт его не берёт.
+        muted = new_agent(client, workflow="off")
+        moved, refused = REGISTRY.require(muted).run_tool(
+            "update_plan", json.dumps({"steps": THREE}, ensure_ascii=False)
+        )
+        assert not moved and "рабочий процесс в этом чате выключен" in refused, refused
+        assert REGISTRY.store.load_plan(muted) is None, REGISTRY.store.load_plan(muted)
+
         approve = client.post(f"/api/agents/{chat}/plan/approve")
         assert approve.status_code == 200, approve.text
         assert approve.json()["plan"]["stage"] == "execution", approve.json()
@@ -3470,7 +3544,18 @@ def check_task_state_machine():
         ):
             moved, refusal = agent.run_tool(name, json.dumps(args, ensure_ascii=False))
             assert not moved, (name, refusal)
-            assert "НЕ выполнен" in refusal and "задача на паузе" in refusal, refusal
+            # Формула отказа проверяется **всеми четырьмя частями**: что
+            # не выполнено и почему, что запрещено утверждать, что допустимо
+            # взамен и каков план сейчас. Причина и врезанный план здесь
+            # различены нарочно: слова «задача на паузе» стоят и в причине,
+            # и спрашивать по ним план значило бы проверять причину дважды,
+            # а про план не спросить вовсе.
+            assert refusal.startswith(
+                f"{name} НЕ выполнен, состояние не изменилось: задача на паузе."
+            ), refusal
+            assert "НЕ утверждай, что это сделано." in refusal, refusal
+            assert "Допустимо: дождаться, пока человек снимет паузу." in refusal, refusal
+            assert "\n1. [ ] собрать требования" in refusal, refusal
         assert json.dumps(agent.plan, ensure_ascii=False, sort_keys=True) == frozen, agent.plan
 
         assert client.post(f"/api/agents/{chat}/plan/pause").status_code == 409, "пауза дважды"
@@ -3544,17 +3629,27 @@ def check_task_state_machine():
 
         # --- отказы: у каждой причины свой текст ----------------------------
         rejected: dict = {}
-        for reason, name, args in (
-            ("пусто", "update_plan", {"steps": []}),
+        names = ", ".join(taskplan.TOOL_NAMES)
+        for reason, name, args, allowed in (
+            ("пусто", "update_plan", {"steps": []}, taskplan.ALLOWED["update_plan"]),
             ("двое в работе", "update_plan",
-             {"steps": steps(("раз", "in_progress"), ("два", "in_progress"))}),
-            ("чужой статус", "update_plan", {"steps": [{"title": "раз", "status": "готово"}]}),
-            ("без заголовка", "update_plan", {"steps": [{"title": "", "status": "pending"}]}),
-            ("чужое имя", "плана_нет", {"steps": THREE}),
+             {"steps": steps(("раз", "in_progress"), ("два", "in_progress"))},
+             taskplan.ALLOWED["update_plan"]),
+            ("чужой статус", "update_plan", {"steps": [{"title": "раз", "status": "готово"}]},
+             taskplan.ALLOWED["update_plan"]),
+            ("без заголовка", "update_plan", {"steps": [{"title": "", "status": "pending"}]},
+             taskplan.ALLOWED["update_plan"]),
+            ("чужое имя", "плана_нет", {"steps": THREE}, f"звать можно {names}"),
         ):
             moved, text = agent.run_tool(name, json.dumps(args, ensure_ascii=False))
             assert not moved, (reason, text)
-            assert "НЕ выполнен" in text and "НЕ утверждай" in text, (reason, text)
+            assert text.startswith(f"{name} НЕ выполнен, состояние не изменилось: "), text
+            assert "НЕ утверждай, что это сделано." in text, (reason, text)
+            # Выход — **дословно** из таблицы, а не пересказ: её семь строк
+            # иначе не названы ни одним утверждением, хотя формулу отказа
+            # CLAUDE.md цитирует целиком.
+            assert f"Допустимо: {allowed}." in text, (reason, text)
+            assert text.endswith("Текущий план:\nплан утверждён: нет\nшагов ещё нет"), text
             assert agent.plan["steps"] == [], (reason, agent.plan)
             rejected[reason] = text
         # Причины называют себя по-разному: схлопни любую ветку в общую —
@@ -3566,6 +3661,73 @@ def check_task_state_machine():
         assert not moved and "НЕ выполнен" in torn, torn
         assert agent.plan == taskplan.empty(), agent.plan
 
+        # --- список короче утверждённого: утверждение снимается -------------
+        #
+        # Иначе так: человек утвердил три шага, модель присылает один со
+        # статусом `done` — двух других просто нет. `approved` остался бы,
+        # этап стал бы `validation`, хвост результата позвал бы дальше,
+        # и следующий вызов закрыл бы задачу. Двух шагов из трёх никто
+        # не делал и никто не отменял.
+        assert agent.run_tool("update_plan", json.dumps({"steps": THREE},
+                                                        ensure_ascii=False))[0]
+        assert client.post(f"/api/agents/{chat}/plan/approve").status_code == 200
+        moved, shorter = agent.run_tool(
+            "update_plan",
+            json.dumps({"steps": [{"title": "собрать требования", "status": "done"}]},
+                       ensure_ascii=False),
+        )
+        assert moved, shorter
+        assert agent.plan["approved"] is False, agent.plan
+        assert agent.plan_view()["stage"] == "approval", agent.plan_view()
+        # И это **названо**: молча вернуть план к ожиданию кнопки значило бы
+        # оставить модель ждать неизвестно чего.
+        assert "Шагов стало меньше, чем утверждал человек" in shorter, shorter
+        # Переименование утверждения не снимает: у шага нет идентификатора,
+        # и сверка по заголовкам читала бы правку формулировки как «удалили
+        # один, добавили другой».
+        assert client.post(f"/api/agents/{chat}/plan/approve").status_code == 200
+        assert agent.run_tool(
+            "update_plan",
+            json.dumps({"steps": [{"title": "собрать требования к оплате", "status": "done"}]},
+                       ensure_ascii=False),
+        )[0]
+        assert agent.plan["approved"] is True, agent.plan
+
+        # --- запись в хранилище раньше памяти -------------------------------
+        #
+        # Занятая база — путь штатный и документированный (`BEGIN IMMEDIATE`,
+        # 503). Упади запись после присваивания — в памяти лежал бы новый
+        # план, в файле старый, и модель получила бы отказ «состояние
+        # не изменилось» с уже изменённым планом под ним.
+        assert agent.plan_view()["stage"] == "validation", agent.plan_view()
+        kept = json.dumps(agent.plan, ensure_ascii=False, sort_keys=True)
+        with patch.object(Store, "save_plan", side_effect=RuntimeError("база занята")):
+            moved, failed = agent.run_tool("finish_task", json.dumps({"problems": []}))
+            assert not moved, failed
+            # И кнопка так же: пауза на этом этапе законна, и упади запись —
+            # человек увидит ошибку, а план в памяти обязан остаться
+            # прежним, иначе следующий обмен уедет приостановленным
+            # по состоянию, которого в файле нет.
+            try:
+                agent.pause_plan()
+                raise AssertionError("пауза прошла при упавшей записи")
+            except RuntimeError:
+                pass
+        assert json.dumps(agent.plan, ensure_ascii=False, sort_keys=True) == kept, agent.plan
+
+        # --- отказ обязан называть выход, которого ещё не сделали -----------
+        #
+        # До причины «problems не список» доходят только с утверждённым
+        # планом и всеми шагами `done` — общий выход по имени действия
+        # советовал бы здесь уже сделанное, а директива без выхода это
+        # тупик, который модель обходит объявлением успеха.
+        moved, stuck = agent.run_tool(
+            "finish_task", json.dumps({"problems": "нет проблем"}, ensure_ascii=False)
+        )
+        assert not moved, stuck
+        assert "передай problems массивом строк" in stuck, stuck
+        assert taskplan.ALLOWED["finish_task"] not in stuck, stuck
+
         # --- список слева: ключ `plan` есть и у выгруженного чата ------------
         #
         # Список строится двумя ветвями кода: живой чат описывает себя сам,
@@ -3573,6 +3735,7 @@ def check_task_state_machine():
         # и сразу после перезапуска сервера весь список приезжал бы
         # с `workflow: "plan"` и **без** всякого `plan`: два поля одного
         # механизма разъехались бы внутри одного тела.
+        assert client.post(f"/api/agents/{chat}/plan/reset").status_code == 200
         assert agent.run_tool("update_plan", json.dumps({"steps": THREE},
                                                         ensure_ascii=False))[0]
         assert REGISTRY._unload(chat) is True, "чат не был живым"
@@ -3677,12 +3840,16 @@ def check_task_state_machine():
 
     return (
         f"шесть этапов вычислены из шести планов, {len(taskplan.STAGES)} без ярлыка "
-        "в базе; пересечение approval и validation разобрано порядком; при "
-        "выключенном процессе промпт слово в слово прежний, при включённом "
-        "блок едет и с пустым списком, а правило этапа — системным; четыре "
-        "врезки на слотах 1—4; пауза отказала оба инструмента и вернула тот же "
-        "этап; сброс снял все три флажка; план и пауза пережили перезапуск "
-        "и уехали в ветку; обмен ушёл без ключа tools"
+        "в базе; пересечение approval и validation разобрано порядком, метки "
+        "шагов дословны; при выключенном процессе промпт слово в слово прежний, "
+        "при включённом блок едет и с пустым списком, а правило этапа — "
+        "системным; четыре врезки на слотах 1—4; человеческих действий модели "
+        f"не объявлено: {len(taskplan.ALLOWED) - len(taskplan.TOOL_NAMES)}, и все "
+        "отсечены, выключенному чату план не пишется; укороченный список снял утверждение, переименование — "
+        "нет; упавшая запись не тронула память; отказ назван всеми четырьмя "
+        "частями и выходом из таблицы; пауза отказала оба инструмента и вернула "
+        "тот же этап; сброс снял все три флажка; план и пауза пережили "
+        "перезапуск и уехали в ветку; обмен ушёл без ключа tools"
     )
 
 
