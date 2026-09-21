@@ -3329,8 +3329,12 @@ def check_task_state_machine():
       инструмента на ней отказаны. Снятие паузы возвращает тот же этап,
       что был до неё, сам собой — этап вычисляется из списка, а список
       не менялся. Это и есть «продолжение без повторных объяснений»;
-    * **рамка этого диффа** — обмен инструменты не объявляет: `tools`
-      в теле запроса нет.
+    * **объявление** — обмен объявляет инструменты ровно тому чату, где
+      рабочий процесс включён: при `plan` ключ `tools` в теле равен
+      `tool_specs`, при `off` ключа нет вовсе. Раньше здесь стояло
+      обратное — обмен не объявлял их никому, и та строка стерегла рамку
+      своего диффа: исполнять вызовы было ещё нечем. Исполнять научились
+      (цикл оборотов в `ask`), и утверждение сменило знак, а не исчезло.
     """
     from app import plan as taskplan
     from app.agent import Agent
@@ -3462,14 +3466,17 @@ def check_task_state_machine():
         assert wrong.status_code == 400, wrong.text
         assert "off" in wrong.text and "plan" in wrong.text, wrong.text
 
-        # --- рамка диффа: обмен инструменты не объявляет --------------------
+        # --- объявление: включённому чату инструменты объявлены -------------
         #
-        # Снимается на чате, у которого рабочий процесс **включён**: там
-        # `tool_specs` непуст, и утверждение стережёт именно этот дифф.
-        # На выключенном оно держалось бы само собой.
+        # Снимается на **обоих** чатах, и оба нужны: «ключа нет» на
+        # выключенном стоит там, где присутствие достижимо — на включённом
+        # ключ есть, и ровно тот, что объявляет `tool_specs`.
         live = REGISTRY.require(plain)
         assert len(live.tool_specs()) == 2, live.tool_specs()
         _frames(client, plain, "а теперь с планом")
+        assert _stub.CALLS[-1]["payload"]["tools"] == live.tool_specs(), _stub.CALLS[-1]
+        off = new_agent(client, workflow="off")
+        _frames(client, off, "а этому нечего вести")
         assert "tools" not in _stub.CALLS[-1]["payload"], _stub.CALLS[-1]["payload"].keys()
 
         # --- кнопки человека: этап решает один код --------------------------
@@ -3849,7 +3856,459 @@ def check_task_state_machine():
         "нет; упавшая запись не тронула память; отказ назван всеми четырьмя "
         "частями и выходом из таблицы; пауза отказала оба инструмента и вернула "
         "тот же этап; сброс снял все три флажка; план и пауза пережили "
-        "перезапуск и уехали в ветку; обмен ушёл без ключа tools"
+        "перезапуск и уехали в ветку; включённому чату tools объявлены, "
+        "выключенному — нет"
+    )
+
+
+# --- День 13: цикл оборотов ---------------------------------------------------
+
+PLAN_STEPS = [
+    {"title": "собрать требования", "status": "pending"},
+    {"title": "схема базы", "status": "pending"},
+    {"title": "ручки", "status": "pending"},
+]
+"""План, который «присылает модель». Три шага: результат `update_plan`
+называет их число, и по нему видно, какой именно вызов исполнился."""
+
+
+def _call(name: str, args: dict, call_id: str) -> dict:
+    """Вызов в том виде, в каком его отдаёт транспорт: `arguments` — строка."""
+    return {"id": call_id, "name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+
+
+def _first_turn(messages) -> bool:
+    """Первый ли это оборот обмена — по тому, есть ли в ленте ответ ролью
+    `tool`, а не по номеру вызова к заглушке.
+
+    Номер сквозной на весь процесс: добавь проверке один обмен в начале —
+    и сценарий «на первом обороте вызов» уехал бы на чужой оборот молча.
+    Роль `tool` в ленте — признак самого оборота, а не порядка вызовов.
+    """
+    return not any(m.get("role") == "tool" for m in messages)
+
+
+def _calls_on_first(*calls):
+    """Вызовы на первом обороте и молчание на всех следующих."""
+    return lambda messages, index: [dict(c) for c in calls] if _first_turn(messages) else None
+
+
+def _word_on_second(messages, index) -> str:
+    """Ответ живой модели: на первом обороте ни символа текста, на втором —
+    слова. Так ответила `openai/gpt-4o-mini` на живом прогоне, и ради этого
+    цикл и заведён."""
+    return "" if _first_turn(messages) else "план готов, начинаю"
+
+
+@check("цикл оборотов: вызов исполнен, слово за моделью, в истории одна пара")
+def check_tool_turn_loop():
+    """Задание дня: чтобы рабочий процесс был виден, одного вызова к модели
+    мало.
+
+    Живой прогон `openai/gpt-4o-mini` вернул вызов `update_plan` на пять
+    шагов и **ни одного символа текста** — при том, что в системном сообщении
+    её просили «кратко перечисли шаги». Значит цикл «модель → инструмент →
+    модель» это **условие видимости**, а не оптимизация: без второго оборота
+    человек не увидел бы на экране ни слова.
+
+    Разделы:
+
+    * **два оборота, одна пара** — обращений к модели два, в истории одна
+      пара «вопрос — ответ», и текст в ней от второго оборота: промежуточный
+      ход в историю не пишется вовсе (`take_last_exchange` ждёт хвост
+      `["user", "assistant"]`);
+    * **что уехало обратно** — ход ассистента с `tool_calls` (`arguments`
+      строкой, `type: "function"`) и **по одному** `{"role": "tool"}` на
+      каждый вызов, с тем же `tool_call_id`. Один ответ на все вызовы
+      провайдер отвергает;
+    * **промпт не пересобирается** — лента второго оборота начинается
+      сообщение в сообщение тем же промптом, что уехал кадром `start`:
+      память и профиль читаются один раз на обмен, и пересборка развела бы
+      запрос с номерами слотов;
+    * **два вызова в одном ответе** — исполнены оба, в порядке приезда;
+    * **кадр `tool` раньше `done`**, и план в нём уже новый;
+    * **отказ доезжает до модели** — блокирующей директивой, а не молчанием;
+    * **битые аргументы** — план прежний, исключения нет, обмен записан;
+    * **предел** — вызовов к модели ровно `MAX_TURNS`, и у последнего нет
+      `tools`: объявить их и не дать исполнить значило бы кончить обмен
+      вызовом, то есть пустым ответом;
+    * **отмена** — накопленные, но не исполненные вызовы не исполняются;
+    * **нет текста ни на одном обороте** — обмен не записан, и `done`
+      называет причину словами;
+    * **выключенный процесс** — ни `tools` в теле, ни кадров `tool`,
+      последовательность ролей прежняя;
+    * **сжатие** — служебный вызов идёт без инструментов: у него своя
+      работа, и план ему ни к чему.
+    """
+    import app.plan as taskplan
+
+    # --- два оборота, одна пара ---------------------------------------------
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    with TestClient(main.app) as client:
+        chat = new_agent(client, system="СИС", workflow="plan")
+        frames = _frames(client, chat, "спланируй работу")
+        history = client.get(f"/api/agents/{chat}").json()["transcript"]
+        plan_now = REGISTRY.require(chat).plan_view()
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert [m["role"] for m in history] == ["user", "assistant"], history
+    assert history[-1]["content"] == "план готов, начинаю", history[-1]
+    kinds = [f["event"] for f in frames]
+    # Кадр `start` один на весь обмен: он показывает промпт, с которого
+    # обмен начался, и второй такой же кадр развёл бы номера врезок.
+    assert kinds.count("start") == 1, kinds
+    assert frames[-1]["committed"] is True and frames[-1]["error"] is None, frames[-1]
+    assert frames[-1]["metrics"]["turns"] == 2, frames[-1]["metrics"]
+
+    # --- что уехало обратно --------------------------------------------------
+    sent = _stub.CALLS[1]["messages"]
+    move, answer = sent[-2], sent[-1]
+    assert move["role"] == "assistant" and move["content"] is None, move
+    assert move["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "update_plan",
+                "arguments": json.dumps({"steps": PLAN_STEPS}, ensure_ascii=False),
+            },
+        }
+    ], move["tool_calls"]
+    # Аргументы уезжают **строкой**, как приехали: разобранный объект
+    # провайдер не примет, а строку он прислал сам.
+    assert isinstance(move["tool_calls"][0]["function"]["arguments"], str), move
+    # Ответ инструмента — своё сообщение ролью `tool` с тем же `tool_call_id`
+    # и без единого лишнего ключа: провайдер ждёт ровно эти три.
+    assert set(answer) == {"role", "tool_call_id", "content"}, answer
+    assert answer["role"] == "tool" and answer["tool_call_id"] == "call_1", answer
+    assert "План записан: 3 шагов" in answer["content"], answer["content"]
+
+    # --- промпт не пересобирается -------------------------------------------
+    head = _stub.CALLS[0]["messages"]
+    assert sent[: len(head)] == head, (sent[: len(head)], head)
+    assert len(sent) == len(head) + 2, (len(sent), len(head))
+    assert _frame(frames, "start")["resolved_messages"] == head, head
+
+    # --- кадр `tool` раньше `done`, и план в нём новый -----------------------
+    assert kinds.index("tool") < kinds.index("done"), kinds
+    told = _frame(frames, "tool")
+    assert told["name"] == "update_plan" and told["ok"] is True, told
+    assert told["message"] == answer["content"], (told["message"], answer["content"])
+    # Этап в кадре — уже `approval`: план записан и ждёт кнопки. Пришли он
+    # после цикла, человек увидел бы шаги позже модели.
+    assert told["plan"]["stage"] == "approval", told["plan"]
+    assert [s["title"] for s in told["plan"]["steps"]] == [
+        s["title"] for s in PLAN_STEPS
+    ], told["plan"]
+    assert plan_now["stage"] == "approval", plan_now
+
+    # --- два вызова в одном ответе: исполнены оба, в порядке приезда ---------
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(
+            _call("update_plan", {"steps": PLAN_STEPS}, "call_a"),
+            _call("update_plan", {"steps": PLAN_STEPS[:1]}, "call_b"),
+        ),
+    )
+    with TestClient(main.app) as client:
+        pair = new_agent(client, workflow="plan")
+        frames = _frames(client, pair, "перепиши план дважды")
+        after = REGISTRY.require(pair).plan_view()
+
+    told = [f for f in frames if f["event"] == "tool"]
+    assert len(told) == 2, [f["event"] for f in frames]
+    # Порядок виден по числу шагов: сперва три, потом один. Исполни цикл
+    # только первый — второго кадра не было бы вовсе; переставь их —
+    # в плане осталось бы три шага.
+    assert "3 шагов" in told[0]["message"] and "1 шагов" in told[1]["message"], told
+    assert [s["title"] for s in after["steps"]] == ["собрать требования"], after
+    sent = _stub.CALLS[1]["messages"]
+    assert [m["role"] for m in sent[-3:]] == ["assistant", "tool", "tool"], sent[-3:]
+    # По одному ответу на каждый вызов и с его собственным `tool_call_id`:
+    # один ответ на все провайдер отвергнет, а чужой id — тем более.
+    assert [m["tool_call_id"] for m in sent[-2:]] == ["call_a", "call_b"], sent[-2:]
+    assert [c["id"] for c in sent[-3]["tool_calls"]] == ["call_a", "call_b"], sent[-3]
+
+    # --- отказ доезжает до модели директивой ---------------------------------
+    #
+    # Сцена выбрана так, чтобы отказ **стерёг**: `finish_task` на
+    # неутверждённом плане — ровно то, чем модель закрывает задачу, которой
+    # никто не утверждал. Проглоти цикл отказ — модель прочитала бы молчание
+    # как согласие.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("finish_task", {"problems": []}, "call_no")),
+    )
+    with TestClient(main.app) as client:
+        denied = new_agent(client, workflow="plan")
+        frames = _frames(client, denied, "закрывай")
+        left = REGISTRY.require(denied).plan_view()
+
+    told = _frame(frames, "tool")
+    assert told["ok"] is False, told
+    assert told["message"].startswith("finish_task НЕ выполнен"), told["message"]
+    assert "НЕ утверждай, что это сделано." in told["message"], told["message"]
+    assert _stub.CALLS[1]["messages"][-1]["content"] == told["message"], _stub.CALLS[1]
+    assert left["stage"] == "planning" and left["finished"] is False, left
+    assert frames[-1]["committed"] is True, frames[-1]
+
+    # --- битые аргументы: план прежний, исключения нет -----------------------
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(
+            {"id": "call_x", "name": "update_plan", "arguments": '{"steps": ['}
+        ),
+    )
+    with TestClient(main.app) as client:
+        torn = new_agent(client, workflow="plan")
+        frames = _frames(client, torn, "план, но обрезанный")
+        broken = REGISTRY.require(torn).plan_view()
+
+    told = _frame(frames, "tool")
+    assert told["ok"] is False and "не разбираемой строкой" in told["message"], told
+    assert broken["steps"] == [] and broken["stage"] == "planning", broken
+    assert frames[-1]["committed"] is True and frames[-1]["error"] is None, frames[-1]
+
+    # --- предел: `MAX_TURNS` вызовов, у последнего нет `tools` ---------------
+    #
+    # Заглушка просит вызов на **каждом** обороте — так выглядит зациклившаяся
+    # модель. Упирается обмен не в тишину, а в слова: последний оборот идёт
+    # без инструментов, модель отвечает текстом, и обмену есть что записать.
+    _stub.reset()
+    _stub.install(
+        reply="ещё немного",
+        tool_calls=lambda messages, index: [
+            _call("update_plan", {"steps": PLAN_STEPS}, f"call_{index}")
+        ],
+    )
+    with TestClient(main.app) as client:
+        endless = new_agent(client, workflow="plan")
+        frames = _frames(client, endless, "крути")
+        told = [f for f in frames if f["event"] == "tool"]
+
+    limit = agent_module.MAX_TURNS
+    assert len(_stub.CALLS) == limit, len(_stub.CALLS)
+    assert len(told) == limit - 1, len(told)
+    assert "tools" not in _stub.CALLS[limit - 1]["payload"], _stub.CALLS[limit - 1]["payload"]
+    assert "tools" in _stub.CALLS[limit - 2]["payload"], _stub.CALLS[limit - 2]["payload"]
+    assert frames[-1]["committed"] is True, frames[-1]
+    assert frames[-1]["metrics"]["turns"] == limit, frames[-1]["metrics"]
+
+    # --- отмена: накопленное не исполняется ----------------------------------
+    #
+    # Вызова два, и первый — кнопка человека: он отказан, а значит план
+    # не меняет. Отменяем на его кадре — до второго вызова, который план
+    # переписал бы. Отсюда и три утверждения разом: кадр был, вызов к модели
+    # один, план прежний. Проверяй цикл отмену только на кусках потока —
+    # второй вызов исполнился бы, и план стал бы не тот.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(
+            _call("approve", {}, "call_human"),
+            _call("update_plan", {"steps": PLAN_STEPS}, "call_late"),
+        ),
+    )
+
+    async def cancel_at_tool():
+        agent = agent_module.Agent(
+            AgentSpec(label="отмена", model="stub/model", workflow="plan")
+        )
+        seen = []
+        async for event in agent.ask("сделай и отменись"):
+            seen.append(event)
+            if event["type"] == "tool":
+                agent.cancel()
+        return agent, seen
+
+    stopped, seen = asyncio.run(cancel_at_tool())
+    told = [e for e in seen if e["type"] == "tool"]
+    assert len(told) == 1 and told[0]["name"] == "approve", told
+    assert told[0]["ok"] is False, told[0]
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    assert stopped.plan["steps"] == [], stopped.plan
+    assert seen[-1]["cancelled"] is True, seen[-1]
+    assert seen[-1]["error"] == "генерация отменена", seen[-1]
+
+    # --- текста нет ни на одном обороте: обмен не записан, причина названа ---
+    _stub.reset()
+    _stub.install(
+        reply="",
+        tool_calls=lambda messages, index: [
+            _call("update_plan", {"steps": PLAN_STEPS}, f"call_{index}")
+        ],
+    )
+    with TestClient(main.app) as client:
+        mute = new_agent(client, workflow="plan")
+        frames = _frames(client, mute, "молчи")
+        history = client.get(f"/api/agents/{mute}").json()["transcript"]
+
+    assert history == [], history
+    done = frames[-1]
+    assert done["committed"] is False, done
+    assert done["question"] == "молчи", done
+    # Молчание в `done` человек прочитал бы как сбой сети: на экране
+    # не появилось бы ни ответа, ни объяснения.
+    assert done["error"] and "ни слова текста" in done["error"], done["error"]
+
+    # --- выключенный процесс: ни `tools`, ни кадров `tool` -------------------
+    #
+    # Утверждение об отсутствии стоит там, где присутствие достижимо: та же
+    # заглушка с теми же вызовами только что дала и ключ в теле, и кадры.
+    _stub.reset()
+    _stub.install(
+        reply="обычный ответ",
+        tool_calls=lambda messages, index: [
+            _call("update_plan", {"steps": PLAN_STEPS}, f"call_{index}")
+        ],
+    )
+    with TestClient(main.app) as client:
+        off = new_agent(client, system="СИС", workflow="off")
+        frames = _frames(client, off, "просто вопрос")
+        history = client.get(f"/api/agents/{off}").json()["transcript"]
+
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    assert "tools" not in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+    assert "tool" not in [f["event"] for f in frames], [f["event"] for f in frames]
+    assert [m["role"] for m in history] == ["user", "assistant"], history
+    assert [m["role"] for m in _stub.CALLS[0]["messages"]] == ["system", "user"], _stub.CALLS[0]
+
+    # --- сжатие идёт без инструментов ----------------------------------------
+    _stub.reset()
+    _stub.install(
+        reply=_service_aware,
+        tool_calls=lambda messages, index: (
+            None if _service_kind(messages) else [_call("update_plan", {"steps": []}, "c")]
+        ),
+    )
+    with TestClient(main.app) as client:
+        folding = new_agent(client, workflow="plan", strategy="summary",
+                            keep_last=2, compress_every=2)
+        _talk(client, folding, 3)
+
+    folded = _service_calls("summary")
+    assert folded, "сжатия не случилось — сцена не та"
+    for call in folded:
+        assert "tools" not in call["payload"], call["payload"].keys()
+
+    return (
+        "оборот вызова и оборот слова: два обращения, одна пара в истории; "
+        "обратно уехали ход с tool_calls и по ответу ролью tool на каждый вызов; "
+        f"промпт не пересобран; кадр tool раньше done и с планом на этапе "
+        f"approval; отказ и битые аргументы доехали директивой, план цел; "
+        f"предел {limit} оборотов, у последнего tools нет; отмена на кадре tool "
+        f"оставила план пустым при одном вызове; без текста обмен не записан "
+        f"и причина названа; выключенному процессу ни tools, ни кадров; "
+        f"сжатие ушло без инструментов (вызовов: {len(folded)})"
+    )
+
+
+@check("метрики обмена — сумма его оборотов, а не последний из них")
+def check_turn_metrics_merged():
+    """Обмен из трёх оборотов оплачен весь, и показать у него числа
+    последнего значило бы соврать втрое: сумма по чату считается по
+    `usage_summary`, а она читает метрики записанного ответа.
+
+    Что складывается, что берётся от первого оборота, а что от последнего —
+    решает `merge_turn_metrics`, и разделы здесь по нему:
+
+    * **складываются** токены и цена: 100 + 200 = 300;
+    * **от первого** — время до первого токена: у обмена оно одно, и это
+      момент, когда на экране появилась первая буква;
+    * **от последнего** — `finish_reason` и модель: они описывают тот вызов,
+      которым обмен кончился;
+    * **`turns`** — сколько оборотов было. Ключ про обмен, а не про
+      провайдера, и в суммы по чату не идёт;
+    * **молчание не становится нулём**: `None` у слагаемого законен, и
+      «нет ни у кого» обязано остаться `None`, а не превратиться в ноль —
+      ноль и прочерк на экране выглядят по-разному.
+    """
+    numbers = {
+        0: {"prompt_tokens": 10, "completion_tokens": 100, "total_tokens": 100,
+            "cost_usd": 0.0001, "ttft_ms": 11.0, "first_token_ms": 5.0,
+            "reasoning_tokens": None, "model": "stub/первая"},
+        1: {"prompt_tokens": 20, "completion_tokens": 200, "total_tokens": 200,
+            "cost_usd": 0.0002, "ttft_ms": 99.0, "first_token_ms": 50.0,
+            "reasoning_tokens": 7, "model": "stub/последняя"},
+    }
+    _stub.install(
+        reply=_word_on_second,
+        usage=lambda index: numbers[index],
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    with TestClient(main.app) as client:
+        chat = new_agent(client, workflow="plan")
+        frames = _frames(client, chat, "два оборота")
+        body = client.get(f"/api/agents/{chat}").json()
+    metrics = frames[-1]["metrics"]
+
+    assert metrics["prompt_tokens"] == 30, metrics
+    assert metrics["completion_tokens"] == 300, metrics
+    assert metrics["total_tokens"] == 300, metrics
+    assert metrics["cost_usd"] == 0.0003, metrics
+    # `None` у первого оборота и число у второго: молчание не съедает число
+    # и само нулём не становится.
+    assert metrics["reasoning_tokens"] == 7, metrics
+    # Время до первого токена — от первого оборота: у второго оно
+    # отсчитывалось бы от его собственного начала и показало бы паузу
+    # короче, чем она была.
+    assert metrics["ttft_ms"] == 11.0, metrics
+    assert metrics["first_token_ms"] == 5.0, metrics
+    # А `finish_reason` и модель — от последнего: они про тот вызов, которым
+    # обмен кончился. На первом обороте провайдер назвал причиной `tool_calls`.
+    assert metrics["finish_reason"] == "stop", metrics
+    assert metrics["model"] == "stub/последняя", metrics
+    assert metrics["turns"] == 2, metrics
+    # Итог по чату считает `USAGE_FIELDS`, и `turns` в него не входит:
+    # обороты это не токены и складывать их по чату незачем.
+    assert body["usage_total"] == {
+        "prompt_tokens": 30, "completion_tokens": 300, "total_tokens": 300,
+        "cost_usd": 0.0003,
+    }, body["usage_total"]
+    assert body["history_len"] == 2, body["history_len"]
+
+    # --- молчание провайдера о цифре не становится нулём ---------------------
+    #
+    # Цены не назвал ни один оборот — и у обмена её нет, а не ноль. `or 0`
+    # при сложении дал бы здесь 0, и на экране вместо прочерка встала бы
+    # бесплатная модель.
+    _stub.reset()
+    silent = {"cost_usd": None, "total_tokens": None, "reasoning_tokens": None}
+    _stub.install(
+        reply=_word_on_second,
+        usage=lambda index: silent,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    with TestClient(main.app) as client:
+        quiet = new_agent(client, workflow="plan")
+        mute = _frames(client, quiet, "молчаливый провайдер")[-1]["metrics"]
+        totals = client.get(f"/api/agents/{quiet}").json()["usage_total"]
+
+    assert mute["cost_usd"] is None, mute
+    assert mute["total_tokens"] is None, mute
+    assert mute["reasoning_tokens"] is None, mute
+    assert mute["turns"] == 2, mute
+    assert totals["cost_usd"] is None and totals["total_tokens"] is None, totals
+
+    # --- обычный обмен: один оборот, и это не «нет оборотов» -----------------
+    _stub.reset()
+    _stub.install(reply="просто слова")
+    with TestClient(main.app) as client:
+        plain = new_agent(client)
+        one = _frames(client, plain, "вопрос")[-1]["metrics"]
+    assert one["turns"] == 1, one
+
+    return (
+        "100 + 200 = 300 токенов и 0.0001 + 0.0002 = 0.0003; ttft 11.0 от "
+        "первого оборота, finish_reason stop и модель от последнего; turns 2 "
+        "у цикла и 1 у обычного обмена, в итог по чату не входит; молчание "
+        "провайдера о цене осталось прочерком, а не нулём"
     )
 
 

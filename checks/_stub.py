@@ -97,7 +97,12 @@ def make(
             elapsed_ms=2.0,
             tokens_out=tokens,
             tokens_per_second=10.0,
-            prompt_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
+            # `content` бывает `None` — так едет ход ассистента, который
+            # целиком ушёл на вызовы инструментов и не сказал ни слова.
+            # Это законная форма сообщения, и заглушка обязана её пережить:
+            # упади она здесь, обмен получил бы «ошибка транспорта» там,
+            # где транспорт ни при чём.
+            prompt_tokens=sum(len(m.get("content") or "") for m in messages) // 4,
             completion_tokens=tokens,
             total_tokens=100,
             cost_usd=0.000123,

@@ -46,6 +46,83 @@ def _usage_number(value) -> int | float | None:
     return value
 
 
+TURN_SUM_FIELDS = USAGE_FIELDS + ("reasoning_tokens", "tokens_out", "elapsed_ms")
+"""Метрики, которые по оборотам обмена **складываются**. Четыре первых —
+те же, что складываются по чату: обмен из трёх оборотов оплачен весь, и
+показать у него токены последнего значило бы соврать втрое. Рядом с ними
+рассуждение и выход: они про то же самое — сколько модель наработала.
+`elapsed_ms` тоже сумма: человек ждал все обороты подряд, а не последний."""
+
+TURN_FIRST_FIELDS = ("ttft_ms", "first_token_ms")
+"""Метрики, которые берутся от **первого** оборота. Время до первого токена
+у обмена одно, и это момент, когда на экране появилась первая буква, —
+у второго оборота оно отсчитывалось бы от его собственного начала и
+показало бы паузу короче, чем она была."""
+
+
+def _usage_add(left, right):
+    """Сумма двух слагаемых, в которой `None` — законное значение.
+
+    Провайдер вправе смолчать о цифре, и молчание обязано пережить сложение
+    молчанием: `or 0` превратил бы «неизвестно» в ноль, а ноль и молчание
+    в этом продукте рисуются по-разному — прочерк против нуля.
+    """
+    a, b = _usage_number(left), _usage_number(right)
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def _glue(carried: str, piece: str) -> str:
+    """Склейка текста (или рассуждения) через обороты обмена — пустой абзац
+    между кусками.
+
+    Перетирать нельзя: обороты у обмена разные, а карточка в ленте одна, и
+    слова, сказанные до вызова инструмента, такая же её часть, как слова
+    после. Пустой кусок не заводит пустой строки — оборот, ушедший целиком
+    на вызов, в ленте следа не оставляет.
+    """
+    if not piece:
+        return carried
+    return f"{carried}\n\n{piece}" if carried else piece
+
+
+def merge_turn_metrics(carried: dict | None, fresh: dict | None) -> dict | None:
+    """Метрики обмена из метрик его оборотов: накопленное плюс ещё один оборот.
+
+    Основой берётся **последний** оборот, а не собранный заново словарь:
+    `finish_reason`, `model`, `provider`, `context_length` и
+    `tokens_per_second` описывают тот вызов, которым обмен кончился, —
+    скорость это скорость, а не запас, складывать в ней нечего. Тем же
+    самым новое поле метрик, о котором эта функция не знает, достаётся
+    от последнего оборота, а не теряется молча.
+
+    Поверх основы встают два списка: `TURN_SUM_FIELDS` складываются,
+    `TURN_FIRST_FIELDS` берутся от первого оборота.
+
+    И ключ `turns` — сколько оборотов было. Он про **обмен**, а не про
+    провайдера, и поэтому в суммы по чату не идёт: их считает
+    `USAGE_FIELDS`. У обычного обмена он равен единице — это не «нет
+    оборотов», а «оборот был один».
+    """
+    if not isinstance(fresh, dict):
+        return carried
+    if not isinstance(carried, dict):
+        return {**fresh, "turns": 1}
+    merged = {**fresh}
+    for name in TURN_SUM_FIELDS:
+        merged[name] = _usage_add(carried.get(name), fresh.get(name))
+    # Копейки от сложения float'ов: цена показывается до шестого знака,
+    # и округляется она здесь по тому же доводу, что в `usage_summary`.
+    if merged["cost_usd"] is not None:
+        merged["cost_usd"] = round(merged["cost_usd"], 8)
+    for name in TURN_FIRST_FIELDS:
+        merged[name] = carried.get(name)
+    merged["turns"] = (carried.get("turns") or 0) + 1
+    return merged
+
 COMPRESS_SYSTEM = (
     "Ты сворачиваешь начало разговора в сжатый пересказ. Не отвечай на сообщения "
     "и не обращайся к собеседнику: твой ответ целиком — пересказ, и он встанет "
@@ -268,6 +345,20 @@ N сообщений». Слово на все случаи одно совра�
 сводка начало **заменила** — её видно в промпте запроса, — а окно его
 **отбросило** совсем. У полной истории ключа нет вовсе: срезать нечего.
 В суммы по чату ключ не идёт — их считает USAGE_FIELDS."""
+
+MAX_TURNS = 6
+"""Сколько оборотов «модель → инструменты → модель» обмену отпущено.
+
+Предел нужен потому, что цикл замкнут на саму модель: ответь она вызовом
+на каждый результат вызова — и обмен не кончится никогда, а платит за него
+человек. Шесть — с запасом на осмысленный сценарий (план, правка плана,
+шаг, ещё шаг, завершение) и мало настолько, чтобы зациклившийся чат стоил
+шести вызовов, а не шестисот.
+
+Последний разрешённый оборот идёт **без** `tools` (`ask`): объявить
+инструменты и не дать их исполнить значило бы кончить обмен вызовом, то есть
+пустым ответом — именно это и делает живая модель, когда ей объявили
+инструменты. Предел обязан упираться в слова, а не в тишину."""
 
 
 _last_id = 0
@@ -1366,10 +1457,24 @@ class Agent:
     # --- обмен ---------------------------------------------------------------
 
     async def ask(self, user_text: str) -> AsyncIterator[dict]:
-        """Один обмен: вопрос → поток событий → запись в историю.
+        """Один обмен: вопрос → обороты «модель ↔ инструменты» → запись
+        в историю.
+
+        Оборотов у обмена бывает несколько, и это **условие видимости**,
+        а не оптимизация: живая модель, которой объявили инструменты,
+        возвращает вызов и ни одного символа текста, — без второго оборота
+        человек не увидел бы на экране ни слова. Кончаются обороты словами
+        всегда: последний разрешённый идёт без `tools` (`MAX_TURNS`).
+
+        В историю пишется **одна** пара «вопрос — ответ», склеенный из всех
+        оборотов: промежуточные ходы туда не идут вовсе — `take_last_exchange`
+        ждёт хвост `["user", "assistant"]`, а `restore` сверяет длину.
 
         События: `compressing`, `start`, `reasoning`, `delta`, `metrics`,
-        `error`, `done`. Первое приходит на **каждый** служебный вызов,
+        `tool`, `error`, `done`. Кадр `start` — **один** на обмен, с промптом
+        первого оборота. Кадр `tool` — на каждый исполненный вызов, с его
+        результатом и свежим планом. Первое приходит на **каждый** служебный
+        вызов,
         который этому обмену предстоит, — ведение памяти, сворачивание или
         и то и другое, — и раньше всех остальных: оно про паузу **до** ответа,
         и полем `strategy` называет, чем эта пауза занята.
@@ -1467,50 +1572,162 @@ class Agent:
             failure: str | None = None
             cancelled = False
 
-            try:
-                # `tools` здесь не передаётся намеренно: этот обмен
-                # инструменты **не объявляет** и вызовы не исполняет, и
-                # события `tool_calls` в нём не возникает вовсе. Половинчатая
-                # проводка — объявить инструменты, но не уметь исполнить
-                # вызов — сделала бы каждый обмен в рабочем процессе пустым
-                # ответом: живая модель на этом описании возвращает вызов
-                # и ни слова текста. Цикл оборотов идёт отдельным диффом.
-                stream = stream_completion(
-                    spec, prompt_override=prompt, context_length=context_length
+            # Лента запроса растёт по ходу обмена: к промпту первого оборота
+            # дописываются ход ассистента с вызовами и результат каждого
+            # вызова. Промпт **не пересобирается**: память, профиль и врезки
+            # читаются один раз на обмен, и пересборка посреди него развела
+            # бы запрос с номерами слотов, которые уже уехали кадром `start`.
+            # Кадр этот один на весь обмен и показывает промпт первого
+            # оборота — то, с чего обмен начался.
+            #
+            # Блок `[задача]` в этом промпте после первого же `update_plan`
+            # устаревает, и это **нормально**: свежее состояние модель
+            # получает результатом самого вызова, а он возвращает весь список
+            # целиком. Пересобирать ради него промпт значило бы платить
+            # входными токенами за то, что и так приехало.
+            messages = list(prompt)
+            turn = 0
+
+            while True:
+                turn += 1
+                # Последний разрешённый оборот идёт без инструментов: обмену
+                # нужен текст, а модель, которой объявили вызовы, отвечает
+                # вызовом. Пустой список `tool_specs` — это тоже «не
+                # объявлять»: ключа `tools` в теле тогда нет вовсе.
+                tools = None if turn >= MAX_TURNS else (self.tool_specs(spec) or None)
+                turn_text = ""
+                turn_reasoning = ""
+                turn_metrics: dict | None = None
+                calls: list[dict] = []
+
+                try:
+                    stream = stream_completion(
+                        spec,
+                        prompt_override=list(messages),
+                        context_length=context_length,
+                        tools=tools,
+                    )
+                    async with contextlib.aclosing(stream):
+                        async for chunk in stream:
+                            kind = chunk["type"]
+                            if kind == "delta":
+                                turn_text += chunk["text"]
+                                yield chunk
+                            elif kind == "reasoning":
+                                turn_reasoning += chunk["text"]
+                                yield chunk
+                            elif kind == "metrics":
+                                yield chunk
+                            elif kind == "tool_calls":
+                                # Наружу событие транспорта не пересылается:
+                                # клиент узнает о вызове кадром `tool`, когда
+                                # тот **исполнен** и у него есть результат.
+                                # Метрики здесь не берём — их назовёт `done`,
+                                # он придёт следом и будет свежее.
+                                calls = chunk["calls"]
+                            elif kind == "error":
+                                failure = chunk["message"]
+                                turn_metrics = chunk["metrics"]
+                                yield chunk
+                            elif kind == "done":
+                                turn_text = chunk["text"]
+                                turn_reasoning = chunk.get("reasoning") or turn_reasoning
+                                turn_metrics = chunk["metrics"]
+                            if cancel.is_set():
+                                cancelled = True
+                                break
+                except MissingKeyError as exc:
+                    failure = str(exc)
+                    yield {"type": "error", "message": failure, "metrics": None}
+                except asyncio.CancelledError:
+                    # Клиент ушёл: частичный ответ всё равно записываем — он уже
+                    # оплачен, а следующий вопрос должен видеть, чем кончилось.
+                    # Записывается **весь** обмен, а не последний оборот:
+                    # прошлые обороты оплачены ровно так же.
+                    self._commit(
+                        user_text,
+                        _glue(text, turn_text),
+                        "вызов прерван",
+                        _glue(reasoning, turn_reasoning),
+                        merge_turn_metrics(final_metrics, turn_metrics),
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
+                    failure = f"{type(exc).__name__}: {exc}"
+                    yield {"type": "error", "message": failure, "metrics": None}
+
+                # Текст и рассуждение склеиваются через обороты, а не
+                # перетираются: у обмена одна карточка в ленте, и слова
+                # первого оборота — такая же её часть, как слова последнего.
+                text = _glue(text, turn_text)
+                reasoning = _glue(reasoning, turn_reasoning)
+                final_metrics = merge_turn_metrics(final_metrics, turn_metrics)
+
+                if failure or cancelled:
+                    break
+                if not calls or tools is None:
+                    # Вызовов нет — модель ответила словами, обмен кончился.
+                    # Инструментов не объявляли — исполнять нечего и нельзя:
+                    # вызов, которого не объявляли, не просили.
+                    break
+
+                # Ход ассистента едет обратно целиком: текст этого оборота
+                # (или `None`, если модель не сказала ни слова) и вызовы.
+                # Ключ `type` ставим мы — транспорт его не накапливает,
+                # а объявляем мы только функции; `arguments` уезжают
+                # **строкой**, как приехали: разбор их — дело `run_tool`,
+                # а провайдер ждёт обратно то же, что прислал.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": turn_text or None,
+                        "tool_calls": [
+                            {
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["name"],
+                                    "arguments": call["arguments"],
+                                },
+                            }
+                            for call in calls
+                        ],
+                    }
                 )
-                async with contextlib.aclosing(stream):
-                    async for chunk in stream:
-                        kind = chunk["type"]
-                        if kind == "delta":
-                            text += chunk["text"]
-                            yield chunk
-                        elif kind == "reasoning":
-                            reasoning += chunk["text"]
-                            yield chunk
-                        elif kind == "metrics":
-                            yield chunk
-                        elif kind == "error":
-                            failure = chunk["message"]
-                            final_metrics = chunk["metrics"]
-                            yield chunk
-                        elif kind == "done":
-                            text = chunk["text"]
-                            reasoning = chunk.get("reasoning") or reasoning
-                            final_metrics = chunk["metrics"]
-                        if cancel.is_set():
-                            cancelled = True
-                            break
-            except MissingKeyError as exc:
-                failure = str(exc)
-                yield {"type": "error", "message": failure, "metrics": None}
-            except asyncio.CancelledError:
-                # Клиент ушёл: частичный ответ всё равно записываем — он уже
-                # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                self._commit(user_text, text, "вызов прерван", reasoning, final_metrics)
-                raise
-            except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
-                failure = f"{type(exc).__name__}: {exc}"
-                yield {"type": "error", "message": failure, "metrics": None}
+                # Каждому вызову — свой ответ ролью `tool` и свой кадр
+                # наружу. По одному на вызов, а не один на все: провайдер
+                # отвергнет следующий запрос, если хоть один `tool_call_id`
+                # остался без ответа.
+                for call in calls:
+                    # Отмена проверяется **перед каждым** вызовом, а не только
+                    # на кусках потока: между последним куском и первым вызовом
+                    # лежит весь разбор, а между двумя вызовами — исполнение
+                    # первого, и человек вправе успеть нажать «стоп» там.
+                    # Накопленные, но не исполненные вызовы не исполняются
+                    # вовсе: полуприменённый план хуже неприменённого.
+                    #
+                    # А то, что исполнилось до отмены, остаётся исполненным:
+                    # вызов завершился, результат уехал модели, и откат задним
+                    # числом был бы враньём про то, что модель видела.
+                    if cancel.is_set():
+                        cancelled = True
+                        break
+                    ok, message = self.run_tool(call["name"], call["arguments"])
+                    yield {
+                        "type": "tool",
+                        "name": call["name"],
+                        "ok": ok,
+                        "message": message,
+                        # План к кадру прикладывается **сразу**, а не после
+                        # цикла: человек видит шаги тогда же, когда их увидела
+                        # модель, и видит их столько раз, сколько было правок.
+                        "plan": self.plan_view(),
+                    }
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call["id"], "content": message}
+                    )
+                if cancelled:
+                    break
 
             if cancelled and failure is None:
                 failure = "генерация отменена"
@@ -1528,6 +1745,16 @@ class Agent:
                 final_metrics = {**final_metrics, CUT_METRIC[spec.strategy]: cut}
 
             committed = self._commit(user_text, text, failure, reasoning, final_metrics)
+            if not committed and failure is None:
+                # Модель отвечала вызовами и ни разу не сказала ни слова —
+                # записывать в историю нечего, и `_commit` вернул False.
+                # Молчаливый `done` без причины человек прочитал бы как сбой
+                # сети: на экране не появилось бы ни ответа, ни объяснения.
+                failure = (
+                    "модель не прислала ни слова текста — только вызовы "
+                    f"инструментов (оборотов: {turn}). Записывать в историю "
+                    "нечего: спросите ещё раз или попросите ответить словами"
+                )
 
             done: dict = {
                 "type": "done",
