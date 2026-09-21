@@ -2007,21 +2007,23 @@ async function routeChecks() {
   //
   // Главное, что видно на экране в этот день, и потому — утверждениями,
   // а не глазами. Полоса стоит в шапке чата, а не во вкладке: панель
-  // сворачивается, вкладка в ней одна из пяти, и этап, спрятанный туда,
+  // сворачивается, вкладка в ней одна из четырёх, и этап, спрятанный туда,
   // на экране не стоял бы почти никогда.
+  //
+  // И это **пульт**: этап переключает человек нажатием, автоматики нет
+  // ни одной. Перепрыгнуть при этом нельзя — нажимается только то, куда
+  // пускает карта переходов.
   {
     const { client, server, document, $, settle, Evt } = freshClient({
       chats: [
         { label: "на проверке", task: { stage: "validation", step: "гоняю тесты", expecting: "" } },
         // Чат, у которого состояния нет вовсе: так его прислал бы сервер
         // другой версии — этапа он не знает. Полоса обязана показать первый,
-        // а не остаться без выделенного: этап у задачи есть всегда. Ответ
-        // модели в нём уже был — значит, и план предложен, и утверждать есть
-        // что: кнопка плана без этого не появляется.
+        // а не остаться без выделенного: этап у задачи есть всегда.
         { label: "из будущего", task: null },
-        // Чат на планировании, в котором план уже предложен: только здесь
-        // и появляется кнопка утверждения — утверждать нечего, пока модель
-        // не ответила ни разу.
+        // Чат на планировании: отсюда человек и выпускает задачу в работу,
+        // нажав на «работу». Догадываться о том, что план утверждён,
+        // по тексту разговора нельзя — это его решение.
         {
           label: "план предложен",
           transcript: [
@@ -2040,11 +2042,15 @@ async function routeChecks() {
       const one = stages().find((b) => b.classList.contains("current"));
       return one ? one.dataset.stage : "(выделенного нет)";
     };
+    const stage = (token) => stages().find((b) => b.dataset.stage === token);
     const taskPatches = () =>
       server.state.requests.filter((r) => r.method === "PATCH" && /\/task$/.test(r.path));
+    const stagePosts = () =>
+      server.state.requests.filter((r) => r.method === "POST" && /\/task\/stage$/.test(r.path));
     // Приглушённые — те, куда с текущего этапа карта не пускает.
     const far = () =>
       stages().filter((b) => b.classList.contains("far")).map((b) => b.dataset.stage).join(" ");
+    const moves = () => $("#task-log").querySelectorAll(".move").map((n) => n.textContent);
 
     // Все четыре этапа на полосе и в том порядке, в каком задача их проходит.
     check("на полосе четыре этапа, по порядку и подписанные по-русски",
@@ -2072,13 +2078,14 @@ async function routeChecks() {
     // на экране обязано стоять ровно то, что **видит модель**.
     const note = () => $("#stage-note").textContent;
     check("под полосой стоит инструкция этапа — та же, что уедет в промпт",
-      note().includes("инструкция: проверь сделанное сразу, а не обещай проверить,"
-        + " и назови вердикт первой строкой"),
+      note().includes("инструкция: перечисли конкретные проблемы в сделанном выше, пунктами"),
       note());
+    check("и она просит результат, а не рассказ о смене этапа",
+      note().includes("не описывай процесс и не сообщай о смене этапа"), note());
     // И набранное человеком побеждает зашитое: «сейчас» здесь его,
     // а «ожидается» — этапа.
     check("в строке под полосой «сейчас» — набранное человеком, а не зашитое",
-      note().startsWith("сейчас: гоняю тесты · ожидается: вердикт"), note());
+      note().startsWith("сейчас: гоняю тесты · ожидается: перечень проблем"), note());
 
     // Чат, приехавший без состояния вовсе: полоса показывает первый этап,
     // а не остаётся без выделенного. Этап у задачи есть всегда, и «сервер
@@ -2090,21 +2097,55 @@ async function routeChecks() {
     open(2);
     await settle(40);
 
-    // Полоса — показ, а не пульт: нажатием этап не меняется. У каждого
-    // перехода ровно один механизм, и ни один из них не начинается
-    // со щелчка по полосе.
-    stages().find((b) => b.dataset.stage === "done").dispatchEvent(new Evt("click"));
-    await settle(60);
-    check("нажатие на этап ничего не шлёт и этап не двигает",
-      taskPatches().length === 0 && current() === "validation",
-      current() + " — " + JSON.stringify(taskPatches().map((r) => [r.path, r.body])));
-
-    // И запрет виден **до** попытки его нарушить: достижимое по карте
-    // показано обычным, недостижимое приглушено. Карту называет сервер
+    // Запрет виден **до** попытки его нарушить: достижимое по карте нажимается,
+    // недостижимое приглушено и не нажимается вовсе. Карту называет сервер
     // полем `moves` — вторая её копия на клиенте разошлась бы молча.
     check("с проверки достижимы готово и работа, планирование приглушено",
-      far() === "planning",
-      "приглушены: " + far());
+      far() === "planning", "приглушены: " + far());
+    check("недостижимый этап не просто бледный, а не нажимается",
+      stage("planning").disabled === true && stage("done").disabled === false,
+      "planning disabled: " + stage("planning").disabled);
+
+    // Нажатие на недостижимый этап не шлёт ничего: перепрыгнуть нельзя,
+    // и это видно раньше, чем запрос ушёл на сервер.
+    stage("planning").dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("нажатие на приглушённый этап ничего не шлёт и этап не двигает",
+      stagePosts().length === 0 && current() === "validation",
+      current() + " — " + JSON.stringify(stagePosts().map((r) => [r.path, r.body])));
+
+    // А нажатие на достижимый — переключает, своей ручкой и одним полем.
+    stage("done").dispatchEvent(new Evt("click"));
+    await settle(80);
+    check("нажатие на достижимый этап переключает задачу своей ручкой",
+      stagePosts().length === 1 &&
+        JSON.stringify(stagePosts()[0].body) === JSON.stringify({ stage: "done" }) &&
+        taskPatches().length === 0,
+      JSON.stringify(stagePosts().map((r) => [r.path, r.body])));
+    check("и полоса переехала на «готово», а уходов с него уже нет",
+      current() === "done" && far() === "planning execution validation",
+      current() + " — приглушены: " + far());
+    // Переключение этапа обмена **не отправляет**: человек сменил этап,
+    // а говорить за него следующий вопрос никто не вправе.
+    check("переключение этапа не отправляет обмен за человека",
+      server.state.sent.length === 0, JSON.stringify(server.state.sent));
+    // Под полосой встала инструкция нового этапа — та, что уедет в промпт.
+    check("под полосой встала инструкция нового этапа",
+      note().includes("инструкция: подведи итог: что сделано и что осталось за рамками"),
+      note());
+
+    // Журнал переходов — свёрнутой строкой: летопись, а не состояние.
+    check("журнал свёрнут в строку «переходов: 1»",
+      $("#task-log-toggle").textContent === "переходов: 1" &&
+        $("#task-log").classList.contains("hidden"),
+      $("#task-log-toggle").textContent);
+    $("#task-log-toggle").dispatchEvent(new Evt("click"));
+    await settle(20);
+    check("развёрнутый журнал называет переход и того, кто его сделал",
+      !$("#task-log").classList.contains("hidden") &&
+        moves().length === 1 && moves()[0].includes("проверка → готово") &&
+        moves()[0].includes("человек"),
+      JSON.stringify(moves()));
 
     // Вкладки «Задача» больше нет вовсе: она повторяла шапку, а два места
     // для одного и того же расходятся на первой же правке. Проверяется
@@ -2115,6 +2156,11 @@ async function routeChecks() {
     check("и страницы «Задача» нет в списке страниц панели",
       document.querySelectorAll(".tab").every((t) => t.dataset.tab !== "task"),
       document.querySelectorAll(".tab").map((t) => t.dataset.tab).join(" "));
+    // Вкладки «Журнал» нет вовсе: журнал работы снесли вместе с автоматикой,
+    // а летопись переходов живёт под полосой.
+    check("вкладки «Журнал» нет ни кнопкой, ни страницей",
+      !$("#tab-btn-log") && !$("#tab-log") && !$("#log-list"),
+      "вкладка «Журнал» на месте");
 
     // Правка «сейчас» — щелчком прямо под полосой, тем же приёмом, каким
     // правятся записи памяти: поле встаёт на место строки, Enter сохраняет.
@@ -2136,7 +2182,7 @@ async function routeChecks() {
         JSON.stringify(last.body) === JSON.stringify({ expecting: "ваше подтверждение" }),
       JSON.stringify(taskPatches().map((r) => r.body)));
     check("а этап от правки поля не сдвинулся",
-      current() === "validation", current() + " — " + shown());
+      current() === "done", current() + " — " + shown());
     // Инструкция этапа не правится вовсе: она про то, как вести себя
     // на этапе, а не про эту задачу, и зашита в карту.
     check("инструкция этапа щелчком не правится",
@@ -2150,67 +2196,31 @@ async function routeChecks() {
         !document.querySelector(".panel").querySelector("#stages"),
       "полосы в шапке чата нет");
 
-    // Кнопка «Утвердить план» — единственная дверь из планирования в работу:
-    // служебный вызов по этому ребру не ходит, «план утверждён» это решение
-    // человека. На прочих этапах утверждать нечего, и кнопки нет.
-    check("на чате не из планирования кнопки «Утвердить план» нет",
-      !$("#approve-plan"), "кнопка стоит там, где утверждать нечего");
+    // Выход из планирования — тоже нажатие, и тоже явное действие человека:
+    // «план утверждён» из текста разговора не выводится ничем.
     open(4);
     await settle(40);
-    check("на планировании кнопка «Утвердить план» стоит рядом с полосой",
-      Boolean($("#approve-plan")) &&
-        Boolean(document.querySelector(".chat").querySelector("#approve-plan")),
-      "кнопки утверждения плана нет");
-    const wasPatches = taskPatches().length;
-    const wasSent = server.state.sent.length;
-    $("#approve-plan").dispatchEvent(new Evt("click"));
-    await settle(200);
-    const approves = server.state.requests.filter(
-      (r) => r.method === "POST" && /\/task\/approve$/.test(r.path));
-    check("«Утвердить план» идёт своей ручкой, а не правкой состояния",
-      approves.length === 1 && taskPatches().length === wasPatches,
-      JSON.stringify(server.state.requests.slice(-3).map((r) => [r.method, r.path])));
-    check("и полоса переехала на «работу», а кнопка утверждения исчезла",
-      current() === "execution" && !$("#approve-plan"), current() + " — " + shown());
-    // И кнопка **сама отправляет обмен**: человек утвердил план — значит,
-    // дальше работают, и требовать от него ещё и «делай» значило бы
-    // просить подтверждение дважды.
-    check("утверждение плана само отправляет обмен",
-      server.state.sent.length === wasSent + 1 &&
-        server.state.sent.slice(-1)[0].text ===
-          "План утверждён. Выполни первый шаг плана прямо сейчас "
-          + "и покажи результат работы, а не намерение её начать.",
-      JSON.stringify(server.state.sent.slice(-1)));
+    check("на планировании достижима одна «работа», остальное приглушено",
+      current() === "planning" && far() === "validation done", far());
+    stage("execution").dispatchEvent(new Evt("click"));
+    await settle(80);
+    check("нажатие на «работу» выпускает задачу из планирования",
+      current() === "execution" &&
+        JSON.stringify(stagePosts().slice(-1)[0].body) === JSON.stringify({ stage: "execution" }),
+      current() + " — " + JSON.stringify(stagePosts().slice(-1)[0].body));
+    check("и под полосой встала инструкция работы",
+      note().includes("инструкция: выдай сам результат: текст, код, описание"), note());
   }
 
-  // ── кнопка плана: в пустом чате её нет ──
+  // ── запрещённый переход отбивает сервер, а не разметка ──
   //
-  // Утверждать нечего, пока плана не предложили: кнопка в пустом чате
-  // обещала бы решение, которого человек ещё не принимал.
+  // Полоса недостижимое и так не даёт нажать, но правило обязано держаться
+  // **кодом**: запрос мимо полосы — из другой вкладки, из curl, от клиента
+  // другой версии — получает отказ. Здесь он приходит настоящим 409, и
+  // клиент показывает его теми словами, какими его собрал сервер.
   {
-    const { client, $, settle } = freshClient({
-      chats: [{ label: "ещё не говорили", transcript: [] }],
-    });
-    client.init();
-    await settle(40);
-    check("в чате без ответа модели кнопки «Утвердить план» нет",
-      !$("#approve-plan"), "кнопка стоит в пустом чате");
-  }
-
-
-  // ── этап двигает инструмент модели: полоса едет сразу после ответа ──
-  //
-  // Ключевой кадр дня, и потому утверждениями, а не глазами: модель сама
-  // уводит задачу на проверку, а следом просит «готово» через голову
-  // проверки — и получает отказ. Клиент про это ничего не решает: он рисует
-  // то состояние, которое приехало кадром `done`, и показывает ту строку
-  // отказа, которую собрал сервер.
-  {
-    const { client, $, settle, Evt } = freshClient({
+    const { client, server, $, settle, Evt } = freshClient({
       chats: [{ label: "в работе", task: { stage: "execution", step: "", expecting: "" } }],
-      // Первый обмен уводит на проверку, второй просит «готово» из работы —
-      // карта такого не разрешает.
-      toolStage: (i) => (i === 0 ? "validation" : "planning"),
     });
     client.init();
     await settle(30);
@@ -2218,279 +2228,28 @@ async function routeChecks() {
     open(2);
     await settle(40);
 
-    const stages = () => $("#stages").querySelectorAll(".stage");
-    const current = () => {
-      const one = stages().find((b) => b.classList.contains("current"));
-      return one ? one.dataset.stage : "(выделенного нет)";
-    };
-    const moves = () => $("#task-log").querySelectorAll(".move").map((n) => n.textContent);
-
-    check("до обмена полоса стоит на том этапе, который приехал с чатом",
-      current() === "execution", current());
-    check("и журнала переходов ещё нет вовсе",
-      $("#task-moves").classList.contains("hidden"), "журнал показан пустым");
-
-    $("#input").value = "закончил, посмотри";
-    $("#composer").requestSubmit();
-    await settle(400);
-    check("полоса переехала на проверку сразу после ответа",
-      current() === "validation", current());
-    check("и под полосой встала инструкция нового этапа",
-      $("#stage-note").textContent.includes("вызови update_stage"),
-      $("#stage-note").textContent);
-
-    // Журнал — свёрнутой строкой: летопись, а не состояние. Разворачивается
-    // по щелчку.
-    check("журнал свёрнут в строку «переходов: 1»",
-      $("#task-log-toggle").textContent === "переходов: 1" &&
-        $("#task-log").classList.contains("hidden"),
-      $("#task-log-toggle").textContent);
-    $("#task-log-toggle").dispatchEvent(new Evt("click"));
-    await settle(20);
-    check("развёрнутый журнал называет переход и того, кто его сделал",
-      !$("#task-log").classList.contains("hidden") &&
-        moves().length === 1 && moves()[0].includes("работа → проверка") &&
-        moves()[0].includes("агент"),
-      JSON.stringify(moves()));
-
-    // А теперь модель просит прыжок через этап — и его не дают. Это видно
-    // трижды: полоса не сдвинулась, в журнале строка «отклонено», а под
-    // ответом строка отказа. Молчать нельзя: модель просила переход.
-    $("#input").value = "всё, начнём заново";
-    $("#composer").requestSubmit();
-    await settle(400);
-    check("запрещённый переход полосу не сдвинул",
-      current() === "validation", current());
-    check("в журнале он стоит отклонённым",
-      moves().length === 2 && moves()[1].includes("отклонено") &&
-        moves()[1].includes("проверка → планирование"),
-      JSON.stringify(moves()));
-    const note = $("#feed").querySelectorAll(".usage-stage").map((n) => n.textContent);
-    check("и под ответом стоит строка отказа, а не молчание",
-      note.length === 1 &&
-        note[0] === "переход в «планирование» отклонён: можно только в готово или работа",
-      JSON.stringify(note));
-  }
-
-  // ── журнал работы: всё, что случилось в этом чате, строка за строкой ──
-  //
-  // Вкладка копит события в памяти, ровно как промпт обмена: ни ручки, ни
-  // колонки под неё нет, и сервер о ней не знает ничего. Поэтому и проверять
-  // её можно только так — настоящим обменом через настоящий клиент.
-  //
-  // Ключ в журнал попасть не должен ни при каких событиях. Тело запроса
-  // его не содержит — он живёт в заголовке `Authorization`, — и приманка
-  // поэтому лежит там, где ключ у чата и мог бы оказаться: в `extra_body`,
-  // куске конфига, который клиент держит на руках и в промпт не отправляет.
-  // Журнал, дописавший к строке конфиг чата или заголовки запроса,
-  // покраснеет здесь же.
-  //
-  // В системном промпте приманке больше не место: его журнал показывает
-  // **дословно** и обязан — это слова самого человека, уехавшие в модель.
-  {
-    const LURE = "sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА";
-    const { client, $, settle, Evt } = freshClient({
-      delay: 12,
-      chats: [
-        {
-          label: "в работе",
-          system: "системный промпт чата",
-          extra_body: { authorization: "Bearer " + LURE },
-          task: { stage: "execution", step: "", expecting: "" },
-        },
-      ],
-      // Первый обмен уводит на проверку, второй просит «планирование» —
-      // карта такого не разрешает, и журнал обязан показать довод отказа.
-      toolStage: (i) => (i === 0 ? "validation" : "planning"),
-      // И первый же обмен идёт со сворачиванием: строка о служебной работе
-      // обязана назвать, сколько сообщений свернулось.
-      service: (i) => (i === 0 ? { insert: "[пересказ начала]", covered: 0, strategy: "summary" } : null),
-      usage: (i) => (i === 0
-        ? { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, summarized: 10,
-            elapsed_ms: 1500 }
-        : { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 }),
+    const id = server.state.agents.slice(-1)[0].id;
+    const jump = await server.fetchStub("/api/agents/" + id + "/task/stage", {
+      method: "POST", body: JSON.stringify({ stage: "done" }),
     });
-    client.init();
-    await settle(30);
-    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
-    const tab = (name) => document.querySelectorAll(".tab")
-      .find((t) => t.dataset.tab === name).dispatchEvent(new Evt("click"));
-    const rows = () => $("#log-list").querySelectorAll(".log-row").map((r) => ({
-      what: r.querySelector(".log-what").textContent,
-      detail: r.querySelector(".log-detail").textContent,
-    }));
-    const said = () => JSON.stringify(rows());
-    const row = (what, needle) => rows()
-      .some((r) => r.what === what && r.detail.indexOf(needle) >= 0);
-    // Тело строки: свёрнуто, раскрывается щелчком по самой строке. Журнал
-    // перерисовывается целиком, поэтому узел после клика ищем заново.
-    // Строк с одним именем в журнале бывает несколько — по одной на обмен;
-    // берём последнюю, ту, что породил текущий обмен.
-    const item = (what) => $("#log-list").querySelectorAll(".log-item")
-      .filter((n) => n.querySelector(".log-what").textContent === what)
-      .slice(-1)[0];
-    const expand = (what) => {
-      const before = item(what);
-      if (!before) return "(строки «" + what + "» в журнале нет)";
-      before.querySelector(".log-row").dispatchEvent(new Evt("click"));
-      const after = item(what);
-      const body = after && after.querySelector(".log-body");
-      if (!body || body.classList.contains("hidden")) return "(тело не раскрылось)";
-      return body.textContent;
-    };
-
-    open(2);
-    await settle(40);
-    tab("log");
-    await settle(20);
-
-    // Страница журнала перечислена в списке страниц панели: забытая в нём,
-    // она оставила бы поверх себя прежнюю — и видно это только глазами.
-    check("вкладка «Журнал» открывается, а прежняя страница уходит с экрана",
-      !$("#tab-log").classList.contains("hidden") &&
-        $("#tab-model").classList.contains("hidden") &&
-        $("#tab-memory").classList.contains("hidden"),
-      "log скрыт: " + $("#tab-log").classList.contains("hidden"));
-
-    // Обмен идёт — и всё это время видно, **на каком он шаге**: строка
-    // состояния называет текущий служебный обход, а журнал пополняется
-    // по ходу, а не после конца. Смотрим в обмен, пока он идёт: обоими
-    // утверждениями проверяется именно это.
-    const steps = [];
-    let early = [];
-    $("#input").value = "доделал первый шаг";
-    $("#composer").requestSubmit();
-    for (let i = 0; i < 70; i++) {
-      await settle(6);
-      const line = $("#feed").querySelector(".card-status-text");
-      if (line && steps[steps.length - 1] !== line.textContent) steps.push(line.textContent);
-      // Ответа в карточке ещё нет — значит обмен точно не кончился.
-      const body = $("#feed").querySelector(".card-body");
-      if (body && !body.textContent) early = rows().map((r) => r.what);
-    }
-    await settle(400);
-
-    check("строка состояния называет каждый служебный обход, а не только сворачивание",
-      steps.indexOf("Сворачиваю начало разговора…") >= 0 &&
-        steps.indexOf("Исполняю вызов инструмента…") >= 0 &&
-        steps.indexOf("Жду продолжения после вызова…") >= 0,
-      JSON.stringify(steps));
-    check("журнал пополняется по ходу обмена, а не после его конца",
-      early.indexOf("вызов инструмента") >= 0 &&
-        early.indexOf("ответ получен") < 0,
-      JSON.stringify(early));
-
-    check("журнал открывает обмен строкой с вопросом",
-      row("обмен начат", "доделал первый шаг"), said());
-    check("служебная работа названа числом свёрнутых сообщений",
-      row("сворачивание", "свёрнуто сообщений: 10"), said());
-    check("применённый вызов инструмента назвал и просимое, и решение кода",
-      row("вызов инструмента", "просил «проверка» — применено: работа → проверка"), said());
-    check("ответ получен — с токенами входа, выхода и временем",
-      row("ответ получен", "вход 120") && row("ответ получен", "выход 30") &&
-        rows().some((r) => r.what === "ответ получен" && / с$/.test(r.detail)),
-      said());
-
-    // ── содержимое, а не пересказ ──
-    //
-    // Каждая строка раскрывается и показывает то, что правда уехало
-    // и правда пришло. Пересказ «обмен начат» ничего не отлаживает:
-    // чинить по нему нечего, потому что в нём нет ни одного настоящего
-    // слова из запроса.
-    const asked = expand("запрос к модели");
-    check("строка запроса раскрывается и показывает отправленные сообщения дословно",
-      asked.indexOf("[system]\nсистемный промпт чата") >= 0 &&
-        asked.indexOf("[факты о разговоре]\nэтап: работа") >= 0 &&
-        asked.indexOf("[user]\nдоделал первый шаг") >= 0,
-      asked);
-    check("и сводка в нём стоит той же врезкой, какой уехала",
-      asked.indexOf("[пересказ начала]") >= 0, asked);
-
-    const tool = expand("вызов инструмента");
-    check("аргументы вызова инструмента видны дословно",
-      tool.indexOf("инструмент: update_stage") >= 0 &&
-        tool.indexOf('аргументы: {"stage":"validation"}') >= 0,
-      tool);
-    check("и рядом — что решил код и что ответили модели",
-      tool.indexOf("решение кода: применено: работа → проверка") >= 0 &&
-        tool.indexOf("ответ инструмента модели: готово, этап теперь: validation") >= 0,
-      tool);
-
-    const next = expand("продолжение");
-    check("продолжение показывает, что уехало вторым обходом",
-      next.indexOf("[tool]\nготово, этап теперь: validation") >= 0 &&
-        next.indexOf('"name":"update_stage"') >= 0,
-      next);
-
-    const folding = expand("сворачивание: запрос");
-    check("на пересказ ушедшее тоже видно дословно",
-      folding.indexOf("[system]\nТы сворачиваешь начало разговора") >= 0, folding);
-    const retold = expand("сворачивание: пересказ");
-    check("и то, что с пересказа вернулось",
-      retold.indexOf("[пересказ начала]") >= 0, retold);
-
-    const answered = expand("ответ получен");
-    check("ответ модели виден целиком", answered === "ответ модели", answered);
-
-    // Переключение вкладок журнал не трогает: он живёт в памяти вкладки,
-    // а не в разметке страницы.
-    const before = said();
-    tab("memory");
-    await settle(20);
-    tab("log");
-    await settle(20);
-    check("журнал переживает переключение вкладок",
-      said() === before, said());
-
-    // Отказ: модель просит прыжок через этап, код отказывает — и журнал
-    // обязан назвать причину, а не просто «отклонено».
-    $("#input").value = "всё, начнём заново";
-    $("#composer").requestSubmit();
-    await settle(400);
-    check("отклонённый вызов стоит в журнале с доводом отказа",
-      row("вызов инструмента",
-        "просил «планирование» — отклонено: можно только в готово или работа"), said());
-    // И тот же довод — в теле строки, рядом с тем, что было запрошено:
-    // по строке видно, что просили, по телу — почему не дали.
-    const denied = expand("вызов инструмента");
-    check("довод отказа виден и в раскрытой строке, вместе с ответом модели",
-      denied.indexOf('аргументы: {"stage":"planning"}') >= 0 &&
-        denied.indexOf("ответ инструмента модели: нельзя: из validation можно только в") >= 0 &&
-        denied.indexOf("строка под ответом: переход в «планирование» отклонён: "
-          + "можно только в готово или работа") >= 0,
-      denied);
-    check("и прежние строки обмен не унёс",
-      row("обмен начат", "доделал первый шаг") &&
-        row("сворачивание", "свёрнуто сообщений: 10"),
-      said());
-
-    // Журнал — про открытый чат, а не общий поток: у соседнего он свой.
-    open(0);
-    await settle(40);
-    check("у соседнего чата журнал свой и чужих обменов в нём нет",
-      rows().length === 0 && $("#log-list").textContent.indexOf("доделал") < 0,
-      said());
-    open(2);
-    await settle(40);
-    check("а вернувшись, видим журнал того же чата",
-      row("обмен начат", "доделал первый шаг"), said());
-
-    // И ни одной строки с ключом — ни свёрнутой, ни раскрытой. Раскрываем
-    // все подряд: свёрнутое тело всё равно лежит в разметке, но утечка,
-    // которую видно только после клика, — такая же утечка.
-    $("#log-list").querySelectorAll(".log-row.has-body")
-      .forEach((r) => r.dispatchEvent(new Evt("click")));
-    const wholeLog = $("#log-list").textContent;
-    check("ключа в журнале нет ни в одной записи",
-      wholeLog.indexOf("sk-or") < 0 && wholeLog.indexOf(LURE) < 0 &&
-        wholeLog.indexOf("Bearer") < 0 && wholeLog.indexOf("authorization") < 0,
-      wholeLog);
-    // А показанное — показано: иначе «ключа нет» держалось бы на пустом
-    // журнале, а не на том, что в нём едут только сообщения запроса.
-    check("и при этом в журнале правда лежит то, что уехало в модель",
-      wholeLog.indexOf("системный промпт чата") >= 0 &&
-        wholeLog.indexOf("доделал первый шаг") >= 0,
-      wholeLog);
+    const said = await jump.json();
+    check("ручка отбивает прыжок через этап отказом с внятным текстом",
+      jump.status === 409 &&
+        said.detail === "переход в «готово» отклонён: сначала проверка",
+      jump.status + " — " + JSON.stringify(said));
+    const after = await (await server.fetchStub("/api/agents/" + id)).json();
+    check("и состояние от отбитого перехода не сдвинулось",
+      after.task.stage === "execution", JSON.stringify(after.task));
+    check("а отклонённая попытка легла строкой в журнал переходов",
+      after.task_log.length === 1 && after.task_log[0].ok === false,
+      JSON.stringify(after.task_log));
+    // Незнакомый этап — это не запрет карты, а слово, которого в ней нет:
+    // 400, а не 409.
+    const alien = await server.fetchStub("/api/agents/" + id + "/task/stage", {
+      method: "POST", body: JSON.stringify({ stage: "выполняется" }),
+    });
+    check("незнакомый этап ручка отбивает четырёхсотым, а не отказом карты",
+      alien.status === 400, String(alien.status));
   }
 
 }

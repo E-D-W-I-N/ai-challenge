@@ -305,20 +305,26 @@ button, input, select, textarea { font: inherit; color: inherit; }
   flex-wrap: wrap;
   min-width: 0;
 }
-/* Этап на полосе — показ, а не кнопка: нажатием этап больше не меняется.
-   Текущий выделен, достижимые по карте переходов видны обычными,
-   недостижимые (`.far`) приглушены — запрет виден до того, как его
-   попытались нарушить. Кружок перед подписью — часть текста, а не
-   картинка: из сети клиент не тянет ничего. */
+/* Этап на полосе — кнопка: ею задачу и переключают. Текущий выделен,
+   достижимые по карте переходов нажимаются, недостижимые (`.far`)
+   приглушены и не нажимаются — запрет виден до того, как его попытались
+   нарушить. Кружок перед подписью — часть текста, а не картинка: из сети
+   клиент не тянет ничего. */
 .stage {
+  border: 0;
+  background: none;
   border-radius: 8px;
   padding: 5px 9px;
   color: var(--muted);
+  font: inherit;
   font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
   user-select: none;
+  cursor: pointer;
 }
+.stage:not(:disabled):hover { color: var(--text); background: var(--bg-soft); }
+.stage:disabled { cursor: default; }
 .stage.far { color: var(--faint); opacity: .55; }
 .stage.current {
   background: var(--bg-soft);
@@ -331,24 +337,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
   letter-spacing: -.05em;
   user-select: none;
 }
-
-/* Единственная дверь из планирования в работу — и потому кнопка, а не этап
-   на полосе: нажатие означает «план утверждён», и выглядеть оно обязано
-   действием, а не выбором из четырёх. */
-.stage-approve {
-  margin-left: 10px;
-  border: 0;
-  border-radius: 8px;
-  padding: 5px 10px;
-  background: var(--accent, #2f6feb);
-  color: #fff;
-  font: inherit;
-  font-size: 12.5px;
-  font-weight: 650;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.stage-approve:hover { filter: brightness(1.08); }
 
 /* Строка под полосой: чем заняты, чего ждут и что велено модели. Ровно то,
    что уезжает в блок задачи, — поэтому не прячется и переносится, а не
@@ -484,9 +472,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
   overflow-wrap: anywhere;
 }
 .usage-how { margin-top: 2px; opacity: .85; }
-/* Отказ инструменту: модель просила перевести задачу, её не пустили.
-   Стоит первой строкой и заметнее чисел — это новость, а числа нет. */
-.usage-stage { margin-bottom: 3px; color: var(--warn, #b4540a); font-weight: 600; }
 .card.failed { border-color: var(--danger); }
 .card-error {
   margin: 0 16px 14px;
@@ -1060,43 +1045,4 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
-}
-
-/* Журнал работы: строка на событие, моноширинным — время и числа обязаны
-   стоять столбиком, иначе поток событий не читается глазами. Самое свежее
-   внизу, как в любом логе; объяснений вокруг нет — в панели место дорогое. */
-.log { display: flex; flex-direction: column; gap: 3px; }
-.log-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-.log-at { flex: 0 0 auto; color: var(--faint); font-variant-numeric: tabular-nums; }
-.log-what { flex: 0 0 auto; font-weight: 650; }
-.log-detail { min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
-.log-detail:empty { display: none; }
-.log-row.bad .log-what { color: var(--warn, #b4540a); }
-.log-empty { color: var(--faint); font-size: 11.5px; }
-
-/* Содержимое шага — дословно и под строкой, по клику. Свёрнуто по умолчанию:
-   промпт обмена в полный рост утопил бы вкладку на первом же ответе. */
-.log-item { display: flex; flex-direction: column; }
-.log-row.has-body { cursor: pointer; }
-.log-row.has-body .log-what::after { content: " ▸"; color: var(--faint); }
-.log-item:has(.log-body:not(.hidden)) .log-row .log-what::after { content: " ▾"; }
-.log-body {
-  margin: 2px 0 6px 0;
-  padding: 6px 8px;
-  background: var(--code-bg, rgba(127, 127, 127, 0.1));
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 340px;
-  overflow-y: auto;
 }
