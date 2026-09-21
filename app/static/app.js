@@ -948,43 +948,37 @@ const STEP_MARKS = { done: "✓", in_progress: "▶", pending: "○" };
 // дальше», и печатать человеку нечего, а «переоткрыть» значит «я не согласен»,
 // и почему именно — знает только он.
 //
-// `deny` — человеческий текст отказа. Ручка на 409 отдаёт директиву,
-// написанную **для модели** («…НЕ утверждай, что это сделано»), и совать её
-// в лицо человеку нельзя. Второй формулы отказа на сервере при этом
-// не заводим: клиент говорит своё, выбирая его по коду ответа.
+// Готового текста отказа здесь нет намеренно: его строит `planDenial`
+// по **свежему** этапу, и второй его источник рядом с таблицей разошёлся бы
+// с первым молча.
 const PLAN_ACTIONS = [
   {
     action: "approve",
     label: "Утвердить план",
     stages: ["approval"],
     say: "План утверждён, выполняй первый шаг",
-    deny: "Утвердить не вышло: план уже не ждёт утверждения.",
   },
   {
     action: "pause",
     label: "Пауза",
     stages: ["planning", "approval", "execution", "validation"],
-    deny: "Пауза не вышла: приостановить можно только незавершённую работу.",
   },
   {
     action: "resume",
     label: "Продолжить",
     stages: ["paused"],
     say: "Пауза снята, продолжай с текущего шага",
-    deny: "Снять паузу не вышло: задача не на паузе.",
   },
   {
     action: "reopen",
     label: "Переоткрыть",
     stages: ["done"],
-    deny: "Переоткрыть не вышло: задача не завершена.",
   },
   {
     action: "reset",
     label: "Выйти из режима задачи",
     stages: null,
     off: true,
-    deny: "Выйти не вышло: чат сейчас занят ответом.",
   },
 ];
 
@@ -1059,6 +1053,27 @@ function renderTask(agent) {
   box.appendChild(list);
 }
 
+// Человеческий текст отказа — из **свежего** этапа, а не из таблицы действий.
+//
+// Отказать ручка может по двум разным поводам: этап под кнопкой оказался
+// не тот (вторая вкладка успела раньше) или чат занят ответом. Назови причину
+// по действию — и второй случай получил бы фразу про этап, которого никто
+// не менял, то есть враньё ровно там, где мы отказались врать директивой
+// для модели.
+//
+// Поэтому спрашиваем уже **перечитанный** план: действию он больше
+// не подходит — называем, какой этап теперь, и человек видит и причину,
+// и правду; подходит — значит отказали не из-за него, и причину
+// не выдумываем вовсе.
+function planDenial(entry, plan) {
+  const stage = (plan || {}).stage;
+  if (entry.stages && !entry.stages.includes(stage)) {
+    return "«" + entry.label + "» сейчас нельзя: задача на этапе «" +
+      (STAGE_LABELS[stage] || stage) + "».";
+  }
+  return "«" + entry.label + "» не вышло — попробуйте ещё раз.";
+}
+
 // Свежий чат от сервера — и в открытый, и в строку списка разом: тело у них
 // одно, и разъезжаться им не с чего.
 function mergeAgent(id, fresh) {
@@ -1079,14 +1094,19 @@ async function planMove(entry) {
   try {
     moved = await api("/api/agents/" + id + "/plan/" + entry.action, { method: "POST" });
   } catch (err) {
-    // 409 — «не тот этап» или «чат занят»: тело такого отказа написано для
-    // модели, и человеку едет наш текст. Прочее (сети нет, чата нет) говорит
-    // само за себя, и переводить его не во что.
-    hint(err.status === 409 ? entry.deny : String(err.message || err), true);
-    // Раз этап под кнопкой оказался не тот, что на экране, — перечитываем
-    // чат: оставленная шапка показывала бы кнопку, которая только что
-    // отказала.
-    if (err.status === 409) await refreshCurrent(null);
+    // Прочее (сети нет, чата нет) говорит само за себя, и переводить его
+    // не во что.
+    if (err.status !== 409) {
+      hint(String(err.message || err), true);
+      return;
+    }
+    // 409 — тело такого отказа написано для модели, и человеку едет наш
+    // текст. Перечитываем **прежде**, чем говорить: фраза строится из свежего
+    // этапа, а сказанная до перечитывания опиралась бы ровно на то состояние,
+    // которое только что оказалось неверным. Заодно уходит с экрана кнопка,
+    // которая только что отказала.
+    await refreshCurrent(null);
+    hint(planDenial(entry, state.current && state.current.plan), true);
     return;
   }
   if (!state.current || state.current.id !== id) return;
@@ -1160,7 +1180,7 @@ async function startTask(description) {
   }
   mergeAgent(agent.id, updated);
   renderTask(state.current);
-  await exchange("/api/agents/" + agent.id + "/messages", { text: description }, description);
+  await exchange("/api/agents/" + agent.id + "/messages", { text: description }, description, true);
 }
 
 // ─────────────────────── отправка сообщения ───────────────────
@@ -1222,7 +1242,7 @@ async function send() {
   const described = taskCommand(text);
   if (described !== null) return startTask(described);
 
-  await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
+  await exchange("/api/agents/" + state.current.id + "/messages", { text }, text, true);
 }
 
 async function regenerate() {
@@ -1231,7 +1251,19 @@ async function regenerate() {
 }
 
 // Один обмен: рисуем пузырь вопроса, карточку ответа и стримим в неё.
-async function exchange(path, body, questionText) {
+//
+// `questionText` — что показать пузырём; `null` значит «пузыря нет», и это
+// перегенерация, заменяющая последний ответ.
+//
+// `fromInput` — **откуда** этот текст взялся, и это отдельный признак
+// намеренно. Смыслов у вопроса два — «нарисуй пузырь» и «забери текст
+// из поля», — и у перегенерации они совпадали (ни того, ни другого),
+// а у кнопок шапки расходятся: пузырь рисовать надо, а поле не трогать,
+// потому что текст в него никто не набирал. Слей их обратно в один признак —
+// и «Утвердить план» стирало бы недописанный вопрос. Отсюда же и возврат
+// текста в поле у упавшего обмена: вернуть туда можно только то, что оттуда
+// и взяли.
+async function exchange(path, body, questionText, fromInput = false) {
   const feed = $("#feed");
   const agent = state.current;
 
@@ -1242,9 +1274,10 @@ async function exchange(path, body, questionText) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
     return false;
   }
-  // Текст забираем из поля только теперь: до этой строки отправка могла
-  // не состояться.
-  if (questionText !== null) {
+  // Поле чистим только теперь: до этой строки отправка могла не состояться.
+  // И только если текст пришёл из него — обмен, затеянный кнопкой шапки,
+  // чужого черновика не касается.
+  if (fromInput) {
     const input = $("#input");
     input.value = "";
     autoGrow(input);
@@ -1421,8 +1454,10 @@ async function exchange(path, body, questionText) {
       const bubbles = feed.querySelectorAll(".msg-user");
       if (bubbles.length) bubbles[bubbles.length - 1].remove();
       card.remove();
-      const input = $("#input");
-      if (!input.value) { input.value = questionText; autoGrow(input); }
+      if (fromInput) {
+        const input = $("#input");
+        if (!input.value) { input.value = questionText; autoGrow(input); }
+      }
     }
   }
 

@@ -2035,7 +2035,12 @@ async function routeChecks() {
     paused: { steps: [STEP("собрать требования", "done"), STEP("накидать структуру", "pending")],
               approved: true, finished: false, paused: true },
   };
-  const withPlan = (label, stage) => ({ label, workflow: "plan", plan: PLANS[stage] });
+  // Копия, а не ссылка: планы отсюда попадают прямо в состояние стенда,
+  // и проверка, правящая их у себя (вторая вкладка утвердила план раньше),
+  // иначе правила бы заготовку — и следующий стенд поднимался бы не с того
+  // этапа, о котором его просили.
+  const withPlan = (label, stage) =>
+    ({ label, workflow: "plan", plan: JSON.parse(JSON.stringify(PLANS[stage])) });
 
   // Тексты-константы кнопок: по одной на **переход**. Держим их здесь
   // отдельными значениями, чтобы утверждение «у продолжения своя» стояло
@@ -2203,8 +2208,16 @@ async function routeChecks() {
     await settle(30);
     $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
     await settle(40);
+    // Человек набирал вопрос и не дописал его. Кнопка шапки шлёт свой обмен
+    // мимо поля: текст в него никто не набирал, и стирать чужой черновик
+    // ей нечем и незачем.
+    const DRAFT = "недописанный вопрос";
+    $("#input").value = DRAFT;
     taskButton($, "Утвердить план").dispatchEvent(new Evt("click"));
     await settle(200);
+
+    check("кнопка шапки не тронула недописанное в поле ввода",
+      $("#input").value === DRAFT, JSON.stringify($("#input").value));
 
     const approveAt = postedPlan(server, "approve");
     const postAt = postedMessage(server);
@@ -2385,13 +2398,52 @@ async function routeChecks() {
     check("ручка и правда отказывает директивой, написанной для модели",
       refused.status === 409 && body.detail.includes("НЕ утверждай"),
       refused.status + " " + body.detail);
-    check("а человек видит человеческий текст",
-      shown.includes("не ждёт утверждения") &&
+    check("а человек видит человеческий текст — и свежий этап в нём назван",
+      shown.includes("Утвердить план") && shown.includes("этапе «работа»") &&
         $("#composer-hint").classList.contains("error"), shown);
     check("и директивы для модели на экране нет",
       !shown.includes("НЕ утверждай") && !shown.includes("НЕ выполнен"), shown);
     check("шапка перечитана: кнопки, которая только что отказала, больше нет",
       !taskButtons($).includes("Утвердить план"), JSON.stringify(taskButtons($)));
+  }
+
+  // ── тот же 409, но этап не менялся: причину не выдумываем ──
+  //
+  // Поводов у отказа два, а код один: не тот этап — или чат занят ответом
+  // (наш интерфейс в занятый чат не стучится, но вторая вкладка и любой
+  // другой клиент — запросто). Назови причину по **действию**, и здесь
+  // на экран уехала бы фраза про этап, которого никто не менял, — враньё
+  // ровно там, где мы отказались врать директивой для модели.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [withPlan("на утверждении", "approval")],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    // Вторая вкладка занята ответом. Этап при этом тот же, что был.
+    server.state.agents[2].busy = true;
+    const stageBefore = taskStage($);
+    taskButton($, "Утвердить план").dispatchEvent(new Evt("click"));
+    await settle(200);
+
+    const shown = $("#composer-hint").textContent;
+    // Что ручка отдаёт на самом деле. Без этой строки «этап не менялся»
+    // стояло бы на догадке: проверялось бы отсутствие фразы там, где, может,
+    // и отказа-то не было.
+    const refused = await fetch("/api/agents/" + server.state.agents[2].id + "/plan/approve",
+      { method: "POST" });
+    check("занятый чат отказывает тем же кодом 409, что и не тот этап",
+      refused.status === 409, String(refused.status));
+    check("этап при этом не менялся", taskStage($) === stageBefore,
+      stageBefore + " → " + taskStage($));
+    check("на экране сказано, что не вышло, и названа кнопка",
+      shown.includes("Утвердить план") && shown.includes("не вышло"), shown);
+    check("и фразы про этап в нём нет — причину не выдумываем",
+      !shown.includes("этап"), shown);
+    check("кнопка при этом осталась: отказали не из-за этапа",
+      taskButtons($).includes("Утвердить план"), JSON.stringify(taskButtons($)));
   }
 
   // ── просмотр промпта: блок задачи подписан своей ролью ──

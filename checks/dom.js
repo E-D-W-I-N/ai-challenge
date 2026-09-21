@@ -1136,6 +1136,13 @@ function buildServer(options) {
     const planMatch = /^\/plan\/([a-z]+)$/.exec(tail);
     if (planMatch && method === "POST") {
       if (!PLAN_MOVES.includes(planMatch[1])) return fail(404, "нет такой ручки плана");
+      // Занятый чат — тот же 409, что и «не тот этап», и это важно: два
+      // разных повода под одним кодом. Обмен идёт на слепке конфига, но план
+      // читает живой, и переход посреди него дал бы промпт одного этапа
+      // с правилом другого.
+      if (agent.busy) {
+        return fail(409, "агент " + agent.id + " уже занят: дождитесь текущего ответа");
+      }
       const moved = planApply(agent.plan, planMatch[1]);
       if (moved.error) return fail(409, moved.error);
       agent.plan = moved.plan;
