@@ -2560,6 +2560,45 @@ async function routeChecks() {
       $("#composer-hint").textContent);
   }
 
+  // ── отмена, пришедшая кадром `done`, цепочку останавливает ──
+  //
+  // Отмену ставит не только наша кнопка: соседняя вкладка того же чата зовёт
+  // `/cancel`, и наш поток дочитывается до конца — кадром `done`, в котором
+  // сервер говорит `cancelled`. Своего признака отмены у клиента в этом случае
+  // нет вовсе (рвать ему было нечего), и не прочитай он слово сервера —
+  // цепочка отправила бы следующий обмен **сама**, уже после того, как человек
+  // попросил остановиться. Платит за него он же.
+  //
+  // Сцена собрана так, чтобы падать было на чём: этап сдвинут, значит
+  // продолжение здесь достижимо — соседний блок с теми же планами и без отмены
+  // его и делает.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "отменят снаружи", workflow: "plan", plan: copyPlan(WORKING) }],
+      tools: (i) => moveTo(CHECKED),
+      cancelled: true,
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "доделывай";
+    $("#composer").requestSubmit();
+    await settle(400);
+
+    check("отменённый снаружи обмен этап всё-таки сдвинул — сцена та",
+      taskStage($).startsWith("Задача · проверка"), taskStage($));
+    check("отмена приехала кадром done, а не обрывом: поток дочитан до конца",
+      client.state.busy === false && $("#feed").querySelectorAll(".card").length === 1,
+      "карточек: " + $("#feed").querySelectorAll(".card").length);
+    check("цепочка на отмене встала: продолжения нет",
+      server.state.sent.length === 1,
+      JSON.stringify(server.state.sent.map((x) => x.text)));
+    check("и человеку сказано, что остановлено, а не молча",
+      $("#composer-hint").textContent.includes("Остановлено"),
+      $("#composer-hint").textContent);
+  }
+
   // ── упавший обмен цепочку не продолжает ──
   //
   // Вторая половина того же условия, что и «Стоп»: вызов успел исполниться

@@ -486,6 +486,13 @@ function buildServer(options) {
     // вызов, и план в нём уже новый — как на сервере, где `plan_view()`
     // читается прямо на месте правки.
     tools: (options && options.tools) || null,
+    // Обмен, отменённый **на сервере**: `true` или функция (номер обмена) →
+    // `true`. Поток при этом дочитывается до конца, а кадр `done` несёт
+    // `cancelled: true` — так выглядит отмена, поставленная соседней вкладкой
+    // через `/cancel`: свой поток наш клиент рвёт сам и кадра `done` тогда
+    // не видит вовсе. Без этой формы кадра утверждение «цепочка встала
+    // на отмене» держалось бы само собой.
+    cancelled: (options && options.cancelled) || null,
     // Сколько миллисекунд ручка думает, прежде чем ответить: число или
     // функция (метод, путь) → число. Ноль по умолчанию — ни одна прежняя
     // проверка от этого не меняется.
@@ -923,6 +930,8 @@ function buildServer(options) {
     }
     // Числа приходят последним кадром, как настоящий usage от OpenRouter:
     // до него в кадрах их нет, и плитки показывают прочерк.
+    const stopped = typeof state.cancelled === "function"
+      ? state.cancelled(index) : state.cancelled;
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
     const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
     // Длина истории до записи: по ней откатываем обмен, оборванный «Стопом»
@@ -949,8 +958,11 @@ function buildServer(options) {
       ...toolFrames,
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
+      // Отменённый на сервере обмен приезжает тем же `done`, и начатый ответ
+      // в нём записан: он оплачен, и сервер его пишет (`_commit` частичный
+      // ответ не выбрасывает).
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null,
-        committed: true, ...stages },
+        committed: true, ...stages, ...(stopped ? { cancelled: true } : {}) },
     ];
     // Где в потоке первый кусок текста. Обмен, оборванный до него, сервер
     // в историю не пишет; оборванный после — пишет начатое, и оно оплачено.
