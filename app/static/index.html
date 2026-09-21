@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 11</span>
+            <span class="brand-sub">чат · день 12</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -57,6 +57,8 @@
           <button class="tab" data-tab="agent" type="button" role="tab">Агент</button>
           <button class="tab" id="tab-btn-memory" data-tab="memory" type="button"
                   role="tab">Память</button>
+          <button class="tab" id="tab-btn-profile" data-tab="profile" type="button"
+                  role="tab">Профиль</button>
         </div>
         <button class="icon-btn" id="panel-toggle" type="button"
                 title="Свернуть настройки" aria-label="Свернуть настройки"></button>
@@ -258,6 +260,33 @@
             </div>
             <p class="hint" id="mem-status"></p>
           </div>
+        </section>
+
+        <!-- Профиль: как отвечать именно этому человеку. Три поля свободного
+             текста — стиль, формат и контекст, — и ничего кроме: примеры
+             стоят подсказками в самих полях.
+
+             Поля тоже **без** приставки `f-`: профиль не настройка чата —
+             он один на всю базу, у него своя ручка, и PATCH чата при правке
+             стиля был бы запросом ни о чём. Общий слушатель `change`
+             на #panel-body различает их по приставке. -->
+        <section class="tab-page hidden" id="tab-profile">
+          <label class="field">
+            <span class="field-label">Стиль</span>
+            <textarea id="profile-style" class="control area" rows="2"
+                      placeholder="например: кратко, без вступлений, на ты"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">Формат</span>
+            <textarea id="profile-format" class="control area" rows="2"
+                      placeholder="например: с примерами кода, списком"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">Контекст</span>
+            <textarea id="profile-context" class="control area" rows="2"
+                      placeholder="например: собираю ТЗ на мобильное приложение"></textarea>
+          </label>
+          <p class="hint" id="profile-status"></p>
         </section>
       </div>
 

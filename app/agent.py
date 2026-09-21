@@ -21,7 +21,14 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
-from .schema import CONTEXT_FIELDS, MEMORY_LABELS, WORKING_LABELS, AgentSpec
+from .schema import (
+    CONTEXT_FIELDS,
+    MEMORY_LABELS,
+    PROFILE_FIELDS,
+    PROFILE_LABELS,
+    WORKING_LABELS,
+    AgentSpec,
+)
 from .store import Store
 
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd")
@@ -157,6 +164,53 @@ def memory_message(records: list[dict]) -> dict:
             "[конец долговременной памяти]"
         ),
     }
+
+
+def profile_block(values: dict) -> str:
+    """Профиль строками «подпись поля: текст» под заголовком `[как отвечать]`.
+
+    В блок попадают **только заполненные** поля и в том порядке, в каком они
+    перечислены (`PROFILE_FIELDS`): пустое поле уехало бы строкой «формат: »
+    и сказало бы модели ровно ничего, заняв место распоряжения.
+
+    Подпись поля — по одной карте с интерфейсом (`PROFILE_LABELS`), ровно как
+    у обоих слоёв памяти: второй таблицей подписей модель читала бы одно
+    слово, а человек видел бы другое.
+    """
+    lines = [
+        f"{PROFILE_LABELS.get(field, field)}: {values[field]}"
+        for field in PROFILE_FIELDS
+        if values.get(field)
+    ]
+    return "[как отвечать]\n" + "\n".join(lines)
+
+
+def system_message(system: str, profile: dict) -> dict | None:
+    """Системное сообщение промпта — или `None`, если его нет вовсе.
+
+    Здесь меняется правило, прожившее четыре дня: «системный промпт живёт
+    ровно в одном месте — `spec.system`». Место у него по-прежнему одно,
+    но **роль сообщения определяется источником**: системным сообщением едет
+    то, что задал человек, — а профиль задал он, руками, во вкладке. Врезки
+    памяти едут ролью `user` по тому же правилу с другой стороны: их
+    содержимое человек тоже вписал, но встают они в промпт как сведения,
+    на которые модель опирается, а не как распоряжение, которому следует.
+
+    Профиль дописывается **в то же** сообщение, а не встаёт вторым системным:
+    у чата ровно одно системное сообщение, и «кто ты» и «как отвечать»
+    читаются как одно распоряжение.
+
+    Ловушка здесь ровно одна, и она молчаливая: номера врезок берутся
+    из длины уже собранного начала промпта, а системное сообщение теперь
+    заводится и у чата **без** `spec.system` — если профиль непуст. Правило
+    «голый чат уходит без системной реплики» осталось прежним; голый теперь
+    значит «ни системного промпта, ни профиля».
+    """
+    block = profile_block(profile) if profile else ""
+    parts = [part for part in (system, block) if part]
+    if not parts:
+        return None
+    return {"role": "system", "content": "\n\n".join(parts)}
 
 
 PROMPT_SLOTS = ("memory_at", "working_at", "summary_at")
@@ -534,8 +588,26 @@ class Agent:
             return []
         return self.store.list_memory()
 
+    def profile_items(self, profile=None) -> dict:
+        """Что из профиля уедет в промпт — заполненные поля или пустой словарь.
+
+        Условие одно на два случая, как у `memory_items`: профиль пуст или
+        хранилища у агента нет. **Пустой профиль обязан быть неотличим
+        от отсутствующего** — и здесь это строже, чем у памяти: профиль
+        заводит собой **системное** сообщение, и пустой блок сдвинул бы
+        не только себя, а номера всех врезок разом.
+
+        `profile` — уже прочитанный словарь: обмен читает профиль один раз
+        и передаёт сюда и в сборку промпта, ровно как память.
+        """
+        if profile is not None:
+            return dict(profile)
+        if self.store is None:
+            return {}
+        return self.store.load_profile()
+
     def prompt_head(
-        self, spec: AgentSpec | None = None, memory=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None
     ) -> tuple[list[dict], dict[str, int | None], int]:
         """Начало промпта разом: сообщения **до** истории, номер каждой врезки
         в них и срез, с которого история уезжает дальше.
@@ -551,7 +623,8 @@ class Agent:
         начала. Разойтись с порядком сборки ему поэтому негде — порядок и есть
         единственный источник обоих ответов.
 
-        Порядок от общего к частному: системный промпт, долговременная память
+        Порядок от общего к частному: системное сообщение (системный промпт
+        чата и профиль — всё, что задал человек), долговременная память
         (что знали до чата), рабочая (что знаем про эту задачу), врезка
         стратегии (чем свёрнут сам чат). Ноль — законное значение любого
         номера: у чата без системного промпта первая же врезка стоит нулевым
@@ -561,8 +634,14 @@ class Agent:
 
         messages: list[dict] = []
         slots: dict[str, int | None] = {name: None for name in PROMPT_SLOTS}
-        if spec.system:
-            messages.append({"role": "system", "content": spec.system})
+        # Системное сообщение — то, что задал человек: системный промпт чата
+        # и профиль, если он непуст. Своего номера у него нет и не нужно:
+        # оно всегда первое, и клиент подписывает его по позиции. А вот
+        # на номера **остальных** врезок оно влияет прямо, и потому собрано
+        # здесь же, где они берутся, — одним `system_message`.
+        head = system_message(spec.system, self.profile_items(profile))
+        if head is not None:
+            messages.append(head)
 
         records = self.memory_items(spec, memory)
         if records:
@@ -582,7 +661,7 @@ class Agent:
         return messages, slots, cut
 
     def build_prompt(
-        self, user_text: str, *, spec: AgentSpec | None = None, memory=None
+        self, user_text: str, *, spec: AgentSpec | None = None, memory=None, profile=None
     ) -> list[dict]:
         """Системный промпт + долговременная память + рабочая память + начало
         истории по стратегии + хвост + вопрос.
@@ -601,12 +680,14 @@ class Agent:
         сообщения; `spec` передаёт обмен — он собирает промпт и тело запроса
         из одного слепка, и память читает один раз на обмен.
         """
-        messages, _, cut = self.prompt_head(spec, memory)
+        messages, _, cut = self.prompt_head(spec, memory, profile)
         messages.extend(turn.as_message() for turn in self.history[cut:])
         messages.append({"role": "user", "content": user_text})
         return messages
 
-    def prompt_slots(self, spec: AgentSpec | None = None, memory=None) -> dict[str, int | None]:
+    def prompt_slots(
+        self, spec: AgentSpec | None = None, memory=None, profile=None
+    ) -> dict[str, int | None]:
         """Номера всех врезок промпта разом: `memory_at`, `working_at`,
         `summary_at`. `None` у любого — врезки в промпте нет вовсе.
 
@@ -615,7 +696,7 @@ class Agent:
         формулы, и разошлись бы они молча. Уезжают они тоже разом — одним
         кадром `start`, — и спрашивать их порознь было бы неоткуда.
         """
-        return self.prompt_head(spec, memory)[1]
+        return self.prompt_head(spec, memory, profile)[1]
 
     def compress_plan(self, spec: AgentSpec) -> tuple[int, int] | None:
         """Что предстоит свернуть этим обменом: `(свёрнуто, новая граница)` —
@@ -1090,8 +1171,15 @@ class Agent:
             # к модели и длится сколько угодно, и память, записанную за это
             # время, честнее взять свежей.
             memory = self.memory_items(spec)
+            # Профиль — тем же порядком и по тому же доводу: прочитан один
+            # раз на обмен и уезжает и в промпт, и в номера врезок. Он
+            # заводит собой системное сообщение, и прочитанный дважды
+            # развёл бы промпт с номерами сильнее любой врезки.
+            profile = self.profile_items()
 
-            prompt = self.build_prompt(user_text, spec=spec, memory=memory)
+            prompt = self.build_prompt(
+                user_text, spec=spec, memory=memory, profile=profile
+            )
 
             # `summary_at` — место врезки стратегии в промпте, `memory_at`
             # и `working_at` — места врезок памяти; `None` у любого из них
@@ -1110,7 +1198,7 @@ class Agent:
                 "type": "start",
                 "resolved_messages": prompt,
                 "question": user_text,
-                **self.prompt_slots(spec, memory),
+                **self.prompt_slots(spec, memory, profile),
                 "strategy": spec.strategy,
             }
 
