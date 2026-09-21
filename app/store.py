@@ -178,16 +178,15 @@ CREATE TABLE IF NOT EXISTS task_state (
 -- AUTOINCREMENT, как у обоих слоёв памяти: строка здесь имеет идентичность,
 -- никогда не переписывается и номер удалённой заново не выдаётся.
 --
--- `stage_from` и `stage_to` равны, когда служебный вызов решил оставить этап
--- как был. Такая строка в журнале переходов на экране не показывается —
--- переход это новость, а оставленный этап нет, — но в таблице стоит, и
--- стоит не зря: в ней лежат **метрики вызова**, который это решил. Правило
--- то же, что у сводок: числа служебного вызова живут там же, где его
--- результат, и вызов, чья цена нигде не записана, сделал бы экономию
--- чата враньём.
+-- `ok` — состоялся переход или был отбит картой. Отклонённые попытки лежат
+-- здесь наравне с удавшимися, и это не отчётность ради отчётности: журнал
+-- обязан показывать не только то, что переходы случаются, но и то, что
+-- запрещённые **не** случаются. Иначе автомату приходится верить на слово.
 --
--- У строки человека метрик нет вовсе (`NULL`): нажатие кнопки ничего
--- не стоит.
+-- Строк «остались там же» тут не бывает вовсе: попросить тот этап, на котором
+-- и стоишь, — не ошибка и не переход, и записывать нечего. Метрик рядом тоже
+-- нет: этап двигает инструмент внутри самого обмена, отдельного обращения
+-- к модели у него не бывает, и своей цены у перехода нет.
 --
 -- Каскада нет, FK не объявлены — чистится вместе с состоянием, на всех трёх
 -- путях и одним методом (`clear_task`): журнал переходов забытого разговора
@@ -198,7 +197,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     stage_from TEXT NOT NULL,
     stage_to   TEXT NOT NULL,
     who        TEXT NOT NULL,
-    metrics    TEXT,
+    ok         INTEGER NOT NULL,
     at         REAL NOT NULL
 );
 
@@ -347,15 +346,15 @@ def _task_row(row) -> dict:
 
 
 def _task_move_row(row) -> dict:
-    """Строка журнала этапа в том виде, в каком её ждут и вкладка, и счёт
-    стоимости: откуда, куда, кто и когда — плюс метрики вызова, если решал
-    вызов. Одна форма на оба чтения, довод тот же, что у `_task_row`."""
+    """Строка журнала этапа в том виде, в каком её ждёт экран: откуда, куда,
+    кто и когда — и состоялся ли переход. Одна форма на оба чтения, довод
+    тот же, что у `_task_row`."""
     return {
         "seq": row["seq"],
         "stage_from": row["stage_from"],
         "stage_to": row["stage_to"],
         "who": row["who"],
-        "metrics": _loads(row["metrics"], None) if row["metrics"] else None,
+        "ok": bool(row["ok"]),
         "at": row["at"],
     }
 
@@ -523,9 +522,12 @@ class Store:
         `ALTER` и `DROP` меняют файл наравне с `INSERT`, и путь записи мимо
         обёртки был бы путём мимо `redact()`.
 
-        Снимает она и лишнее: колонку авторства у обоих слоёв памяти
-        и таблицу состояния ведения. Отличать автора стало не от кого —
-        пишет в память только человек, — а вести её некому.
+        Снимает она и лишнее: колонку авторства у обоих слоёв памяти,
+        таблицу состояния ведения и цену перехода в журнале этапа. Отличать
+        автора стало не от кого — пишет в память только человек, — вести
+        состояние некому, а платить за переход нечем: этап двигает инструмент
+        внутри обмена. Взамен цены журнал получает `ok`: состоялся переход
+        или его отбила карта.
         """
         done: list[str] = []
         with self.tx() as conn:
@@ -548,6 +550,24 @@ class Store:
             # во что обошёлся. Вызова не стало; читать некому, платить не за
             # что, и зажимать окно этим числом больше не надо. Содержимого
             # не жаль: обе были производными от истории.
+            # Журнал этапа завели под служебный вызов, который двигал задачу
+            # отдельным обращением к модели: в `metrics` лежала его цена.
+            # Вызова не стало — этап двигает инструмент внутри самого обмена,
+            # и платить за переход больше нечем. Зато появилось, что о нём
+            # сказать: состоялся он или его отбила карта. Колонку снимаем,
+            # `ok` добавляем — строкам старой базы ставим «состоялся», потому
+            # что отклонённых в ней и не было: писать их стало некому и тогда,
+            # когда писать было кому.
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(task_log)").fetchall()
+            }
+            if columns and "ok" not in columns:
+                conn.execute("ALTER TABLE task_log ADD COLUMN ok INTEGER NOT NULL DEFAULT 1")
+                done.append("task_log.ok")
+            if "metrics" in columns:
+                conn.execute("ALTER TABLE task_log DROP COLUMN metrics")
+                done.append("task_log.metrics")
             for table in ("facts", "working_state"):
                 if conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
@@ -1014,7 +1034,7 @@ class Store:
         stage_from: str,
         stage_to: str,
         who: str,
-        metrics: dict | None = None,
+        ok: bool,
         at: float | None = None,
     ) -> dict:
         """Дописывает строку журнала этапа и отдаёт её целиком.
@@ -1022,26 +1042,20 @@ class Store:
         Только дописывает: строки журнала не правятся и не перенумеровываются
         никогда — это летопись, а не состояние. Номер выдаёт база.
 
-        `stage_from == stage_to` — законный случай: служебный вызов решил
-        оставить этап как был, и строка стоит здесь ради его метрик.
+        `ok=False` — попытку отбила карта переходов. Строка всё равно стоит:
+        отклонённый прыжок это улика того, что автомат работает, и на экране
+        она стоит рядом с удавшимися.
         """
         stamp = time.time() if at is None else at
         with self.tx() as conn:
             cur = conn.execute(
-                "INSERT INTO task_log (session_id, stage_from, stage_to, who, metrics, at) "
+                "INSERT INTO task_log (session_id, stage_from, stage_to, who, ok, at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    stage_from,
-                    stage_to,
-                    who,
-                    _dumps(metrics) if metrics else None,
-                    stamp,
-                ),
+                (session_id, stage_from, stage_to, who, 1 if ok else 0, stamp),
             )
             seq = cur.lastrowid
             row = conn.execute(
-                "SELECT seq, stage_from, stage_to, who, metrics, at FROM task_log "
+                "SELECT seq, stage_from, stage_to, who, ok, at FROM task_log "
                 "WHERE seq = ?",
                 (seq,),
             ).fetchone()
@@ -1052,7 +1066,7 @@ class Store:
         к последнему."""
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT seq, stage_from, stage_to, who, metrics, at FROM task_log "
+                "SELECT seq, stage_from, stage_to, who, ok, at FROM task_log "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
