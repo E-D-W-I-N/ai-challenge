@@ -36,7 +36,7 @@ import app.main as main  # noqa: E402
 import app.llm as llm_module  # noqa: E402
 from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
-from app.schema import AgentSpec, blank_task  # noqa: E402
+from app.schema import AgentSpec, TASK_STAGES, TASK_STAGE_PLAN, blank_task  # noqa: E402
 from app.store import Store  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -1583,6 +1583,19 @@ def check_task_stage():
     assert jumper.move_stage("done") == "moved"
     assert jumper.move_stage("execution") == "denied", jumper.task
     assert jumper.task["stage"] == "done", jumper.task
+
+    # Закрытая задача — **тоже работа**: на «готове» модель обязана подвести
+    # итог, а не отмолчаться вежливостью. Пустая инструкция ровно это и
+    # стоила: этап переключался, а сказать модели, что на нём делать,
+    # оказывалось нечем. Поэтому утверждение двойное — ни у одного этапа
+    # пустой инструкции нет, и инструкция «готова» доезжает до промпта
+    # той же строкой блока, что и у остальных.
+    assert all(TASK_STAGE_PLAN[name]["guide"] for name in TASK_STAGES), TASK_STAGE_PLAN
+    closing = jumper.build_prompt("что в итоге")[0]["content"]
+    assert closing.startswith("[факты о разговоре]\nэтап: готово\n"), closing
+    assert "сейчас: подвести итог работы" in closing, closing
+    assert "ожидается: итог" in closing, closing
+    assert "инструкция: подведи итог" in closing and "за рамками" in closing, closing
     # Журнал переживает перезапуск целиком — вместе с отклонёнными строками.
     assert [(m["stage_to"], m["ok"]) for m in store.list_task_log(jumper.id)] == [
         ("validation", False), ("execution", True), ("validation", True),
@@ -1636,7 +1649,9 @@ def check_task_stage():
         "правка текста этапа не принимает — 400; запрещённый картой переход "
         "отбит и записан в журнал отклонённым, тот же этап и незнакомый "
         "в журнал не идут вовсе; пять строк журнала пережили переоткрытие "
-        "файла, этап и шаг тоже — и уехали в ветку целиком"
+        "файла, этап и шаг тоже — и уехали в ветку целиком; инструкция "
+        "непуста у всех четырёх этапов, и «готово» просит итог прямо "
+        "в промпте"
     )
 
 

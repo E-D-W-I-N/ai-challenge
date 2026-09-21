@@ -2258,6 +2258,119 @@ async function routeChecks() {
       JSON.stringify(note));
   }
 
+  // ── журнал работы: всё, что случилось в этом чате, строка за строкой ──
+  //
+  // Вкладка копит события в памяти, ровно как промпт обмена: ни ручки, ни
+  // колонки под неё нет, и сервер о ней не знает ничего. Поэтому и проверять
+  // её можно только так — настоящим обменом через настоящий клиент.
+  //
+  // Ключ в журнал попасть не должен ни при каких событиях: чат нарочно
+  // заведён с приманкой в системном промпте — она уезжает в каждом запросе,
+  // и журнал, дописывающий к строке тело запроса или конфиг чата,
+  // покраснеет здесь же.
+  {
+    const LURE = "sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА";
+    const { client, $, settle, Evt } = freshClient({
+      chats: [
+        {
+          label: "в работе",
+          system: "системный промпт с приманкой " + LURE,
+          task: { stage: "execution", step: "", expecting: "" },
+        },
+      ],
+      // Первый обмен уводит на проверку, второй просит «планирование» —
+      // карта такого не разрешает, и журнал обязан показать довод отказа.
+      toolStage: (i) => (i === 0 ? "validation" : "planning"),
+      // И первый же обмен идёт со сворачиванием: строка о служебной работе
+      // обязана назвать, сколько сообщений свернулось.
+      service: (i) => (i === 0 ? { insert: "[пересказ начала]", covered: 0, strategy: "summary" } : null),
+      usage: (i) => (i === 0
+        ? { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, summarized: 10,
+            elapsed_ms: 1500 }
+        : { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 }),
+    });
+    client.init();
+    await settle(30);
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    const tab = (name) => document.querySelectorAll(".tab")
+      .find((t) => t.dataset.tab === name).dispatchEvent(new Evt("click"));
+    const rows = () => $("#log-list").querySelectorAll(".log-row").map((r) => ({
+      what: r.querySelector(".log-what").textContent,
+      detail: r.querySelector(".log-detail").textContent,
+    }));
+    const said = () => JSON.stringify(rows());
+    const row = (what, needle) => rows()
+      .some((r) => r.what === what && r.detail.indexOf(needle) >= 0);
+
+    open(2);
+    await settle(40);
+    tab("log");
+    await settle(20);
+
+    // Страница журнала перечислена в списке страниц панели: забытая в нём,
+    // она оставила бы поверх себя прежнюю — и видно это только глазами.
+    check("вкладка «Журнал» открывается, а прежняя страница уходит с экрана",
+      !$("#tab-log").classList.contains("hidden") &&
+        $("#tab-model").classList.contains("hidden") &&
+        $("#tab-memory").classList.contains("hidden"),
+      "log скрыт: " + $("#tab-log").classList.contains("hidden"));
+
+    $("#input").value = "доделал первый шаг";
+    $("#composer").requestSubmit();
+    await settle(400);
+
+    check("журнал открывает обмен строкой с вопросом",
+      row("обмен начат", "доделал первый шаг"), said());
+    check("служебная работа названа числом свёрнутых сообщений",
+      row("сворачивание", "свёрнуто сообщений: 10"), said());
+    check("применённый вызов инструмента назвал и просимое, и решение кода",
+      row("вызов инструмента", "просил «проверка» — применено: работа → проверка"), said());
+    check("ответ получен — с токенами входа, выхода и временем",
+      row("ответ получен", "вход 120") && row("ответ получен", "выход 30") &&
+        rows().some((r) => r.what === "ответ получен" && / с$/.test(r.detail)),
+      said());
+
+    // Переключение вкладок журнал не трогает: он живёт в памяти вкладки,
+    // а не в разметке страницы.
+    const before = said();
+    tab("memory");
+    await settle(20);
+    tab("log");
+    await settle(20);
+    check("журнал переживает переключение вкладок",
+      said() === before, said());
+
+    // Отказ: модель просит прыжок через этап, код отказывает — и журнал
+    // обязан назвать причину, а не просто «отклонено».
+    $("#input").value = "всё, начнём заново";
+    $("#composer").requestSubmit();
+    await settle(400);
+    check("отклонённый вызов стоит в журнале с доводом отказа",
+      row("вызов инструмента",
+        "просил «планирование» — отклонено: можно только в готово или работа"), said());
+    check("и прежние строки обмен не унёс",
+      row("обмен начат", "доделал первый шаг") &&
+        row("сворачивание", "свёрнуто сообщений: 10"),
+      said());
+
+    // Журнал — про открытый чат, а не общий поток: у соседнего он свой.
+    open(0);
+    await settle(40);
+    check("у соседнего чата журнал свой и чужих обменов в нём нет",
+      rows().length === 0 && $("#log-list").textContent.indexOf("доделал") < 0,
+      said());
+    open(2);
+    await settle(40);
+    check("а вернувшись, видим журнал того же чата",
+      row("обмен начат", "доделал первый шаг"), said());
+
+    // И ни одной строки с ключом: в журнал едут только свои поля событий.
+    check("ключа в журнале нет ни в одной строке",
+      $("#log-list").textContent.indexOf("sk-or") < 0 &&
+        $("#log-list").textContent.indexOf(LURE) < 0,
+      $("#log-list").textContent);
+  }
+
 }
 
 // ── итог ──

@@ -24,6 +24,7 @@ const state = {
   prompts: new Map(),  // промпты обменов этой вкладки (см. promptKey)
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
+  log: new Map(),      // журнал работы по чатам (см. logEvent)
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -556,6 +557,9 @@ async function openAgent(agentId) {
   // здесь не нужно: обе ветки ниже кончаются отрисовкой, а она его считает.
   if (memoryTabOpen()) loadMemory();
   else renderMemory();
+  // Журнал — про **этот** чат: в нём работа открытого, а не общий поток.
+  // Запроса за ним нет вовсе, он и так в памяти вкладки.
+  renderLog();
 
   const input = $("#input");
   input.value = "";
@@ -989,6 +993,25 @@ async function exchange(path, body, questionText) {
   setBusy(true);
   hint("");
 
+  // Журнал работы: пишем сюда же, где события и приходят, — второго места,
+  // знающего про ход обмена, заводить нельзя. Чат запоминаем **на входе**:
+  // пока идёт обмен, открыть могли уже соседний, и запись обязана лечь
+  // в журнал того чата, который её породил.
+  const logId = agent.id;
+  // Переходы этапа приезжают целым журналом, а не событием: что случилось
+  // в **этом** обмене — это строки, которых в нём не было до него. Сверяем
+  // по номерам, а не по длине: номер строки её и опознаёт.
+  const seenMoves = new Set(((agent.task_log) || []).map((m) => m.seq));
+  logEvent(
+    logId,
+    "обмен начат",
+    questionText === null ? "перегенерация последнего ответа" : oneLine(questionText, 90)
+  );
+  // Строка сворачивания заводится по событию, а подробность к ней приезжает
+  // с числами ответа: сколько сообщений свернулось, говорят они. Дописываем
+  // в ту же строку, а не заводим вторую, — работа была одна.
+  let folded = null;
+
   const controller = new AbortController();
   state.abort = controller;
   let answer = "";
@@ -1006,6 +1029,10 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "compressing":
+            // В журнал работы служебная работа идёт своей строкой, а число
+            // свёрнутых сообщений допишется в неё же, когда приедут числа
+            // ответа: раньше его не знает никто.
+            folded = logEvent(logId, "сворачивание", "идёт");
             // Служебный вызов — отдельное обращение к модели ДО ответа:
             // пауза уже идёт, и карточка обязана сказать, из-за чего она
             // пустая. Событие приходит, только когда вызов правда будет, —
@@ -1081,6 +1108,7 @@ async function exchange(path, body, questionText) {
             break;
           case "error":
             failure = e.message;
+            logEvent(logId, "ошибка", oneLine(e.message, 120), true);
             // Перерисовка здесь не лишняя: метрики упавшего обмена меняют
             // показанное (пометкой «из прошлого обмена», а на частичных
             // числах — и значением), а `done` после ошибки приходит не всегда.
@@ -1100,6 +1128,20 @@ async function exchange(path, body, questionText) {
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
             if (e.metrics) keepMetrics(e.metrics);
+            // Сколько сообщений свернулось — в ту же строку журнала, что
+            // завело событие: работа была одна, и двумя строками она
+            // читалась бы как две.
+            if (folded && e.metrics && has(e.metrics.summarized)) {
+              folded.detail = "свёрнуто сообщений: " + fmt.tokens(e.metrics.summarized);
+            }
+            // Вызовы инструмента — по новым строкам журнала переходов.
+            // Отклонённые стоят там же, а довод отказа несёт строка,
+            // собранная сервером: сочинять её здесь значило бы завести
+            // вторую карту переходов.
+            (e.task_log || [])
+              .filter((m) => !seenMoves.has(m.seq))
+              .forEach((m) => logMove(logId, m, e.metrics));
+            if (!e.error) logEvent(logId, "ответ получен", logAnswerDetail(e.metrics));
             bodyEl.innerHTML = renderMarkdown(answer);
             renderTiles();
             break;
@@ -1108,7 +1150,11 @@ async function exchange(path, body, questionText) {
       controller.signal
     );
   } catch (err) {
-    if (err.name !== "AbortError") failure = String(err.message || err);
+    if (err.name === "AbortError") logEvent(logId, "отменено", "поток остановлен", true);
+    else {
+      failure = String(err.message || err);
+      logEvent(logId, "ошибка", oneLine(failure, 120), true);
+    }
   }
 
   card.classList.remove("busy");
@@ -1183,7 +1229,7 @@ async function refreshCurrent(prompt) {
 // те же два поля, — а два места для одного и того же расходятся на первой же
 // правке. Оба поля и журнал переходов переехали под полосу, туда, где на них
 // и смотрят.
-const PANEL_TABS = ["model", "agent", "memory", "profile"];
+const PANEL_TABS = ["model", "agent", "memory", "profile", "log"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -2348,6 +2394,116 @@ function startStageEdit(row, name, was) {
   input.onblur = () => finish(true);
 }
 
+// ──────────────────────── журнал работы ───────────────────────
+//
+// Что в этом чате происходило: обмен за обменом, сверху вниз по времени.
+// Не то же, что журнал переходов под полосой, — тот летопись **состояния**,
+// одна строка на переход, и живёт он в базе. Этот про **работу**: вопрос,
+// сворачивание, вызов инструмента и его исход, числа ответа, ошибки
+// и отмены.
+//
+// Копится он в памяти вкладки, ровно как промпт обмена (`state.prompts`),
+// и по тому же доводу: всё это производные событий, которые клиент и так
+// получает потоком, — ни колонки, ни таблицы под них нет и заводить нечего.
+// Отсюда и честная строка во вкладке: показано происходившее **с момента
+// открытия страницы**. Кнопки очистки нет — её роль играет перезагрузка.
+//
+// Ключ — чат: журнал показывает работу **открытого** чата, а не общий
+// поток. Сложи их в один список, и переключение чата выдавало бы чужие
+// обмены за свои.
+const logTabOpen = () => !$("#tab-log").classList.contains("hidden");
+
+// Время события — с секундами, в отличие от журнала переходов: там строка
+// на переход и их за задачу три, здесь несколько строк на один обмен, и
+// без секунд они слиплись бы в одну минуту.
+const logClock = (at) => {
+  const d = new Date((at || 0) * 1000);
+  const two = (n) => String(n).padStart(2, "0");
+  return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+};
+
+// Запись в журнал. Возвращает саму запись: у сворачивания подробность
+// становится известна позже самого события — сколько сообщений свёрнуто,
+// говорят числа ответа, — и дописывается она в ту же строку, а не второй.
+function logEvent(agentId, what, detail, bad) {
+  if (!agentId) return null;
+  const entry = { at: Date.now() / 1000, what, detail: detail || "", bad: Boolean(bad) };
+  const list = state.log.get(agentId) || [];
+  list.push(entry);
+  state.log.set(agentId, list);
+  // Рисуем только при открытой вкладке: закрытой отрисовка не нужна, а
+  // событий на обмен приходит много.
+  if (logTabOpen()) renderLog();
+  return entry;
+}
+
+function renderLog() {
+  const box = $("#log-list");
+  if (!box) return;
+  box.innerHTML = "";
+  const list = (state.current && state.log.get(state.current.id)) || [];
+  if (!list.length) {
+    box.appendChild(el("div", "log-empty", "Пока ничего не происходило."));
+    return;
+  }
+  // Самое свежее внизу — порядок записи и есть порядок показа.
+  list.forEach((entry) => {
+    const row = el("div", "log-row" + (entry.bad ? " bad" : ""));
+    row.append(
+      el("span", "log-at", logClock(entry.at)),
+      el("span", "log-what", entry.what),
+      el("span", "log-detail", entry.detail)
+    );
+    box.appendChild(row);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+// Вопрос одной строкой: журнал это лента событий, а не вторая копия
+// переписки, и абзац в ней сломал бы столбик времени.
+function oneLine(text, limit) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim();
+  return flat.length > limit ? flat.slice(0, limit - 1) + "…" : flat;
+}
+
+// Строка про переход этапа: что просили и что решил код. Просили — это
+// `stage_to`: аргумент инструмента и есть тот этап, куда просились.
+//
+// Отказ называет **причину**, и берётся она из строки, собранной сервером
+// (`stage_note`), а не сочиняется здесь: карта переходов одна, и вторая её
+// копия на клиенте разошлась бы с первой молча. Отказов на обмен бывает
+// несколько, и склеены они точкой с запятой — свой ищем по названному
+// в нём этапу.
+//
+// Исходов у вызова сервер различает четыре, а сюда доезжают два: «этап уже
+// такой» и «нет такого этапа» переходами не были, и ни строки журнала, ни
+// приписки под ответом за ними нет — клиенту их взять неоткуда, и выдумывать
+// строку про то, чего он не видел, нельзя.
+function logMove(agentId, move, metrics) {
+  const label = stageLabel(move.stage_to);
+  const path = stageLabel(move.stage_from) + " → " + label;
+  const what = move.who === "agent" ? "вызов инструмента" : "переход вручную";
+  if (move.ok) {
+    logEvent(agentId, what, "просил «" + label + "» — применено: " + path);
+    return;
+  }
+  const note = String((metrics && metrics.stage_note) || "")
+    .split("; ")
+    .find((one) => one.indexOf("«" + label + "»") >= 0) || "";
+  const why = note.indexOf(": ") >= 0 ? note.slice(note.indexOf(": ") + 2) : "";
+  logEvent(agentId, what, "просил «" + label + "» — отклонено" + (why ? ": " + why : ""), true);
+}
+
+// Числа ответа — те же, что в строке под ним, и теми же помощниками:
+// вторым форматированием они разошлись бы с лентой молча.
+function logAnswerDetail(m) {
+  const parts = [];
+  if (m && has(m.prompt_tokens)) parts.push("вход " + fmt.tokens(m.prompt_tokens));
+  if (m && has(m.completion_tokens)) parts.push("выход " + fmt.tokens(m.completion_tokens));
+  if (m && has(m.elapsed_ms)) parts.push(fmt.sec(m.elapsed_ms) + " с");
+  return parts.join(" · ");
+}
+
 // ─────────────────────────── профиль ──────────────────────────
 //
 // Профиль — про то, **как** с человеком разговаривать: стиль, формат
@@ -2664,6 +2820,10 @@ function init() {
       // Профиль — тем же порядком и по тому же доводу: лениво, на открытие
       // вкладки. Он глобальный, и перечитывать его на смену чата незачем.
       if (which === "profile") loadProfile();
+      // Журнал ничего не запрашивает: он уже в памяти вкладки. Рисуем его
+      // на открытие — при закрытой вкладке отрисовка молчит, а событий
+      // на обмен приходит много.
+      if (which === "log") renderLog();
     };
   });
 
@@ -2693,6 +2853,7 @@ function init() {
   // задача, — и не мигает пустым местом на открытии.
   renderStages(null);
   renderMemory();
+  renderLog();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
 
