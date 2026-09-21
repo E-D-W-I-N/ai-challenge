@@ -620,7 +620,13 @@ function buildServer(options) {
         + 'нашёл проблемы — вызови update_stage(stage="execution"), '
         + 'не нашёл — update_stage(stage="done")',
     },
-    done: { step: "задача закрыта", expecting: "", guide: "" },
+    done: {
+      step: "подвести итог работы",
+      expecting: "итог",
+      guide: "подведи итог сразу и одним сообщением: что сделано "
+        + "и что осталось за рамками; новой работы не начинай "
+        + "и менять этап тебе здесь нечем",
+    },
   };
   const TASK_STAGE_LABELS = {
     planning: "планирование",

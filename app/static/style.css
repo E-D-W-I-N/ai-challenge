@@ -1061,3 +1061,22 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* Журнал работы: строка на событие, моноширинным — время и числа обязаны
+   стоять столбиком, иначе поток событий не читается глазами. Самое свежее
+   внизу, как в любом логе; объяснений вокруг нет — в панели место дорогое. */
+.log { display: flex; flex-direction: column; gap: 3px; }
+.log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.log-at { flex: 0 0 auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+.log-what { flex: 0 0 auto; font-weight: 650; }
+.log-detail { min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.log-detail:empty { display: none; }
+.log-row.bad .log-what { color: var(--warn, #b4540a); }
+.log-empty { color: var(--faint); font-size: 11.5px; }
