@@ -714,20 +714,23 @@ function cutNote(m) {
   return "";
 }
 
-// Служебные вызовы — те, что идут к модели ДО ответа и кладут в промпт свою
-// врезку. Он снова один — сворачивание: этап двигает инструмент внутри
-// самого обмена, отдельного обращения у него нет, и обещать паузу, которой
-// не будет, незачем.
+// Служебные шаги обмена — те, на которых собеседник ждёт, а текста ещё
+// нет. Их три, потому что их три и на сервере: сворачивание идёт **до**
+// ответа, вызов инструмента и ожидание продолжения — посреди него.
+// Середина до сих пор молчала: модель уходила за кнопкой, карточка стояла
+// пустой, и понять, что работа идёт, было неоткуда.
 //
 // Один индекс на оба показа, а не две таблицы: строка состояния обещала бы
-// одно, а подпись называла бы другое, и разошлись бы они молча. Какой вызов
+// одно, а подпись называла бы другое, и разошлись бы они молча. Какой шаг
 // идёт, говорит сервер полем `strategy`; клиент про это не догадывается
 // по тексту сообщений. Врезка рабочей памяти подписана здесь же, хотя
-// служебного вызова за ней больше нет: её текст в промпте не изменился —
+// служебного вызова за ней нет вовсе: её текст в промпте не изменился —
 // изменилось только то, чья это работа.
 const SERVICE_CALLS = {
   summary: { status: "Сворачиваю начало разговора…", role: "сводка начала разговора" },
   facts: { role: "факты о разговоре" },
+  tool: { status: "Исполняю вызов инструмента…" },
+  continue: { status: "Жду продолжения после вызова…" },
 };
 
 function usageLine(turn) {
@@ -1029,10 +1032,13 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "compressing":
-            // В журнал работы служебная работа идёт своей строкой, а число
-            // свёрнутых сообщений допишется в неё же, когда приедут числа
-            // ответа: раньше его не знает никто.
-            folded = logEvent(logId, "сворачивание", "идёт");
+            // В журнал сворачивание идёт своей строкой, а число свёрнутых
+            // сообщений допишется в неё же, когда приедут числа ответа:
+            // раньше его не знает никто. У вызова инструмента и продолжения
+            // строку заводит не этот кадр, а отладочный — тот, что приезжает
+            // с содержимым: строка без содержимого была бы ровно тем
+            // пересказом, от которого журнал и уходит.
+            if (e.strategy === "summary") folded = logEvent(logId, "сворачивание", "идёт");
             // Служебный вызов — отдельное обращение к модели ДО ответа:
             // пауза уже идёт, и карточка обязана сказать, из-за чего она
             // пустая. Событие приходит, только когда вызов правда будет, —
@@ -1083,6 +1089,16 @@ async function exchange(path, body, questionText) {
                 summaryAt: e.summary_at,
                 strategy: e.strategy,
               };
+              // Он же — строкой журнала, с телом: что уехало в модель,
+              // ролями и текстом, как уехало. Второй раз спрашивать сервер
+              // не о чем — кадр `start` это уже привёз.
+              logEvent(
+                logId,
+                "запрос к модели",
+                "сообщений: " + e.resolved_messages.length,
+                false,
+                promptText(e.resolved_messages)
+              );
             }
             break;
           case "reasoning":
@@ -1096,6 +1112,10 @@ async function exchange(path, body, questionText) {
             scrollFeed();
             break;
           case "delta":
+            // Текст пошёл — шаг кончился, и строке состояния больше нечего
+            // показывать. У сворачивания её снимал кадр `start`, но вызов
+            // инструмента стоит **после** него, и снимать её там уже некому.
+            if (status) { status.remove(); status = null; }
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
             if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
@@ -1106,9 +1126,14 @@ async function exchange(path, body, questionText) {
             keepMetrics(e.metrics);
             renderTiles();
             break;
+          case "debug":
+            // Содержимое шага — дословно и **по ходу**: строка появляется
+            // в журнале тогда же, когда шаг случился, а не в конце обмена.
+            logDebug(logId, e);
+            break;
           case "error":
             failure = e.message;
-            logEvent(logId, "ошибка", oneLine(e.message, 120), true);
+            logEvent(logId, "ошибка", oneLine(e.message, 120), true, e.message);
             // Перерисовка здесь не лишняя: метрики упавшего обмена меняют
             // показанное (пометкой «из прошлого обмена», а на частичных
             // числах — и значением), а `done` после ошибки приходит не всегда.
@@ -1134,14 +1159,20 @@ async function exchange(path, body, questionText) {
             if (folded && e.metrics && has(e.metrics.summarized)) {
               folded.detail = "свёрнуто сообщений: " + fmt.tokens(e.metrics.summarized);
             }
-            // Вызовы инструмента — по новым строкам журнала переходов.
-            // Отклонённые стоят там же, а довод отказа несёт строка,
-            // собранная сервером: сочинять её здесь значило бы завести
-            // вторую карту переходов.
+            // Переходы **человека** — по новым строкам журнала переходов:
+            // кнопка утверждения плана ходит мимо обмена, и отладочного
+            // кадра за ней нет. Вызовы модели сюда не идут: их строку уже
+            // завёл кадр `debug`, и завести её второй раз значило бы
+            // рассказать об одной работе дважды.
             (e.task_log || [])
-              .filter((m) => !seenMoves.has(m.seq))
+              .filter((m) => !seenMoves.has(m.seq) && m.who !== "agent")
               .forEach((m) => logMove(logId, m, e.metrics));
-            if (!e.error) logEvent(logId, "ответ получен", logAnswerDetail(e.metrics));
+            if (status) { status.remove(); status = null; }
+            if (!e.error) {
+              // Сырой текст ответа целиком — телом строки: лента показывает
+              // его разметкой, а здесь он нужен таким, каким пришёл.
+              logEvent(logId, "ответ получен", logAnswerDetail(e.metrics), false, answer);
+            }
             bodyEl.innerHTML = renderMarkdown(answer);
             renderTiles();
             break;
@@ -1153,10 +1184,12 @@ async function exchange(path, body, questionText) {
     if (err.name === "AbortError") logEvent(logId, "отменено", "поток остановлен", true);
     else {
       failure = String(err.message || err);
-      logEvent(logId, "ошибка", oneLine(failure, 120), true);
+      logEvent(logId, "ошибка", oneLine(failure, 120), true, failure);
     }
   }
 
+  // Обмен кончился, чем бы ни кончился: шага, который «идёт», больше нет.
+  if (status) { status.remove(); status = null; }
   card.classList.remove("busy");
   state.abort = null;
   setBusy(false);
@@ -2425,9 +2458,20 @@ const logClock = (at) => {
 // Запись в журнал. Возвращает саму запись: у сворачивания подробность
 // становится известна позже самого события — сколько сообщений свёрнуто,
 // говорят числа ответа, — и дописывается она в ту же строку, а не второй.
-function logEvent(agentId, what, detail, bad) {
+//
+// `body` — **дословное** содержимое шага: сообщения запроса, сырой ответ,
+// аргументы вызова. Строка показывает подпись, тело раскрывается по клику:
+// покажи его сразу — вкладка утонула бы на первом же обмене.
+function logEvent(agentId, what, detail, bad, body) {
   if (!agentId) return null;
-  const entry = { at: Date.now() / 1000, what, detail: detail || "", bad: Boolean(bad) };
+  const entry = {
+    at: Date.now() / 1000,
+    what,
+    detail: detail || "",
+    bad: Boolean(bad),
+    body: body || "",
+    open: false,
+  };
   const list = state.log.get(agentId) || [];
   list.push(entry);
   state.log.set(agentId, list);
@@ -2448,15 +2492,91 @@ function renderLog() {
   }
   // Самое свежее внизу — порядок записи и есть порядок показа.
   list.forEach((entry) => {
-    const row = el("div", "log-row" + (entry.bad ? " bad" : ""));
+    const item = el("div", "log-item");
+    const row = el(
+      "div",
+      "log-row" + (entry.bad ? " bad" : "") + (entry.body ? " has-body" : "")
+    );
     row.append(
       el("span", "log-at", logClock(entry.at)),
       el("span", "log-what", entry.what),
       el("span", "log-detail", entry.detail)
     );
-    box.appendChild(row);
+    item.appendChild(row);
+    if (entry.body) {
+      // Раскрытое держится на самой записи, а не на разметке: журнал
+      // перерисовывается на каждое событие, и раскрытое тело схлопывалось бы
+      // под руками читателя на следующей же строке.
+      row.onclick = () => { entry.open = !entry.open; renderLog(); };
+      const body = el("pre", "log-body", entry.body);
+      body.classList.toggle("hidden", !entry.open);
+      item.appendChild(body);
+    }
+    box.appendChild(item);
   });
   box.scrollTop = box.scrollHeight;
+}
+
+// Сообщения запроса дословно: роль и текст, как уехало. Вызов инструмента
+// в сообщении модели — тем же json, каким он и приехал: журнал показывает
+// содержимое, а не его пересказ.
+function promptText(messages) {
+  return (messages || [])
+    .map((m) => {
+      const calls = m.tool_calls ? "\n" + JSON.stringify(m.tool_calls) : "";
+      return "[" + m.role + "]\n" + (m.content || "") + calls;
+    })
+    .join("\n\n");
+}
+
+// Отладочный кадр — строкой журнала. Тексты в нём собрал сервер, клиент
+// только подписывает строку и складывает тело: сочини он довод отказа сам,
+// на клиенте завелась бы вторая карта переходов.
+function logDebug(agentId, e) {
+  if (e.step === "compress_request") {
+    logEvent(agentId, "сворачивание: запрос", "сообщений: " + (e.messages || []).length,
+      false, promptText(e.messages));
+  } else if (e.step === "compress_reply") {
+    logEvent(agentId, "сворачивание: пересказ", oneLine(e.text, 90), false, e.text);
+  } else if (e.step === "tool") {
+    logToolCall(agentId, e);
+  } else if (e.step === "continue") {
+    logEvent(agentId, "продолжение", "сообщений: " + (e.messages || []).length,
+      false, promptText(e.messages));
+  }
+}
+
+// Вызов инструмента: что просила модель, что решил код и что ему ответили.
+// Одной строкой, а не тремя: работа была одна, и разложенная на три строки
+// она читалась бы как три разных события.
+//
+// Исходов четыре, и сюда доезжают все четыре — в отличие от журнала
+// переходов, где «этап уже такой» и «нет такого этапа» переходами не были
+// и строки не завели. Довод отказа берётся из `note`, собранной сервером.
+function logToolCall(agentId, e) {
+  const asked = e.stage_to
+    ? "просил «" + stageLabel(e.stage_to) + "»"
+    : "этап не назван";
+  const why = e.note && e.note.indexOf(": ") >= 0
+    ? e.note.slice(e.note.indexOf(": ") + 2)
+    : "";
+  const decided = {
+    moved: "применено: " + stageLabel(e.stage_from) + " → " + stageLabel(e.stage_to),
+    denied: "отклонено" + (why ? ": " + why : ""),
+    same: "этап уже такой",
+    unknown: "отклонено: такого этапа нет",
+  }[e.outcome] || e.outcome;
+  const body = [
+    "инструмент: " + e.name,
+    "аргументы: " + e.arguments,
+    "этап был: " + stageLabel(e.stage_from),
+    "решение кода: " + decided,
+    "ответ инструмента модели: " + e.reply,
+  ]
+    .concat(e.note ? ["строка под ответом: " + e.note] : [])
+    .join("\n");
+  logEvent(agentId, "вызов инструмента", asked + " — " + decided,
+    e.outcome !== "moved" && e.outcome !== "same", body);
 }
 
 // Вопрос одной строкой: журнал это лента событий, а не вторая копия
@@ -2466,19 +2586,19 @@ function oneLine(text, limit) {
   return flat.length > limit ? flat.slice(0, limit - 1) + "…" : flat;
 }
 
-// Строка про переход этапа: что просили и что решил код. Просили — это
-// `stage_to`: аргумент инструмента и есть тот этап, куда просились.
+// Строка про переход, сделанный **человеком**: кнопка утверждения плана
+// ходит мимо обмена, отладочного кадра за ней нет, и узнать о ней можно
+// только по новой строке журнала переходов.
+//
+// Переходы модели сюда не идут: их строку заводит кадр `debug`, и там она
+// богаче — с аргументами вызова и ответом инструмента. Две строки об одной
+// работе читались бы как две работы.
 //
 // Отказ называет **причину**, и берётся она из строки, собранной сервером
 // (`stage_note`), а не сочиняется здесь: карта переходов одна, и вторая её
 // копия на клиенте разошлась бы с первой молча. Отказов на обмен бывает
 // несколько, и склеены они точкой с запятой — свой ищем по названному
 // в нём этапу.
-//
-// Исходов у вызова сервер различает четыре, а сюда доезжают два: «этап уже
-// такой» и «нет такого этапа» переходами не были, и ни строки журнала, ни
-// приписки под ответом за ними нет — клиенту их взять неоткуда, и выдумывать
-// строку про то, чего он не видел, нельзя.
 function logMove(agentId, move, metrics) {
   const label = stageLabel(move.stage_to);
   const path = stageLabel(move.stage_from) + " → " + label;

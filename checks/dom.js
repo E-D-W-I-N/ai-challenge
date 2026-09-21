@@ -780,7 +780,15 @@ function buildServer(options) {
   // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
   const memoryInsert = () => state.memory;
 
-  const factsInsert = () => state.facts;
+  // Блок задачи: состояние плюс записи рабочей памяти. Едет он **всегда**
+  // и при любом этапе — ровно как на сервере, где условия у этой врезки
+  // нет вовсе: этап у задачи есть всегда, а модель не видит ни полосы,
+  // ни панели. `state.facts` — записи человека строками или null: записей
+  // может не быть, а блока не может не быть.
+  const factsInsert = (agent) =>
+    "[факты о разговоре]\n" +
+    [...taskLines(agent.task), ...(state.facts ? [state.facts] : [])].join("\n") +
+    "\n[конец фактов о разговоре]";
 
   // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
   // одним ответом. Формула слота здесь не считается, а берётся из длины уже
@@ -802,11 +810,8 @@ function buildServer(options) {
       slots.memory_at = messages.length;
       messages.push({ role: "user", content: memory });
     }
-    const facts = factsInsert();
-    if (facts) {
-      slots.working_at = messages.length;
-      messages.push({ role: "user", content: facts });
-    }
+    slots.working_at = messages.length;
+    messages.push({ role: "user", content: factsInsert(agent) });
     // Окно — единственная стратегия, которая режет **без** врезки: вместо
     // отброшенного начала не встаёт ничего, слот у неё пуст, и в промпте
     // остаётся ровно хвост.
@@ -875,6 +880,22 @@ function buildServer(options) {
     return ok ? "moved" : "denied";
   }
 
+  // Что инструмент отвечает **модели**: по существу, а не «ок». Своя копия,
+  // как и весь стенд, и по той же карте — этапы названы токенами, ими же
+  // модель и просит.
+  function toolReply(outcome, stage, target) {
+    if (outcome === "moved") return "готово, этап теперь: " + target;
+    if (outcome === "same") return "этап уже такой: " + stage + ", менять нечего";
+    if (outcome === "unknown") return "нет такого этапа. Допустимые: " + TASK_STAGES.join(", ");
+    if (stage === "planning") {
+      return "нельзя: из planning задачу выпускает только человек, кнопкой "
+        + "«Утвердить план». Дождись её";
+    }
+    const allowed = TASK_MOVES[stage] || [];
+    if (!allowed.length) return "нельзя: " + stage + " — конечный этап, уйти с него нельзя";
+    return "нельзя: из " + stage + " можно только в " + allowed.join(" или ");
+  }
+
   // Отказ человеку — русскими подписями этапов, теми же, что на полосе.
   // Своя копия, как и весь стенд, и по той же карте: стенд, отказывающий
   // не там, где сервер, оставил бы зелёным запрет, сломанный в браузере.
@@ -912,11 +933,40 @@ function buildServer(options) {
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
     const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
-    // Отказ приезжает приписькой к числам обмена — ровно как срезанное
-    // начало истории: он про этот обмен и обязан его пережить.
+    // Отказ приезжает припиской к числам обмена — ровно как срезанное
+    // начало истории: он про этот обмен и обязан его пережить. А шаг, пока
+    // он идёт, назван строкой состояния; его содержимое приезжает
+    // отладочным кадром — ровно как на сервере, где журнал пополняется
+    // по ходу обмена, а не в конце.
+    const toolFrames = [];
     if (asked) {
+      const stageBefore = agent.task.stage;
       const outcome = moveStage(agent, asked, "agent");
-      if (outcome === "denied") metrics.stage_note = denyNote(agent.task.stage, asked);
+      const note = outcome === "denied" ? denyNote(agent.task.stage, asked) : null;
+      if (note) metrics.stage_note = note;
+      const args = JSON.stringify({ stage: asked });
+      toolFrames.push(
+        { event: "compressing", agent: agent.id, strategy: "tool" },
+        {
+          event: "debug", agent: agent.id, step: "tool",
+          name: "update_stage", arguments: args,
+          stage_from: stageBefore, stage_to: asked,
+          outcome, reply: toolReply(outcome, stageBefore, asked), note,
+        },
+        { event: "compressing", agent: agent.id, strategy: "continue" },
+        {
+          event: "debug", agent: agent.id, step: "continue", round: 1,
+          messages: [
+            ...resolved,
+            { role: "assistant", content: "", tool_calls: [
+              { id: "call_1", type: "function",
+                function: { name: "update_stage", arguments: args } },
+            ] },
+            { role: "tool", tool_call_id: "call_1",
+              content: toolReply(outcome, stageBefore, asked) },
+          ],
+        }
+      );
     }
     agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
@@ -932,8 +982,24 @@ function buildServer(options) {
       // Место врезки в промпте и чем она занята называет сервер — клиент не
       // разбирает текст сообщений. Кадр `compressing` приходит на служебный
       // вызов обмена и полем `strategy` называет, какой идёт.
-      ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
+      ...(service
+        ? [
+            { event: "compressing", agent: agent.id, strategy: serviceStrategy(service) },
+            // Что уехало на пересказ и что с него вернулось — дословно
+            // и до ответа, как на сервере.
+            {
+              event: "debug", agent: agent.id, step: "compress_request",
+              messages: [
+                { role: "system", content: "Ты сворачиваешь начало разговора" },
+                { role: "user", content: "Сообщения, которые надо добавить в пересказ:\n"
+                  + (agent.transcript || []).map((t) => t.content).join("\n") },
+              ],
+            },
+            { event: "debug", agent: agent.id, step: "compress_reply", text: service.insert },
+          ]
+        : []),
       startFrame(agent, text, resolved, service),
+      ...toolFrames,
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       {
