@@ -545,6 +545,7 @@ async function openAgent(agentId) {
   renderFeed(agent);
   fillPanel(agent);
   fillTask(agent);
+  renderTaskLog(agent);
   taskStatus("");
   renderTiles();
 
@@ -723,6 +724,10 @@ function cutNote(m) {
 // изменилось только то, чья это работа.
 const SERVICE_CALLS = {
   summary: { status: "Сворачиваю начало разговора…", role: "сводка начала разговора" },
+  // Ведение этапа — второй служебный вызов обмена, и строка состояния у него
+  // своя: пауза перед ответом случается из-за него, и молчать о ней нельзя.
+  // Врезки в промпт он не заводит, поэтому подписи роли у него нет вовсе.
+  task: { status: "Определяю этап задачи…" },
   facts: { role: "факты о разговоре" },
 };
 
@@ -1027,6 +1032,13 @@ async function exchange(path, body, questionText) {
             // Промпт собран — значит служебный вызов позади и дальше пойдёт
             // ответ: строке состояния больше нечего показывать.
             if (status) { status.remove(); status = null; }
+            // Этап приехал вместе с промптом — и приехал **новый**: служебный
+            // вызов отработал до сборки промпта, и в этом же кадре стоит то
+            // состояние, с которым обмен уехал в модель. Полоса в шапке
+            // перекрашивается здесь, то есть раньше первого токена ответа.
+            // Поля вкладки при этом не трогаем: в них мог набирать человек,
+            // и затирать набранное кадром обмена нельзя.
+            if (e.task) applyTask(e.task, false);
             // Промпт держим у каждого обмена, а не только у того, где есть
             // врезка. У «Всей истории» он и правда повторяет ленту, зато
             // скользящее окно начало **отбрасывает** — и прочитать, что
@@ -1138,6 +1150,11 @@ async function refreshCurrent(prompt) {
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
     renderFeed(fresh);
+    // Полоса и журнал — по тому же свежему ответу: этап мог переехать
+    // служебным вызовом этого обмена, и на экране обязано стоять
+    // состояние сервера, а не то, что мы дорисовали по дороге.
+    renderStages(fresh);
+    renderTaskLog(fresh);
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
     // перерисовываем, иначе панель отстаёт на один обмен.
     renderTiles();
@@ -2065,6 +2082,11 @@ function taskOf(agent) {
     stage: task.stage || TASK_DEFAULT_STAGE,
     step: task.step || "",
     expecting: task.expecting || "",
+    // Строки блока задачи — те самые, что уезжают в промпт, и собраны они
+    // сервером. Под полосой стоит ровно то, что **видит модель**: собери их
+    // здесь сами — и зашитые умолчания этапов стали бы второй таблицей,
+    // а на экране и в промпте оказались бы два разных текста.
+    lines: task.lines || [],
   };
 }
 
@@ -2082,7 +2104,8 @@ function taskStatus(text, isError) {
 function renderStages(agent) {
   const box = $("#stages");
   box.innerHTML = "";
-  const current = taskOf(agent).stage;
+  const task = taskOf(agent);
+  const current = task.stage;
   TASK_STAGES.forEach(([token, label], i) => {
     if (i) box.appendChild(el("span", "stage-arrow", "──▶"));
     const btn = el(
@@ -2098,6 +2121,25 @@ function renderStages(agent) {
     btn.onclick = () => { if (token !== current) setStage(token); };
     box.appendChild(btn);
   });
+
+  // Единственная дверь из планирования в работу. Служебный вызов по этому
+  // ребру не ходит намеренно: «план утверждён» — решение человека, и
+  // догадываться о нём по тексту разговора нельзя. Кнопка стоит только
+  // на планировании: на остальных этапах утверждать нечего.
+  if (current === TASK_DEFAULT_STAGE) {
+    const ok = el("button", "stage-approve", "Утвердить план");
+    ok.type = "button";
+    ok.id = "approve-plan";
+    ok.title = "План утверждён: задача переходит в работу";
+    ok.onclick = () => setStage("execution");
+    box.appendChild(ok);
+  }
+
+  // Под полосой — то же, что уедет в блок задачи: чем заняты, чего ждут
+  // и что велено модели на этом этапе. Первая строка здесь пропущена —
+  // это сам этап, и он нарисован полосой выше.
+  const note = $("#stage-note");
+  note.textContent = task.lines.slice(1).join(" · ");
 }
 
 function fillTask(agent) {
@@ -2109,12 +2151,15 @@ function fillTask(agent) {
 // слева: полоса рисуется по `state.current`, а список переживает открытие
 // соседнего чата. Показываем **записанное** из ответа ручки, а не набранное:
 // текст по дороге чистит `redact()`.
-function applyTask(task) {
+function applyTask(task, withFields) {
   if (state.current) state.current.task = task;
   const row = state.agents.find((a) => state.current && a.id === state.current.id);
   if (row) row.task = task;
   renderStages(state.current);
-  fillTask(state.current);
+  // Поля вкладки перезаполняются только тогда, когда состояние пришло
+  // по правке: кадром обмена этап двигает агент, а в полях в эту секунду
+  // мог набирать человек.
+  if (withFields !== false) fillTask(state.current);
 }
 
 async function setStage(stage) {
@@ -2126,6 +2171,39 @@ async function setStage(stage) {
   } catch (err) {
     taskStatus(String(err.message || err), true);
   }
+}
+
+// Журнал этапа: кто и когда переключил задачу. Только переходы — строка
+// «остались там же» новостью не является, и на экране её нет; в базе она
+// стоит ради метрик служебного вызова, которые в неё и записаны.
+const TASK_WHO = { agent: "агент", human: "человек" };
+
+const clock = (at) => {
+  const d = new Date((at || 0) * 1000);
+  const two = (n) => String(n).padStart(2, "0");
+  return two(d.getHours()) + ":" + two(d.getMinutes());
+};
+
+function renderTaskLog(agent) {
+  const box = $("#task-log");
+  if (!box) return;
+  box.innerHTML = "";
+  const moves = ((agent && agent.task_log) || []).filter(
+    (m) => m.stage_from !== m.stage_to
+  );
+  if (!moves.length) {
+    box.appendChild(el("p", "hint", "Переходов ещё не было."));
+    return;
+  }
+  moves.forEach((m) => {
+    const row = el("div", "move");
+    row.append(
+      el("span", "move-path", stageLabel(m.stage_from) + " → " + stageLabel(m.stage_to)),
+      el("span", "move-who", TASK_WHO[m.who] || m.who),
+      el("span", "move-at", clock(m.at))
+    );
+    box.appendChild(row);
+  });
 }
 
 const stageLabel = (stage) =>

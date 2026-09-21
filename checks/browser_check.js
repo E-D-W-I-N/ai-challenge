@@ -2043,6 +2043,18 @@ async function routeChecks() {
     check("во вкладке «Задача» стоит текущий шаг этого чата",
       $("#task-step").value === "гоняю тесты", JSON.stringify($("#task-step").value));
 
+    // Под полосой — то, что уедет в блок задачи: чем заняты, чего ждут
+    // и что велено модели. Строки собрал сервер, клиент их только показал:
+    // на экране обязано стоять ровно то, что **видит модель**.
+    const note = () => $("#stage-note").textContent;
+    check("под полосой стоит инструкция этапа — та же, что уедет в промпт",
+      note().includes("инструкция: первой строкой ответа напиши «проверка пройдена»"),
+      note());
+    // И набранное человеком побеждает зашитое: «сейчас» здесь его,
+    // а «ожидается» — этапа.
+    check("в строке под полосой «сейчас» — набранное человеком, а не зашитое",
+      note().startsWith("сейчас: гоняю тесты · ожидается: вердикт"), note());
+
     // Чат, приехавший без состояния вовсе: полоса показывает первый этап,
     // а не остаётся без выделенного. Этап у задачи есть всегда, и «сервер
     // о нём не сказал» — это умолчание, а не пустота.
@@ -2094,6 +2106,93 @@ async function routeChecks() {
       Boolean(document.querySelector(".chat").querySelector("#stages")) &&
         !document.querySelector(".panel").querySelector("#stages"),
       "полосы в шапке чата нет");
+
+    // Кнопка «Утвердить план» — единственная дверь из планирования в работу:
+    // служебный вызов по этому ребру не ходит, «план утверждён» это решение
+    // человека. На прочих этапах утверждать нечего, и кнопки нет.
+    check("на чате не из планирования кнопки «Утвердить план» нет",
+      !$("#approve-plan"), "кнопка стоит там, где утверждать нечего");
+    open(1);
+    await settle(40);
+    check("на планировании кнопка «Утвердить план» стоит рядом с полосой",
+      Boolean($("#approve-plan")) &&
+        Boolean(document.querySelector(".chat").querySelector("#approve-plan")),
+      "кнопки утверждения плана нет");
+    const wasPatches = taskPatches().length;
+    $("#approve-plan").dispatchEvent(new Evt("click"));
+    await settle(60);
+    const approve = taskPatches().slice(-1)[0];
+    check("нажатие «Утвердить план» переводит задачу в работу одним полем",
+      taskPatches().length === wasPatches + 1 &&
+        JSON.stringify(approve.body) === JSON.stringify({ stage: "execution" }),
+      JSON.stringify(taskPatches().map((r) => r.body)));
+    check("и полоса переехала на «работу», а кнопка утверждения исчезла",
+      current() === "execution" && !$("#approve-plan"), current() + " — " + shown());
+  }
+
+  // ── этап двигает служебный вызов: полоса едет до ответа ──
+  //
+  // Ключевой кадр дня, и потому утверждениями, а не глазами: агент сам
+  // уводит задачу на проверку, не находит годного результата — и полоса
+  // едет **назад** в работу. Клиент про это ничего не решает: он рисует
+  // то состояние, которое приехало кадром `start`, и рисует раньше, чем
+  // придёт первый токен ответа.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      delay: 60,
+      chats: [{ label: "в работе", task: { stage: "execution", step: "", expecting: "" } }],
+      // Первый обмен уводит на проверку, второй — обратно в работу.
+      taskMove: (i) => (i === 0 ? "validation" : "execution"),
+    });
+    client.init();
+    await settle(30);
+    // Свои чаты стенд добавляет после двух общих, поэтому третий по счёту.
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    open(2);
+    await settle(40);
+
+    const stages = () => $("#stages").querySelectorAll(".stage");
+    const current = () => {
+      const one = stages().find((b) => b.classList.contains("current"));
+      return one ? one.dataset.stage : "(выделенного нет)";
+    };
+    const moves = () => $("#task-log").querySelectorAll(".move").map((n) => n.textContent);
+
+    check("до обмена полоса стоит на том этапе, который приехал с чатом",
+      current() === "execution", current());
+
+    $("#input").value = "закончил, посмотри";
+    $("#composer").requestSubmit();
+    await settle(90);          // кадр о служебном вызове пришёл, ответ не пошёл
+    const status = $("#feed").querySelector(".card-status");
+    check("пока идёт вызов на этап, карточка говорит об этом",
+      Boolean(status) && status.textContent.includes("Определяю этап задачи"),
+      status && status.textContent);
+    // Ещё один кадр — это `start`: промпт собран, ответ ещё не пошёл.
+    // Полоса обязана переехать уже здесь, на пустой карточке.
+    await settle(70);
+    check("полоса переехала на проверку **до** первого токена ответа",
+      current() === "validation" && !$("#feed").querySelector(".card-body").textContent,
+      current() + " — тело карточки: " +
+        JSON.stringify($("#feed").querySelector(".card-body").textContent));
+    await settle(400);
+    check("и под полосой встала инструкция нового этапа",
+      $("#stage-note").textContent.includes("первой строкой ответа"),
+      $("#stage-note").textContent);
+    check("журнал переходов называет переход и того, кто его сделал",
+      moves().length === 1 && moves()[0].includes("работа → проверка") &&
+        moves()[0].includes("агент"),
+      JSON.stringify(moves()));
+
+    // Проверка не дала годного результата — и полоса едет **назад**.
+    $("#input").value = "вот исправленное";
+    $("#composer").requestSubmit();
+    await settle(400);
+    check("не давшая результата проверка вернула полосу в работу",
+      current() === "execution", current());
+    check("и оба перехода стоят в журнале по порядку",
+      moves().length === 2 && moves()[1].includes("проверка → работа"),
+      JSON.stringify(moves()));
   }
 
 }
