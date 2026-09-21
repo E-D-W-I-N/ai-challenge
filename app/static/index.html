@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 12</span>
+            <span class="brand-sub">чат · день 13</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -36,6 +36,16 @@
 
     <!-- ── по центру: лента ──────────────────────────────────────────── -->
     <main class="chat">
+      <!-- Шапка задачи: этап, шаги и кнопки перехода. Пуста в разметке и
+           спрятана ею же — наполняет её `renderTask` по ключу `plan`, который
+           сервер кладёт в тело чата всегда. У обычного чата (`workflow: "off"`)
+           шапки нет вовсе: режим задачи включают командой `/task`, а обычный
+           чат обязан остаться обычным.
+
+           Стоит перед лентой, а не внутри неё: лента прокручивается, а этап
+           и кнопки обязаны быть на виду в любом месте разговора. -->
+      <section class="task hidden" id="task" aria-label="Задача"></section>
+
       <div class="feed" id="feed"></div>
 
       <form class="composer" id="composer">

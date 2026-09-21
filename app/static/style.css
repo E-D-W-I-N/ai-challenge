@@ -299,6 +299,124 @@ button, input, select, textarea { font: inherit; color: inherit; }
   gap: 18px;
 }
 
+/* ── шапка задачи ──────────────────────────────────────────────────────
+   Стоит над лентой и не прокручивается вместе с ней: этап, текущий шаг и
+   кнопки перехода обязаны быть на виду в любом месте разговора. У обычного
+   чата её нет вовсе — прячет `renderTask`, а не стиль.
+
+   Шаги помечены **значком**, а цветом только подкрашены: цвет пропадает
+   и в чёрно-белом, и у дальтоника, и на записи экрана, а три статуса обязаны
+   различаться с первого взгляда. */
+.task {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+  padding: 10px 28px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 42vh;
+  overflow-y: auto;
+}
+.task-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.task-stage {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.task-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.task-btn {
+  flex: 0 0 auto;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.task-btn:hover { background: var(--bg-soft); border-color: var(--faint); }
+.task-btn:disabled { opacity: .45; cursor: default; }
+.task-btn:disabled:hover { background: var(--bg); border-color: var(--line); }
+/* Выход из режима — рядом с остальными, но тише их: он не про работу над
+   задачей, а про то, чтобы её не стало. */
+.task-btn.off { color: var(--muted); }
+.task-btn.off:hover { color: var(--danger); border-color: var(--danger); }
+
+.task-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.task-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.task-mark {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--faint);
+}
+.task-step.done { color: var(--faint); }
+.task-step.done .task-mark { color: var(--ok); }
+.task-step.done .task-step-title { text-decoration: line-through; }
+.task-step.in_progress { color: var(--text); font-weight: 600; }
+.task-step.in_progress .task-mark { color: var(--accent); }
+/* Текущий шаг подсвечен и тогда, когда модель забыла пометить его
+   `in_progress`: текущим его называет сервер, а не статус в строке. */
+.task-step.current { color: var(--text); }
+.task-empty { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--faint); }
+
+/* ── пауза видна самим видом списка ──
+   Остановленный шаг рисовался ровно как работающий: тот же значок, тот же
+   жирный, тот же акцент. На записи экрана зритель увидит, что ничего
+   не изменилось, и поверит глазам, а не подписи в двенадцать пикселей.
+   А пауза у нас — отдельная кнопка и отдельное обещание.
+
+   Правила стоят **после** правил статусов: они их перекрывают, и держится
+   это на порядке, а не на `!important`. */
+.task.stage-paused { background: var(--warn-bg); border-bottom-color: var(--warn-line); }
+.task.stage-paused .task-stage {
+  color: var(--warn-text);
+  font-size: 12.5px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.task.stage-paused .task-steps { opacity: .55; }
+.task.stage-paused .task-step,
+.task.stage-paused .task-step.in_progress,
+.task.stage-paused .task-step.current {
+  color: var(--muted);
+  font-weight: 400;
+}
+.task.stage-paused .task-mark,
+.task.stage-paused .task-step.done .task-mark,
+.task.stage-paused .task-step.in_progress .task-mark { color: var(--warn-text); }
+
+/* Завершённая задача — тем же способом: этап читается фоном, а не только
+   словом. Одна карта классов на оба случая, и заводится она в одном месте
+   (`renderTask`). */
+.task.stage-done .task-stage { color: var(--ok); }
+
 /* Лента — колоночный флексбокс, и её элементы по умолчанию сжимаются.
    У карточки к тому же `overflow: hidden`, из-за чего её минимальный размер
    равен нулю: вместо прокрутки лента давила карточки в полоску. */
