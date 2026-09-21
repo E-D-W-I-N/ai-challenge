@@ -539,8 +539,13 @@ async function openAgent(agentId) {
   // а числа — только его собственные.
   resetMetrics(agent);
   renderList();
+  // Полоса этапов — вместе с лентой и по тому же ответу: состояние приехало
+  // с чатом, и спрашивать его отдельно незачем.
+  renderStages(agent);
   renderFeed(agent);
   fillPanel(agent);
+  fillTask(agent);
+  taskStatus("");
   renderTiles();
 
   // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
@@ -1150,7 +1155,7 @@ async function refreshCurrent(prompt) {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory", "profile"];
+const PANEL_TABS = ["model", "agent", "task", "memory", "profile"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -2024,6 +2029,130 @@ function fillKinds(select, kinds, blankLabel) {
   });
 }
 
+// ──────────────────────── состояние задачи ────────────────────
+//
+// Этап задачи, текущий шаг и ожидаемое действие. Этап переключает человек —
+// кнопкой полосы в шапке чата, — а два поля правит во вкладке «Задача».
+// Выводить состояние из разговора агент не вправе: довод тот же, по которому
+// он не пишет ни в один слой памяти.
+//
+// Запроса за ним нет: состояние приезжает с самим чатом (`GET
+// /api/agents/{id}`), потому что полоса стоит в шапке и рисуется тем же
+// ответом, что и лента. Второй источник того же числа разошёлся бы с первым.
+
+// Этапы: токен для сервера и русская подпись. Одна карта на полосу и на
+// строку врезки — слова те же, что в `TASK_STAGE_LABELS` на сервере, ими же
+// этап подписан в промпте. Порядок тот же, в каком задача их проходит.
+const TASK_STAGES = [
+  ["planning", "планирование"],
+  ["execution", "работа"],
+  ["validation", "проверка"],
+  ["done", "готово"],
+];
+
+// Два поля свободного текста — тем же списком, что `TASK_TEXT_FIELDS`
+// на сервере, и в том же порядке: им же собраны строки врезки.
+const TASK_TEXT_FIELDS = ["step", "expecting"];
+
+const TASK_DEFAULT_STAGE = TASK_STAGES[0][0];
+
+// Состояние открытого чата — или умолчание: этап у задачи есть всегда,
+// и чат, которого сервер ещё не прислал, стоит на первом этапе, а не
+// ни на каком.
+function taskOf(agent) {
+  const task = (agent && agent.task) || {};
+  return {
+    stage: task.stage || TASK_DEFAULT_STAGE,
+    step: task.step || "",
+    expecting: task.expecting || "",
+  };
+}
+
+const taskInput = (name) => $("#task-" + name);
+
+function taskStatus(text, isError) {
+  const box = $("#task-status");
+  box.className = "hint" + (isError ? " error" : "");
+  box.textContent = text || "";
+}
+
+// Полоса этапов: текущий выделен, остальные приглушены, между ними стрелка.
+// Кружок — часть подписи кнопки, а не отдельный узел: из сети клиент ничего
+// не тянет, и одному символу незачем становиться картинкой.
+function renderStages(agent) {
+  const box = $("#stages");
+  box.innerHTML = "";
+  const current = taskOf(agent).stage;
+  TASK_STAGES.forEach(([token, label], i) => {
+    if (i) box.appendChild(el("span", "stage-arrow", "──▶"));
+    const btn = el(
+      "button",
+      "stage" + (token === current ? " current" : ""),
+      (token === current ? "● " : "○ ") + label
+    );
+    btn.type = "button";
+    btn.dataset.stage = token;
+    btn.title = "Этап задачи: " + label;
+    // Нажатие на текущий этап ничего не шлёт: правка, которой нет, — это
+    // запрос ни о чём, а ручка ответила бы на него «ок».
+    btn.onclick = () => { if (token !== current) setStage(token); };
+    box.appendChild(btn);
+  });
+}
+
+function fillTask(agent) {
+  const task = taskOf(agent);
+  TASK_TEXT_FIELDS.forEach((name) => { taskInput(name).value = task[name]; });
+}
+
+// Записанное состояние кладётся и в открытый чат, и в его запись в списке
+// слева: полоса рисуется по `state.current`, а список переживает открытие
+// соседнего чата. Показываем **записанное** из ответа ручки, а не набранное:
+// текст по дороге чистит `redact()`.
+function applyTask(task) {
+  if (state.current) state.current.task = task;
+  const row = state.agents.find((a) => state.current && a.id === state.current.id);
+  if (row) row.task = task;
+  renderStages(state.current);
+  fillTask(state.current);
+}
+
+async function setStage(stage) {
+  if (!(state.current && state.current.id)) return;
+  try {
+    const answer = await api(taskUrl(), json("PATCH", { stage }));
+    applyTask(answer.task);
+    taskStatus("Этап: " + stageLabel(answer.task.stage) + ".");
+  } catch (err) {
+    taskStatus(String(err.message || err), true);
+  }
+}
+
+const stageLabel = (stage) =>
+  (TASK_STAGES.find(([token]) => token === stage) || [stage, stage])[1];
+
+const taskUrl = () => "/api/agents/" + (state.current && state.current.id) + "/task";
+
+// Правка одного поля: уезжает **только тронутое**, остальные не называются
+// вовсе — иначе вторая вкладка, правящая «ожидается», затирала бы шаг,
+// набранный в первой. Пустая строка поле снимает, и тогда оно не едет
+// во врезку вовсе. Довод и форма те же, что у профиля.
+async function saveTask(name) {
+  if (!(state.current && state.current.id)) {
+    taskStatus("Чат ещё не открыт: состояние задачи живёт в разговоре.", true);
+    return;
+  }
+  try {
+    const answer = await api(taskUrl(), json("PATCH", { [name]: taskInput(name).value }));
+    applyTask(answer.task);
+    taskStatus(TASK_TEXT_FIELDS.some((key) => answer.task[key])
+      ? "Состояние задачи сохранено: оно уезжает в блок задачи каждого запроса."
+      : "Поля пусты: в блок задачи уезжает только этап.");
+  } catch (err) {
+    taskStatus(String(err.message || err), true);
+  }
+}
+
 // ─────────────────────────── профиль ──────────────────────────
 //
 // Профиль — про то, **как** с человеком разговаривать: стиль, формат
@@ -2315,6 +2444,9 @@ function init() {
     // сохранения нет нигде в панели.
     const id = String(ev.target.id || "");
     if (id.startsWith("profile-")) return saveProfile(id.slice("profile-".length));
+    // Поля задачи — тем же событием и по той же причине: у состояния своя
+    // ручка, и PATCH чата при правке текущего шага был бы запросом ни о чём.
+    if (id.startsWith("task-")) return saveTask(id.slice("task-".length));
     if (!id.startsWith("f-")) return;
     if (id === "f-response_format_kind") syncResponseFormat();
     // Показ полей меняется на самом выборе, а не после сохранения: пролив
@@ -2362,6 +2494,10 @@ function init() {
 
   setBusy(false);
   renderTiles();
+  // Полоса рисуется сразу, ещё до первого ответа сервера: у чата, которого
+  // нет, она показывает первый этап — тот же, с которого начнётся любая
+  // задача, — и не мигает пустым местом на открытии.
+  renderStages(null);
   renderMemory();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }

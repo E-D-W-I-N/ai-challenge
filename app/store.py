@@ -38,6 +38,8 @@ import threading
 import time
 from pathlib import Path
 
+from .schema import TASK_FIELDS, blank_task
+
 from .config import ROOT, api_key
 
 DEFAULT_DB_PATH = ROOT / "data" / "agents.db"
@@ -138,6 +140,35 @@ CREATE TABLE IF NOT EXISTS working_memory (
 );
 
 CREATE INDEX IF NOT EXISTS working_by_session ON working_memory(session_id);
+
+-- Состояние задачи чата: на каком она этапе, что делается сейчас и какого
+-- действия ждут. Одна строка на чат — у разговора ровно одна задача, поэтому
+-- `session_id` первичным ключом, как у `branches`.
+--
+-- Своя таблица, а не поле в `config`: `config` это `asdict(spec)`, «чем один
+-- чат отличается от другого», а этап — не настройка, а то, где разговор
+-- сейчас находится. Тот же довод, по которому туда не поехали ни сводка,
+-- ни родство. И тот же, по которому это таблица, а не колонка: `CREATE TABLE
+-- IF NOT EXISTS` накатится на живую базу сам.
+--
+-- Строки может не быть вовсе, и это законно: чат, которого никто не трогал,
+-- живёт с умолчанием (`blank_task`, app/schema.py) — планирование и два
+-- пустых поля. А если строка есть, заполнены все три колонки: пустая строка
+-- здесь и значит «поле не задано», и во врезку такое поле не едет. Второго
+-- представления пустоты не заводим — `NULL` рядом с `''` различал бы то,
+-- чего не различает ни врезка, ни вкладка.
+--
+-- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: этап
+-- живёт в разговоре и умирает с ним, ровно как рабочая память. Забытый
+-- разговор, оставивший «этап: проверка», врал бы следующему в первой же
+-- строке блока задачи.
+CREATE TABLE IF NOT EXISTS task_state (
+    session_id TEXT PRIMARY KEY,
+    stage      TEXT NOT NULL,
+    step       TEXT NOT NULL,
+    expecting  TEXT NOT NULL,
+    at         REAL NOT NULL
+);
 
 -- Происхождение чата: чей он потомок и сколько первых сообщений унёс.
 -- Ветка — обычный чат, отдельная строка в `sessions` с копией истории до
@@ -264,6 +295,21 @@ def _branch_row(parent_id, forked_at) -> dict | None:
     if parent_id is None:
         return None
     return {"parent_id": parent_id, "forked_at": forked_at}
+
+
+def _task_row(row) -> dict:
+    """Состояние задачи в том виде, в каком его ждут и ручка, и врезка
+    в промпт, и полоса этапов в шапке. Строки нет — отдаётся умолчание,
+    а не `None`: этап у задачи есть всегда, и «чат, которого не трогали»
+    отличается от «чат на планировании» только тем, что об этом никто
+    не спрашивал. Одна форма на все чтения — довод тот же, что
+    у `_branch_row`."""
+    task = blank_task()
+    if row is None:
+        return task
+    for name in TASK_FIELDS:
+        task[name] = row[name]
+    return task
 
 
 def _memory_row(row: sqlite3.Row) -> dict:
@@ -575,9 +621,11 @@ class Store:
             SELECT s.*, (
                 SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
             ) AS history_len,
-            b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at
+            b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at,
+            t.stage AS stage, t.step AS step, t.expecting AS expecting
             FROM sessions s
             LEFT JOIN branches b ON b.session_id = s.id
+            LEFT JOIN task_state t ON t.session_id = s.id
             ORDER BY s.updated_at DESC
         """
         with self.reading() as conn:
@@ -593,6 +641,10 @@ class Store:
             # список слева рисуется по нему целиком, и пометка ветки обязана
             # стоить столько же, сколько имя чата.
             data["branch"] = _branch_row(row["branch_parent_id"], row["branch_forked_at"])
+            # И состояние задачи — тем же запросом и по тому же доводу:
+            # полоса этапов в шапке обязана стоить столько же, сколько имя
+            # чата, и не зависеть от того, поднят чат в память или вытеснен.
+            data["task"] = _task_row(None if row["stage"] is None else row)
             out.append(data)
         return out
 
@@ -601,12 +653,14 @@ class Store:
             return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def delete_session(self, session_id: str) -> bool:
-        """Стирает чат вместе с репликами, сводками и рабочей памятью, все
-        таблицы одной транзакцией. False — его и не было.
+        """Стирает чат вместе с репликами, сводками, рабочей памятью
+        и состоянием задачи, все таблицы одной транзакцией. False — его
+        и не было.
 
         Внешних ключей в схеме нет, каскада тоже: не вычистишь `summaries`,
-        `working_memory` и `branches` руками — сводка,
-        цели и происхождение удалённого разговора достанутся чату с тем же id.
+        `working_memory`, `task_state` и `branches` руками — сводка,
+        цели, этап и происхождение удалённого разговора достанутся чату
+        с тем же id.
 
         Долговременная память (`memory`) здесь не трогается намеренно: чат ей
         не владелец, а читатель, и слой переживает и удаление чата, и `forget()`.
@@ -621,12 +675,13 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta`, сводки, рабочую память, родство,
-        долговременную память и профиль. Нужно только проверкам: оставленный счётчик
+        """Стирает базу целиком, включая `meta`, сводки, рабочую память,
+        состояние задачи, родство, долговременную память и профиль. Нужно только проверкам: оставленный счётчик
         имён отдал бы следующей номер посередине, оставленная сводка — чужое
         начало разговора, а оставленная строка родства сделала бы свежий чат
         веткой мёртвого.
@@ -643,6 +698,7 @@ class Store:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM working_memory")
+            conn.execute("DELETE FROM task_state")
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM profile")
@@ -844,6 +900,70 @@ class Store:
         в памяти есть хоть одна запись."""
         with self.tx() as conn:
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+
+    # --- состояние задачи -----------------------------------------------------
+    #
+    # Слой чата, как рабочая память: этап, текущий шаг и ожидаемое действие
+    # живут в разговоре и умирают с ним. Методов два, а не четыре: состояние —
+    # одна строка на чат, а не список записей, и править её по одной операции
+    # не из чего.
+
+    def load_task(self, session_id: str) -> dict:
+        """Состояние задачи чата — или умолчание, если строки ещё нет."""
+        with self.reading() as conn:
+            row = conn.execute(
+                f"SELECT {', '.join(TASK_FIELDS)} FROM task_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return _task_row(row)
+
+    def save_task(self, session_id: str, values: dict, at: float | None = None) -> dict:
+        """Переписывает названные поля состояния и отдаёт его целиком.
+
+        Названные, а не все: вторая вкладка, правящая «ожидается», затирала бы
+        шаг, набранный в первой. Довод и форма те же, что у `save_profile`.
+
+        Чтение и запись — под одной транзакцией: между «прочитал прежнее»
+        и «записал слитое» пролез бы второй писатель, и его правка пропала бы
+        молча. `tx()` берёт блокировку сразу (BEGIN IMMEDIATE), поэтому
+        слияние здесь безопасно, а не «почти всегда».
+
+        Отдаётся **записанное**, а не присланное: параметры едут через `tx()`,
+        и `redact()` чистит их по дороге.
+        """
+        stamp = time.time() if at is None else at
+        with self.tx() as conn:
+            row = conn.execute(
+                f"SELECT {', '.join(TASK_FIELDS)} FROM task_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            task = _task_row(row)
+            task.update({name: values[name] for name in TASK_FIELDS if name in values})
+            conn.execute(
+                """
+                INSERT INTO task_state (session_id, stage, step, expecting, at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    stage     = excluded.stage,
+                    step      = excluded.step,
+                    expecting = excluded.expecting,
+                    at        = excluded.at
+                """,
+                (session_id, task["stage"], task["step"], task["expecting"], stamp),
+            )
+            saved = conn.execute(
+                f"SELECT {', '.join(TASK_FIELDS)} FROM task_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return _task_row(saved)
+
+    def clear_task(self, session_id: str) -> None:
+        """Возвращает чату умолчание: строки не стало, и задача снова
+        на планировании. Забытый разговор не вправе оставить следующему свой
+        этап — врезка блока задачи зажима по длине истории не имеет, ровно
+        как у рабочей памяти."""
+        with self.tx() as conn:
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
 
     # --- происхождение чата ---------------------------------------------------
 

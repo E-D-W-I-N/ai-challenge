@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 12</span>
+            <span class="brand-sub">чат · день 13</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -36,6 +36,19 @@
 
     <!-- ── по центру: лента ──────────────────────────────────────────── -->
     <main class="chat">
+      <!-- Полоса этапов задачи — в шапке чата, а не во вкладке панели:
+           состояние задачи обязано быть видно всегда, а не только тогда,
+           когда за ним пришли. Панель сворачивается, вкладка в ней одна
+           из пяти, и этап, спрятанный туда, на экране не стоял бы почти
+           никогда.
+
+           Пуста в разметке намеренно: кнопки строит `renderStages` из той же
+           карты этапов, какой этап подписан во врезке промпта. Двумя
+           таблицами подписи разъехались бы молча. -->
+      <header class="chat-head">
+        <div class="stages" id="stages" role="group" aria-label="Этап задачи"></div>
+      </header>
+
       <div class="feed" id="feed"></div>
 
       <form class="composer" id="composer">
@@ -55,6 +68,8 @@
         <div class="tabs" role="tablist">
           <button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab">Модель</button>
           <button class="tab" data-tab="agent" type="button" role="tab">Агент</button>
+          <button class="tab" id="tab-btn-task" data-tab="task" type="button"
+                  role="tab">Задача</button>
           <button class="tab" id="tab-btn-memory" data-tab="memory" type="button"
                   role="tab">Память</button>
           <button class="tab" id="tab-btn-profile" data-tab="profile" type="button"
@@ -176,6 +191,31 @@
             <input id="f-compress_every" class="control" type="number" step="1" placeholder="—">
           </label>
 
+        </section>
+
+        <!-- Задача: подробности того, что показывает полоса этапов в шапке.
+             Сам этап здесь не повторяется — он переключается наверху, и два
+             места для одного действия развели бы их на первом же нажатии.
+
+             Два поля и всё: примеры стоят подсказками в самих полях, абзацев
+             с объяснениями нет — ровно как во вкладке «Профиль».
+
+             Поля **без** приставки `f-`, как у «Памяти» и «Профиля»: её носят
+             поля конфига чата, и общий слушатель `change` на панели различает
+             по ней одно от другого. Состояние задачи не настройка чата —
+             у него своя ручка. -->
+        <section class="tab-page hidden" id="tab-task">
+          <label class="field">
+            <span class="field-label">Текущий шаг</span>
+            <textarea id="task-step" class="control area" rows="2"
+                      placeholder="например: собрать требования"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">Что ожидается</span>
+            <textarea id="task-expecting" class="control area" rows="2"
+                      placeholder="например: ваше подтверждение плана"></textarea>
+          </label>
+          <p class="hint" id="task-status"></p>
         </section>
 
         <!-- Память агента: три слоя, по разделу на каждый, в порядке от
