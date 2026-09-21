@@ -501,7 +501,7 @@ def check_cut_only_where_chosen():
     # 1. Живой маршрут без стратегии вовсе: 25 обменов — больше прежнего окна.
     turns = 25
     with TestClient(main.app) as client:
-        agent_id = new_agent(client, system="СИС")
+        agent_id = new_agent(client, system="СИС", workflow="on")
         assert client.get(f"/api/agents/{agent_id}").json()["strategy"] == "full", "умолчание не full"
         for response in _talk(client, agent_id, turns):
             assert response.status_code == 200, response.text
@@ -531,7 +531,7 @@ def check_cut_only_where_chosen():
     )
 
     # 2. Рост истории: 500 реплик — больше прежнего потолка хранимого.
-    long_chat = _fill(_bare("длинный", system="СИС"), 500, role="user")
+    long_chat = _fill(_bare("длинный", system="СИС", workflow="on"), 500, role="user")
     assert len(long_chat.history) == 500, "история подрезана при росте"
     assert long_chat.history[0].content == "реплика 0", "у истории отъели начало"
 
@@ -548,7 +548,7 @@ def check_cut_only_where_chosen():
     _stub.reset()
     _stub.install(reply=_service_aware)
     with TestClient(main.app) as client:
-        numbers_only = new_agent(client, keep_last=KEEP, compress_every=EVERY)
+        numbers_only = new_agent(client, keep_last=KEEP, compress_every=EVERY, workflow="on")
         _talk(client, numbers_only, 9)
         assert not _service_calls(), "стратегия `full`, а сжатие запустилось"
         # Блок задачи плюс 16 реплик восьми обменов плюс вопрос.
@@ -558,7 +558,7 @@ def check_cut_only_where_chosen():
     # --- window: уезжает хвост, отброшенное названо числом --------------------
     _stub.reset()
     with TestClient(main.app) as client:
-        win_id = new_agent(client, strategy="window", keep_last=KEEP)
+        win_id = new_agent(client, strategy="window", keep_last=KEEP, workflow="on")
         _talk(client, win_id, 9)
 
         win = REGISTRY.require(win_id)
@@ -612,7 +612,7 @@ def check_cut_only_where_chosen():
 
     # Ноль в хвосте — это ноль, а не «не задано»: уезжает только вопрос.
     bare = _fill(
-        _bare("ноль", strategy="window", keep_last=0, system="СИС"), 6
+        _bare("ноль", strategy="window", keep_last=0, system="СИС", workflow="on"), 6
     )
     assert bare.context_cut() == (6, None), bare.context_cut()
     # Системный промпт, блок задачи и вопрос: истории не уехало ни реплики.
@@ -636,7 +636,7 @@ def check_cut_only_where_chosen():
     _stub.reset()
     _stub.install(reply=lambda m, i: f"ответ {i}")
     with TestClient(main.app) as client:
-        narrow = new_agent(client, strategy="window", keep_last=2)
+        narrow = new_agent(client, strategy="window", keep_last=2, workflow="on")
         goal = client.post(
             f"/api/agents/{narrow}/working", json={"kind": "goal", "content": "собрать ТЗ"}
         )
@@ -679,6 +679,7 @@ def check_cut_only_where_chosen():
     with TestClient(main.app) as client:
         folded_id = new_agent(
             client,
+            workflow="on",
             strategy="summary",
             keep_last=KEEP,
             compress_every=EVERY,
@@ -810,7 +811,8 @@ def check_cut_only_where_chosen():
     # пишутся разом, и свёрнутый вопрос без своего ответа сделал бы хвост
     # бессмысленным. При нечётном окне граница округляется вниз до чётного.
     odd = _fill(
-        _bare("нечёт", strategy="summary", keep_last=5, compress_every=EVERY), 20
+        _bare("нечёт", strategy="summary", keep_last=5, compress_every=EVERY,
+              workflow="on"), 20
     )
     asyncio.run(odd.compress(odd.spec))
     odd_cover = odd.summary_cover()
@@ -824,6 +826,7 @@ def check_cut_only_where_chosen():
     # бы, что свёрнуто реплик больше, чем в чате было.
     short = _fill(
         _bare("перегенерация", strategy="summary", keep_last=0, compress_every=EVERY,
+              workflow="on",
 ), 10
     )
     asyncio.run(short.compress(short.spec))
@@ -847,13 +850,22 @@ def check_cut_only_where_chosen():
         assert fresh["strategy"] == "full", fresh["strategy"]
         assert fresh["keep_last"] is None, fresh["keep_last"]
         assert fresh["compress_every"] is None, fresh["compress_every"]
+        # И «Рабочий процесс» у чата из умолчаний выключен: большинство чатов
+        # это разговоры, и машина состояний им ни к чему.
+        assert fresh["workflow"] == "off", fresh["workflow"]
         _talk(client, fresh["id"], 9)
     assert not _service_calls(), "чат из умолчаний ходил к модели за чем-то ещё"
     # И к модели он ходит ровно по разу на обмен: служебный вызов у чата
     # из умолчаний один — сжатие, — и тот не запускается.
     assert len(_stub.CALLS) == 9, len(_stub.CALLS)
-    assert len(_stub.CALLS[-1]["messages"]) == 18, len(_stub.CALLS[-1]["messages"])
-    assert _stub.CALLS[-1]["messages"][1]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][1]
+    # Блока задачи в промпте такого чата нет вовсе: 16 реплик восьми обменов
+    # плюс вопрос, и ни одного служебного сообщения перед ними. Выключенный
+    # переключатель обязан не стоить чату ни токена.
+    assert len(_stub.CALLS[-1]["messages"]) == 17, len(_stub.CALLS[-1]["messages"])
+    assert _stub.CALLS[-1]["messages"][0]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][0]
+    assert not any(
+        "факты о разговоре" in m["content"] for m in _stub.CALLS[-1]["messages"]
+    ), _stub.CALLS[-1]["messages"]
 
     return (
         f"full — вся история из {2 * turns} реплик и 500 хранимых целиком; "
@@ -919,10 +931,10 @@ def check_compression_saves_input():
         # Память обоим выключена: проверка про экономию сжатия, и вызов
         # на ведение памяти — лишнее обращение к модели в обеих колонках
         # сравнения сразу.
-        plain = new_agent(client, label="без сжатия")
+        plain = new_agent(client, label="без сжатия", workflow="on")
         folded = new_agent(
             client, label="со сжатием", strategy="summary", keep_last=KEEP,
-            compress_every=EVERY,
+            compress_every=EVERY, workflow="on",
         )
         events = {plain: [], folded: []}
         for i in range(12):
@@ -1065,7 +1077,7 @@ def check_summary_apart_and_cleanup():
     # по номеру. У чатов второй половины она включена — им нужен непустой слой.
     spec = AgentSpec(
         label="сжатый", model="stub/model", strategy="summary",
-        keep_last=KEEP, compress_every=EVERY,
+        keep_last=KEEP, compress_every=EVERY, workflow="on",
     )
     agent = Agent(spec, store=store)
     _ask(agent, 9)
@@ -1220,16 +1232,14 @@ def check_working_memory():
         # Закрывающая скобка нейтральная: за врезкой рабочей памяти может
         # встать сводка начала разговора, и «дальше — последние сообщения
         # как есть» соврало бы ровно там, где врезок в промпте три.
+        # Рабочий процесс у этого чата **выключен** — он обычный разговор,
+        # — и строк состояния задачи в блоке нет ни одной. Слой от
+        # переключателя не зависит вовсе: записи вписал человек, и уезжают
+        # они при любом его положении. Врезка та же, что была до Дня 13.
         assert sent[1] == {
             "role": "user",
             "content": (
                 "[факты о разговоре]\n"
-                "этап: планирование\n"
-                "сейчас: собрать требования и предложить план\n"
-                "ожидается: ваше подтверждение плана\n"
-                "инструкция: выдай сам план, списком шагов; не описывай "
-                "процесс и не сообщай о смене этапа — про этап говорит "
-                "интерфейс\n"
                 "решение: берём Kotlin\n"
                 "[конец фактов о разговоре]"
             ),
@@ -1364,7 +1374,10 @@ def check_working_memory():
     _stub.install(reply=lambda m, i: f"ответ {i}")
     path = _temp_db("working-restart")
     store = Store(path).init()
-    spec = AgentSpec(label="с памятью", model="stub/model", strategy="window", keep_last=KEEP)
+    spec = AgentSpec(
+        label="с памятью", model="stub/model", strategy="window", keep_last=KEEP,
+        workflow="on",
+    )
     agent = Agent(spec, store=store)
     _ask(agent, 9)
     mine = agent.add_working_record("question", "успеем ли к маю")
@@ -1445,7 +1458,7 @@ def check_working_memory():
     )
 
 
-@check("этап задачи: переключается руками, карта не даёт прыгнуть, блок едет всегда")
+@check("этап задачи: руками по карте, блок едет у того, кто ведёт задачу")
 def check_task_stage():
     """Состояние задачи — конечный автомат чата: этап, текущий шаг и то,
     какого действия ждут.
@@ -1476,7 +1489,7 @@ def check_task_stage():
         # это и есть планирование. То есть весь этап планирования модель
         # работала вслепую: ни где задача, ни чего от неё ждут, ни того,
         # что приступать рано, в промпте не стояло ни словом.
-        chat = new_agent(client, system="СИС")
+        chat = new_agent(client, system="СИС", workflow="on")
         _talk(client, chat, 1)
         sent = _stub.CALLS[-1]["messages"]
         assert [m["role"] for m in sent] == ["system", "user", "user"], sent
@@ -1608,11 +1621,60 @@ def check_task_stage():
         # Этап от всего этого не сдвинулся ни разу.
         assert REGISTRY.require(chat).task["stage"] == "execution", REGISTRY.require(chat).task
 
+        # --- 5а. «Рабочий процесс»: два положения, и оба на одном чате -------
+        #
+        # Умолчание — «выключен»: большинство чатов это разговоры, и машина
+        # состояний им ни к чему — она занимает место в шапке и врезку
+        # в промпте. Всё, что выше, — про чат, которому её включили.
+        #
+        # И здесь же ловушка, из-за которой это место самое опасное: блок
+        # задачи перестаёт ехать, а значит у таких чатов **сдвигаются номера
+        # врезок**. Сдвинуться есть чему, поэтому рядом лежит непустая
+        # долговременная память — та самая соседка, которой сдвиг и вышел бы
+        # боком: подпись роли в просмотре промпта берётся из номера, и
+        # ошибись он — памятью оказалось бы подписано чужое сообщение.
+        kept = client.post("/api/memory", json={"kind": "knowledge", "content": "релиз в мае"})
+        assert kept.status_code == 200, kept.text
+        talk = new_agent(client, system="СИС")
+        assert client.get(f"/api/agents/{talk}").json()["workflow"] == "off", "умолчание не off"
+        off = _frame(_frames(client, talk, "просто разговор"), "start")
+        # Блока нет вовсе, и слот его пуст: выключенный переключатель
+        # не стоит чату ни токена. Память встала сразу за системным
+        # сообщением — там, где стояла бы и до Дня 13.
+        assert off["working_at"] is None, off["working_at"]
+        assert off["memory_at"] == 1, off["memory_at"]
+        assert [m["role"] for m in off["resolved_messages"]] == ["system", "user", "user"], off
+        assert off["resolved_messages"][1]["content"].startswith("[долговременная память]"), off
+        assert not any(
+            "факты о разговоре" in m["content"] for m in off["resolved_messages"]
+        ), off["resolved_messages"]
+
+        # Включили тому же чату — и блок встал: за памятью, своим слотом,
+        # и номер памяти при этом не поехал.
+        turned = client.patch(f"/api/agents/{talk}", json={"workflow": "on"})
+        assert turned.status_code == 200 and turned.json()["workflow"] == "on", turned.text
+        on = _frame(_frames(client, talk, "теперь задача"), "start")
+        assert on["memory_at"] == 1, on["memory_at"]
+        assert on["working_at"] == 2, on["working_at"]
+        assert on["resolved_messages"][1]["content"].startswith("[долговременная память]"), on
+        assert on["resolved_messages"][2]["content"].startswith(
+            "[факты о разговоре]\nэтап: планирование"
+        ), on["resolved_messages"][2]
+
+        # Значение из закрытого списка: чужое ручки не пропустят, а `bool`
+        # отбрасывается отдельно — в Python `True` это `int`.
+        assert client.patch(f"/api/agents/{talk}", json={"workflow": "иногда"}).status_code == 400
+        assert client.patch(f"/api/agents/{talk}", json={"workflow": True}).status_code == 400
+        assert REGISTRY.require(talk).spec.workflow == "on", REGISTRY.require(talk).spec.workflow
+        client.delete(f"/api/memory/{kept.json()['seq']}")
+
     # --- 6. Одна дверь на все переходы, и в ней карта ------------------------
     _stub.reset()
     path = _temp_db("task-moves")
     store = Store(path).init()
-    jumper = Agent(AgentSpec(label="через этап", model="stub/model"), store=store)
+    jumper = Agent(
+        AgentSpec(label="через этап", model="stub/model", workflow="on"), store=store
+    )
 
     # Запрещённый картой переход не происходит — но **в журнал попадает**:
     # отклонённая попытка это улика того, что автомат работает, и без неё
@@ -1679,7 +1741,9 @@ def check_task_stage():
     _stub.install(reply=lambda m, i: f"ответ {i}")
     path = _temp_db("task-restart")
     store = Store(path).init()
-    agent = Agent(AgentSpec(label="на паузе", model="stub/model"), store=store)
+    agent = Agent(
+        AgentSpec(label="на паузе", model="stub/model", workflow="on"), store=store
+    )
     _ask(agent, 2)
     agent.move_stage("execution")
     agent.move_stage("validation")
@@ -1716,7 +1780,10 @@ def check_task_stage():
         "блока, достижимые этапы и журнал; прыжок через этап отбит 409 "
         "с доводом и записан отклонённым, незнакомый этап — 400; правка "
         "текста этапа не принимает — 400, а набранное руками побеждает "
-        "зашитое; проверка вернула задачу в работу, из «готова» выхода нет; "
+        "зашитое; «Рабочий процесс» выключен у нового чата — блока в промпте "
+        "нет вовсе и память стоит за системным сообщением, включён — блок "
+        "встал за ней и номера врезок не поехали; проверка вернула задачу "
+        "в работу, из «готова» выхода нет; "
         "инструкции у четырёх этапов разные и все просят результат, а не "
         "рассказ; семь строк журнала, этап и шаг пережили переоткрытие "
         "файла и уехали в ветку целиком"
@@ -1759,7 +1826,7 @@ def check_branch_independent():
         # Копию самой памяти разбирает раздел ниже, там она включена.
         parent = new_agent(
             client, label="родитель", system="СИС", temperature=0.5,
-            extra_body={"provider": {"order": ["stub"]}},
+            workflow="on", extra_body={"provider": {"order": ["stub"]}},
         )
         _talk(client, parent, 3)
         spoken = len(_stub.CALLS)
@@ -1990,7 +2057,7 @@ def check_branch_independent():
     reg = AgentRegistry(store=store)
     folded = agent_module.Agent(
         AgentSpec(label="сжатый", model="stub/model", strategy="summary",
-                  keep_last=KEEP, compress_every=EVERY),
+                  keep_last=KEEP, compress_every=EVERY, workflow="on"),
         store=store,
     )
     _ask(folded, 9)
@@ -2154,7 +2221,7 @@ def check_long_term_memory():
         # у памяти пустота бывает и прятать в ней нечего, а этап назван
         # всегда. Поэтому слот памяти здесь пуст, а слот блока — нет.
         assert client.get("/api/memory").json() == {"total": 0, "records": []}, "память не пуста"
-        plain = new_agent(client, system="СИС")
+        plain = new_agent(client, system="СИС", workflow="on")
         start = _frame(_frames(client, plain, "первый"), "start")
         assert start["memory_at"] is None, start["memory_at"]
         assert start["working_at"] == 1, start["working_at"]
@@ -2222,7 +2289,7 @@ def check_long_term_memory():
 
         # Чат без системного промпта: память стоит нулевым сообщением, и ноль
         # здесь — не «врезки нет». На этом держится строгое сравнение у клиента.
-        bare = new_agent(client, system="")
+        bare = new_agent(client, system="", workflow="on")
         start = _frame(_frames(client, bare, "голый"), "start")
         assert start["memory_at"] == 0, start["memory_at"]
         assert start["working_at"] == 1, start["working_at"]
@@ -2434,7 +2501,7 @@ def check_long_term_memory():
     _stub.install(reply=lambda m, i: f"ответ {i}")
     path = _temp_db("memory")
     store = Store(path).init()
-    spec = AgentSpec(label="с памятью", model="stub/model")
+    spec = AgentSpec(label="с памятью", model="stub/model", workflow="on")
     agent = Agent(spec, store=store)
     store.add_memory("profile", "пишу на Kotlin")
     asyncio.run(drain(agent.ask("вопрос")))
@@ -2536,7 +2603,7 @@ def check_long_term_memory():
         assert "[долговременная память]" in revived.build_prompt("после перезапуска")[0]["content"]
 
         # Агент без хранилища не падает — память у него просто пуста.
-        homeless = Agent(AgentSpec(label="без базы", model="stub/model"))
+        homeless = Agent(AgentSpec(label="без базы", model="stub/model", workflow="on"))
         assert homeless.memory_items() == [], homeless.memory_items()
         assert homeless.prompt_slots()["memory_at"] is None, homeless.prompt_slots()
         # Врезки памяти нет — её нечем наполнить; блок задачи есть: этап
@@ -2709,15 +2776,15 @@ def check_profile_changes_answer():
         # --- 1. Профиль пуст: ни блока, ни системного сообщения ---------------
         #
         # Системного сообщения у такого чата нет вовсе — это и проверяется.
-        # Блок задачи при этом есть: он не системный и прячется не по этому
-        # правилу, а вернее сказать — не прячется вовсе.
+        # Блока задачи тоже нет: чат обычный, «Рабочий процесс» у него
+        # выключен, и в промпте остаётся один вопрос. Два пустых слоя —
+        # два разных правила, и молчат оба одинаково.
         assert client.get("/api/profile").json() == {"profile": {}}, "профиль не пуст"
         blank = new_agent(client, label="без профиля")
         empty_answer, blank_prompt = answer(blank, client)
         assert not any(m["role"] == "system" for m in blank_prompt), blank_prompt
-        assert len(blank_prompt) == 2, blank_prompt
-        assert blank_prompt[0]["content"].startswith("[факты о разговоре]"), blank_prompt[0]
-        assert blank_prompt[1] == {"role": "user", "content": question}, blank_prompt[1]
+        assert len(blank_prompt) == 1, blank_prompt
+        assert blank_prompt[0] == {"role": "user", "content": question}, blank_prompt[0]
 
         # --- 2. Профиль вписал человек — и только человек ---------------------
         #
@@ -2952,11 +3019,10 @@ def check_panel_reaches_request():
             continue
         assert payload.get(name) == value, (name, payload.get(name), value)
     # Правка панели меняет конфиг, а не переписку: прошлый обмен на месте.
-    # Между системным промптом и перепиской стоит блок задачи — он едет
-    # с каждым обменом.
-    assert [m["role"] for m in sent] == ["system", "user", "user", "assistant", "user"], sent
-    assert sent[1]["content"].startswith("[факты о разговоре]"), sent[1]
-    assert sent[2]["content"] == "первый", sent[2]
+    # Блока задачи здесь нет — чат обычный, — и за системным промптом сразу
+    # начинается переписка.
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"], sent
+    assert sent[1]["content"] == "первый", sent[1]
 
     assert not any(m["role"] == "system" for m in bare["messages"]), bare["messages"]
     assert "top_k" not in bare["payload"] and "stop" not in bare["payload"], bare["payload"]
@@ -3349,9 +3415,14 @@ def check_config_survives_by_construction():
         assert revived.history[-1].metrics == {"provider": "stub"}, revived.history[-1].metrics
         # И это же целиком уезжает в модель: восстановленная история — обычная.
         prompt = revived.build_prompt("новый вопрос")
-        # Системный промпт, блок задачи, история и новый вопрос.
-        assert len(prompt) == 1 + 1 + messages + 1 + 1, len(prompt)
-        assert prompt[2]["content"] == "реплика 0", prompt[2]
+        # Системный промпт, история и новый вопрос. Блока задачи здесь нет,
+        # и это тоже round-trip: пробой `workflow` досталось значение не из
+        # списка, а незнакомое читается как «выключен» — чат из чужой базы
+        # остаётся обычным разговором, пока не попросили обратного.
+        assert revived.spec.workflow == "текст-workflow", revived.spec.workflow
+        assert len(prompt) == 1 + messages + 1 + 1, len(prompt)
+        assert prompt[1]["content"] == "реплика 0", prompt[1]
+        assert not any("факты о разговоре" in m["content"] for m in prompt), prompt[:2]
 
         # Колонки схемы и колонки, которые читает код, — один набор.
         # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,

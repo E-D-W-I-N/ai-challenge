@@ -83,10 +83,11 @@ def main() -> int:
     assert second["restored"] == 2, f"история не вернулась из базы: {second}"
 
     roles = [m["role"] for m in second["prompt"]]
-    # Системный промпт, блок задачи (он едет при каждом обмене — этап
-    # у задачи есть всегда), поднятая из базы пара и новый вопрос.
-    assert roles == ["system", "user", "user", "assistant", "user"], roles
-    assert second["prompt"][1]["content"].startswith("[факты о разговоре]"), second["prompt"][1]
+    # Системный промпт, поднятая из базы пара и новый вопрос. Блока задачи
+    # здесь нет: чат обычный, «Рабочий процесс» у него выключен — и выключен
+    # он и после переоткрытия файла, как всякое поле конфига.
+    assert roles == ["system", "user", "assistant", "user"], roles
+    assert not any("факты о разговоре" in m["content"] for m in second["prompt"]), second["prompt"]
     joined = " ".join(m["content"] for m in second["prompt"])
     for word in ("Нина", "Казань", "вегетарианка"):
         assert word in joined, f"после перезапуска агент забыл «{word}»: {joined[:200]}"
