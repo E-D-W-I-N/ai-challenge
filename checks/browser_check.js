@@ -909,7 +909,10 @@ async function routeChecks() {
     check("стратегию видно переключить и пока идёт ответ",
       shownContext($) === "keep_last=Размер окна, сообщений", shownContext($));
 
-    await settle(70);          // пришёл кадр start: сворачивание позади
+    // Между кадром о сворачивании и кадром `start` идут два отладочных:
+    // что уехало на пересказ и что с него вернулось. Ждём их тоже —
+    // сворачивание кончается на `start`, а не раньше.
+    await settle(190);         // пришёл кадр start: сворачивание позади
     check("ответ пошёл — строка состояния ушла",
       !$("#feed").querySelector(".card-status"),
       "строка осталась: " + usageText($("#feed"), ".card-status"));
@@ -941,7 +944,7 @@ async function routeChecks() {
     cardButton(cards[0], "Показать промпт запроса").dispatchEvent(new Evt("click"));
     check("и под ней — его собственный промпт, без врезки и без чужого вопроса",
       JSON.stringify(promptRoles(cards[0])) ===
-        JSON.stringify(["системный промпт", "сообщение пользователя"]) &&
+        JSON.stringify(["системный промпт", "факты о разговоре", "сообщение пользователя"]) &&
         promptTexts(cards[0]).includes("первый вопрос") &&
         !promptTexts(cards[0]).includes(SUMMARY),
       JSON.stringify(promptRoles(cards[0])) + " " + JSON.stringify(promptTexts(cards[0])));
@@ -971,9 +974,11 @@ async function routeChecks() {
       JSON.stringify(roles) + " " + JSON.stringify(texts));
     // Хвост истории уехал как есть, и чей голос где — видно: вопрос
     // пользователя и ответ модели подписаны по-разному.
-    check("роли идут в том порядке, в каком уехали: промпт, сводка, хвост, вопрос",
+    // Блок задачи стоит между системным промптом и врезкой стратегии —
+    // он едет при любой обрезке и ни одной реплики не заменяет.
+    check("роли идут в том порядке, в каком уехали: промпт, задача, сводка, хвост, вопрос",
       JSON.stringify(roles) === JSON.stringify([
-        "системный промпт", "сводка начала разговора",
+        "системный промпт", "факты о разговоре", "сводка начала разговора",
         "сообщение пользователя", "ответ модели", "сообщение пользователя",
       ]),
       JSON.stringify(roles));
@@ -1015,11 +1020,12 @@ async function routeChecks() {
       JSON.stringify(shown));
   }
 
-  // ── чат без системного промпта: сводка встаёт первым сообщением ──
+  // ── чат без системного промпта: врезка встаёт первым сообщением ──
   //
-  // `system` по умолчанию пуст, и такой чат — самый обычный: сводка в его
-  // промпте стоит нулевым сообщением, а `summary_at` равен нулю. Ноль —
-  // не «сводки нет», и кнопка обязана быть на месте.
+  // `system` по умолчанию пуст, и такой чат — самый обычный: первым
+  // сообщением в его промпте стоит блок задачи, и слот у него равен нулю.
+  // Ноль — не «врезки нет», и подпись обязана встать именно над ним,
+  // а не над соседом.
   {
     const { client, $, settle, Evt } = freshClient({
       chats: [{ label: "без системного", system: "" }],
@@ -1037,9 +1043,11 @@ async function routeChecks() {
     cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
     const view = card.querySelector(".prompt-view");
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
-    check("без системного промпта сводка стоит первой, и кнопка на месте",
+    check("без системного промпта врезки стоят первыми, и кнопка на месте",
       JSON.stringify(roles) ===
-        JSON.stringify(["сводка начала разговора", "сообщение пользователя"]),
+        JSON.stringify([
+          "факты о разговоре", "сводка начала разговора", "сообщение пользователя",
+        ]),
       JSON.stringify(roles));
   }
 
@@ -1055,10 +1063,10 @@ async function routeChecks() {
   // состояния у неё нет и быть не может: служебного вызова за ней не стоит
   // — её вписал человек, и паузы перед ответом она не даёт.
   {
-    const FACTS = "[факты о разговоре]\nцель: собрать ТЗ\nсрок: май\n[конец фактов о разговоре]";
+    const RECORDS = "цель: собрать ТЗ\nсрок: май";
     const { client, $, settle, Evt } = freshClient({
       delay: 60,
-      facts: FACTS,
+      facts: RECORDS,
     });
     client.init();
     await settle(40);
@@ -1076,9 +1084,13 @@ async function routeChecks() {
     const view = card.querySelector(".prompt-view");
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
     const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    // В блоке и этап, и записи: состояние задачи стоит первыми строками,
+    // записи человека — за ним. Обе половины обязаны быть видны.
+    const block = texts[1] || "";
     check("в промпте видна выписка фактов — и подписана фактами, а не сводкой",
       roles.includes("факты о разговоре") && !roles.includes("сводка начала разговора") &&
-        texts.includes(FACTS),
+        block.startsWith("[факты о разговоре]\nэтап: планирование") &&
+        block.includes(RECORDS),
       JSON.stringify(roles) + " " + JSON.stringify(texts));
     check("порядок тот же: системный промпт, врезка, вопрос",
       JSON.stringify(roles) === JSON.stringify([
@@ -1098,11 +1110,11 @@ async function routeChecks() {
   // врезок больше одной.
   {
     const MEMORY = "[долговременная память]\nо собеседнике: пишу на Kotlin\n[конец долговременной памяти]";
-    const FACTS = "[факты о разговоре]\nцель: собрать ТЗ\n[конец фактов о разговоре]";
+    const RECORDS = "цель: собрать ТЗ";
     const SUM = "[пересказ начала разговора, свёрнуто сообщений: 2]\nбыло то-то";
     const { client, server, $, settle, Evt } = freshClient({
       memory: MEMORY,
-      facts: FACTS,
+      facts: RECORDS,
       service: { insert: SUM, covered: 0, strategy: "summary" },
     });
     client.init();
@@ -1122,7 +1134,9 @@ async function routeChecks() {
         "сводка начала разговора", "сообщение пользователя",
       ]), JSON.stringify(roles));
     check("и под подписями стоят те самые тексты, а не перепутанные местами",
-      texts[1] === MEMORY && texts[2] === FACTS && texts[3] === SUM,
+      texts[1] === MEMORY && texts[3] === SUM &&
+        texts[2].startsWith("[факты о разговоре]\nэтап: планирование") &&
+        texts[2].includes(RECORDS),
       JSON.stringify(texts));
   }
 
@@ -1145,7 +1159,7 @@ async function routeChecks() {
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
     check("без памяти её подпись не вылезает ни над одним сообщением промпта",
       JSON.stringify(roles) === JSON.stringify([
-        "системный промпт", "сообщение пользователя",
+        "системный промпт", "факты о разговоре", "сообщение пользователя",
       ]), JSON.stringify(roles));
   }
 
@@ -1174,7 +1188,7 @@ async function routeChecks() {
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
     check("без системного промпта память стоит первой, и подпись у неё своя",
       JSON.stringify(roles) === JSON.stringify([
-        "долговременная память", "сообщение пользователя",
+        "долговременная память", "факты о разговоре", "сообщение пользователя",
       ]), JSON.stringify(roles));
   }
 
@@ -1203,9 +1217,9 @@ async function routeChecks() {
     cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
     const view = card.querySelector(".prompt-view");
     const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
-    check("в промпте несжатого обмена — системный промпт и вопрос, врезки нет",
+    check("в промпте несжатого обмена — промпт, задача и вопрос, врезки стратегии нет",
       JSON.stringify(roles) ===
-        JSON.stringify(["системный промпт", "сообщение пользователя"]),
+        JSON.stringify(["системный промпт", "факты о разговоре", "сообщение пользователя"]),
       JSON.stringify(roles));
   }
 
@@ -1250,10 +1264,10 @@ async function routeChecks() {
       texts.includes("свежий вопрос") && texts.includes("свежий ответ") &&
         !texts.includes("давний вопрос") && !texts.includes("давний ответ"),
       JSON.stringify(texts));
-    check("врезки у окна в промпте нет, и роли подписаны как обычно",
+    check("врезки стратегии у окна в промпте нет, и роли подписаны как обычно",
       JSON.stringify(roles) === JSON.stringify([
-        "системный промпт", "сообщение пользователя", "ответ модели",
-        "сообщение пользователя",
+        "системный промпт", "факты о разговоре", "сообщение пользователя",
+        "ответ модели", "сообщение пользователя",
       ]),
       JSON.stringify(roles));
     // Лента при этом показывает историю целиком: промпт — про уехавшее,
@@ -2264,17 +2278,24 @@ async function routeChecks() {
   // колонки под неё нет, и сервер о ней не знает ничего. Поэтому и проверять
   // её можно только так — настоящим обменом через настоящий клиент.
   //
-  // Ключ в журнал попасть не должен ни при каких событиях: чат нарочно
-  // заведён с приманкой в системном промпте — она уезжает в каждом запросе,
-  // и журнал, дописывающий к строке тело запроса или конфиг чата,
+  // Ключ в журнал попасть не должен ни при каких событиях. Тело запроса
+  // его не содержит — он живёт в заголовке `Authorization`, — и приманка
+  // поэтому лежит там, где ключ у чата и мог бы оказаться: в `extra_body`,
+  // куске конфига, который клиент держит на руках и в промпт не отправляет.
+  // Журнал, дописавший к строке конфиг чата или заголовки запроса,
   // покраснеет здесь же.
+  //
+  // В системном промпте приманке больше не место: его журнал показывает
+  // **дословно** и обязан — это слова самого человека, уехавшие в модель.
   {
     const LURE = "sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА";
     const { client, $, settle, Evt } = freshClient({
+      delay: 12,
       chats: [
         {
           label: "в работе",
-          system: "системный промпт с приманкой " + LURE,
+          system: "системный промпт чата",
+          extra_body: { authorization: "Bearer " + LURE },
           task: { stage: "execution", step: "", expecting: "" },
         },
       ],
@@ -2301,6 +2322,22 @@ async function routeChecks() {
     const said = () => JSON.stringify(rows());
     const row = (what, needle) => rows()
       .some((r) => r.what === what && r.detail.indexOf(needle) >= 0);
+    // Тело строки: свёрнуто, раскрывается щелчком по самой строке. Журнал
+    // перерисовывается целиком, поэтому узел после клика ищем заново.
+    // Строк с одним именем в журнале бывает несколько — по одной на обмен;
+    // берём последнюю, ту, что породил текущий обмен.
+    const item = (what) => $("#log-list").querySelectorAll(".log-item")
+      .filter((n) => n.querySelector(".log-what").textContent === what)
+      .slice(-1)[0];
+    const expand = (what) => {
+      const before = item(what);
+      if (!before) return "(строки «" + what + "» в журнале нет)";
+      before.querySelector(".log-row").dispatchEvent(new Evt("click"));
+      const after = item(what);
+      const body = after && after.querySelector(".log-body");
+      if (!body || body.classList.contains("hidden")) return "(тело не раскрылось)";
+      return body.textContent;
+    };
 
     open(2);
     await settle(40);
@@ -2315,9 +2352,33 @@ async function routeChecks() {
         $("#tab-memory").classList.contains("hidden"),
       "log скрыт: " + $("#tab-log").classList.contains("hidden"));
 
+    // Обмен идёт — и всё это время видно, **на каком он шаге**: строка
+    // состояния называет текущий служебный обход, а журнал пополняется
+    // по ходу, а не после конца. Смотрим в обмен, пока он идёт: обоими
+    // утверждениями проверяется именно это.
+    const steps = [];
+    let early = [];
     $("#input").value = "доделал первый шаг";
     $("#composer").requestSubmit();
+    for (let i = 0; i < 70; i++) {
+      await settle(6);
+      const line = $("#feed").querySelector(".card-status-text");
+      if (line && steps[steps.length - 1] !== line.textContent) steps.push(line.textContent);
+      // Ответа в карточке ещё нет — значит обмен точно не кончился.
+      const body = $("#feed").querySelector(".card-body");
+      if (body && !body.textContent) early = rows().map((r) => r.what);
+    }
     await settle(400);
+
+    check("строка состояния называет каждый служебный обход, а не только сворачивание",
+      steps.indexOf("Сворачиваю начало разговора…") >= 0 &&
+        steps.indexOf("Исполняю вызов инструмента…") >= 0 &&
+        steps.indexOf("Жду продолжения после вызова…") >= 0,
+      JSON.stringify(steps));
+    check("журнал пополняется по ходу обмена, а не после его конца",
+      early.indexOf("вызов инструмента") >= 0 &&
+        early.indexOf("ответ получен") < 0,
+      JSON.stringify(early));
 
     check("журнал открывает обмен строкой с вопросом",
       row("обмен начат", "доделал первый шаг"), said());
@@ -2329,6 +2390,47 @@ async function routeChecks() {
       row("ответ получен", "вход 120") && row("ответ получен", "выход 30") &&
         rows().some((r) => r.what === "ответ получен" && / с$/.test(r.detail)),
       said());
+
+    // ── содержимое, а не пересказ ──
+    //
+    // Каждая строка раскрывается и показывает то, что правда уехало
+    // и правда пришло. Пересказ «обмен начат» ничего не отлаживает:
+    // чинить по нему нечего, потому что в нём нет ни одного настоящего
+    // слова из запроса.
+    const asked = expand("запрос к модели");
+    check("строка запроса раскрывается и показывает отправленные сообщения дословно",
+      asked.indexOf("[system]\nсистемный промпт чата") >= 0 &&
+        asked.indexOf("[факты о разговоре]\nэтап: работа") >= 0 &&
+        asked.indexOf("[user]\nдоделал первый шаг") >= 0,
+      asked);
+    check("и сводка в нём стоит той же врезкой, какой уехала",
+      asked.indexOf("[пересказ начала]") >= 0, asked);
+
+    const tool = expand("вызов инструмента");
+    check("аргументы вызова инструмента видны дословно",
+      tool.indexOf("инструмент: update_stage") >= 0 &&
+        tool.indexOf('аргументы: {"stage":"validation"}') >= 0,
+      tool);
+    check("и рядом — что решил код и что ответили модели",
+      tool.indexOf("решение кода: применено: работа → проверка") >= 0 &&
+        tool.indexOf("ответ инструмента модели: готово, этап теперь: validation") >= 0,
+      tool);
+
+    const next = expand("продолжение");
+    check("продолжение показывает, что уехало вторым обходом",
+      next.indexOf("[tool]\nготово, этап теперь: validation") >= 0 &&
+        next.indexOf('"name":"update_stage"') >= 0,
+      next);
+
+    const folding = expand("сворачивание: запрос");
+    check("на пересказ ушедшее тоже видно дословно",
+      folding.indexOf("[system]\nТы сворачиваешь начало разговора") >= 0, folding);
+    const retold = expand("сворачивание: пересказ");
+    check("и то, что с пересказа вернулось",
+      retold.indexOf("[пересказ начала]") >= 0, retold);
+
+    const answered = expand("ответ получен");
+    check("ответ модели виден целиком", answered === "ответ модели", answered);
 
     // Переключение вкладок журнал не трогает: он живёт в памяти вкладки,
     // а не в разметке страницы.
@@ -2348,6 +2450,15 @@ async function routeChecks() {
     check("отклонённый вызов стоит в журнале с доводом отказа",
       row("вызов инструмента",
         "просил «планирование» — отклонено: можно только в готово или работа"), said());
+    // И тот же довод — в теле строки, рядом с тем, что было запрошено:
+    // по строке видно, что просили, по телу — почему не дали.
+    const denied = expand("вызов инструмента");
+    check("довод отказа виден и в раскрытой строке, вместе с ответом модели",
+      denied.indexOf('аргументы: {"stage":"planning"}') >= 0 &&
+        denied.indexOf("ответ инструмента модели: нельзя: из validation можно только в") >= 0 &&
+        denied.indexOf("строка под ответом: переход в «планирование» отклонён: "
+          + "можно только в готово или работа") >= 0,
+      denied);
     check("и прежние строки обмен не унёс",
       row("обмен начат", "доделал первый шаг") &&
         row("сворачивание", "свёрнуто сообщений: 10"),
@@ -2364,11 +2475,22 @@ async function routeChecks() {
     check("а вернувшись, видим журнал того же чата",
       row("обмен начат", "доделал первый шаг"), said());
 
-    // И ни одной строки с ключом: в журнал едут только свои поля событий.
-    check("ключа в журнале нет ни в одной строке",
-      $("#log-list").textContent.indexOf("sk-or") < 0 &&
-        $("#log-list").textContent.indexOf(LURE) < 0,
-      $("#log-list").textContent);
+    // И ни одной строки с ключом — ни свёрнутой, ни раскрытой. Раскрываем
+    // все подряд: свёрнутое тело всё равно лежит в разметке, но утечка,
+    // которую видно только после клика, — такая же утечка.
+    $("#log-list").querySelectorAll(".log-row.has-body")
+      .forEach((r) => r.dispatchEvent(new Evt("click")));
+    const wholeLog = $("#log-list").textContent;
+    check("ключа в журнале нет ни в одной записи",
+      wholeLog.indexOf("sk-or") < 0 && wholeLog.indexOf(LURE) < 0 &&
+        wholeLog.indexOf("Bearer") < 0 && wholeLog.indexOf("authorization") < 0,
+      wholeLog);
+    // А показанное — показано: иначе «ключа нет» держалось бы на пустом
+    // журнале, а не на том, что в нём едут только сообщения запроса.
+    check("и при этом в журнале правда лежит то, что уехало в модель",
+      wholeLog.indexOf("системный промпт чата") >= 0 &&
+        wholeLog.indexOf("доделал первый шаг") >= 0,
+      wholeLog);
   }
 
 }

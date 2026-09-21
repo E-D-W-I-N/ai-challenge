@@ -507,13 +507,18 @@ def check_cut_only_where_chosen():
             assert response.status_code == 200, response.text
 
     sent = _stub.CALLS[-1]["messages"]
-    # Системный промпт + вся переписка (по две реплики на обмен) + новый вопрос.
+    # Системный промпт, блок задачи и вся переписка (по две реплики на обмен)
+    # плюс новый вопрос. Блок задачи едет **при любом** этапе, включая
+    # умолчание: модель не видит ни полосы этапов, ни панели, и первый же
+    # обмен без него уходил вслепую.
     assert [m["role"] for m in sent] == (
-        ["system"] + ["user", "assistant"] * (turns - 1) + ["user"]
+        ["system", "user"] + ["user", "assistant"] * (turns - 1) + ["user"]
     ), [m["role"] for m in sent]
-    assert sent[1]["content"] == "вопрос 0", sent[1]
-    assert sent[-1]["content"] == f"вопрос {turns - 1}", sent[-1]
-    assert [m["content"] for m in sent[1:-1:2]] == [f"вопрос {i}" for i in range(turns - 1)]
+    assert sent[1]["content"].startswith("[факты о разговоре]\nэтап: планирование"), sent[1]
+    talk = sent[2:]
+    assert talk[0]["content"] == "вопрос 0", talk[0]
+    assert talk[-1]["content"] == f"вопрос {turns - 1}", talk[-1]
+    assert [m["content"] for m in talk[:-1:2]] == [f"вопрос {i}" for i in range(turns - 1)]
     assert not _service_calls(), "без стратегии сжатие не запускается вовсе"
 
     agent = REGISTRY.require(agent_id)
@@ -531,8 +536,9 @@ def check_cut_only_where_chosen():
     assert long_chat.history[0].content == "реплика 0", "у истории отъели начало"
 
     prompt = long_chat.build_prompt("последний вопрос")
-    assert len(prompt) == 502, len(prompt)
-    assert prompt[1]["content"] == "реплика 0", prompt[1]
+    # Системный промпт, блок задачи, 500 реплик и вопрос.
+    assert len(prompt) == 503, len(prompt)
+    assert prompt[2]["content"] == "реплика 0", prompt[2]
 
     # 3. Числа заданы, а стратегия так и осталась `full` — не срезается **всё
     # равно ничего**. Это ровно тот случай, в котором живут чаты Дня 9 после
@@ -545,8 +551,9 @@ def check_cut_only_where_chosen():
         numbers_only = new_agent(client, keep_last=KEEP, compress_every=EVERY)
         _talk(client, numbers_only, 9)
         assert not _service_calls(), "стратегия `full`, а сжатие запустилось"
-        assert len(_stub.CALLS[-1]["messages"]) == 17, len(_stub.CALLS[-1]["messages"])
-        assert _stub.CALLS[-1]["messages"][0]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][0]
+        # Блок задачи плюс 16 реплик восьми обменов плюс вопрос.
+        assert len(_stub.CALLS[-1]["messages"]) == 18, len(_stub.CALLS[-1]["messages"])
+        assert _stub.CALLS[-1]["messages"][1]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][1]
 
     # --- window: уезжает хвост, отброшенное названо числом --------------------
     _stub.reset()
@@ -556,11 +563,12 @@ def check_cut_only_where_chosen():
 
         win = REGISTRY.require(win_id)
         sent = _stub.CALLS[-1]["messages"]
-        # Ровно последние KEEP реплик и вопрос — и ни одной врезки: окно
-        # ничего не заменяет, оно отбрасывает.
-        assert [m["role"] for m in sent] == ["user", "assistant"] * 3 + ["user"], sent
-        assert len(sent) == KEEP + 1, len(sent)
-        assert sent[0]["content"] == "вопрос 5", sent[0]
+        # Блок задачи, ровно последние KEEP реплик и вопрос — и ни одной
+        # врезки стратегии: окно ничего не заменяет, оно отбрасывает.
+        assert [m["role"] for m in sent] == ["user"] + ["user", "assistant"] * 3 + ["user"], sent
+        assert len(sent) == 1 + KEEP + 1, len(sent)
+        assert sent[0]["content"].startswith("[факты о разговоре]"), sent[0]
+        assert sent[1]["content"] == "вопрос 5", sent[1]
         assert sent[-1]["content"] == "вопрос 8", sent[-1]
         assert not any("пересказ начала разговора" in m["content"] for m in sent), sent
 
@@ -574,7 +582,9 @@ def check_cut_only_where_chosen():
         # — ровно как у сводки, и потому оно сходится с тем, что уехало.
         dropped = win.history[-1].metrics["dropped"]
         assert dropped == 10, win.history[-1].metrics
-        assert dropped + (len(sent) - 1) == len(win.history) - 2 == 16, (
+        # Минус вопрос и минус блок задачи: врезкой ни одна реплика
+        # не заменена, она добавлена.
+        assert dropped + (len(sent) - 2) == len(win.history) - 2 == 16, (
             dropped, len(sent), len(win.history)
         )
         assert "summarized" not in win.history[-1].metrics, "окно назвалось сводкой"
@@ -598,15 +608,19 @@ def check_cut_only_where_chosen():
         assert off.status_code == 200, off.text
         assert len(win.history) == 16, "перегенерация сняла не пару"
         assert win.context_cut() == (0, None), win.context_cut()
-        assert len(win.build_prompt("ещё")) == 17, len(win.build_prompt("ещё"))
+        assert len(win.build_prompt("ещё")) == 18, len(win.build_prompt("ещё"))
 
     # Ноль в хвосте — это ноль, а не «не задано»: уезжает только вопрос.
     bare = _fill(
         _bare("ноль", strategy="window", keep_last=0, system="СИС"), 6
     )
     assert bare.context_cut() == (6, None), bare.context_cut()
-    assert [m["content"] for m in bare.build_prompt("вопрос")] == ["СИС", "вопрос"], (
+    # Системный промпт, блок задачи и вопрос: истории не уехало ни реплики.
+    assert [m["content"] for m in bare.build_prompt("вопрос")][::2] == ["СИС", "вопрос"], (
         bare.build_prompt("вопрос")
+    )
+    assert bare.build_prompt("вопрос")[1]["content"].startswith("[факты о разговоре]"), (
+        bare.build_prompt("вопрос")[1]
     )
 
     # --- окно режет ровно столько, сколько просили --------------------------
@@ -674,8 +688,8 @@ def check_cut_only_where_chosen():
         _talk(client, folded_id, 5)
 
         early = _stub.CALLS[-1]["messages"]
-        assert [m["role"] for m in early] == ["user", "assistant"] * 4 + ["user"], early
-        assert early[0]["content"] == "вопрос 0", early[0]
+        assert [m["role"] for m in early] == ["user"] + ["user", "assistant"] * 4 + ["user"], early
+        assert early[1]["content"] == "вопрос 0", early[1]
         assert not _service_calls(), "сжатие запустилось до порога"
 
         # 5. Дошли до порога: 9-й обмен сам уезжает уже сжатым.
@@ -684,13 +698,16 @@ def check_cut_only_where_chosen():
         folded = REGISTRY.require(folded_id)
         covered = folded.summary_cover()
         sent = _stub.CALLS[-1]["messages"]
-        tail = sent[1:-1]
+        # Первым — блок задачи, он едет при любой стратегии и ничего
+        # не заменяет; сводка стоит за ним, на месте свёрнутого начала.
+        tail = sent[2:-1]
 
         assert len(folded.summaries) == 1, folded.summaries
         assert covered == 10, covered
-        # Сводка — первой репликой, с подписью: это не вопрос пользователя.
-        assert sent[0]["role"] == "user" and "пересказ начала разговора" in sent[0]["content"], sent[0]
-        assert "СВОДКА" in sent[0]["content"], sent[0]
+        assert sent[0]["content"].startswith("[факты о разговоре]"), sent[0]
+        # Сводка — с подписью: это не вопрос пользователя.
+        assert sent[1]["role"] == "user" and "пересказ начала разговора" in sent[1]["content"], sent[1]
+        assert "СВОДКА" in sent[1]["content"], sent[1]
         # Хвост — ровно последние N, и начинается он там, где кончилась сводка.
         assert len(tail) == KEEP, [m["content"] for m in tail]
         assert tail[0]["content"] == "вопрос 5", tail[0]
@@ -758,8 +775,9 @@ def check_cut_only_where_chosen():
         assert off.status_code == 200, off.text
         client.post(f"/api/agents/{folded_id}/messages", json={"text": "после выключения"})
         back = _stub.CALLS[-1]["messages"]
-        assert len(back) == 28 + 1, len(back)
-        assert back[0]["content"] == "вопрос 0", back[0]
+        # Блок задачи, вся история и вопрос.
+        assert len(back) == 1 + 28 + 1, len(back)
+        assert back[1]["content"] == "вопрос 0", back[1]
         assert folded.context_cut() == (0, None), folded.context_cut()
         assert not any("пересказ начала разговора" in m["content"] for m in back), back[0]
         assert len(folded.summaries) == 2, "сводки выброшены переключателем"
@@ -771,7 +789,7 @@ def check_cut_only_where_chosen():
         client.patch(f"/api/agents/{folded_id}", json={"strategy": "window"})
         client.post(f"/api/agents/{folded_id}/messages", json={"text": "с окном"})
         win_back = _stub.CALLS[-1]["messages"]
-        assert len(win_back) == KEEP + 1, len(win_back)
+        assert len(win_back) == 1 + KEEP + 1, len(win_back)
         assert not any("пересказ начала разговора" in m["content"] for m in win_back), win_back[0]
         assert folded.history[-1].metrics["dropped"] == 30 - KEEP, folded.history[-1].metrics
 
@@ -794,7 +812,7 @@ def check_cut_only_where_chosen():
     odd = _fill(
         _bare("нечёт", strategy="summary", keep_last=5, compress_every=EVERY), 20
     )
-    asyncio.run(odd.compress(odd.spec))
+    asyncio.run(drain(odd.compress(odd.spec)))
     odd_cover = odd.summary_cover()
     assert odd_cover == 14, odd_cover
     assert odd_cover % 2 == 0, f"граница разорвала пару: свёрнуто {odd_cover} реплик"
@@ -808,13 +826,15 @@ def check_cut_only_where_chosen():
         _bare("перегенерация", strategy="summary", keep_last=0, compress_every=EVERY,
 ), 10
     )
-    asyncio.run(short.compress(short.spec))
+    asyncio.run(drain(short.compress(short.spec)))
     assert short.summary_cover() == 10, short.summary_cover()
     assert short.take_last_exchange() is not None, "перегенерация не сняла пару"
     short_cover = short.summary_cover()
     assert short_cover == 8 == len(short.history), (short_cover, len(short.history))
     short_prompt = short.build_prompt("вопрос после перегенерации")
-    assert short_cover + (len(short_prompt) - 2) == len(short.history), short_prompt
+    # Минус вопрос, минус сводка и минус блок задачи: он ничего не заменяет,
+    # он добавляется, и в равенство «свёрнутое плюс хвост» не входит.
+    assert short_cover + (len(short_prompt) - 3) == len(short.history), short_prompt
 
     # 11. Умолчание — «не резать», и держится это не на честном слове.
     # Кнопка «Новый чат» идёт мимо разбора полей, прямо от умолчаний
@@ -832,8 +852,8 @@ def check_cut_only_where_chosen():
     # И к модели он ходит ровно по разу на обмен: служебный вызов у чата
     # из умолчаний один — сжатие, — и тот не запускается.
     assert len(_stub.CALLS) == 9, len(_stub.CALLS)
-    assert len(_stub.CALLS[-1]["messages"]) == 17, len(_stub.CALLS[-1]["messages"])
-    assert _stub.CALLS[-1]["messages"][0]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][0]
+    assert len(_stub.CALLS[-1]["messages"]) == 18, len(_stub.CALLS[-1]["messages"])
+    assert _stub.CALLS[-1]["messages"][1]["content"] == "вопрос 0", _stub.CALLS[-1]["messages"][1]
 
     return (
         f"full — вся история из {2 * turns} реплик и 500 хранимых целиком; "
@@ -926,10 +946,12 @@ def check_compression_saves_input():
     plain_chars = sum(len(m["content"]) for m in plain_in)
     folded_chars = sum(len(m["content"]) for m in folded_in)
 
-    # 12 обменов: у несжатого в промпте 11 пар и вопрос, у сжатого — сводка,
-    # 6 непокрытых пар и вопрос. Сворачивалось один раз, на девятом обмене.
-    assert len(plain_in) == 23, len(plain_in)
-    assert len(folded_in) == 14, len(folded_in)
+    # 12 обменов: у несжатого в промпте блок задачи, 11 пар и вопрос,
+    # у сжатого — блок задачи, сводка, 6 непокрытых пар и вопрос.
+    # Сворачивалось один раз, на девятом обмене. Блок задачи есть у обоих
+    # и на экономию поэтому не влияет: он едет при любой стратегии.
+    assert len(plain_in) == 24, len(plain_in)
+    assert len(folded_in) == 15, len(folded_in)
     assert folded_chars < plain_chars / 1.5, (folded_chars, plain_chars)
 
     # И ничего не потеряно: выброшенное покрыто сводкой ровно по границе.
@@ -940,13 +962,15 @@ def check_compression_saves_input():
     with_system.system = "ты бот"
     slot = agent.prompt_slots(with_system)["summary_at"]
     shifted = agent.build_prompt("ещё", spec=with_system)
-    assert slot == 1, slot
+    # Системный промпт и блок задачи — два сообщения до сводки.
+    assert slot == 2, slot
     assert "пересказ начала разговора" in shifted[slot]["content"], shifted[slot]
 
     covered = agent.summary_cover()
     assert covered == 10, covered
-    assert covered + (len(folded_in) - 2) == len(agent.history) - 2, (covered, len(folded_in))
-    assert "пересказ начала разговора" in folded_in[0]["content"], folded_in[0]
+    # Минус вопрос, минус сводка и минус блок задачи: он ничего не заменяет.
+    assert covered + (len(folded_in) - 3) == len(agent.history) - 2, (covered, len(folded_in))
+    assert "пересказ начала разговора" in folded_in[1]["content"], folded_in[1]
 
     # Вызов на сжатие — такой же вызов к модели, и три правила тела на нём
     # тоже. Особенно третье: собери сводку провайдер со включённым
@@ -989,7 +1013,10 @@ def check_compression_saves_input():
     assert start_of(folded, 7)["summary_at"] is None, "сводка объявилась раньше сворачивания"
     assert start_of(plain, 11)["summary_at"] is None, "в чате без сжатия нашлась сводка"
     last = start_of(folded, 11)
-    assert last["summary_at"] == 0, last["summary_at"]
+    # Ноль занят блоком задачи — он едет всегда и стоит перед врезкой
+    # стратегии, — так что сводка здесь первая.
+    assert last["working_at"] == 0, last["working_at"]
+    assert last["summary_at"] == 1, last["summary_at"]
     assert "пересказ начала разговора" in last["resolved_messages"][last["summary_at"]]["content"], (
         f"summary_at показывает не на сводку: {last['resolved_messages'][last['summary_at']]}"
     )
@@ -1058,7 +1085,9 @@ def check_summary_apart_and_cleanup():
         # Сводки нет среди реплик: она в своей таблице, а не в ленте.
         contents = [r[2] for r in again.message_rows(agent_id)]
         assert not any("СВОДКА" in c for c in contents), contents
-        assert revived.build_prompt("ещё")[0]["content"].count("СВОДКА") == 1, "сводка не подставилась"
+        # Нулевым сообщением стоит блок задачи — он едет всегда, — сводка
+        # за ним.
+        assert revived.build_prompt("ещё")[1]["content"].count("СВОДКА") == 1, "сводка не подставилась"
 
         # И обмен после перезапуска её не стирает: `save_history` переписывает
         # `messages` целиком, а `summaries` не трогает вовсе.
@@ -1100,8 +1129,14 @@ def check_summary_apart_and_cleanup():
         assert revived.summaries == [], revived.summaries
         assert revived.summary_cover() == 0, revived.summary_cover()
         fresh_prompt = revived.build_prompt("ещё")
-        assert len(fresh_prompt) == 5, len(fresh_prompt)
-        assert fresh_prompt[0]["content"] == "новый вопрос 0", fresh_prompt[0]
+        # Блок задачи, четыре реплики двух обменов и вопрос. Забытый разговор
+        # блока не теряет — этап у него есть и после `forget()`, — но врать
+        # прежним он не вправе: `clear_task` вернул его на умолчание.
+        assert len(fresh_prompt) == 6, len(fresh_prompt)
+        assert fresh_prompt[0]["content"].startswith(
+            "[факты о разговоре]\nэтап: планирование"
+        ), fresh_prompt[0]
+        assert fresh_prompt[1]["content"] == "новый вопрос 0", fresh_prompt[1]
     cells = sum(len(row) for row in CLEANUP_TABLE.values())
     wiped = sum(sum(row) for row in CLEANUP_TABLE.values())
     return (
@@ -1365,11 +1400,22 @@ def check_working_memory():
         assert revived.working == [], revived.working
         assert again.message_rows(agent_id) == [], again.message_rows(agent_id)
         _ask(revived, 4, "новый вопрос {i}")
-        # Врезки в промпте нового разговора нет вовсе: записи унесены вместе
-        # с историей, и цели забытого разговора следующему не достались.
+        # Блок задачи в промпте нового разговора есть — он есть всегда,
+        # этап у чата не исчезает, — но **записей** в нём не осталось ни
+        # одной: они унесены вместе с историей, и цели забытого разговора
+        # следующему не достались. Блок при этом ровно такой, каким он
+        # бывает у нетронутого чата: `forget()` вернул и этап на умолчание.
         fresh = revived.build_prompt("ещё")
-        assert not any("[факты о разговоре]" in m["content"] for m in fresh), fresh
+        assert fresh[0]["content"] == (
+            "[факты о разговоре]\nэтап: планирование\n"
+            "сейчас: собрать требования и предложить план\n"
+            "ожидается: ваше подтверждение плана\n"
+            "инструкция: не приступай к работе, пока человек не утвердит "
+            "план кнопкой; менять этап тебе здесь нечем\n"
+            "[конец фактов о разговоре]"
+        ), fresh[0]
         assert not any("успеем ли к маю" in m["content"] for m in fresh), fresh
+        assert not any("собрать ТЗ" in m["content"] for m in fresh), fresh
 
         # Удаление чата и очистка базы уносят рабочую память тем же порядком,
         # и обе эти клетки — в таблице «слой × путь очистки»
@@ -1423,19 +1469,37 @@ def check_task_stage():
 
     _stub.install(reply=lambda m, i: f"ответ {i}")
     with TestClient(main.app) as client:
-        # --- 1. Пустой чат: блока нет вовсе -----------------------------------
+        # --- 1. Нетронутый чат: блок задачи есть с первого же обмена ---------
         #
-        # Этап у задачи есть всегда, но умолчание само по себе не новость:
-        # чат стоит на планировании ровно потому, что его завели. Врезка
-        # на пустом месте сдвинула бы каждую последовательность ролей,
-        # на которую смотрит любая проверка, — довод тот же, что у обоих
-        # слоёв памяти.
+        # Раньше его тут не было: блок заводился только от уведённого
+        # с умолчания этапа, заполненного поля или записи — а умолчание
+        # это и есть планирование. То есть весь этап планирования модель
+        # работала вслепую: ни где задача, ни чего от неё ждут, ни того,
+        # что приступать рано, в промпте не стояло ни словом. Живой прогон
+        # это и показал — дальше модель путалась в собственном статусе
+        # и дёргала инструмент наугад.
+        #
+        # Довод «умолчание само по себе не новость» был про человека:
+        # он видит полосу этапов в шапке. Модель не видит ничего, кроме
+        # промпта, и для неё это самая нужная новость. Этап есть всегда —
+        # значит и блок есть всегда.
         chat = new_agent(client, system="СИС")
         _talk(client, chat, 1)
         sent = _stub.CALLS[-1]["messages"]
-        assert [m["role"] for m in sent] == ["system", "user"], sent
-        assert not any("[факты о разговоре]" in m["content"] for m in sent), sent
-        assert REGISTRY.require(chat).prompt_slots()["working_at"] is None, "слот у пустого чата занят"
+        assert [m["role"] for m in sent] == ["system", "user", "user"], sent
+        # Блок стоит сразу за системным промптом и несёт этап первой строкой
+        # и инструкцию планирования — ту самую, которая запрещает приступать
+        # к работе до кнопки.
+        assert sent[1]["content"] == (
+            "[факты о разговоре]\nэтап: планирование\n"
+            "сейчас: собрать требования и предложить план\n"
+            "ожидается: ваше подтверждение плана\n"
+            "инструкция: не приступай к работе, пока человек не утвердит "
+            "план кнопкой; менять этап тебе здесь нечем\n"
+            "[конец фактов о разговоре]"
+        ), sent[1]
+        assert sent[2]["content"] == "вопрос 0", sent[2]
+        assert REGISTRY.require(chat).prompt_slots()["working_at"] == 1, "слот блока задачи пуст"
 
         url = f"/api/agents/{chat}/task"
 
@@ -2130,7 +2194,10 @@ def check_branch_independent():
         # Продолжаем каждую ветку и родителя — и смотрим, что уехало в модель.
         client.post(f"/api/agents/{two['id']}/messages", json={"text": "во второй ветке"})
         sent = [m["content"] for m in _stub.CALLS[-1]["messages"]]
-        assert sent == [
+        # Блок задачи — вторым сообщением: состояние ветка унесла целиком,
+        # и едет оно у неё так же, как у всякого чата.
+        assert sent[1].startswith("[факты о разговоре]\nэтап: планирование"), sent[1]
+        assert sent[:1] + sent[2:] == [
             "СИС", "вопрос 0", "ответ на вопрос 0", "вопрос 1", "ответ на вопрос 1",
             "во второй ветке",
         ], sent
@@ -2306,18 +2373,20 @@ def check_branch_independent():
     # ветки нет вовсе, и свёрнутое плюс хвост по-прежнему равно её истории.
     assert [item["upto"] for item in edge.summaries] == [10], edge.summaries
     assert edge.summary_cover() == 10, edge.summary_cover()
-    assert len(edge.build_prompt("ещё")) == 2, edge.build_prompt("ещё")
+    # Блок задачи, сводка и вопрос: истории дословно не уехало ни реплики.
+    assert len(edge.build_prompt("ещё")) == 3, edge.build_prompt("ещё")
     # `upto == at + 1`: одной из покрытых сводкой реплик в ветке уже нет —
     # не едет. Резать в такой ветке нечем, её история уезжает целиком.
     assert near.summaries == [], near.summaries
     assert store.load_summaries(near.id) == [], store.load_summaries(near.id)
-    assert near.summary_cover() == 0 and len(near.build_prompt("ещё")) == 10, near.summary_cover()
+    assert near.summary_cover() == 0 and len(near.build_prompt("ещё")) == 11, near.summary_cover()
     # А у дальней сводка своя и покрывает ровно унесённое.
     assert [item["upto"] for item in far.summaries] == [10], far.summaries
     assert [item["upto"] for item in store.load_summaries(far.id)] == [10]
     far_prompt = far.build_prompt("ещё")
-    assert "СВОДКА" in far_prompt[0]["content"], far_prompt[0]
-    assert far.summary_cover() + (len(far_prompt) - 2) == len(far.history) == 18, far_prompt
+    assert "СВОДКА" in far_prompt[1]["content"], far_prompt[1]
+    # Минус вопрос, минус сводка и минус блок задачи: он ничего не заменяет.
+    assert far.summary_cover() + (len(far_prompt) - 3) == len(far.history) == 18, far_prompt
 
     # Реплики у ветки свои: общий объект сделал бы два чата одним в той
     # части, которую они делят.
@@ -2443,15 +2512,20 @@ def check_long_term_memory():
     with TestClient(main.app) as client:
         # --- 1. Пустая память неотличима от отсутствующей --------------------
         #
-        # Пусто в обоих слоях сразу: врезки нет вовсе, а не пустая. Иначе
-        # каждая проверка с точной последовательностью ролей поехала бы
-        # на сообщение.
+        # Пусто — врезки нет вовсе, а не пустая. Иначе каждая проверка
+        # с точной последовательностью ролей поехала бы на сообщение.
+        #
+        # Блок задачи прячется **не** по этому правилу и не прячется вовсе:
+        # у памяти пустота бывает и прятать в ней нечего, а этап назван
+        # всегда. Поэтому слот памяти здесь пуст, а слот блока — нет.
         assert client.get("/api/memory").json() == {"total": 0, "records": []}, "память не пуста"
         plain = new_agent(client, system="СИС")
         start = _frame(_frames(client, plain, "первый"), "start")
         assert start["memory_at"] is None, start["memory_at"]
-        assert start["working_at"] is None, start["working_at"]
-        assert [m["role"] for m in _stub.CALLS[-1]["messages"]] == ["system", "user"], _stub.CALLS[-1]
+        assert start["working_at"] == 1, start["working_at"]
+        assert [m["role"] for m in _stub.CALLS[-1]["messages"]] == [
+            "system", "user", "user"
+        ], _stub.CALLS[-1]
 
         # --- 2. Ручки: тип записи выбирает человек, а не сервер ---------------
         #
@@ -2495,7 +2569,11 @@ def check_long_term_memory():
         _stub.reset()
         client.post(f"/api/agents/{plain}/messages", json={"text": "второй"})
         sent = _stub.CALLS[-1]["messages"]
-        assert [m["role"] for m in sent] == ["system", "user", "user", "assistant", "user"], sent
+        # Системный промпт, память, блок задачи, пара реплик и вопрос.
+        assert [m["role"] for m in sent] == [
+            "system", "user", "user", "user", "assistant", "user"
+        ], sent
+        assert sent[2]["content"].startswith("[факты о разговоре]"), sent[2]
         block = sent[1]["content"]
         assert block.startswith("[долговременная память]"), block
         assert block.endswith("[конец долговременной памяти]"), block
@@ -2512,7 +2590,7 @@ def check_long_term_memory():
         bare = new_agent(client, system="")
         start = _frame(_frames(client, bare, "голый"), "start")
         assert start["memory_at"] == 0, start["memory_at"]
-        assert start["working_at"] is None, start["working_at"]
+        assert start["working_at"] == 1, start["working_at"]
         assert start["summary_at"] is None, start["summary_at"]
         assert start["resolved_messages"][0]["content"].startswith("[долговременная память]")
 
@@ -2826,7 +2904,12 @@ def check_long_term_memory():
         homeless = Agent(AgentSpec(label="без базы", model="stub/model"))
         assert homeless.memory_items() == [], homeless.memory_items()
         assert homeless.prompt_slots()["memory_at"] is None, homeless.prompt_slots()
-        assert homeless.build_prompt("вопрос") == [{"role": "user", "content": "вопрос"}]
+        # Врезки памяти нет — её нечем наполнить; блок задачи есть: этап
+        # у чата без базы всё равно свой, и умолчание у него не «пусто».
+        homeless_prompt = homeless.build_prompt("вопрос")
+        assert len(homeless_prompt) == 2, homeless_prompt
+        assert homeless_prompt[0]["content"].startswith("[факты о разговоре]"), homeless_prompt[0]
+        assert homeless_prompt[1] == {"role": "user", "content": "вопрос"}, homeless_prompt[1]
 
         # И единственный путь, который память стирает, — служебная очистка
         # базы. Забудь её там — и `kill_all()` перед каждой проверкой
@@ -2835,9 +2918,12 @@ def check_long_term_memory():
         assert again.list_memory() == [], again.list_memory()
         assert revived.memory_items() == [], revived.memory_items()
         assert revived.working_items() == [], revived.working_items()
-        assert revived.build_prompt("после очистки") == [
-            {"role": "user", "content": "после очистки"}
-        ], revived.build_prompt("после очистки")
+        # Обе врезки памяти ушли, блок задачи остался: этап у чата есть
+        # и после очистки базы — умолчанием, но есть.
+        wiped = revived.build_prompt("после очистки")
+        assert len(wiped) == 2, wiped
+        assert wiped[0]["content"].startswith("[факты о разговоре]"), wiped[0]
+        assert wiped[1] == {"role": "user", "content": "после очистки"}, wiped[1]
 
     return (
         "пустая память неотличима от отсутствующей; тип записи без умолчания, "
@@ -2986,10 +3072,17 @@ def check_profile_changes_answer():
 
     with TestClient(main.app) as client:
         # --- 1. Профиль пуст: ни блока, ни системного сообщения ---------------
+        #
+        # Системного сообщения у такого чата нет вовсе — это и проверяется.
+        # Блок задачи при этом есть: он не системный и прячется не по этому
+        # правилу, а вернее сказать — не прячется вовсе.
         assert client.get("/api/profile").json() == {"profile": {}}, "профиль не пуст"
         blank = new_agent(client, label="без профиля")
         empty_answer, blank_prompt = answer(blank, client)
-        assert blank_prompt == [{"role": "user", "content": question}], blank_prompt
+        assert not any(m["role"] == "system" for m in blank_prompt), blank_prompt
+        assert len(blank_prompt) == 2, blank_prompt
+        assert blank_prompt[0]["content"].startswith("[факты о разговоре]"), blank_prompt[0]
+        assert blank_prompt[1] == {"role": "user", "content": question}, blank_prompt[1]
 
         # --- 2. Профиль вписал человек — и только человек ---------------------
         #
@@ -3224,8 +3317,11 @@ def check_panel_reaches_request():
             continue
         assert payload.get(name) == value, (name, payload.get(name), value)
     # Правка панели меняет конфиг, а не переписку: прошлый обмен на месте.
-    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"], sent
-    assert sent[1]["content"] == "первый", sent[1]
+    # Между системным промптом и перепиской стоит блок задачи — он едет
+    # с каждым обменом.
+    assert [m["role"] for m in sent] == ["system", "user", "user", "assistant", "user"], sent
+    assert sent[1]["content"].startswith("[факты о разговоре]"), sent[1]
+    assert sent[2]["content"] == "первый", sent[2]
 
     assert not any(m["role"] == "system" for m in bare["messages"]), bare["messages"]
     assert "top_k" not in bare["payload"] and "stop" not in bare["payload"], bare["payload"]
@@ -3283,7 +3379,28 @@ def check_call_body_invariants():
     # И плагин тут **единственный**: у чата без своих плагинов наш встаёт
     # один, а не дописывается к чужому списку из ниоткуда.
     assert payload["plugins"] == [{"id": "context-compression", "enabled": False}], payload
-    return "4 вызова через ручки и один напрямую — все три правила на каждом"
+
+    # --- ключа в теле запроса нет: он живёт в заголовке -----------------------
+    #
+    # Это не праздное утверждение: журнал работы теперь показывает тело
+    # запроса **дословно** — весь список сообщений, как он уехал. Окажись
+    # ключ в теле, он приехал бы в браузер и встал бы строкой на экране,
+    # а оттуда — в чужую запись экрана. Заголовки собирает `stream_completion`
+    # и в события не кладёт вовсе; в тело их не подмешивает никто.
+    key = "sk-or-v1-приманка-для-проверки"
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": key}):
+        assert llm_module.api_key() == key, "ключ не подхватился — приманка не проверила ничего"
+        with_key = build_payload(
+            AgentSpec(label="с ключом в окружении", model="stub/m"),
+            [{"role": "user", "content": "вопрос"}],
+        )
+        assert key not in json.dumps(with_key, ensure_ascii=False), with_key
+        assert "Authorization" not in json.dumps(with_key), with_key
+
+    return (
+        "4 вызова через ручки и один напрямую — все три правила на каждом; "
+        "ключа в теле запроса нет, он только в заголовке"
+    )
 
 
 # --- День 8: подсчёт токенов --------------------------------------------------
@@ -3597,8 +3714,9 @@ def check_config_survives_by_construction():
         assert revived.history[-1].metrics == {"provider": "stub"}, revived.history[-1].metrics
         # И это же целиком уезжает в модель: восстановленная история — обычная.
         prompt = revived.build_prompt("новый вопрос")
-        assert len(prompt) == 1 + messages + 1 + 1, len(prompt)
-        assert prompt[1]["content"] == "реплика 0", prompt[1]
+        # Системный промпт, блок задачи, история и новый вопрос.
+        assert len(prompt) == 1 + 1 + messages + 1 + 1, len(prompt)
+        assert prompt[2]["content"] == "реплика 0", prompt[2]
 
         # Колонки схемы и колонки, которые читает код, — один набор.
         # Лишняя колонка так же плоха, как потерянная: она либо мёртвая,

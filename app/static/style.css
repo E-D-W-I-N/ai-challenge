@@ -1080,3 +1080,23 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .log-detail:empty { display: none; }
 .log-row.bad .log-what { color: var(--warn, #b4540a); }
 .log-empty { color: var(--faint); font-size: 11.5px; }
+
+/* Содержимое шага — дословно и под строкой, по клику. Свёрнуто по умолчанию:
+   промпт обмена в полный рост утопил бы вкладку на первом же ответе. */
+.log-item { display: flex; flex-direction: column; }
+.log-row.has-body { cursor: pointer; }
+.log-row.has-body .log-what::after { content: " ▸"; color: var(--faint); }
+.log-item:has(.log-body:not(.hidden)) .log-row .log-what::after { content: " ▾"; }
+.log-body {
+  margin: 2px 0 6px 0;
+  padding: 6px 8px;
+  background: var(--code-bg, rgba(127, 127, 127, 0.1));
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 340px;
+  overflow-y: auto;
+}
