@@ -33,6 +33,7 @@ from .schema import (
     MEMORY_KINDS,
     PROFILE_FIELDS,
     STRATEGIES,
+    WORKFLOW_MODES,
     TASK_STAGES,
     TASK_TEXT_FIELDS,
     WORKING_KINDS,
@@ -250,7 +251,7 @@ def _sampling_fields(payload: dict, where: str = "") -> dict:
 
 
 def _context_fields(payload: dict, where: str = "") -> dict:
-    """Стратегия, окно памяти и порог сжатия.
+    """Рабочий процесс, стратегия, окно памяти и порог сжатия.
 
     Числа разбираются как параметры сэмплирования: `keep_last = null` значит
     «резать нечем» и в модель уезжает вся история — это не то же самое, что
@@ -263,6 +264,11 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     только то, что разобрано, а не всё тело.
     """
     values: dict = {
+        # «Рабочий процесс» — не про историю вовсе: он решает, ведёт ли чат
+        # задачу. Разбирается он здесь потому, что нитка у закрытых списков
+        # одна, и второй такой же рядом заводить незачем. Умолчание — `off`:
+        # чат, которого об этом не просили, остаётся разговором.
+        "workflow": _choice_field(payload, "workflow", WORKFLOW_MODES, "off", where),
         "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
     }
     for name in CONTEXT_NUMBERS:

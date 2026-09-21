@@ -532,7 +532,13 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
+  // Умолчание у «Рабочего процесса» — `off`, ровно как на сервере: чат,
+  // которого об этом не просили, идёт обычным разговором. Стенд, включивший
+  // его за пользователя, оставил бы зелёной полосу, которой у нового чата
+  // быть не должно.
+  const CONTEXT = {
+    workflow: "off", strategy: "full", keep_last: null, compress_every: null,
+  };
 
   const blank = (id, label) => ({
     id,
@@ -765,15 +771,22 @@ function buildServer(options) {
   // случая, как на сервере: памяти нет вовсе или выключатель чата в «off».
   const memoryInsert = () => state.memory;
 
-  // Блок задачи: состояние плюс записи рабочей памяти. Едет он **всегда**
-  // и при любом этапе — ровно как на сервере, где условия у этой врезки
-  // нет вовсе: этап у задачи есть всегда, а модель не видит ни полосы,
-  // ни панели. `state.facts` — записи человека строками или null: записей
-  // может не быть, а блока не может не быть.
-  const factsInsert = (agent) =>
-    "[факты о разговоре]\n" +
-    [...taskLines(agent.task), ...(state.facts ? [state.facts] : [])].join("\n") +
-    "\n[конец фактов о разговоре]";
+  // Блок задачи: состояние плюс записи рабочей памяти. Состояние едет при
+  // любом этапе, включая умолчание, — но только у чата, который задачу
+  // **ведёт**: «Рабочий процесс» выключен, и строк состояния в блоке нет
+  // вовсе, ровно как на сервере. `state.facts` — записи человека строками
+  // или null: их вписал человек, и от переключателя они не зависят.
+  //
+  // Пусто и то и другое — врезки нет совсем, и слот у неё пуст: пустой блок
+  // сдвинул бы номера соседей, не сказав ни слова.
+  const factsInsert = (agent) => {
+    const lines = [
+      ...(agent.workflow === "on" ? taskLines(agent.task) : []),
+      ...(state.facts ? [state.facts] : []),
+    ];
+    if (!lines.length) return null;
+    return "[факты о разговоре]\n" + lines.join("\n") + "\n[конец фактов о разговоре]";
+  };
 
   // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
   // одним ответом. Формула слота здесь не считается, а берётся из длины уже
@@ -795,8 +808,11 @@ function buildServer(options) {
       slots.memory_at = messages.length;
       messages.push({ role: "user", content: memory });
     }
-    slots.working_at = messages.length;
-    messages.push({ role: "user", content: factsInsert(agent) });
+    const facts = factsInsert(agent);
+    if (facts) {
+      slots.working_at = messages.length;
+      messages.push({ role: "user", content: facts });
+    }
     // Окно — единственная стратегия, которая режет **без** врезки: вместо
     // отброшенного начала не встаёт ничего, слот у неё пуст, и в промпте
     // остаётся ровно хвост.
@@ -880,8 +896,13 @@ function buildServer(options) {
 
   function sse(agent, text) {
     // Записываем конфиг в момент прихода запроса: именно он уехал бы в модель.
+    // Состояние задачи — тем же снимком и по тому же доводу: промпт сервер
+    // собирает на приходе запроса, и обмен, уехавший раньше записи этапа,
+    // увёз бы в блоке задачи прежний. Снимок здесь это и показывает.
     const index = state.sent.length;
-    state.sent.push({ id: agent.id, text, config: config(agent) });
+    state.sent.push({
+      id: agent.id, text, config: config(agent), task: { ...agent.task },
+    });
     const failed = typeof state.fail === "function" ? state.fail(index) : state.fail;
     const service = typeof state.service === "function" ? state.service(index) : state.service;
     // Промпт собирается до записи обмена в стенограмму: в модель уехало то,

@@ -192,9 +192,12 @@ function freshClient(options) {
   const dom = require(path.join(__dirname, "dom.js"));
   // Свои чаты добавляем ПОСЛЕ распаковки options, иначе options.chats затрёт
   // список, а не дополнит его.
+  // Оба чата ведут задачу: «Рабочий процесс» у них включён, как его включил
+  // бы человек. Умолчание у стенда — как на сервере, `off`, и чат, который
+  // проверяет обычный разговор, заводит себя сам, ничего здесь не включая.
   const seeded = [
-    { label: "первый чат", system: "СТАРЫЙ ПРОМПТ", model: "первая/модель" },
-    { label: "второй чат", system: "ЧУЖОЙ ПРОМПТ", model: "вторая/модель" },
+    { label: "первый чат", system: "СТАРЫЙ ПРОМПТ", model: "первая/модель", workflow: "on" },
+    { label: "второй чат", system: "ЧУЖОЙ ПРОМПТ", model: "вторая/модель", workflow: "on" },
     ...((options && options.chats) || []),
   ];
   const env = dom.boot(HTML, { ...options, chats: seeded });
@@ -1028,7 +1031,7 @@ async function routeChecks() {
   // а не над соседом.
   {
     const { client, $, settle, Evt } = freshClient({
-      chats: [{ label: "без системного", system: "" }],
+      chats: [{ label: "без системного", system: "", workflow: "on" }],
       service: { insert: SUMMARY, covered: 0 },
     });
     client.init();
@@ -1171,7 +1174,7 @@ async function routeChecks() {
   {
     const MEMORY = "[долговременная память]\nрешение: оплата только картой\n[конец долговременной памяти]";
     const { client, $, settle, Evt } = freshClient({
-      chats: [{ label: "без системного", system: "" }],
+      chats: [{ label: "без системного", system: "", workflow: "on" }],
       memory: MEMORY,
     });
     client.init();
@@ -1240,7 +1243,7 @@ async function routeChecks() {
       delay: 60,
       chats: [{
         label: "окно", system: "ПРОМПТ ОКНА", strategy: "window", keep_last: 2,
-        transcript: past, history_len: past.length,
+        workflow: "on", transcript: past, history_len: past.length,
       }],
     });
     client.init();
@@ -2016,16 +2019,20 @@ async function routeChecks() {
   {
     const { client, server, document, $, settle, Evt } = freshClient({
       chats: [
-        { label: "на проверке", task: { stage: "validation", step: "гоняю тесты", expecting: "" } },
+        {
+          label: "на проверке", workflow: "on",
+          task: { stage: "validation", step: "гоняю тесты", expecting: "" },
+        },
         // Чат, у которого состояния нет вовсе: так его прислал бы сервер
         // другой версии — этапа он не знает. Полоса обязана показать первый,
         // а не остаться без выделенного: этап у задачи есть всегда.
-        { label: "из будущего", task: null },
+        { label: "из будущего", workflow: "on", task: null },
         // Чат на планировании: отсюда человек и выпускает задачу в работу,
         // нажав на «работу». Догадываться о том, что план утверждён,
         // по тексту разговора нельзя — это его решение.
         {
           label: "план предложен",
+          workflow: "on",
           transcript: [
             { role: "user", content: "что делаем?", error: null, reasoning: "", metrics: null },
             { role: "assistant", content: "план такой", error: null, reasoning: "", metrics: null },
@@ -2125,10 +2132,35 @@ async function routeChecks() {
     check("и полоса переехала на «готово», а уходов с него уже нет",
       current() === "done" && far() === "planning execution validation",
       current() + " — приглушены: " + far());
-    // Переключение этапа обмена **не отправляет**: человек сменил этап,
-    // а говорить за него следующий вопрос никто не вправе.
-    check("переключение этапа не отправляет обмен за человека",
-      server.state.sent.length === 0, JSON.stringify(server.state.sent));
+    // Нажатие **отправляет обмен** — тот, который на этом этапе и нужен.
+    // Раньше оно только двигало этап, и человек после каждого нажатия писал
+    // модели одно и то же руками.
+    check("нажатие на этап отправляет обмен, и текст его — вопрос этого этапа",
+      server.state.sent.length === 1 &&
+        server.state.sent[0].text === "Подведи итог: что сделано, что осталось за рамками.",
+      JSON.stringify(server.state.sent.map((s) => s.text)));
+    // **Порядок**: сперва записан этап, потом уехал обмен. Стенд снимает
+    // состояние задачи в момент прихода запроса — ровно тогда, когда сервер
+    // собирает промпт, — и здесь в нём стоит **новый** этап. Отправь клиент
+    // обмен раньше записи, и модель получила бы вопрос «готова»
+    // с инструкцией «проверки».
+    check("этап записан раньше, чем ушёл запрос: в теле запроса стоит новый",
+      server.state.sent[0] && server.state.sent[0].task.stage === "done",
+      JSON.stringify(server.state.sent[0] && server.state.sent[0].task));
+    // И реплика это реплика **человека**: она стоит в ленте тем же пузырём,
+    // каким встала бы набранная руками.
+    check("отправленное нажатием видно в ленте как обычный вопрос человека",
+      $("#feed").querySelectorAll(".msg-user").map((b) => b.textContent)
+        .includes("Подведи итог: что сделано, что осталось за рамками."),
+      JSON.stringify($("#feed").querySelectorAll(".msg-user").map((b) => b.textContent)));
+
+    // Нажатие на **текущий** этап — не переход: ни запроса, ни обмена.
+    // Оставаться там, где стоишь, не просьба сделать что-нибудь ещё раз.
+    stage("done").dispatchEvent(new Evt("click"));
+    await settle(60);
+    check("нажатие на текущий этап обмена не шлёт — это не переход",
+      server.state.sent.length === 1 && stagePosts().length === 1,
+      server.state.sent.length + " обменов, " + stagePosts().length + " переходов");
     // Под полосой встала инструкция нового этапа — та, что уедет в промпт.
     check("под полосой встала инструкция нового этапа",
       note().includes("инструкция: подведи итог: что сделано и что осталось за рамками"),
@@ -2208,8 +2240,108 @@ async function routeChecks() {
       current() === "execution" &&
         JSON.stringify(stagePosts().slice(-1)[0].body) === JSON.stringify({ stage: "execution" }),
       current() + " — " + JSON.stringify(stagePosts().slice(-1)[0].body));
+    // Текст обмена **зависит от этапа**: на работе просят результат первого
+    // шага, а не итог, которым кончалась проверка. Одна фраза на все четыре
+    // этапа была бы переключателем, который ничего не переключает.
+    const asked = server.state.sent.slice(-1)[0];
+    check("текст обмена зависит от этапа: на «работе» просят результат шага",
+      server.state.sent.length === 2 &&
+        asked.text === "Выполни первый шаг плана и покажи результат работы." &&
+        asked.text !== server.state.sent[0].text,
+      JSON.stringify(server.state.sent.map((s) => s.text)));
+    check("и этот обмен тоже уехал уже с новым этапом",
+      asked.task.stage === "execution", JSON.stringify(asked.task));
     check("и под полосой встала инструкция работы",
       note().includes("инструкция: выдай сам результат: текст, код, описание"), note());
+  }
+
+  // ── «Рабочий процесс»: выключен — обычный разговор, включён — задача ──
+  //
+  // Умолчание у нового чата — «выключен»: большинство чатов это разговоры,
+  // и машина состояний им ни к чему — она занимает место в шапке и врезку
+  // в промпте. Оба положения проверяются **рядом**, на двух чатах одной
+  // сцены: переключатель, ничего не решающий, зелен был бы в любом из них
+  // поодиночке.
+  //
+  // И главное здесь — **номера врезок**. Блок задачи перестаёт ехать, значит
+  // у таких чатов всё, что за ним, сдвигается на одну позицию. Подписи ролей
+  // в просмотре промпта клиент берёт из номеров, присланных сервером, —
+  // ошибись номер, и памятью оказалось бы подписано чужое сообщение.
+  {
+    const MEMORY =
+      "[долговременная память]\nо собеседнике: пишу на Kotlin\n[конец долговременной памяти]";
+    const { client, server, $, settle, Evt } = freshClient({
+      memory: MEMORY,
+      chats: [
+        // Ничего не включали — значит разговор: умолчание стенда то же,
+        // что у сервера.
+        { label: "просто разговор", system: "ПРОМПТ РАЗГОВОРА" },
+        { label: "с задачей", system: "ПРОМПТ ЗАДАЧИ", workflow: "on" },
+      ],
+    });
+    client.init();
+    await settle(30);
+    const open = (i) =>
+      $("#agent-list").querySelectorAll(".item-open")[i].dispatchEvent(new Evt("click"));
+    const promptRoles = (card) => {
+      const shown = card && card.querySelector(".prompt-view");
+      return shown ? shown.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    };
+    const ask = async (text) => {
+      $("#input").value = text;
+      $("#composer").requestSubmit();
+      await settle(120);
+      const cards = $("#feed").querySelectorAll(".card");
+      const card = cards[cards.length - 1];
+      cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+      return promptRoles(card);
+    };
+
+    open(2);
+    await settle(40);
+    check("выключенный рабочий процесс не показывает полосы этапов вовсе",
+      $("#stages").querySelectorAll(".stage").length === 0 &&
+        $("#chat-head").classList.contains("hidden"),
+      String($("#stages").querySelectorAll(".stage").length) + " этапов на полосе");
+    check("и журнала переходов у такого чата на экране нет",
+      $("#task-moves").classList.contains("hidden"), "журнал виден");
+    check("в панели переключатель стоит на «выключен»",
+      $("#f-workflow").value === "off", $("#f-workflow").value);
+    check("блока задачи в промпте такого чата нет, а память стоит сразу за промптом",
+      JSON.stringify(await ask("вопрос разговора")) ===
+        JSON.stringify(["системный промпт", "долговременная память", "сообщение пользователя"]),
+      JSON.stringify(promptRoles($("#feed").querySelectorAll(".card").slice(-1)[0])));
+
+    // А у соседнего чата, который задачу ведёт, есть и полоса, и блок —
+    // и врезка памяти в нём стоит там же, а блок **за** ней.
+    open(3);
+    await settle(40);
+    check("включённый рабочий процесс показывает полосу этапов",
+      $("#stages").querySelectorAll(".stage").length === 4 &&
+        !$("#chat-head").classList.contains("hidden"),
+      String($("#stages").querySelectorAll(".stage").length) + " этапов на полосе");
+    check("в панели переключатель стоит на «включён»",
+      $("#f-workflow").value === "on", $("#f-workflow").value);
+    check("и блок задачи в промпте есть — за памятью, и номера врезок не разъехались",
+      JSON.stringify(await ask("вопрос задачи")) ===
+        JSON.stringify([
+          "системный промпт", "долговременная память", "факты о разговоре",
+          "сообщение пользователя",
+        ]),
+      JSON.stringify(promptRoles($("#feed").querySelectorAll(".card").slice(-1)[0])));
+
+    // Переключатель — поле панели, и уезжает он PATCH'ем чата, как всякое
+    // другое: своей ручки у него нет.
+    $("#f-workflow").value = "off";
+    $("#f-workflow").dispatchEvent(new Evt("change"));
+    await settle(60);
+    const patched = server.state.requests
+      .filter((r) => r.method === "PATCH" && /\/api\/agents\/[^/]+$/.test(r.path))
+      .slice(-1)[0];
+    check("выбор в панели уезжает в конфиг чата, а полоса уходит с экрана",
+      patched && patched.body.workflow === "off" &&
+        $("#stages").querySelectorAll(".stage").length === 0,
+      JSON.stringify(patched && patched.body.workflow));
   }
 
   // ── запрещённый переход отбивает сервер, а не разметка ──
@@ -2220,7 +2352,10 @@ async function routeChecks() {
   // клиент показывает его теми словами, какими его собрал сервер.
   {
     const { client, server, $, settle, Evt } = freshClient({
-      chats: [{ label: "в работе", task: { stage: "execution", step: "", expecting: "" } }],
+      chats: [{
+        label: "в работе", workflow: "on",
+        task: { stage: "execution", step: "", expecting: "" },
+      }],
     });
     client.init();
     await settle(30);
