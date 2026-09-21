@@ -40,6 +40,7 @@ def make(
     delay: float = 0.0,
     reasoning: str = "",
     usage: Callable[[int], dict] | dict | None = None,
+    tool_calls: Callable[[list[dict], int], list | None] | list | None = None,
 ):
     """Собирает заглушку `stream_completion`.
 
@@ -51,12 +52,19 @@ def make(
         (номер вызова) → словарь. Без него у каждого ответа одни и те же
         числа, и сумма по чату сошлась бы на любом коде. `None` в поле —
         законное значение: так провайдер молчит о цифре.
+    tool_calls — какие вызовы инструментов «запросила модель»: список или
+        функция (messages, номер вызова) → список. Уже собранные, а не
+        обрывками по `index`: склейку кусков стережёт своя проверка, и она
+        гоняет настоящий `stream_completion` на подменённом транспорте.
+        Умолчание `None` не меняет ничего: без него события `tool_calls` нет.
     """
     from app.llm import Metrics, build_payload
 
     known = {f.name for f in dataclass_fields(Metrics)}
 
-    async def fake_stream_completion(session, *, prompt_override=None, context_length=None):
+    async def fake_stream_completion(
+        session, *, prompt_override=None, context_length=None, tools=None
+    ):
         messages = list(prompt_override or [])
         index = len(CALLS)
         CALLS.append(
@@ -64,7 +72,10 @@ def make(
                 "model": session.model,
                 "label": session.label,
                 "messages": [dict(m) for m in messages],
-                "payload": build_payload(session, prompt_override),
+                # Инструменты уезжают в настоящий `build_payload`: проверки
+                # смотрят в записанное тело и спрашивают его «объявлены ли
+                # `tools` и какие», а пересказ заглушки отвечал бы за себя.
+                "payload": build_payload(session, prompt_override, tools=tools),
             }
         )
 
@@ -126,6 +137,19 @@ def make(
                 if delay:
                     await asyncio.sleep(delay)
                 yield {"type": "delta", "text": text[start : start + size], "metrics": metrics}
+
+            # Вызовы — после текста и до метрик, ровно там, где их отдаёт
+            # настоящий транспорт: причину обмена провайдер называет на
+            # последнем содержательном куске. Форма события та же.
+            calls = tool_calls(messages, index) if callable(tool_calls) else tool_calls
+            if calls:
+                metrics = {**metrics, "finish_reason": "tool_calls"}
+                yield {
+                    "type": "tool_calls",
+                    "calls": [dict(call) for call in calls],
+                    "metrics": metrics,
+                }
+
             yield {"type": "metrics", "metrics": metrics}
             yield {"type": "done", "text": text, "reasoning": reasoning, "metrics": metrics}
             finished = True

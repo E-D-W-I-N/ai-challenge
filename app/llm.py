@@ -198,11 +198,22 @@ def merge_plugins(ours: list[dict], theirs: list) -> list:
     return [*kept, *theirs]
 
 
-def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dict:
+def build_payload(
+    session: AgentSpec,
+    messages: list[dict] | None = None,
+    *,
+    tools: list[dict] | None = None,
+) -> dict:
     """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
     контекста — на каждом вызове.
 
-    Промпт приходит снаружи: собирает его агент, из слепка конфига.
+    Промпт приходит снаружи: собирает его агент, из слепка конфига. Инструменты
+    — тоже снаружи и тем же порядком: что объявить модели, решает вызывающий,
+    а не слепок. Пустой список — это «не объявлять ничего», и ключа в теле
+    не будет: `tools: []` у части провайдеров значит другое, чем его отсутствие.
+
+    `tool_choice` не отправляется вовсе: звать инструмент или ответить словами
+    — решение модели, и принуждать её к вызову нам незачем.
     """
     payload: dict = {
         "model": session.model,
@@ -225,6 +236,8 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
         payload["stop"] = session.stop
     if session.response_format is not None:
         payload["response_format"] = session.response_format
+    if tools:
+        payload["tools"] = tools
 
     for key, value in (session.extra_body or {}).items():
         if key == "provider" and isinstance(value, dict):
@@ -236,6 +249,29 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
     return payload
 
 
+def collected_calls(calls: dict[int, dict]) -> list[dict]:
+    """Накопленные вызовы — списком по возрастанию `index`.
+
+    Порядок в ответе задаёт `index`, а не порядок приезда: куски двух вызовов
+    приходят вперемешку, и второй вправе начаться раньше, чем кончится первый.
+
+    Пустой или отсутствующий `id` заменяется на `call_{index}`: в ответном
+    сообщении `tool_call_id` обязателен, а провайдер вправе его не прислать —
+    и тогда единственное, чем вызовы различимы, это их номер.
+
+    Аргументы отдаются строкой, как приехали: разбор JSON — дело вызывающего,
+    и он вправе оказаться битым. Транспорт на этом падать не должен.
+    """
+    return [
+        {
+            "id": call["id"] or f"call_{index}",
+            "name": call["name"],
+            "arguments": call["arguments"],
+        }
+        for index, call in sorted(calls.items())
+    ]
+
+
 class MissingKeyError(RuntimeError):
     pass
 
@@ -245,16 +281,22 @@ async def stream_completion(
     *,
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
+    tools: list[dict] | None = None,
 ) -> AsyncIterator[dict]:
-    """События {"type": "delta"|"reasoning"|"metrics"|"done"|"error", ...}: метрики
-    обновляются по мере генерации, финальный usage приходит последним чанком."""
+    """События {"type": "delta"|"reasoning"|"tool_calls"|"metrics"|"done"|"error", ...}:
+    метрики обновляются по мере генерации, финальный usage приходит последним чанком.
+
+    `tool_calls` — новый тип события, и получают его только те, кто инструменты
+    объявил: без `tools` накопитель остаётся пустым и события не бывает вовсе.
+    Перебирающие события обязаны переживать незнакомый тип молча.
+    """
     key = api_key()
     if key is None:
         raise MissingKeyError(
             "OPENROUTER_API_KEY не найден. Скопируйте .env.example в .env и впишите ключ."
         )
 
-    payload = build_payload(session, prompt_override)
+    payload = build_payload(session, prompt_override, tools=tools)
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -266,6 +308,8 @@ async def stream_completion(
     started = time.monotonic()
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    calls: dict[int, dict] = {}
+    announced = False
 
     try:
         # Клиент общий на процесс, а семафор держится на всё время стрима:
@@ -341,8 +385,50 @@ async def stream_completion(
                                 "text": piece,
                                 "metrics": metrics.as_dict(),
                             }
+                        # Вызовы копятся **рядом** с текстом, а не вместо него:
+                        # у одних моделей `content` приезжает пустым, у других
+                        # перед вызовом идут слова. Ветвление `if/else` одно
+                        # из двух теряло бы молча.
+                        #
+                        # У куска гарантирован только `index`: `id`, `type`
+                        # и `function.name` вправе отсутствовать в любом
+                        # отдельном куске, а `arguments` приезжают обрывками.
+                        # Поэтому имя и `id` берём при первом появлении и не
+                        # затираем пустыми потом, а аргументы дописываем
+                        # строкой. JSON здесь не разбираем вовсе.
+                        for fragment in delta.get("tool_calls") or []:
+                            index = fragment.get("index")
+                            if not isinstance(index, int):
+                                # Куска без номера быть не должно — он
+                                # единственное обязательное поле фрагмента,
+                                # а сортировать смесь чисел со строками нечем.
+                                continue
+                            slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                            if fragment.get("id") and not slot["id"]:
+                                slot["id"] = fragment["id"]
+                            function = fragment.get("function") or {}
+                            if function.get("name") and not slot["name"]:
+                                slot["name"] = function["name"]
+                            slot["arguments"] += function.get("arguments") or ""
+
                         if choice.get("finish_reason"):
                             metrics.finish_reason = choice["finish_reason"]
+                            # `finish_reason: "tool_calls"` приезжает дважды —
+                            # на последнем содержательном куске и ещё раз на
+                            # куске с usage. Событие обязано быть одно: два
+                            # объявления дали бы следующему слою два оборота
+                            # вместо одного, то есть двойной вызов инструмента.
+                            if (
+                                choice["finish_reason"] == "tool_calls"
+                                and calls
+                                and not announced
+                            ):
+                                announced = True
+                                yield {
+                                    "type": "tool_calls",
+                                    "calls": collected_calls(calls),
+                                    "metrics": metrics.as_dict(),
+                                }
 
                     usage = chunk.get("usage")
                     if usage:
@@ -356,6 +442,18 @@ async def stream_completion(
         return
 
     metrics.elapsed_ms = (time.monotonic() - started) * 1000
+    # Страховка: вызовы накопились, а объявления не было — провайдер назвал
+    # причиной `stop` или не назвал её совсем. Опираться на одну `finish_reason`
+    # нельзя: модель без поддержки инструментов OpenRouter подменяет шаблоном,
+    # и наличие вызовов говорит о них надёжнее, чем слово про причину. Событие
+    # уходит здесь, до `done`: `done` — конец обмена, и после него слушателю
+    # уже нечего делать с вызовом.
+    if calls and not announced:
+        yield {
+            "type": "tool_calls",
+            "calls": collected_calls(calls),
+            "metrics": metrics.as_dict(),
+        }
     yield {
         "type": "done",
         "text": "".join(text_parts),

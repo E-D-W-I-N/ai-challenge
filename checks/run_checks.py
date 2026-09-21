@@ -2678,6 +2678,34 @@ def _parsed_metrics(lines, **kwargs) -> dict:
     return next(e for e in events if e["type"] == "done")["metrics"]
 
 
+def _streamed(lines, *, spec=None, **kwargs) -> tuple[list[dict], dict]:
+    """Гоняет настоящий `stream_completion` на подменённом транспорте и отдаёт
+    **все** события вместе с телом запроса, которое ушло бы в OpenRouter.
+
+    У `_parsed_metrics` ответом одни метрики, и для чисел этого хватает. Про
+    вызовы инструментов спрашивается другое: сколько событий и в каком порядке
+    они пришли, — значит нужен весь список. Утверждений здесь нет ни одного:
+    помощник ставит сцену, а меряет её проверка.
+    """
+    import app.llm as llm
+
+    sent: list[dict] = []
+
+    class _Recorder(_FakeClient):
+        """Тот же транспорт, но запоминает тело запроса: «объявлены ли `tools`»
+        читается из настоящего `json=`, а не из пересказа."""
+
+        def stream(self, *args, **call_kwargs):
+            sent.append(call_kwargs.get("json"))
+            return super().stream(*args, **call_kwargs)
+
+    with patch.object(llm, "shared_client", lambda: _Recorder(_FakeResponse(lines))), \
+            patch.object(llm, "api_key", lambda: "sk-or-проверочный"):
+        target = spec if spec is not None else AgentSpec(label="вызовы", model="stub/tools")
+        events = asyncio.run(drain(llm.stream_completion(target, prompt_override=[], **kwargs)))
+    return events, sent[-1]
+
+
 @check("входные, выходные и всего — числа провайдера, разобранные сервером")
 def check_usage_parsed_by_server():
     """Главные числа дня приезжают последним чанком OpenRouter, и разбирает
@@ -2829,6 +2857,257 @@ def check_usage_summary_skips_unknown():
     sneaky.remember("user", "вопрос", metrics=_usage(999, 999, 999, 9.0))
     assert sneaky.usage_summary() is None, sneaky.usage_summary()
     return "ответ без чисел пропущен, чат без чисел даёт None, вопросы не считаются"
+
+
+# --- День 13: транспорт вызовов инструментов -----------------------------------
+
+
+@check("вызовы инструментов: куски склеены по index, событие одно и раньше done")
+def check_tool_calls_transport():
+    """День 13 начинается с транспорта: этап задачи будет **вычисляться** из
+    списка шагов, а список ведёт сама модель вызовами инструментов. Значит
+    первое, что обязано быть настоящим, — разбор потока с вызовами, и проверка
+    гоняет настоящий `stream_completion` на кусках той формы, что описана
+    в машинной схеме OpenRouter, а не в их прозе.
+
+    Пять свойств этой формы, каждое из которых ломает наивный разбор:
+
+    - `finish_reason` лежит на `choices[0]`, а не в `delta` (потоковый пример
+      из документации OpenRouter проверяет `delta.finish_reason` и не
+      срабатывает никогда);
+    - у фрагмента вызова обязателен только `index`: `id`, `type` и
+      `function.name` вправе отсутствовать в любом отдельном куске,
+      а `arguments` приезжают обрывками и склеиваются строкой;
+    - `finish_reason: "tool_calls"` приходит дважды — на последнем
+      содержательном куске и ещё раз на куске с `usage`;
+    - текст и вызов приезжают вместе, иногда в одном куске;
+    - `arguments` вправе оказаться битым JSON, и ошибки провайдер не пришлёт.
+
+    Отсюда и страховка: модель без поддержки инструментов OpenRouter подменяет
+    шаблоном и отдаёт обычный текст, поэтому событие держится на наличии
+    накопленных вызовов, а не на слове про причину.
+    """
+    def piece(index, **fields):
+        """Кусок потока с одним фрагментом вызова — форма из схемы."""
+        return {"choices": [{"delta": {"tool_calls": [{"index": index, **fields}]}}]}
+
+    # --- два вызова вперемешку, обрывками, и причина дважды -------------------
+    events, _ = _streamed(
+        _sse_chunks(
+            # Второй вызов начинается раньше, чем кончился первый: порядок
+            # в событии задаёт `index`, а не порядок приезда.
+            piece(1, id="call_b", type="function",
+                  function={"name": "finish_task", "arguments": '{"ok":'}),
+            piece(0, id="call_a", type="function",
+                  function={"name": "update_plan", "arguments": '{"steps":'}),
+            piece(1, function={"arguments": " true"}),
+            # Кусок, несущий **только** `index`: ни `id`, ни имени, ни
+            # аргументов. Вызов обязан собраться целиком и от него не пострадать.
+            piece(0),
+            piece(0, function={"arguments": ' ["раз",'}),
+            # Кусок без номера и кусок с номером не-числом: `index` —
+            # единственное обязательное поле фрагмента, и провайдер, нарушивший
+            # свою же схему, не вправе ни уронить стрим, ни завести третий
+            # вызов, ни дописать мусор в чужие аргументы.
+            {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": "мусор"}}]}}]},
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": "0", "function": {"arguments": "мусор"}}]}}
+                ]
+            },
+            piece(1, function={"arguments": "}"}),
+            piece(0, function={"arguments": ' "два"]}'}),
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            # Причина приезжает вторым разом — на куске с usage.
+            {
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 9, "total_tokens": 49},
+            },
+        )
+    )
+    kinds = [e["type"] for e in events]
+    assert kinds.count("tool_calls") == 1, kinds
+    assert kinds.index("tool_calls") < kinds.index("done"), kinds
+    announced = events[kinds.index("tool_calls")]
+    assert announced["calls"] == [
+        {"id": "call_a", "name": "update_plan", "arguments": '{"steps": ["раз", "два"]}'},
+        {"id": "call_b", "name": "finish_task", "arguments": '{"ok": true}'},
+    ], announced["calls"]
+    assert announced["metrics"]["finish_reason"] == "tool_calls", announced["metrics"]
+
+    # --- текст и вызов в одном ответе ----------------------------------------
+    mixed, _ = _streamed(
+        _sse_chunks(
+            {"choices": [{"delta": {"content": "Сейчас "}}]},
+            # Слова и вызов в одном куске: `if/else` потерял бы одно из двух.
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "составлю план.",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_m",
+                                    "function": {
+                                        "name": "update_plan",
+                                        "arguments": '{"steps": []}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        )
+    )
+    mixed_kinds = [e["type"] for e in mixed]
+    assert mixed_kinds.count("delta") == 2, mixed_kinds
+    assert mixed_kinds.count("tool_calls") == 1, mixed_kinds
+    assert mixed[-1]["type"] == "done", mixed_kinds
+    assert mixed[-1]["text"] == "Сейчас составлю план.", mixed[-1]
+    mixed_calls = mixed[mixed_kinds.index("tool_calls")]["calls"]
+    assert mixed_calls == [
+        {"id": "call_m", "name": "update_plan", "arguments": '{"steps": []}'}
+    ], mixed_calls
+
+    # --- страховка: вызовы есть, а причина приехала «stop» -------------------
+    saved, _ = _streamed(
+        _sse_chunks(
+            piece(0, id="call_s", function={"name": "finish_task", "arguments": "{}"}),
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+    )
+    saved_kinds = [e["type"] for e in saved]
+    assert saved_kinds.count("tool_calls") == 1, saved_kinds
+    assert saved_kinds.index("tool_calls") < saved_kinds.index("done"), saved_kinds
+    # Причину транспорт не переписывает: сказали «stop» — значит stop. Событие
+    # держится на накопленных вызовах, а не на слове про причину.
+    assert saved[saved_kinds.index("tool_calls")]["metrics"]["finish_reason"] == "stop", saved
+
+    # --- id провайдер вправе не прислать -------------------------------------
+    nameless, _ = _streamed(
+        _sse_chunks(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                # Один без `id` вовсе, второй с пустым: в ответном
+                                # сообщении `tool_call_id` обязателен, и пустая
+                                # строка тут ничем не лучше отсутствия.
+                                {
+                                    "index": 2,
+                                    "function": {"name": "finish_task", "arguments": "{}"},
+                                },
+                                {
+                                    "index": 0,
+                                    "id": "",
+                                    "function": {"name": "update_plan", "arguments": "{}"},
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        )
+    )
+    ids = [c["id"] for c in next(e for e in nameless if e["type"] == "tool_calls")["calls"]]
+    # Номер в подставленном id — тот самый `index`, а не порядковый счётчик:
+    # у второго вызова индекс 2, и id обязан сказать 2.
+    assert ids == ["call_0", "call_2"], ids
+    assert all(ids), ids
+
+    # --- битый JSON в аргументах ---------------------------------------------
+    torn = '{"steps": ["раз"'
+    raw, _ = _streamed(
+        _sse_chunks(
+            piece(0, id="call_j", function={"name": "update_plan", "arguments": torn}),
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        )
+    )
+    torn_call = next(e for e in raw if e["type"] == "tool_calls")["calls"][0]
+    assert torn_call["arguments"] == torn, torn_call
+    # И строка эта правда неразбираемая: разбери её транспорт — упал бы он,
+    # а разбирать её будет следующий слой и под `try`.
+    broke = False
+    try:
+        json.loads(torn_call["arguments"])
+    except ValueError:
+        broke = True
+    assert broke, torn_call["arguments"]
+
+    # --- объявление инструментов в теле запроса ------------------------------
+    plan_tool = {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": "переписать список шагов задачи",
+            "parameters": {"type": "object", "properties": {"steps": {"type": "array"}}},
+        },
+    }
+    plain = _sse_chunks({"choices": [{"delta": {"content": "ок"}, "finish_reason": "stop"}]})
+
+    _, declared = _streamed(plain, tools=[plan_tool])
+    assert declared["tools"] == [plan_tool], declared.get("tools")
+    # `tool_choice` не отправляется вовсе: звать инструмент или ответить
+    # словами — решение модели.
+    assert "tool_choice" not in declared, declared
+
+    _, silent = _streamed(plain)
+    assert "tools" not in silent, silent
+    # Пустой список — это тоже «не объявлять ничего»: `tools: []` у части
+    # провайдеров значит другое, чем отсутствие ключа.
+    _, empty = _streamed(plain, tools=[])
+    assert "tools" not in empty, empty
+    # Помимо инструментов в теле не поменялось ничего: три правила на месте
+    # у обоих запросов.
+    assert not _body_rules(declared) and not _body_rules(silent), (declared, silent)
+
+    # Своё тело чата перебивает инструменты — как перебивает всё остальное.
+    mine = {"type": "function", "function": {"name": "своё"}}
+    _, overridden = _streamed(
+        plain,
+        spec=AgentSpec(label="своё тело", model="stub/tools", extra_body={"tools": [mine]}),
+        tools=[plan_tool],
+    )
+    assert overridden["tools"] == [mine], overridden["tools"]
+
+    # --- незнакомый тип события обмен переживает ------------------------------
+    #
+    # `tool_calls` в этом дне не ждёт никто: `tools` не передаёт ни один
+    # вызывающий, и событие в продукте не возникает вовсе. Но перебор событий
+    # в `ask` обязан пережить чужой тип молча — иначе следующий PR уронит
+    # обмен раньше, чем научится вызов исполнять. Заглушка отдаёт событие
+    # той же формы, что настоящий транспорт, и обмен обязан записаться.
+    _stub.install(
+        reply="ок",
+        tool_calls=[{"id": "call_a", "name": "update_plan", "arguments": "{}"}],
+    )
+    with TestClient(main.app) as client:
+        chat = new_agent(client)
+        answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+        assert answer.status_code == 200, answer.text
+        frames = sse(answer.text)
+        history = client.get(f"/api/agents/{chat}").json()["transcript"]
+    frame_kinds = [f["event"] for f in frames]
+    # Наружу событие не уехало: `ask` перечисляет известные имена и чужое
+    # не пересылает. Появись оно в ленте — клиент этого дня не знал бы,
+    # что с ним делать.
+    assert "tool_calls" not in frame_kinds, frame_kinds
+    assert frame_kinds[-1] == "done" and frames[-1]["committed"] is True, frames[-1]
+    assert [m["role"] for m in history] == ["user", "assistant"], history
+    assert history[-1]["content"] == "ок", history[-1]
+
+    return (
+        "два вызова собраны из обрывков вперемешку, событие одно на две причины "
+        "и раньше done; текст и вызов вместе; страховка на «stop»; id без "
+        "провайдера — call_{index}; битый JSON отдан строкой; tools объявлены, "
+        "а без них ключа в теле нет и extra_body их перебивает; обмен "
+        "переживает незнакомый тип события и записывается"
+    )
 
 
 # --- День 7: память переживает перезапуск, чаты изолированы -------------------
