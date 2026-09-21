@@ -4414,6 +4414,135 @@ def check_turn_metrics_merged():
     )
 
 
+@check("живая база догоняет схему: наследство выброшенной попытки Дня 13 снесено")
+def check_plan_tables_migrated():
+    """У этого репозитория была первая попытка Дня 13, и её выбросили целиком —
+    но база пользователя её пережила. Имя `task_state` в ней занято таблицей
+    с колонками `stage`, `step` и `expecting`, а `CREATE TABLE IF NOT EXISTS`
+    такую не трогает и колонку в неё не добавляет: `load_plan` падал на «no
+    such column: approved», и с ним падало открытие **любого** чата.
+
+    Поэтому сцена здесь — настоящий старый SQL, дословно тот, что лежит
+    у пользователя, и со своими строками: пустые таблицы держали бы «после
+    миграции пусто» сами собой. И вторая база рядом, **нашей** формы и с живым
+    планом человека: миграция, отличающая наследство по имени вместо формы,
+    прошла бы на первой зелёной, а у второй отняла бы работу.
+    """
+    import sqlite3
+
+    from app import plan as taskplan
+    from app.agent import Agent
+
+    # --- 1. База выброшенной попытки: три её таблицы и строки в них ----------
+    old_path = _temp_db("plan-old")
+    os.makedirs(os.path.dirname(old_path), exist_ok=True)
+    old = sqlite3.connect(old_path)
+    old.executescript(
+        """
+        CREATE TABLE sessions (
+            id          TEXT PRIMARY KEY,
+            label       TEXT NOT NULL DEFAULT '',
+            config      TEXT NOT NULL DEFAULT '{}',
+            context_length INTEGER,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL);
+        INSERT INTO sessions VALUES ('ag_00001', 'вчерашний чат',
+            '{"label": "вчерашний чат", "model": "stub/model"}', NULL, 1.0, 1.0);
+
+        CREATE TABLE task_state (            -- СТАРАЯ форма
+            session_id TEXT PRIMARY KEY,
+            stage      TEXT NOT NULL,
+            step       TEXT NOT NULL,
+            expecting  TEXT NOT NULL,
+            at         REAL NOT NULL);
+        INSERT INTO task_state VALUES ('ag_00001', 'execution', 'собрать ТЗ', 'работа', 1.0);
+        INSERT INTO task_state VALUES ('ag_00002', 'planning', '', 'план', 1.0);
+
+        CREATE TABLE task_log (              -- мёртвая целиком
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+            stage_from TEXT NOT NULL, stage_to TEXT NOT NULL, who TEXT NOT NULL,
+            at REAL NOT NULL, ok INTEGER NOT NULL DEFAULT 1);
+        INSERT INTO task_log (session_id, stage_from, stage_to, who, at)
+            VALUES ('ag_00001', 'planning', 'approval', 'agent', 1.0);
+        INSERT INTO task_log (session_id, stage_from, stage_to, who, at)
+            VALUES ('ag_00001', 'approval', 'execution', 'human', 2.0);
+
+        CREATE TABLE task_steps (            -- форма совпала случайно
+            session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+            title TEXT NOT NULL, status TEXT NOT NULL,
+            PRIMARY KEY (session_id, seq));
+        INSERT INTO task_steps VALUES ('ag_00001', 0, 'шаг выброшенной попытки', 'done');
+        """
+    )
+    old.commit()
+    old.close()
+
+    with _reopened(old_path) as migrated:
+        # Колонки в файле те же, что в схеме, и **в том же** `init()`: снос
+        # без заведения заново дал бы открывшийся чат только со второго
+        # запуска сервера — а падает он прямо сейчас.
+        columns = {r["name"] for r in migrated.conn.execute("PRAGMA table_info(task_state)")}
+        assert columns == {"session_id", "approved", "finished", "paused", "at"}, columns
+        # То, ради чего всё: чтение плана больше не падает и говорит
+        # «планом не занимались» — строк выброшенной попытки не стало.
+        assert migrated.load_plan("ag_00001") is None, migrated.load_plan("ag_00001")
+        assert migrated.load_plan("ag_00002") is None, migrated.load_plan("ag_00002")
+        tables = {
+            row["name"]
+            for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "task_log" not in tables, tables
+        assert {"task_state", "task_steps"} <= tables, tables
+        # Шаги без своего состояния — сироты той же работы, и они унесены.
+        # Утверждение стоит на непустом: строку в `task_steps` сцена вписала.
+        orphans = migrated.conn.execute("SELECT * FROM task_steps").fetchall()
+        assert orphans == [], [tuple(r) for r in orphans]
+        # Полный путь, которым падал сервер: чат поднимается из базы, и
+        # `load_plan` внутри подъёма отдаёт пустой план, а не исключение.
+        revived = Agent(
+            AgentSpec(label="пусто", model="x/y"), agent_id="ag_00001", store=migrated
+        )
+        assert revived.plan == taskplan.empty(), revived.plan
+        # Заведённая заново таблица рабочая: план пишется и читается обратно.
+        fresh = {**taskplan.empty(), "steps": [{"title": "новый шаг", "status": "pending"}]}
+        migrated.save_plan("ag_00001", fresh)
+        assert migrated.load_plan("ag_00001") == fresh, migrated.load_plan("ag_00001")
+        # И второй запуск на той же базе не делает ничего: миграция
+        # идемпотентна, иначе каждый старт сервера сносил бы свежий план.
+        assert migrated._migrate() == [], migrated._migrate()
+        assert migrated.load_plan("ag_00001") == fresh, migrated.load_plan("ag_00001")
+
+    # --- 2. База нашей формы: настоящий план человека уцелел ----------------
+    #
+    # План здесь и со шагами, и со всеми тремя флажками: на пустом «уцелел»
+    # держалось бы само собой.
+    live_path = _temp_db("plan-live")
+    plan = {
+        "steps": [
+            {"title": "собрать ТЗ", "status": "done"},
+            {"title": "свести смету", "status": "doing"},
+        ],
+        "approved": True,
+        "finished": True,
+        "paused": True,
+    }
+    with _reopened(live_path) as live:
+        live.save_plan("ag_00001", plan)
+    with _reopened(live_path) as again:
+        assert again.load_plan("ag_00001") == plan, again.load_plan("ag_00001")
+        assert again._migrate() == [], again._migrate()
+
+    return (
+        "старая `task_state` со `stage`, `step` и `expecting` снесена и заведена "
+        "заново тем же "
+        "init(), `task_log` не осталось, осиротевший шаг унесён; load_plan "
+        "отдаёт None вместо падения, чат поднялся из базы; второй init() не "
+        "сделал ничего; база нашей формы пережила миграцию с двумя шагами "
+        "и тремя флажками"
+    )
+
+
+
 # --- День 7: память переживает перезапуск, чаты изолированы -------------------
 
 

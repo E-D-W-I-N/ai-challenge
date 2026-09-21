@@ -190,11 +190,11 @@ EXISTS` накатится на живую базу сам — переноса 
 Живых вызовов к LLM нет — поток подменяется заглушкой.
 
 ```bash
-.venv/bin/python checks/run_checks.py    # 34 проверки, включая три ниже и клиентскую
+.venv/bin/python checks/run_checks.py    # 35 проверок, включая три ниже и клиентскую
 .venv/bin/python checks/restart.py       # два процесса подряд на одном файле
 .venv/bin/python checks/two_processes.py # сервер и консоль на одной базе
 .venv/bin/python checks/spawn_100.py     # сто агентов в одном процессе
-node checks/browser_check.js             # клиент под node, 267 утверждений
+node checks/browser_check.js             # клиент под node, 358 утверждений
 ```
 
 Бьют по поведению, а не по исходнику: `browser_check.js` исполняет настоящий

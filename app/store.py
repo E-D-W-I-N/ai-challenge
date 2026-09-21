@@ -49,6 +49,20 @@ DEFAULT_DB_PATH = ROOT / "data" / "agents.db"
 MEMORY = ":memory:"
 """Особый путь sqlite: база живёт в памяти и перезапуска не переживает."""
 
+TASK_STATE_DDL = """CREATE TABLE IF NOT EXISTS task_state (
+    session_id TEXT PRIMARY KEY,
+    approved   INTEGER NOT NULL DEFAULT 0,
+    finished   INTEGER NOT NULL DEFAULT 0,
+    paused     INTEGER NOT NULL DEFAULT 0,
+    at         REAL NOT NULL
+);
+"""
+"""Флажки задачи отдельным именем, потому что заводят их два места: схема
+целиком (`SCHEMA` включает эту строку в себя) и `_migrate`, который сносит
+таблицу того же имени, оставшуюся от выброшенной попытки Дня 13, и обязан
+завести новую тут же, своей транзакцией — `executescript` со схемой к тому
+времени уже прошёл. Второй копией `CREATE` два места разъехались бы молча."""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
@@ -189,21 +203,19 @@ CREATE INDEX IF NOT EXISTS branches_by_parent ON branches(parent_id);
 -- `executemany`, всё одной `tx()` (образец — `save_summaries`). Номер здесь
 -- порядок, а не идентичность.
 --
--- Новая таблица накатывается на живую базу сама — прецедент `branches`, —
--- и `_migrate` про неё ничего не знает: он про колонки.
+-- Имя `task_state` в этом репозитории **уже было занято** — таблицей первой,
+-- выброшенной попытки Дня 13, с колонками `stage`, `step` и `expecting`.
+-- `CREATE TABLE IF NOT EXISTS` такую не трогает и колонку в неё не добавляет:
+-- на живой базе первое же чтение плана падало на «no such column: approved»,
+-- а с ним и открытие любого чата. Догоняет её `_migrate` — по форме, а не
+-- по имени, — и заводит эту таблицу заново; отсюда и отдельная
+-- `TASK_STATE_DDL`: двух копий одного `CREATE` быть не должно.
 --
 -- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: удаление
 -- чата, очистка базы, `forget()`. План — содержимое разговора: забытый
 -- разговор, оставивший свои шаги следующему, врал бы про этап с первого же
 -- сообщения.
-CREATE TABLE IF NOT EXISTS task_state (
-    session_id TEXT PRIMARY KEY,
-    approved   INTEGER NOT NULL DEFAULT 0,
-    finished   INTEGER NOT NULL DEFAULT 0,
-    paused     INTEGER NOT NULL DEFAULT 0,
-    at         REAL NOT NULL
-);
-
+""" + TASK_STATE_DDL + """
 CREATE TABLE IF NOT EXISTS task_steps (
     session_id TEXT NOT NULL,
     seq        INTEGER NOT NULL,
@@ -481,6 +493,11 @@ class Store:
         Снимает она и лишнее: колонку авторства у обоих слоёв памяти
         и таблицу состояния ведения. Отличать автора стало не от кого —
         пишет в память только человек, — а вести её некому.
+
+        И наследство выброшенной попытки Дня 13: таблицу `task_state` чужой
+        формы вместе с её `task_log` и осиротевшими шагами. Имя было занято
+        до нас, поэтому узнаём эту таблицу по составу колонок, а не по имени:
+        `task_state` **нашей** формы хранит настоящие планы человека.
         """
         done: list[str] = []
         with self.tx() as conn:
@@ -490,11 +507,7 @@ class Store:
             # различать хоть что-нибудь. Снимаем — но **только колонку**:
             # записи под ней набраны руками, и терять их нельзя.
             for table in ("memory", "working_memory"):
-                columns = {
-                    row["name"]
-                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-                }
-                if "author" in columns:
+                if "author" in self._columns(conn, table):
                     conn.execute(f"ALTER TABLE {table} DROP COLUMN author")
                     done.append(f"{table}.author")
             # Две таблицы, в которые больше не ходит ни один путь кода:
@@ -509,7 +522,42 @@ class Store:
                 ).fetchone():
                     conn.execute(f"DROP TABLE {table}")
                     done.append(table)
+            # Наследство первой попытки Дня 13 — той, которую выбросили
+            # целиком. Имя `task_state` она уже занимала, своими колонками
+            # `stage`, `step` и `expecting`, а `CREATE TABLE IF NOT EXISTS`
+            # такую таблицу не трогает и колонку в неё не добавляет: у
+            # пользователя падало первое же чтение плана — «no such column:
+            # approved», — а с ним открытие любого чата.
+            #
+            # Узнаём её **по форме, а не по имени**: колонок нет вовсе —
+            # нет и таблицы, делать нечего; есть `approved` — таблица наша,
+            # и в ней лежат настоящие планы, трогать их нельзя ни строкой.
+            # Нет `approved` — та самая. Сносим её, сносим мёртвый целиком
+            # `task_log` и чистим `task_steps`: форма шагов у той попытки
+            # совпала с нашей случайно, но шаги без своего состояния —
+            # сироты той же выброшенной работы.
+            #
+            # Заводим таблицу заново здесь же, этой транзакцией: схема
+            # `executescript` прошла **до** миграции, и одного сноса хватило
+            # бы лишь на то, чтобы чат открылся со второго запуска сервера.
+            plan_columns = self._columns(conn, "task_state")
+            if plan_columns and "approved" not in plan_columns:
+                conn.execute("DROP TABLE task_state")
+                conn.execute(TASK_STATE_DDL)
+                conn.execute("DELETE FROM task_steps")
+                done.append("task_state")
+                if self._columns(conn, "task_log"):
+                    conn.execute("DROP TABLE task_log")
+                    done.append("task_log")
         return done
+
+    @staticmethod
+    def _columns(conn, table: str) -> set[str]:
+        """Имена колонок таблицы — пустой набор, если таблицы нет вовсе.
+        Отсюда и «по форме, а не по имени» одним выражением: пусто значит
+        «нечего догонять». Читается через ту же обёртку транзакции, что и
+        запись: состав колонок решает, менять ли файл."""
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
     def close(self) -> None:
         with self._lock:
