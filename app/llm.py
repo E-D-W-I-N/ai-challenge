@@ -203,6 +203,7 @@ def build_payload(
     messages: list[dict] | None = None,
     *,
     tools: list[dict] | None = None,
+    tool_choice: dict | None = None,
 ) -> dict:
     """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
     контекста — на каждом вызове.
@@ -212,8 +213,14 @@ def build_payload(
     а не слепок. Пустой список — это «не объявлять ничего», и ключа в теле
     не будет: `tools: []` у части провайдеров значит другое, чем его отсутствие.
 
-    `tool_choice` не отправляется вовсе: звать инструмент или ответить словами
-    — решение модели, и принуждать её к вызову нам незачем.
+    `tool_choice` не отправляется **никогда, кроме этапа планирования**:
+    обычно звать инструмент или ответить словами решает модель, и принуждать
+    её к вызову незачем. На планировании других законных действий у неё нет
+    вовсе — план она обязана записать, а не пересказать, — и просьба приезжает
+    сюда сверху (`Agent.turn_choice`).
+
+    Без `tools` поле не отправляется, что бы ни передали: `tool_choice` без
+    объявленных функций провайдер отвергнет, и запрос не состоится вовсе.
     """
     payload: dict = {
         "model": session.model,
@@ -238,6 +245,8 @@ def build_payload(
         payload["response_format"] = session.response_format
     if tools:
         payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
     for key, value in (session.extra_body or {}).items():
         if key == "provider" and isinstance(value, dict):
@@ -282,6 +291,7 @@ async def stream_completion(
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
     tools: list[dict] | None = None,
+    tool_choice: dict | None = None,
 ) -> AsyncIterator[dict]:
     """События {"type": "delta"|"reasoning"|"tool_calls"|"metrics"|"done"|"error", ...}:
     метрики обновляются по мере генерации, финальный usage приходит последним чанком.
@@ -296,7 +306,7 @@ async def stream_completion(
             "OPENROUTER_API_KEY не найден. Скопируйте .env.example в .env и впишите ключ."
         )
 
-    payload = build_payload(session, prompt_override, tools=tools)
+    payload = build_payload(session, prompt_override, tools=tools, tool_choice=tool_choice)
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
