@@ -3156,9 +3156,24 @@ def check_tool_calls_transport():
 
     _, declared = _streamed(plain, tools=[plan_tool])
     assert declared["tools"] == [plan_tool], declared.get("tools")
-    # `tool_choice` не отправляется вовсе: звать инструмент или ответить
-    # словами — решение модели.
+    # **Без просьбы** `tool_choice` не отправляется: обычно звать инструмент
+    # или ответить словами решает модель. Просьба приезжает сверху и только
+    # на планировании (`Agent.turn_choice`), а транспорт её не выдумывает.
     assert "tool_choice" not in declared, declared
+
+    forced = {"type": "function", "function": {"name": "update_plan"}}
+    _, forcing = _streamed(plain, tools=[plan_tool], tool_choice=forced)
+    assert forcing["tool_choice"] == forced, forcing.get("tool_choice")
+    # **Без `tools`** — не отправляется, что бы ни передали: поле без
+    # объявленных функций провайдер отвергнет, и запрос не состоится вовсе.
+    # Утверждение об отсутствии стоит там, где присутствие достижимо: тот же
+    # `tool_choice`, та же строка выше — и разница только в `tools`.
+    _, lonely = _streamed(plain, tool_choice=forced)
+    assert "tools" not in lonely and "tool_choice" not in lonely, lonely
+    _, empty_forced = _streamed(plain, tools=[], tool_choice=forced)
+    assert "tool_choice" not in empty_forced, empty_forced
+    # Три правила тела на месте и у принуждающего запроса.
+    assert not _body_rules(forcing), _body_rules(forcing)
 
     _, silent = _streamed(plain)
     assert "tools" not in silent, silent
@@ -3178,6 +3193,17 @@ def check_tool_calls_transport():
         tools=[plan_tool],
     )
     assert overridden["tools"] == [mine], overridden["tools"]
+
+    # И `tool_choice` перебивает — он часть тела, а не исключение из правила.
+    _, unforced = _streamed(
+        plain,
+        spec=AgentSpec(
+            label="своё тело", model="stub/tools", extra_body={"tool_choice": "none"}
+        ),
+        tools=[plan_tool],
+        tool_choice=forced,
+    )
+    assert unforced["tool_choice"] == "none", unforced["tool_choice"]
 
     # --- незнакомый тип события обмен переживает ------------------------------
     #
@@ -4449,6 +4475,161 @@ def check_stage_per_exchange():
         "смена этапа погасила tools, обмен записан и текст непуст; этап "
         "на месте — tools объявлены снова; execution → validation прошёл "
         "сменой правила; у выключенного процесса оба этапа пусты"
+    )
+
+
+@check("на планировании план обязателен: tool_choice, а не уговоры")
+def check_planning_forces_update_plan():
+    """Последнее место дня, где обещание держалось на тексте.
+
+    Во всём остальном правило одно: **инструкция в промпте — просьба,
+    гарантию даёт код**. Утвердить себе план модель не может, работать
+    на паузе не может, завершить неутверждённое не может — всё это держит
+    `plan.apply`. А «на планировании сначала план, а не решение» держалось
+    на уговорах, и живой прогон `openai/gpt-4o-mini` показал цену: на
+    маленькой задаче («юнит-тест на Kotlin для сложения») модель писала
+    решение сразу. Она обучена выполнять просьбу, а не откладывать её;
+    правило этапа стоит в начале промпта, а просьба человека — в конце.
+
+    Закрыто одним полем тела: на `planning` `tool_choice` называет
+    **именно** `update_plan`. Не `"required"` — «любой инструмент»
+    позволило бы позвать `finish_task`, который на этом этапе отказан.
+    Живым запросом это проверено до кода: провайдер поле принял вместе
+    с `provider.require_parameters`, и на той же маленькой задаче модель
+    вернула план из трёх шагов и **ни символа текста**.
+
+    Разделы:
+
+    * **planning — поле есть, и называет `update_plan`**; заодно правило
+      этапа в промпте читается приказом, а не запретом;
+    * **approval — поля нет**, и утверждение об отсутствии стоит там, где
+      присутствие достижимо: тот же чат, следующий обмен, инструменты
+      объявлены — разница только в этапе;
+    * **остальные этапы** — `execution`, `validation`, `paused`, `done`:
+      инструменты объявлены, принуждения нет. Этап каждой сцены назван
+      и сверен, иначе сцена «execution» зелена и будучи `approval`;
+    * **выключенный процесс** — ни `tools`, ни `tool_choice`;
+    * **отказ не снимает принуждения** — `update_plan` с пустым списком
+      этап не двигает, и каждый следующий оборот снова принудительный.
+      Кончается обмен всё равно словами: последний разрешённый оборот
+      идёт без инструментов, а значит и без поля.
+    """
+    import app.plan as taskplan
+
+    forced = {"type": "function", "function": {"name": "update_plan"}}
+    """Ожидаемое поле — **дословно**, а не `taskplan.FORCE_UPDATE_PLAN`:
+    сверка константы с собой зелена и тогда, когда в ней оказалось
+    `"required"` или чужое имя."""
+
+    # --- planning: поле есть, и это именно update_plan ----------------------
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
+    )
+    chat = _bare("принуждение", workflow="plan")
+    events = asyncio.run(drain(chat.ask("напиши юнит-тест на Kotlin")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert _stub.CALLS[0]["payload"]["tool_choice"] == forced, _stub.CALLS[0]["payload"]
+    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+
+    # Правило этапа в том же промпте — **приказ**, а не запрет: вызов назван
+    # единственным законным ответом, и у маленькой задачи есть пол в два шага.
+    # Сверка по этим двум оборотам речи, а не по «первому предложению»:
+    # `update_plan` стоял в первом предложении и у старой формулировки,
+    # и такое утверждение не различало бы ровно то, ради чего написано.
+    rule = _stub.CALLS[0]["messages"][0]["content"]
+    assert "единственный ответ" in rule, rule
+    assert "не меньше двух" in rule, rule
+    # Запрет остался, но **вторым**, после приказа.
+    assert rule.index("update_plan") < rule.index("ничего не выполняй"), rule
+
+    # Смена этапа гасит инструменты — вместе с ними гаснет и принуждение.
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert "tool_choice" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert chat.plan_stage() == "approval", chat.plan_view()
+    assert events[-1]["committed"] is True and events[-1]["text"], events[-1]
+
+    # --- approval: инструменты есть, принуждения нет ------------------------
+    #
+    # Тот же чат, следующий обмен. Утверждение об отсутствии стоит там, где
+    # присутствие достижимо: `tools` объявлены на **обоих** оборотах — тем
+    # же списком, что и на планировании, — и разница только в этапе.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_2")),
+    )
+    asyncio.run(drain(chat.ask("поправь второй шаг")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert chat.plan_stage() == "approval", chat.plan_view()
+    for call in _stub.CALLS:
+        assert "tools" in call["payload"], call["payload"].keys()
+        assert "tool_choice" not in call["payload"], call["payload"].keys()
+
+    # --- остальные этапы: принуждения нет ни на одном -----------------------
+    scenes = {
+        "execution": _approved(),
+        "validation": _approved([{"title": "собрать требования", "status": "done"}]),
+        "paused": {**_approved(), "paused": True},
+        "done": {**_approved(), "finished": True},
+    }
+    for stage, plan in scenes.items():
+        _stub.reset()
+        _stub.install(reply="отвечаю словами")
+        staged = _bare(f"этап {stage}", workflow="plan")
+        staged.plan = plan
+        asyncio.run(drain(staged.ask("что дальше")))
+        # Сцена и правда на том этапе, о котором говорит её имя: иначе
+        # «на execution поля нет» держалось бы на чём угодно.
+        assert staged.plan_stage() == stage, (stage, staged.plan_view())
+        assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+        assert "tools" in _stub.CALLS[0]["payload"], (stage, _stub.CALLS[0]["payload"].keys())
+        assert "tool_choice" not in _stub.CALLS[0]["payload"], (
+            stage, _stub.CALLS[0]["payload"].keys()
+        )
+
+    # --- выключенный процесс: ни того, ни другого ---------------------------
+    _stub.reset()
+    _stub.install(reply="обычный ответ")
+    plain = _bare("обычный чат")
+    asyncio.run(drain(plain.ask("просто вопрос")))
+    assert "tools" not in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+    assert "tool_choice" not in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+
+    # --- отказ не снимает принуждения, а предел всё равно кончает словами ---
+    #
+    # `update_plan` с пустым списком отказан (`plan.apply`), этап остаётся
+    # `planning` — и каждый следующий оборот снова принудительный. Кончается
+    # это не вечным обменом: последний разрешённый оборот идёт без
+    # инструментов, а значит и без поля, и модель отвечает текстом.
+    limit = agent_module.MAX_TURNS
+    _stub.reset()
+    _stub.install(
+        reply="не выходит",
+        tool_calls=lambda messages, index: [_call("update_plan", {"steps": []}, f"call_{index}")],
+    )
+    stuck = _bare("отказ за отказом", workflow="plan")
+    events = asyncio.run(drain(stuck.ask("спланируй")))
+
+    assert len(_stub.CALLS) == limit, len(_stub.CALLS)
+    assert stuck.plan_stage() == "planning", stuck.plan_view()
+    assert all(
+        call["payload"].get("tool_choice") == forced for call in _stub.CALLS[: limit - 1]
+    ), [call["payload"].get("tool_choice") for call in _stub.CALLS]
+    # Последний разрешённый оборот: ни инструментов, ни принуждения, хотя
+    # этап всё ещё `planning`.
+    last = _stub.CALLS[limit - 1]["payload"]
+    assert "tools" not in last and "tool_choice" not in last, last.keys()
+    assert events[-1]["committed"] is True and events[-1]["text"], events[-1]
+
+    return (
+        f"на planning tool_choice называет update_plan, и правило этапа "
+        f"читается приказом; на approval, execution, validation, paused "
+        f"и done поля нет при объявленных инструментах; без рабочего "
+        f"процесса нет ни того, ни другого; отказанный вызов принуждения "
+        f"не снимает — {limit} оборотов, последний без инструментов и словами"
     )
 
 

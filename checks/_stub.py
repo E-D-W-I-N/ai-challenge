@@ -63,7 +63,7 @@ def make(
     known = {f.name for f in dataclass_fields(Metrics)}
 
     async def fake_stream_completion(
-        session, *, prompt_override=None, context_length=None, tools=None
+        session, *, prompt_override=None, context_length=None, tools=None, tool_choice=None
     ):
         messages = list(prompt_override or [])
         index = len(CALLS)
@@ -72,10 +72,13 @@ def make(
                 "model": session.model,
                 "label": session.label,
                 "messages": [dict(m) for m in messages],
-                # Инструменты уезжают в настоящий `build_payload`: проверки
-                # смотрят в записанное тело и спрашивают его «объявлены ли
-                # `tools` и какие», а пересказ заглушки отвечал бы за себя.
-                "payload": build_payload(session, prompt_override, tools=tools),
+                # Инструменты и принуждение к вызову уезжают в настоящий
+                # `build_payload`: проверки смотрят в записанное тело
+                # и спрашивают его «объявлены ли `tools` и какие, есть ли
+                # `tool_choice`», а пересказ заглушки отвечал бы за себя.
+                "payload": build_payload(
+                    session, prompt_override, tools=tools, tool_choice=tool_choice
+                ),
             }
         )
 
