@@ -187,7 +187,7 @@ def build_payload(
     messages: list[dict] | None = None,
     *,
     tools: list[dict] | None = None,
-    tool_choice: dict | None = None,
+    tool_choice: dict | str | None = None,
 ) -> dict:
     """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
     контекста — на каждом вызове.
@@ -261,7 +261,7 @@ async def stream_completion(
     prompt_override: list[dict] | None = None,
     context_length: int | None = None,
     tools: list[dict] | None = None,
-    tool_choice: dict | None = None,
+    tool_choice: dict | str | None = None,
 ) -> AsyncIterator[dict]:
     """События {"type": "delta"|"reasoning"|"tool_calls"|"metrics"|"done"|"error", ...}:
     метрики обновляются по мере генерации, финальный usage приходит последним

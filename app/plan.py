@@ -203,8 +203,18 @@ TOOLS = [
 FORCE_UPDATE_PLAN = {"type": "function", "function": {"name": "update_plan"}}
 """Чем `tool_choice` принуждает модель на этапе планирования. Именно эта
 функция, а не `"required"`: «любой инструмент» позволило бы позвать
-`finish_task`, который на планировании отказан. Когда поле уезжает, решает
-`Agent.turn_choice`."""
+`finish_task`, который на планировании отказан."""
+
+FORCE_ANY_TOOL = "required"
+"""Чем `tool_choice` принуждает на проверке: позвать — обязательно, а какой
+из двух, решает модель. Имя здесь назвать нельзя — вердикт её."""
+
+FORCE_CALL = {"planning": FORCE_UPDATE_PLAN, "validation": FORCE_ANY_TOOL}
+"""Этапы, где промолчать не законно, и чем на каждом принуждаем. Таблица,
+как `STAGE_RULES`: этапа тут нет — поля в теле не будет вовсе. На планировании
+законный вызов один, и назван он **именем**; на проверке их два (`finish_task`
+или возврат шага через `update_plan`), и принуждаем к самому факту вызова.
+Когда поле уезжает, решает `Agent.turn_choice`."""
 
 
 TOOL_NAMES = tuple(tool["function"]["name"] for tool in TOOLS)
@@ -261,16 +271,29 @@ STAGE_RULES = {
 продолжить»), но держится пауза не на нём — оба инструмента отказаны
 кодом (`apply`)."""
 
+FINAL_TURN_RULE = (
+    "Инструменты сейчас недоступны: сделанное ими уже записано — расскажи "
+    "словами, что сделал, и ничего не обещай, обещанный вызов не состоится."
+)
+"""Приписка к правилу на обороте, где инструменты не объявлены (любая
+причина — предел оборотов, продвинувшийся план, выключенный процесс).
+Без неё модель обещает вызов, которого сделать уже не сможет, а на следующем
+обмене читает обещание в истории как сделанное дело."""
 
-def stage_rule(plan) -> str:
+
+def stage_rule(plan, final: bool = False) -> str:
     """Правило этапа — уже с номерами. Подставляются они здесь, а не
-    у вызывающего: вторая подстановка разошлась бы с первой молча."""
+    у вызывающего: вторая подстановка разошлась бы с первой молча.
+    `final` — оборот идёт без инструментов, и правилу дописывается
+    `FINAL_TURN_RULE`: правило собирается в одном месте."""
     stage, current = stage_of(plan)
     rule = STAGE_RULES[stage]
-    if stage != "execution" or current is None:
-        return rule
-    steps = _steps(plan)
-    return rule.format(k=current + 1, n=len(steps), title=steps[current].get("title", ""))
+    if stage == "execution" and current is not None:
+        steps = _steps(plan)
+        rule = rule.format(
+            k=current + 1, n=len(steps), title=steps[current].get("title", "")
+        )
+    return f"{rule} {FINAL_TURN_RULE}" if final else rule
 
 
 class PlanError(Exception):
