@@ -21,7 +21,7 @@ import os
 from dataclasses import replace
 from typing import Iterable
 
-from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config
+from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config, task_view
 from .schema import AgentSpec
 from .store import Store, shared_store
 
@@ -168,6 +168,11 @@ class AgentRegistry:
                     # и он сам: пометка ветки в списке не должна зависеть
                     # от того, поднят чат в память или нет.
                     branch=row.get("branch"),
+                    # Состояние задачи — тем же запросом и тем же видом, каким
+                    # его отдаёт сам чат (`task_view`): поле `task` у выгруженного
+                    # обязано совпадать с полем `task` открытого, иначе список
+                    # слева говорит про задачу неправду.
+                    task=task_view(row.get("task")) or None,
                 )
             )
         entries.sort(key=lambda entry: entry["created_at"])
