@@ -743,10 +743,12 @@ class Agent:
         stage, current = taskplan.stage_of(self.plan)
         return {**copy.deepcopy(self.plan), "stage": stage, "current": current}
 
-    def plan_rule(self, spec: AgentSpec | None = None) -> str:
+    def plan_rule(self, spec: AgentSpec | None = None, final: bool = False) -> str:
         """Правило этапа для системного сообщения — или пустая строка при
-        выключенном процессе: тогда в промпте не меняется ни одно слово."""
-        return taskplan.stage_rule(self.plan) if self.plan_on(spec) else ""
+        выключенном процессе: тогда в промпте не меняется ни одно слово.
+        `final` — оборот без инструментов; приписку к правилу делает
+        `plan.stage_rule`, чтобы правило собиралось в одном месте."""
+        return taskplan.stage_rule(self.plan, final) if self.plan_on(spec) else ""
 
     def plan_stage(self, spec: AgentSpec | None = None) -> str | None:
         """Этап задачи — или `None` при выключенном процессе («задачи нет
@@ -760,6 +762,7 @@ class Agent:
         spec: AgentSpec,
         profile: dict,
         plan_at: int | None,
+        final: bool = False,
     ) -> None:
         """Переписывает **на месте** правило этапа и блок задачи перед каждым
         оборотом: иначе распоряжение оказывается старше приехавших сведений.
@@ -769,10 +772,14 @@ class Agent:
         второе системное сообщение. Номера обоих мест **берутся**, а не
         ищутся разбором. Словарь заменяется целиком — тот же лежит в кадре
         `start`, и кадр обязан остаться прежним.
+
+        `final` — инструментов на этом обороте не будет, и правило говорит
+        об этом словами: иначе модель обещает вызов, сделать который уже
+        не сможет. Спрашивает об этом вызывающий: решает `turn_tools`.
         """
         if not self.plan_on(spec):
             return
-        rule = self.plan_rule(spec)
+        rule = self.plan_rule(spec, final)
         messages[0] = system_message(spec.system, self.profile_items(profile), rule)
         if plan_at is not None:
             messages[plan_at] = task_message(self.plan)
@@ -809,22 +816,23 @@ class Agent:
 
     def turn_choice(
         self, spec: AgentSpec, turn: int, entry: dict | None = None
-    ) -> dict | None:
+    ) -> dict | str | None:
         """Принуждать ли модель к вызову на этом обороте и к какому; `None` —
-        не принуждать.
+        не принуждать. Чем именно, называет `plan.FORCE_CALL`.
 
         **Инструкция в промпте просьба, гарантию даёт код**: живой прогон
-        `openai/gpt-4o-mini` показывал на планировании решение вместо плана.
-        Именно `update_plan`, а не `"required"`: это единственное действие,
-        которое `apply` здесь не отказывает. Первой строкой спрашивает
-        `turn_tools` — поле без `tools` провайдер отвергнет, и отсюда сразу
-        три следствия: нет принуждения на последнем обороте, после
-        продвижения плана и при выключенном процессе. Этап берётся нынешний: план
-        не двигался, значит и этап тот же.
+        `openai/gpt-4o-mini` показывал на планировании решение вместо плана,
+        а на проверке — «вызываю finish_task» вместо вызова. Оба этапа
+        принуждают, но по-разному: где законный вызов один, назван он именем;
+        где их два, принуждаем к самому факту вызова. Первой строкой
+        спрашивает `turn_tools` — поле без `tools` провайдер отвергнет,
+        и отсюда сразу три следствия: нет принуждения на последнем обороте,
+        после продвижения плана и при выключенном процессе. Этап берётся
+        нынешний: план не двигался, значит и этап тот же.
         """
         if not self.turn_tools(spec, turn, entry):
             return None
-        return taskplan.FORCE_UPDATE_PLAN if self.plan_stage(spec) == "planning" else None
+        return taskplan.FORCE_CALL.get(self.plan_stage(spec))
 
     def _save_plan(self, plan: dict | None) -> None:
         """Пишет состояние задачи в хранилище; без хранилища — ничего,
@@ -1175,14 +1183,16 @@ class Agent:
 
             while True:
                 turn += 1
-                # Свежее правило и свежий список — перед каждым запросом:
-                # распоряжение не вправе быть старше сведений.
-                self.restage(messages, spec, profile, slots["plan_at"])
                 # Первый сторож предела: последний оборот идёт без
                 # инструментов. Второй, жёсткий, стоит ниже.
                 tools = self.turn_tools(spec, turn, entry_plan)
                 # Принуждение — тем же местом: поле без `tools` отвергнут.
                 choice = self.turn_choice(spec, turn, entry_plan)
+                # Свежее правило и свежий список — перед каждым запросом:
+                # распоряжение не вправе быть старше сведений. Спрашивается
+                # после `turn_tools`: правило обязано знать, будут ли вызовы,
+                # иначе модель пообещает тот, которого сделать не сможет.
+                self.restage(messages, spec, profile, slots["plan_at"], tools is None)
                 turn_text = ""
                 turn_reasoning = ""
                 turn_metrics: dict | None = None
