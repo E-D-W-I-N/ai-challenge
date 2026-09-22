@@ -3042,7 +3042,10 @@ def check_task_state_machine():
         # модели в контекст и работает её рабочей памятью по задаче.
         for number, step in enumerate(THREE, start=1):
             assert f"{number}. [ ] {step['title']}" in written, written
-        assert "План записан: 3 шагов" in written and "жди кнопки" in written, written
+        assert "План записан: 3 шагов" in written, written
+        # Хвост зовёт модель **ответить человеку**, а не ждать: «жди кнопки»
+        # стояло указанием молчать.
+        assert "Утвердить план" in written and "жди" not in written, written
         assert REGISTRY.store.load_plan(chat)["steps"] == THREE, REGISTRY.store.load_plan(chat)
 
         # --- ворота: пять человеческих действий модели не объявлены ---------
@@ -3865,7 +3868,10 @@ def check_stage_per_exchange():
     # про план на тот момент. Сверка с готовой строкой, а не с куском текста:
     # правило, собранное вторым местом, разошлось бы с первым молча.
     assert taskplan.stage_rule({}) in first[0]["content"], first[0]["content"]
-    assert taskplan.stage_rule(after) in second[0]["content"], second[0]["content"]
+    # Второй оборот идёт уже без инструментов, и правило на нём — короткое
+    # правило **нового** этапа. Старое не осталось на нём ни в каком виде.
+    assert taskplan.stage_rule(after, True) in second[0]["content"], second[0]["content"]
+    assert taskplan.stage_rule({}, True) not in second[0]["content"], second[0]["content"]
     assert first[0]["content"] != second[0]["content"], first[0]["content"]
     assert taskplan.stage_of(after)[0] == "approval", after
 
@@ -3946,7 +3952,12 @@ def check_stage_per_exchange():
 
     assert len(_stub.CALLS) == 2, len(_stub.CALLS)
     assert "Этап: выполнение" in _stub.CALLS[0]["messages"][0]["content"], _stub.CALLS[0]
-    assert "Этап: проверка" in _stub.CALLS[1]["messages"][0]["content"], _stub.CALLS[1]
+    # Второй оборот идёт без инструментов, и правило на нём — правило
+    # **проверки**: «шаг 1 из 1 — выполняй» к этой минуте уже неправда.
+    head = _stub.CALLS[1]["messages"][0]["content"]
+    assert taskplan.stage_of(moved.plan)[0] == "validation", moved.plan
+    assert taskplan.stage_rule(moved.plan, True) in head, head
+    assert "Этап: выполнение" not in head, head
     assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
     assert events[-1]["committed"] is True, events[-1]
     assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
@@ -4369,27 +4380,68 @@ def check_stage_forces_tool_call():
     )
 
 
-@check("оборот без инструментов сказан последним: не обещай, чего не сможешь")
+@check("оборот без инструментов говорит не «нельзя», а каким быть ответу")
 def check_final_turn_rule_said():
-    """Улика живого прогона: модель **проговаривает вызов вместо того, чтобы
-    его сделать** — «Теперь я отмечу шаг», «Вызываю finish_task». Причина
-    наша и структурная: последний оборот обмена идёт без инструментов,
-    и пообещать — единственное, что модели на нём остаётся. На следующем
-    обмене обещание лежит в истории, и дело читается сделанным.
+    """Улика живого прогона: последний оборот обмена идёт **без инструментов**,
+    а правило этапа на нём осталось прежним — «отметь шаг через update_plan»,
+    «позови finish_task». Выполнить этого нельзя, а каким быть ответу,
+    не сказано нигде: один чат дописывал «теперь отмечу шаг как выполненный»,
+    другой — отвечал на исходную просьбу мимо плана.
 
-    Чиним одним предложением в правиле этапа (`plan.FINAL_TURN_RULE`),
-    приписанным там же, где правило собирается. Разделы: оборот
-    с инструментами — приписки нет, а следующий, без них, — есть, и правится
-    оно **на месте**; предел оборотов — тот же путь, другая причина;
-    выключенный процесс — ни правила, ни приписки.
+    Чиним **заменой** правила на таком обороте: своё на каждый этап
+    (`plan.FINAL_RULES`), одно предложение про ответ плюс общая строка
+    (`plan.FINAL_COMMON`). Разделы: таблица — правило своё на каждом этапе,
+    короче полного и без указаний звать инструменты; живая сцена — оборот
+    с инструментами идёт с полным правилом, следующий, без них, — с коротким,
+    и правится оно на месте; предел оборотов — та же замена, другая причина;
+    выключенный процесс — ни того ни другого; хвост `update_plan`
+    на неутверждённом плане зовёт ответить человеку, а не ждать.
     """
     import app.plan as taskplan
 
-    tail = taskplan.FINAL_TURN_RULE
+    steps = [dict(step) for step in PLAN_STEPS]
+    scenes = {
+        "planning": taskplan.empty(),
+        "approval": {**taskplan.empty(), "steps": steps},
+        "execution": {**taskplan.empty(), "approved": True,
+                      "steps": [{**steps[0], "status": "done"}, steps[1], steps[2]]},
+        "validation": {**taskplan.empty(), "approved": True,
+                       "steps": [{**step, "status": "done"} for step in steps]},
+        "done": {**taskplan.empty(), "approved": True, "finished": True, "steps": steps},
+        "paused": {**taskplan.empty(), "approved": True, "paused": True, "steps": steps},
+    }
+    assert set(scenes) == set(taskplan.STAGES), set(scenes)
 
-    # --- план продвинулся: второй оборот без инструментов ------------------
-    # Сцена с врезками: приписка правится на месте, и номера врезок из кадра
-    # `start` обязаны показывать на те же врезки на **обоих** оборотах.
+    # --- своё правило на каждый этап, короче полного и без вызовов ---------
+    full = {stage: taskplan.stage_rule(plan) for stage, plan in scenes.items()}
+    final = {stage: taskplan.stage_rule(plan, True) for stage, plan in scenes.items()}
+    for stage, plan in scenes.items():
+        assert taskplan.stage_of(plan)[0] == stage, (stage, taskplan.stage_of(plan))
+    # Шесть этапов — шесть **разных** правил: одно на все не сказало бы
+    # ни утверждению про кнопку, ни работе про сделанный шаг.
+    assert len(set(final.values())) == len(scenes), final
+    # И каждое короче полного: длинные указания про инструменты на обороте,
+    # где их нет, — не «лишний текст», а ложь.
+    assert all(len(final[stage]) < len(full[stage]) for stage in scenes), {
+        stage: (len(final[stage]), len(full[stage])) for stage in scenes
+    }
+    # Ни одно не зовёт инструмент по имени. Утверждение об отсутствии стоит
+    # там, где присутствие достижимо: полные правила именами полны.
+    for stage in scenes:
+        assert not any(name in final[stage] for name in taskplan.TOOL_NAMES), final[stage]
+    assert sum(
+        any(name in full[stage] for name in taskplan.TOOL_NAMES) for stage in scenes
+    ) >= 3, full
+    # На утверждении ответ назван: перечислить шаги и позвать человека
+    # к кнопке — ровно то, чего в прежнем правиле не было ни словом.
+    assert "Перечисли шаги" in final["approval"], final["approval"]
+    assert "Утвердить план" in final["approval"], final["approval"]
+    # На работе — номер текущего шага: он и на коротком правиле подставлен.
+    assert "шаге 2" in final["execution"], final["execution"]
+
+    # --- живая сцена: план продвинулся, второй оборот без инструментов -----
+    # Врезки нарочно: правило правится **на месте**, и номера врезок из кадра
+    # `start` обязаны показывать на те же врезки на обоих оборотах.
     _stub.install(
         reply=_word_on_second,
         tool_calls=_calls_on_first(_call("update_plan", {"steps": PLAN_STEPS}, "call_1")),
@@ -4405,21 +4457,25 @@ def check_final_turn_rule_said():
     first, second = _stub.CALLS[0]["messages"], _stub.CALLS[1]["messages"]
     started = _frame(frames, "start")
     assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-
-    # Инструменты объявлены — приписки нет: обещать модели пока нечего,
-    # и лишнее «сейчас нельзя» отговорило бы её от законного вызова.
-    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
-    assert tail not in first[0]["content"], first[0]["content"]
-
-    # План продвинулся, инструменты погасли — приписка есть, и правило
-    # целиком то, какое собрал бы `app/plan.py`: второе место сборки
-    # разошлось бы с первым молча.
-    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
-    assert tail in second[0]["content"], second[0]["content"]
-    assert taskplan.stage_rule(after, True) in second[0]["content"], second[0]["content"]
     assert taskplan.stage_of(after)[0] == "approval", after
 
-    # Приписано **к правилу**, а не вторым сообщением: системное по-прежнему
+    # Инструменты объявлены — правило полное: короткое отговорило бы модель
+    # от законного вызова.
+    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+    assert full["planning"] in first[0]["content"], first[0]["content"]
+    assert final["planning"] not in first[0]["content"], first[0]["content"]
+
+    # Инструменты погасли — правило короткое, и ровно то, какое собрал бы
+    # `app/plan.py`: второе место сборки разошлось бы с первым молча.
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert final["approval"] in second[0]["content"], second[0]["content"]
+    assert full["approval"] not in second[0]["content"], second[0]["content"]
+    # Текста в промпте на этом обороте стало **меньше**, а не больше.
+    assert len(second[0]["content"]) < len(first[0]["content"]), (
+        len(second[0]["content"]), len(first[0]["content"])
+    )
+
+    # Заменено **в правиле**, а не вторым сообщением: системное по-прежнему
     # одно, лента выросла ровно на два сообщения, а номера врезок из кадра
     # `start` сошлись на обоих оборотах.
     for sent in (first, second):
@@ -4429,10 +4485,10 @@ def check_final_turn_rule_said():
         assert sent[started["plan_at"]]["content"].startswith("[задача]"), sent
     assert len(second) == len(first) + 2, (len(second), len(first))
 
-    # --- предел оборотов: та же приписка, другая причина -------------------
+    # --- предел оборотов: та же замена, другая причина ---------------------
     # `update_plan` с пустым списком отказан, план не двигается — инструменты
-    # гаснут только на последнем разрешённом обороте, и приписка едет ровно
-    # на нём.
+    # гаснут только на последнем разрешённом обороте, и короткое правило
+    # едет ровно на нём.
     limit = agent_module.MAX_TURNS
     _stub.reset()
     _stub.install(
@@ -4444,12 +4500,15 @@ def check_final_turn_rule_said():
 
     assert len(_stub.CALLS) == limit, len(_stub.CALLS)
     heads = [call["messages"][0]["content"] for call in _stub.CALLS]
-    assert all(tail not in head for head in heads[: limit - 1]), heads
-    assert tail in heads[limit - 1], heads[limit - 1]
+    assert all(full["planning"] in head for head in heads[: limit - 1]), heads
+    assert all(final["planning"] not in head for head in heads[: limit - 1]), heads
+    assert final["planning"] in heads[limit - 1], heads[limit - 1]
+    assert full["planning"] not in heads[limit - 1], heads[limit - 1]
 
-    # --- выключенный процесс: ни правила, ни приписки ----------------------
-    # Инструментов здесь нет ни на одном обороте, а промпт всё равно не
-    # меняется ни на слово: приписка живёт при правиле, а правила тут нет.
+    # --- выключенный процесс: ни правила, ни короткого --------------------
+    # Инструментов здесь нет ни на одном обороте, а промпт всё равно
+    # не меняется ни на слово: короткое правило живёт при правиле этапа,
+    # а этапа тут нет.
     _stub.reset()
     _stub.install(reply="обычный ответ")
     plain = _bare("обычный чат", system="СИС")
@@ -4457,15 +4516,30 @@ def check_final_turn_rule_said():
 
     assert len(_stub.CALLS) == 1, len(_stub.CALLS)
     assert all(
-        tail not in message["content"] for message in _stub.CALLS[0]["messages"]
+        taskplan.FINAL_COMMON not in message["content"] for message in _stub.CALLS[0]["messages"]
     ), _stub.CALLS[0]["messages"]
 
+    # --- хвост результата зовёт ответить, а не ждать -----------------------
+    # Последнее, что модель читает перед бессильным оборотом, — результат
+    # её же вызова. «Жди кнопки» здесь было третьим указанием молчать.
+    _stub.reset()
+    told = _bare("хвост результата", workflow="plan")
+    ok, written = told.run_tool("update_plan", json.dumps({"steps": PLAN_STEPS},
+                                                          ensure_ascii=False))
+    assert ok, written
+    assert told.plan_view()["stage"] == "approval", told.plan_view()
+    assert "Утвердить план" in written, written
+    assert "жди" not in written, written
+
+    saved = len(full["planning"]) - len(final["planning"])
     return (
-        f"оборот с инструментами идёт без приписки, следующий, без них, — "
-        f"с ней, и правило совпало с собранным в app/plan.py; системное "
-        f"сообщение осталось одно, слоты сошлись на обоих оборотах; на пределе "
-        f"приписка уехала только последним из {limit} оборотов; выключенному "
-        f"процессу ни правила, ни приписки"
+        f"шесть этапов — шесть разных правил последнего оборота, каждое короче "
+        f"полного и без имён инструментов; на утверждении оно зовёт перечислить "
+        f"шаги и нажать «Утвердить план»; оборот с инструментами ушёл с полным "
+        f"правилом, следующий, без них, — с коротким и на {saved} знаков короче, "
+        f"системное сообщение одно и слоты сошлись; на пределе короткое уехало "
+        f"только последним из {limit} оборотов; выключенному процессу ни того "
+        f"ни другого; хвост update_plan зовёт ответить человеку"
     )
 
 
