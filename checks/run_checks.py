@@ -3410,11 +3410,16 @@ def _call(name: str, args: dict, call_id: str) -> dict:
     return {"id": call_id, "name": name, "arguments": json.dumps(args, ensure_ascii=False)}
 
 
+def _turn_no(messages) -> int:
+    """Номер оборота внутри обмена, с нуля, — по числу ответов ролью `tool`
+    в ленте, а не по номеру вызова к заглушке: тот сквозной на весь процесс,
+    и один лишний обмен в начале увёл бы сценарий на чужой оборот молча."""
+    return sum(1 for m in messages if m.get("role") == "tool")
+
+
 def _first_turn(messages) -> bool:
-    """Первый ли это оборот обмена — по наличию ответа ролью `tool` в ленте,
-    а не по номеру вызова к заглушке: номер сквозной на весь процесс, и один
-    лишний обмен в начале увёл бы сценарий на чужой оборот молча."""
-    return not any(m.get("role") == "tool" for m in messages)
+    """Первый ли это оборот обмена."""
+    return _turn_no(messages) == 0
 
 
 def _calls_on_first(*calls):
@@ -3973,8 +3978,9 @@ FIVE_STEPS = [{"title": f"шаг {i}", "status": "pending"} for i in range(1, 6)
 
 
 def _marched(done: int) -> list[dict]:
-    """Первые `done` шагов сделаны, следующий — в работе: так план выглядит
-    после отметки, которую модель шлёт одним `update_plan`."""
+    """Первые `done` шагов сделаны, следующий — **взят в работу**: так план
+    выглядит после первого вызова обмена. Продвижением это не считается —
+    обмен идёт дальше, и отметить сделанное ещё есть чем."""
     return [
         {
             "title": step["title"],
@@ -3984,49 +3990,157 @@ def _marched(done: int) -> list[dict]:
     ]
 
 
-@check("один шаг — один обмен: отметка гасит вызовы, у каждого шага свой промпт")
-def check_step_per_exchange():
-    """**Резали по смене этапа, а работа — это один этап**: пять шагов
-    проходили одним обменом. Правило внутри него менялось на каждом обороте
-    («шаг 1 из 5», «шаг 2 из 5»…), и человек не видел ни одного: кнопка
-    показывает промпт, с которого обмен начался.
+def _closed(done: int) -> list[dict]:
+    """Первые `done` шагов сделаны, остальные ждут: так план выглядит после
+    второго вызова обмена — того, которым обмен и кончается. Следующий шаг
+    здесь **не** взят в работу: его возьмёт первый оборот следующего."""
+    return [
+        {"title": step["title"], "status": "done" if i < done else "pending"}
+        for i, step in enumerate(FIVE_STEPS)
+    ]
 
-    Режем по движению плана (`plan.moved`): отметка шага, возврат в
-    `pending`, новый список, флажок. Разделы: отметка внутри `execution`
-    гасит инструменты при **том же** этапе, и `done` называет движение
-    полем; пять шагов — пять обменов, у каждого свой промпт и в нём своё
-    «шаг k из 5»; ответ словами план не двигает.
-    """
-    # --- отметка шага гасит инструменты, а этап тот же ----------------------
-    # Заглушка просит вызов на **каждом** обороте: режь код по смене этапа,
-    # и обмен крутился бы до `MAX_TURNS`, потому что работа — один этап.
+
+PAIR = [{"title": "собрать требования", "status": "pending"},
+        {"title": "схема базы", "status": "pending"}]
+"""Две ступеньки: на плане из одного шага «шаг сделан» неотличимо от «все
+шаги сделаны», и сцена про отметку мерила бы заодно смену этапа."""
+
+
+def _steps_like(*statuses, titles=None) -> list[dict]:
+    """Список шагов по статусам; заголовки — из `PAIR`, если не названы."""
+    names = titles or [step["title"] for step in PAIR]
+    return [{"title": name, "status": status} for name, status in zip(names, statuses)]
+
+
+def _plan(steps, approved=True) -> dict:
+    """План-сцена: шаги и три флажка."""
+    return {"steps": [dict(s) for s in steps], "approved": approved,
+            "finished": False, "paused": False}
+
+
+def _one_call_exchange(entry: dict, call: dict):
+    """Обмен, в котором модель зовёт инструмент на первом обороте и говорит
+    словами на следующем. Отдаёт чат и записанные обращения к заглушке —
+    утверждения о них стоят в проверке."""
     _stub.reset()
-    _stub.install(
-        reply=_word_on_second,
-        tool_calls=lambda messages, index: [
-            _call("update_plan", {"steps": _marched(1)}, f"call_{index}")
-        ],
-    )
-    stepper = _bare("отметка шага", workflow="plan")
-    stepper.plan = _approved(FIVE_STEPS)
-    events = asyncio.run(drain(stepper.ask("работай")))
+    _stub.install(reply=_word_on_second, tool_calls=_calls_on_first(call))
+    agent = _bare("сцена продвижения", workflow="plan")
+    agent.plan = entry
+    asyncio.run(drain(agent.ask("работай")))
+    return agent, list(_stub.CALLS)
 
-    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
-    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
-    done = events[-1]
-    # Этап **не сменился** — и в этом вся суть: по паре этапов клиент
-    # не отличил бы отметку шага от обычного ответа словами.
-    assert (done["stage_from"], done["stage_to"]) == ("execution", "execution"), done
-    assert done["plan_moved"] is True, done
-    assert done["committed"] is True and done["error"] is None, done
-    assert [s["status"] for s in stepper.plan["steps"]][:2] == ["done", "in_progress"], (
-        stepper.plan
-    )
 
-    # --- пять шагов — пять обменов, и в каждом своё «шаг k из 5» ------------
+# Таблица продвижений: что кончает обмен, а что нет. Имя, план на входе,
+# вызов первого оборота, кончился ли обмен, и во что план пришёл. Обратная
+# половина (две строки с `False`) так же обязательна: посчитай мы взятие
+# шага в работу продвижением — инструменты гасли бы ровно там, где отметить
+# сделанное ещё нечем, ради чего всё и затеяно.
+ADVANCES = [
+    (
+        "взял шаг в работу",
+        _plan(PAIR),
+        _call("update_plan", {"steps": _steps_like("in_progress", "pending")}, "take"),
+        False,
+        [("собрать требования", "in_progress"), ("схема базы", "pending")],
+    ),
+    (
+        "переименовал заголовок",
+        _plan(PAIR),
+        _call("update_plan",
+              {"steps": _steps_like("pending", "pending",
+                                    titles=["собрать ТЗ", "схема базы"])},
+              "rename"),
+        False,
+        [("собрать ТЗ", "pending"), ("схема базы", "pending")],
+    ),
+    (
+        "отметил шаг сделанным",
+        _plan(PAIR),
+        _call("update_plan", {"steps": _steps_like("done", "pending")}, "done"),
+        True,
+        [("собрать требования", "done"), ("схема базы", "pending")],
+    ),
+    (
+        "вернул шаг из done в pending",
+        _plan(_steps_like("done", "pending")),
+        _call("update_plan", {"steps": _steps_like("pending", "pending")}, "back"),
+        True,
+        [("собрать требования", "pending"), ("схема базы", "pending")],
+    ),
+    (
+        "поднял флажок: finish_task",
+        _plan(_steps_like("done", "done")),
+        _call("finish_task", {"problems": []}, "finish"),
+        True,
+        [("собрать требования", "done"), ("схема базы", "done")],
+    ),
+    (
+        "прислал шаг сверх прежних",
+        _plan(PAIR),
+        _call("update_plan",
+              {"steps": _steps_like("pending", "pending", "pending",
+                                    titles=["собрать требования", "схема базы", "ручки"])},
+              "grow"),
+        True,
+        [("собрать требования", "pending"), ("схема базы", "pending"),
+         ("ручки", "pending")],
+    ),
+    (
+        # Список короче — но у **неутверждённого** плана: у утверждённого
+        # `update_plan` снял бы заодно `approved`, и утверждение стояло бы
+        # на флажке, а не на составе списка.
+        "убрал шаг из неутверждённого списка",
+        _plan(PAIR + [{"title": "ручки", "status": "pending"}], approved=False),
+        _call("update_plan", {"steps": _steps_like("pending", "pending")}, "shrink"),
+        True,
+        [("собрать требования", "pending"), ("схема базы", "pending")],
+    ),
+]
+
+
+@check("обмен кончает сделанный шаг, а не начатый: у каждого свой промпт")
+def check_step_per_exchange():
+    """**Резали по любому движению плана, а взятие шага в работу — не оно.**
+    На живом прогоне модель первым вызовом ставила шагу `in_progress`,
+    инструменты гасли — и отметить сделанное было нечем: она дорисовывала
+    «Обновляю план: … ← done» словами, в нашем же формате, и следующие
+    обмены повторяли этот пример из истории.
+
+    Кончает обмен только продвижение (`plan.advanced`): шаг стал `done`
+    или вышел из него, список изменился составом, сменился флажок. Разделы:
+    таблица продвижений; пять шагов — пять обменов по три оборота, у каждого
+    свой промпт и своё «шаг k из 5»; правило `execution` запрещает рисовать
+    план словами; ответ словами план не двигает.
+    """
+    # --- что кончает обмен, а что нет ---------------------------------------
+    # Мерило одно на все строки: объявлены ли инструменты на **следующем**
+    # обороте. Вызов у заглушки один, на первом обороте, поэтому обменов
+    # ровно два оборота в любой строке — и разошлись строки только тем,
+    # что в теле второго.
+    for name, entry, call, ends, after in ADVANCES:
+        agent, calls = _one_call_exchange(entry, call)
+        assert len(calls) == 2, (name, len(calls))
+        assert "tools" in calls[0]["payload"], (name, calls[0]["payload"].keys())
+        assert ("tools" in calls[1]["payload"]) is not ends, (
+            name, ends, sorted(calls[1]["payload"])
+        )
+        # Вызов правда исполнился, и план пришёл туда, куда сказано: строка,
+        # у которой план не тронулся, мерила бы не продвижение, а отказ.
+        assert [(s["title"], s["status"]) for s in agent.plan["steps"]] == after, (
+            name, agent.plan["steps"]
+        )
+    # Флажок двинулся один, шаги у него не тронуты вовсе — иначе «флажок
+    # кончает обмен» держалось бы на статусах.
+    assert [name for name, _, _, ends, _ in ADVANCES if ends] == [
+        "отметил шаг сделанным", "вернул шаг из done в pending",
+        "поднял флажок: finish_task", "прислал шаг сверх прежних",
+        "убрал шаг из неутверждённого списка",
+    ], [name for name, _, _, ends, _ in ADVANCES if ends]
+
+    # --- пять шагов — пять обменов по три оборота ---------------------------
     # Обмены шлёт сама проверка: на экране их шлёт цепочка клиента, а здесь
-    # считается то, что видит модель, — промпт каждого обмена.
+    # считается то, что видит модель, — промпт каждого обмена. Оборота три:
+    # взял шаг, закрыл шаг, сказал словами. Средний и есть то, чего не было.
     march = _bare("пять шагов", workflow="plan")
     march.plan = _approved(FIVE_STEPS)
     rules: list[str] = []
@@ -4035,15 +4149,24 @@ def check_step_per_exchange():
     for step in range(len(FIVE_STEPS)):
         _stub.reset()
         _stub.install(
-            reply=_word_on_second,
-            tool_calls=lambda messages, index, _steps=_marched(step + 1): [
-                _call("update_plan", {"steps": _steps}, f"call_{index}")
-            ],
+            reply=lambda messages, index: (
+                "" if _turn_no(messages) < 2 else "шаг сделан, иду дальше"
+            ),
+            tool_calls=lambda messages, index, k=step: (
+                [_call("update_plan", {"steps": _marched(k)}, f"take_{k}")]
+                if _turn_no(messages) == 0
+                else [_call("update_plan", {"steps": _closed(k + 1)}, f"done_{k}")]
+                if _turn_no(messages) == 1
+                else None
+            ),
         )
         events = asyncio.run(drain(march.ask("работай")))
-        # Два оборота на обмен: вызов и слово. Больше значило бы, что отметка
-        # инструменты не погасила.
-        assert len(_stub.CALLS) == 2, (step, len(_stub.CALLS))
+        # Три оборота: взятие шага инструменты не гасит, отметка гасит.
+        # Два значило бы, что обмен кончился на «берусь», четыре — что
+        # отметка не кончила его вовсе.
+        assert len(_stub.CALLS) == 3, (step, len(_stub.CALLS))
+        assert "tools" in _stub.CALLS[1]["payload"], (step, _stub.CALLS[1]["payload"])
+        assert "tools" not in _stub.CALLS[2]["payload"], (step, _stub.CALLS[2]["payload"])
         rules.append(_stub.CALLS[0]["messages"][0]["content"])
         started = next(e for e in events if e["type"] == "start")
         prompts.append(json.dumps(started["resolved_messages"], ensure_ascii=False))
@@ -4061,29 +4184,13 @@ def check_step_per_exchange():
     assert endings[4] == ("execution", "validation", True), endings
     assert march.plan_view()["stage"] == "validation", march.plan_view()
 
-    # --- флажок — тоже движение, хотя список шагов не тронут ----------------
-    # `finish_task` меняет один `finished`, и сравнивай `moved` одни шаги —
-    # инструменты остались бы объявленными до самого предела.
-    _stub.reset()
-    _stub.install(
-        reply=_word_on_second,
-        tool_calls=lambda messages, index: [
-            _call("finish_task", {"problems": []}, f"call_{index}")
-        ],
-    )
-    closing = _bare("флажок", workflow="plan")
-    closing.plan = _approved(_marched(len(FIVE_STEPS)))
-    events = asyncio.run(drain(closing.ask("закрывай")))
-
-    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
-    assert events[-1]["plan_moved"] is True, events[-1]
-    assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
-        "validation", "done",
-    ), events[-1]
-    # Шаги не тронуты ни одним статусом: двинулся ровно флажок.
-    assert [s["status"] for s in closing.plan["steps"]] == ["done"] * 5, closing.plan
-    assert closing.plan["finished"] is True, closing.plan
+    # --- правило этапа запрещает рисовать план словами ----------------------
+    # Утверждение стоит на том самом тексте, который уехал модели пять раз:
+    # вранья «отметил шаг» промпт обязан запрещать словами, раз кодом его
+    # не запретить. Отметка идёт только вызовом, и правило это называет.
+    for index, rule in enumerate(rules):
+        assert "только вызовом update_plan" in rule, (index, rule)
+        assert "не изменить ничего" in rule, (index, rule)
 
     # --- ответ словами план не двигает --------------------------------------
     # Утверждение об отсутствии — там, где присутствие достижимо: тот же чат,
@@ -4091,17 +4198,20 @@ def check_step_per_exchange():
     _stub.reset()
     _stub.install(reply="просто отвечаю")
     events = asyncio.run(drain(march.ask("а расскажи")))
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
     assert events[-1]["plan_moved"] is False, events[-1]
     assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
         "validation", "validation",
     ), events[-1]
 
     return (
-        "отметка шага погасила tools при том же этапе execution, обмен "
-        "записан и plan_moved назван; пять шагов дали пять обменов по два "
-        "оборота, пять разных промптов и правила «шаг 1 из 5» … «шаг 5 "
-        "из 5», последний обмен ушёл в validation; finish_task двинул один "
-        "флажок и тоже погасил tools; ответ словами план не двинул"
+        "семь строк таблицы продвижений: взятие шага в работу и "
+        "переименование обмен не кончили — инструменты на следующем обороте "
+        "остались; done, возврат из done, флажок и оба изменения состава "
+        "кончили; пять шагов дали пять обменов по три оборота, пять разных "
+        "промптов и правила «шаг 1 из 5» … «шаг 5 из 5», последний ушёл "
+        "в validation; правило execution запрещает отмечать шаги словами; "
+        "ответ словами план не двинул"
     )
 
 
