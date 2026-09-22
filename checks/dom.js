@@ -412,6 +412,9 @@ function buildDocument(html) {
     if (classMatch) el.className = classMatch[1];
     const dataTab = /\bdata-tab="([^"]+)"/.exec(attrs);
     if (dataTab) el.dataset.tab = dataTab[1];
+    // Подсказка поля — часть разметки: в ней названа команда `/task`.
+    const placeholder = /\bplaceholder="([^"]+)"/.exec(attrs);
+    if (placeholder) el.placeholder = placeholder[1];
     // value у <option> — от него зависит значение всего <select>.
     const valueMatch = /\bvalue="([^"]*)"/.exec(attrs);
     if (valueMatch) el.value = valueMatch[1];
