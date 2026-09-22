@@ -33,10 +33,11 @@ from .schema import (
     MEMORY_KINDS,
     MOVES,
     PROFILE_FIELDS,
+    STAGE_LABELS,
+    STAGES,
     STRATEGIES,
     TASK_FIELDS,
     TRANSITIONS,
-    WORKFLOW_MODES,
     WORKING_KINDS,
     AgentSpec,
 )
@@ -266,9 +267,6 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     """
     values: dict = {
         "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
-        # Режим задачи — поле конфига, но в панели его нет: включает режим
-        # только команда `/task`, своей ручкой.
-        "workflow": _choice_field(payload, "workflow", WORKFLOW_MODES, "off", where),
     }
     for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
@@ -875,12 +873,6 @@ async def delete_working(agent_id: str, seq: int) -> dict:
 # не знает, их разбирает клиент.
 
 
-@app.get("/api/agents/{agent_id}/task")
-async def get_task(agent_id: str) -> dict:
-    """Состояние задачи или `null` — режим выключен."""
-    return {"task": _agent(agent_id).task_items() or None}
-
-
 @app.post("/api/agents/{agent_id}/task")
 async def start_task(agent_id: str, payload: dict = Body(...)) -> dict:
     """Включает режим: `{"description": "..."}`, этап — планирование."""
@@ -895,11 +887,12 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     `{"expects": "..."}`. Названное меняется, неназванное не трогается.
 
     Переход не из таблицы — 409, и состояние остаётся прежним: отказать
-    честнее, чем сделать соседний ход за человека.
+    честнее, чем сделать соседний ход за человека. Необязательный `from`
+    называет этап, из которого ход выбирали: он только сверяет, не двигая.
     """
     agent = _agent(agent_id)
-    _record_body(payload, ("move", *TASK_FIELDS))
-    if not payload:
+    _record_body(payload, ("move", "from", *TASK_FIELDS))
+    if not any(name in payload for name in ("move", *TASK_FIELDS)):
         raise HTTPException(
             status_code=400,
             detail=f"тело правки пустое: назовите move, {', '.join(TASK_FIELDS)} или часть",
@@ -908,6 +901,15 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     if not task:
         raise HTTPException(
             status_code=409, detail="режим задачи в этом чате не включён: начните с /task"
+        )
+    # Ход обязан выйти из той вершины, которую человек видел: не назвали — едет
+    # умолчание, нынешний этап. Иначе две вкладки делают два хода, и обе с 200.
+    seen = _choice_field(payload, "from", STAGES, task["stage"])
+    if seen != task["stage"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"ход выбирали с этапа «{STAGE_LABELS[seen]}», "
+                    f"а чат уже на этапе «{task['label']}»"),
         )
     # Всё тело разбирается до первой правки: иначе кривой `step` рядом
     # с законным `move` оставил бы состояние наполовину сдвинутым.

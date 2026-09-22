@@ -38,11 +38,12 @@ from app.schema import (  # noqa: E402
     RESUME,
     STAGE_EXPECTS,
     STAGE_LABELS,
+    STAGE_RULES,
     STAGES,
     TRANSITIONS,
     AgentSpec,
 )
-from app.store import Store  # noqa: E402
+from app.store import Store, StoreBusyError  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -2451,6 +2452,13 @@ def _task_url(agent_id: str) -> str:
     return f"/api/agents/{agent_id}/task"
 
 
+def _task_of(client, agent_id: str) -> dict | None:
+    """Состояние задачи так, как его видит клиент: полем `task` самого чата.
+    Отдельной ручки чтения нет — второе место «состояние наружу» обязано было
+    бы совпадать с первым, и совпадало бы только пока за ним следят."""
+    return client.get(f"/api/agents/{agent_id}").json()["task"]
+
+
 def _at_stage(client, stage: str, label: str = "задача"):
     """Чат, доведённый до нужного этапа **командами** — других путей нет.
 
@@ -2492,7 +2500,7 @@ def check_task_machine():
         for stage in STAGES:
             for move in MOVES:
                 agent_id = _at_stage(client, stage, "обход")
-                before = client.get(_task_url(agent_id)).json()["task"]
+                before = _task_of(client, agent_id)
                 assert before["stage"] == stage, (stage, before)
                 answer = client.patch(_task_url(agent_id), json={"move": move})
                 target = TRANSITIONS.get((stage, move))
@@ -2500,7 +2508,7 @@ def check_task_machine():
                     # Незаконный ход: отказ, и состояние цело. Сделать
                     # соседний ход за человека было бы хуже отказа.
                     assert answer.status_code == 409, (stage, move, answer.text)
-                    assert client.get(_task_url(agent_id)).json()["task"] == before, (
+                    assert _task_of(client, agent_id) == before, (
                         f"{stage} + {move}: отказали, а состояние сдвинулось"
                     )
                     refused.append((stage, move))
@@ -2530,7 +2538,7 @@ def check_task_machine():
         # Смена этапа заданное сбрасывает: оставленное, оно называло бы
         # действие прошлого этапа.
         agent_id = _at_stage(client, "execution", "ожидание")
-        default = client.get(_task_url(agent_id)).json()["task"]["expects"]
+        default = _task_of(client, agent_id)["expects"]
         assert default == STAGE_EXPECTS["execution"], default
         mine = client.patch(_task_url(agent_id), json={"expects": "показать черновик"})
         assert mine.status_code == 200, mine.text
@@ -2553,16 +2561,60 @@ def check_task_machine():
         assert client.post(url, json={"description": "х", "stage": "done"}).status_code == 400
         # Кривой текст рядом с законным ходом состояние не двигает: тело
         # разбирается целиком до первой правки.
-        assert client.get(url).json()["task"]["stage"] == "validation", client.get(url).json()
+        assert _task_of(client, agent_id)["stage"] == "validation", _task_of(client, agent_id)
 
-        # --- 5. Режим выключается, и тогда двигать нечего ---------------------
+        # --- 5. Ход называет этап, из которого его выбирали ------------------
+        #
+        # Таблица стережёт, какие рёбра есть, но не то, из какой вершины
+        # человек на самом деле выходил, — а он видел на экране именно её.
+        # Две вкладки на одном чате иначе делают два хода подряд: этап
+        # перепрыгивается, и обе получают 200.
+        picked = _at_stage(client, "planning", "сверка")
+        ahead = client.patch(_task_url(picked), json={"move": "next", "from": "planning"})
+        assert ahead.status_code == 200, ahead.text
+        assert ahead.json()["task"]["stage"] == "execution", ahead.json()
+        # Вторая вкладка всё ещё думает, что чат на планировании.
+        stale = client.patch(_task_url(picked), json={"move": "next", "from": "planning"})
+        assert stale.status_code == 409, stale.text
+        assert "планирование" in stale.json()["detail"], stale.text
+        assert "выполнение" in stale.json()["detail"], stale.text
+        assert _task_of(client, picked)["stage"] == "execution", "отказали, а этап сдвинулся"
+        # Не названный `from` по-прежнему проходит: он необязателен.
+        assert client.patch(_task_url(picked), json={"move": "next"}).status_code == 200
+        assert _task_of(client, picked)["stage"] == "validation", _task_of(client, picked)
+        # Незнакомый этап отсекается на границе, а не совпадением: подпись
+        # вместо ключа — 400, и ход не состоялся.
+        assert client.patch(
+            _task_url(picked), json={"move": "next", "from": "проверка"}
+        ).status_code == 400
+        # Один `from` не просит ничего: он сверяет, а не двигает.
+        assert client.patch(_task_url(picked), json={"from": "validation"}).status_code == 400
+        assert _task_of(client, picked)["stage"] == "validation", _task_of(client, picked)
+
+        # --- 6. Режим выключается, и тогда двигать нечего ---------------------
         assert client.delete(url).json() == {"task": None}, "режим не выключился"
-        assert client.get(url).json() == {"task": None}, client.get(url).json()
-        assert client.get(f"/api/agents/{agent_id}").json()["workflow"] == "off"
+        assert _task_of(client, agent_id) is None, _task_of(client, agent_id)
         assert client.patch(url, json={"move": "next"}).status_code == 409, "двинули выключенный"
         assert client.patch(url, json={"step": "х"}).status_code == 409, "вписали в выключенный"
 
-        # --- 6. К модели за состоянием не ходят ни разу -----------------------
+        # --- 7. Состояние наружу едет одним местом — полем чата ---------------
+        #
+        # Отдельной ручки чтения нет: второе место «состояние наружу» обязано
+        # было бы совпадать с первым. И поля конфига о режиме нет — «идёт ли
+        # задача» говорит сама строка состояния, а второе поле давало бы вход
+        # и выход мимо команд.
+        chat = client.get(f"/api/agents/{picked}").json()
+        assert "task" in chat and "workflow" not in chat, sorted(chat)
+        assert client.get(_task_url(picked)).status_code == 405, "ручка чтения вернулась"
+        # Включить режим ручке конфига нечем...
+        bare = new_agent(client, label="мимо команды")
+        assert client.patch(f"/api/agents/{bare}", json={"workflow": "plan"}).status_code == 400
+        assert _task_of(client, bare) is None, "режим включили мимо команды"
+        # ...и спрятать живую задачу тоже: тогда она воскресла бы перезапуском.
+        assert client.patch(f"/api/agents/{picked}", json={"workflow": "off"}).status_code == 400
+        assert _task_of(client, picked)["stage"] == "validation", "конфиг спрятал задачу"
+
+        # --- 8. К модели за состоянием не ходят ни разу -----------------------
         #
         # Ни вызова, определяющего этап, ни разбора ответа: состояние двигает
         # человек, и чат от режима задачи не дорожает ни на токен.
@@ -2576,6 +2628,73 @@ def check_task_machine():
         "отказаны и состояние цело; «готово» терминально; пауза берётся с трёх "
         "этапов и возвращает туда же; умолчание этапа перебивается заданным, "
         "а смена этапа возвращает к умолчанию"
+    )
+
+
+@check("отказ базы не двигает этап и не прячет задачу")
+def check_task_write_is_atomic():
+    """Состояние задачи меняется в памяти **после** базы, а не до.
+
+    Отказ базы — путь штатный (503 на занятом файле), и человек по нему
+    получает отказ. Сдвинутый под отказом этап расходится с тем, что человек
+    видит: шапка прежняя, а следующий обмен уезжает с правилом нового этапа,
+    и перезапуск потом молча откатывает назад.
+
+    Выход из режима той же монетой: снятие обязано быть целым. Флаг,
+    прятавший недоудалённую строку, был не отказоустойчивостью, а
+    расхождением с отложенным сроком.
+    """
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    path = _temp_db("task-atomic")
+    store = Store(path).init()
+
+    def boom(*args, **kwargs):
+        raise StoreBusyError("база занята другим процессом, повторите")
+
+    try:
+        chat = agent_module.Agent(AgentSpec(label="с задачей", model="stub/model"), store=store)
+        chat.start_task("собрать ТЗ")
+        chat.write_task({"step": "пишу проверку"})
+        before = chat.task_items()
+        assert before["stage"] == "planning" and before["step"] == "пишу проверку", before
+
+        # --- 1. Ход: отказ оставляет этап прежним и в памяти, и в базе -------
+        refused = False
+        with patch.object(store, "save_task", boom):
+            try:
+                chat.move_task("next")
+            except StoreBusyError:
+                refused = True
+        assert refused, "база отказала, а ход прошёл"
+        assert chat.task_items() == before, (before, chat.task_items())
+        assert store.load_task(chat.id)["stage"] == "planning", store.load_task(chat.id)
+        # И промпт следующего обмена — с правилом прежнего этапа: сдвинутый
+        # в памяти этап виден только здесь, шапка о нём не знает.
+        head = chat.build_prompt("ещё")[0]["content"]
+        assert STAGE_RULES["planning"] in head, head
+        assert STAGE_RULES["execution"] not in head, head
+
+        # --- 2. Выход из режима: снято целиком или не тронуто ----------------
+        refused = False
+        with patch.object(store, "clear_task", boom):
+            try:
+                chat.stop_task()
+            except StoreBusyError:
+                refused = True
+        assert refused, "база отказала, а режим выключился"
+        assert chat.task_items() == before, "задачу спрятали, а строка в базе цела"
+        assert store.load_task(chat.id) is not None, "строку сняли, а человеку отдали отказ"
+        assert STAGE_RULES["planning"] in chat.build_prompt("ещё")[0]["content"]
+
+        # --- 3. Без отказа снимается целиком: и в памяти, и в базе -----------
+        chat.stop_task()
+        assert chat.task_items() == {}, chat.task_items()
+        assert store.load_task(chat.id) is None, store.load_task(chat.id)
+    finally:
+        store.close()
+    return (
+        "отказ базы на ходе оставил этап прежним в памяти, в базе и в промпте; "
+        "отказ на выходе не спрятал живую задачу; без отказа она снялась целиком"
     )
 
 
@@ -2675,13 +2794,12 @@ def check_task_in_prompt():
         assert not any("[задача]" in m["content"] for m in compress), compress
 
         # --- 5. Ветка уносит состояние и живёт своей копией -------------------
-        parent = client.get(_task_url(full)).json()["task"]
+        parent = _task_of(client, full)
         branch = client.post(f"/api/agents/{full}/fork", json={"at": 2}).json()["agents"][0]
         assert branch["task"] == parent, (parent, branch["task"])
-        assert branch["workflow"] == "plan", branch["workflow"]
         client.patch(_task_url(branch["id"]), json={"move": "next"})
-        assert client.get(_task_url(branch["id"])).json()["task"]["stage"] == "execution"
-        assert client.get(_task_url(full)).json()["task"] == parent, "ход в ветке двинул родителя"
+        assert _task_of(client, branch["id"])["stage"] == "execution"
+        assert _task_of(client, full) == parent, "ход в ветке двинул родителя"
 
     # --- 6. Перезапуск: продолжение без повторных объяснений ----------------
     _stub.reset()
@@ -2699,7 +2817,6 @@ def check_task_in_prompt():
 
     with _restarted(store, chat_id) as (again, revived):
         assert revived.task_items() == before, (before, revived.task_items())
-        assert revived.spec.workflow == "plan", revived.spec.workflow
         prompt = revived.build_prompt("ещё")
         assert prompt[0]["role"] == "system" and "выполнение" in prompt[0]["content"], prompt[0]
         assert prompt[1]["content"].startswith("[задача]"), prompt[1]

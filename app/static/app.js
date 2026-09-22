@@ -12,6 +12,7 @@ const state = {
   current: null,       // открытый агент (полный ответ GET /api/agents/{id})
   models: [],          // каталог моделей для дропдауна
   busy: false,
+  commanding: false,   // команда режима задачи в полёте — второй Enter не проводит ход дважды
   abort: null,         // AbortController активного потока
   lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
   applying: null,      // незавершённое применение настроек панели
@@ -959,29 +960,30 @@ const MOVE_ASKS = {
 };
 
 // Переход: ручка двигает этап, а текст обмена берётся по этапу **до** неё.
+// Этот же этап едет полем `from` — ход обязан выйти из виденной вершины.
 const moveCommand = (move) => ({
   asks: (arg, stage) => MOVE_ASKS[stage + ":" + move],
-  run: () => taskApi(json("PATCH", { move })),
+  run: (arg, id, stage) => taskApi(id, json("PATCH", { move, from: stage })),
 });
 
 const COMMANDS = {
   "/task": {
     need: "описание задачи",
     asks: (arg) => arg,
-    run: (arg) => taskApi(json("POST", { description: arg })),
+    run: (arg, id) => taskApi(id, json("POST", { description: arg })),
   },
   "/task-next": moveCommand("next"),
   "/task-step": {
     need: "текст шага",
-    run: (arg) => taskApi(json("PATCH", { step: arg })),
+    run: (arg, id) => taskApi(id, json("PATCH", { step: arg })),
   },
   "/task-expect": {
     need: "ожидаемое действие",
-    run: (arg) => taskApi(json("PATCH", { expects: arg })),
+    run: (arg, id) => taskApi(id, json("PATCH", { expects: arg })),
   },
   "/task-pause": moveCommand("pause"),
   "/task-resume": moveCommand("resume"),
-  "/task-off": { run: () => taskApi({ method: "DELETE" }) },
+  "/task-off": { run: (arg, id) => taskApi(id, { method: "DELETE" }) },
 };
 
 // Команда или null — обычное сообщение. После имени обязателен пробел или
@@ -993,9 +995,10 @@ function parseCommand(text) {
   return cmd ? { name: m[1], cmd, arg: (m[2] || "").trim() } : null;
 }
 
-async function taskApi(options) {
-  const answer = await api("/api/agents/" + state.current.id + "/task", options);
-  state.current.task = answer.task;
+// Ручка задачи — в **названный** чат: id снят до запроса и сверен после.
+async function taskApi(id, options) {
+  const answer = await api("/api/agents/" + id + "/task", options);
+  if (state.current && state.current.id === id) state.current.task = answer.task;
   renderTaskHead();
   return answer;
 }
@@ -1005,29 +1008,34 @@ async function runCommand(parsed) {
     hint("После " + parsed.name + " нужен текст: " + parsed.cmd.need + ".", true);
     return;
   }
-  // Этап до ручки: по нему выбран текст обмена, а ручка его уже сменит.
+  // Замок на время команды: двойным Enter иначе уходят два хода и два обмена.
+  if (state.commanding) return;
+  state.commanding = true;
+  // Чат и этап — до ручки: чат успевают переключить, а этап ручка уже сменит.
+  const id = state.current.id;
   const from = (state.current.task || {}).stage;
   try {
-    await parsed.cmd.run(parsed.arg);
-  } catch (err) {
-    // Команда не к месту: состояние на сервере не тронуто, в модель не ушло
-    // ничего, а что можно сделать отсюда — сказано в отказе. Набранное
-    // остаётся в поле: его видно и можно поправить.
-    hint(String(err.message || err), true);
-    return;
-  }
-  const task = state.current.task;
-  hint(task ? "Задача · " + task.label + " · ожидается: " + task.expects
-            : "Режим задачи выключен.");
-  const input = $("#input");
-  input.value = "";
-  autoGrow(input);
-  // Ручка уже прошла — промпт соберётся с правилом **нового** этапа.
-  // Молчащий переход человек принимал за «ничего не произошло».
-  const ask = parsed.cmd.asks && parsed.cmd.asks(parsed.arg, from);
-  if (ask && state.hasKey) {
-    await exchange("/api/agents/" + state.current.id + "/messages",
-      { text: ask }, ask);
+    // Отказ ручки: на сервере ничего не тронуто, в модель не ушло, что не так
+    // — сказано под полем, набранное осталось в нём.
+    const answer = await parsed.cmd.run(parsed.arg, id, from).catch((err) => {
+      hint(String(err.message || err), true);
+      return null;
+    });
+    // Чат сменили, пока летел ответ: ход записан в свой, обмена чужому не будет.
+    if (!answer || !state.current || state.current.id !== id) return;
+    hint(answer.task ? "Задача · " + answer.task.label + " · ожидается: " + answer.task.expects
+                     : "Режим задачи выключен.");
+    const input = $("#input");
+    input.value = "";
+    autoGrow(input);
+    // Ручка уже прошла — промпт соберётся с правилом **нового** этапа.
+    // Молчащий переход человек принимал за «ничего не произошло».
+    const ask = parsed.cmd.asks && parsed.cmd.asks(parsed.arg, from);
+    if (ask && state.hasKey) {
+      await exchange("/api/agents/" + id + "/messages", { text: ask }, ask);
+    }
+  } finally {
+    state.commanding = false;
   }
 }
 

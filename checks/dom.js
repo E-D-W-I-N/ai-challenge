@@ -535,9 +535,7 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  const CONTEXT = {
-    strategy: "full", keep_last: null, compress_every: null, workflow: "off",
-  };
+  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
 
   // Автомат задачи — своя копия, как и всё в стенде: он нарочно независим
   // от сервера. Внутри стенда копия одна — по ней ходят и ручки, и промпт.
@@ -575,7 +573,7 @@ function buildServer(options) {
   // действия подставляются здесь, одним местом на промпт и на ответ ручки.
   const taskView = (agent) => {
     const raw = state.tasks[agent.id];
-    if (agent.workflow !== "plan" || !raw || !STAGE_LABELS[raw.stage]) return null;
+    if (!raw || !STAGE_LABELS[raw.stage]) return null;
     return {
       stage: raw.stage,
       label: STAGE_LABELS[raw.stage],
@@ -682,7 +680,6 @@ function buildServer(options) {
         stage: "planning", step: "", expects: "", description: "задача",
         paused_from: "", ...seededTasks[seed.label],
       };
-      agent.workflow = "plan";
     }
     if (!("usage_total" in seed)) agent.usage_total = sumUsage(agent.transcript);
     // Число сообщений считает сервер — это длина истории, реплика к реплике.
@@ -929,6 +926,11 @@ function buildServer(options) {
     const method = ((init && init.method) || "GET").toUpperCase();
     const body = init && init.body ? JSON.parse(init.body) : null;
     state.requests.push({ method, path, body });
+    // Ручка, отвечающая не сразу: `options.slow` называет её путь. Ею видно,
+    // куда уехало то, что затеяли до переключения чата.
+    if (options && options.slow && path.includes(options.slow)) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
 
     if (path.startsWith("/api/models")) return json({ total: state.models.length, models: state.models });
 
@@ -1080,7 +1082,6 @@ function buildServer(options) {
     // Границы те же, что на сервере: тело только из известных полей, пустое
     // тело правки 400, ход не из таблицы 409 и состояние цело. Стенд, щедрее
     // серверного, оставил бы зелёной команду, получающую в браузере отказ.
-    if (tail === "/task" && method === "GET") return json({ task: taskView(agent) });
     if (tail === "/task" && method === "POST") {
       const keys = Object.keys(body || {});
       const unknown = keys.filter((k) => k !== "description");
@@ -1089,7 +1090,6 @@ function buildServer(options) {
       if (typeof text !== "string" || !text.trim()) {
         return fail(400, "description: непустая строка");
       }
-      agent.workflow = "plan";
       state.tasks[agent.id] = {
         stage: "planning", step: "", expects: "",
         description: clean(text), paused_from: "",
@@ -1098,12 +1098,24 @@ function buildServer(options) {
     }
     if (tail === "/task" && method === "PATCH") {
       const keys = Object.keys(body || {});
-      const unknown = keys.filter((k) => !["move", "step", "expects"].includes(k));
+      const unknown = keys.filter((k) => !["move", "from", "step", "expects"].includes(k));
       if (unknown.length) return fail(400, "лишние поля: " + unknown.join(", "));
-      if (!keys.length) return fail(400, "тело правки пустое: назовите move, step, expects");
+      // `from` только сверяет этап и сам ничего не двигает.
+      if (!keys.some((k) => ["move", "step", "expects"].includes(k))) {
+        return fail(400, "тело правки пустое: назовите move, step, expects");
+      }
       const raw = state.tasks[agent.id];
-      if (agent.workflow !== "plan" || !raw) {
+      if (!raw) {
         return fail(409, "режим задачи в этом чате не включён: начните с /task");
+      }
+      if (keys.includes("from")) {
+        if (typeof body.from !== "string" || !STAGE_LABELS[body.from]) {
+          return fail(400, "from: одно из " + Object.keys(STAGE_LABELS).join(", "));
+        }
+        if (body.from !== raw.stage) {
+          return fail(409, "ход выбирали с этапа «" + STAGE_LABELS[body.from]
+            + "», а чат уже на этапе «" + STAGE_LABELS[raw.stage] + "»");
+        }
       }
       // Тело разбирается до первой правки: кривой текст рядом с законным
       // ходом оставил бы состояние наполовину сдвинутым.
@@ -1139,7 +1151,6 @@ function buildServer(options) {
       return json({ task: taskView(agent) });
     }
     if (tail === "/task" && method === "DELETE") {
-      agent.workflow = "off";
       delete state.tasks[agent.id];
       return json({ task: null });
     }
