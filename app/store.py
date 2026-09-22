@@ -612,9 +612,11 @@ class Store:
             SELECT s.*, (
                 SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
             ) AS history_len,
-            b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at
+            b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at,
+            t.stage, t.step, t.expects, t.description, t.paused_from
             FROM sessions s
             LEFT JOIN branches b ON b.session_id = s.id
+            LEFT JOIN task_state t ON t.session_id = s.id
             ORDER BY s.updated_at DESC
         """
         with self.reading() as conn:
@@ -630,6 +632,12 @@ class Store:
             # список слева рисуется по нему целиком, и пометка ветки обязана
             # стоить столько же, сколько имя чата.
             data["branch"] = _branch_row(row["branch_parent_id"], row["branch_forked_at"])
+            # Состояние задачи — тем же запросом и по тому же доводу: список
+            # слева рисуется по нему целиком, и строка на чат превратила бы
+            # один поход в базу в сотню. Показанное из него собирает
+            # `agent.task_view` — здесь состояние в той же форме, в какой его
+            # отдаёт `load_task`.
+            data["task"] = None if row["stage"] is None else _task_row(row)
             out.append(data)
         return out
 
