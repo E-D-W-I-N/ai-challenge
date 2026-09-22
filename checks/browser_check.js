@@ -1992,8 +1992,9 @@ async function routeChecks() {
   // ── режим задачи: команды в поле ввода, шапка над лентой ──
   //
   // Команды разбираются на клиенте: сервер про слеши не знает. Главное здесь
-  // — что уходит: только `/task` шлёт обмен, остальные двигают состояние
-  // и молчат, а команда не к месту не шлёт вообще ничего.
+  // — что уходит: `/task` и переходы «дальше»/«продолжай» шлют обмен, пауза,
+  // шаг, ожидание и выход только двигают состояние, а команда не к месту
+  // не шлёт вообще ничего.
   {
     const { client, server, $, settle, Evt } = freshClient({
       chats: [{ label: "по этапам" }],
@@ -2006,6 +2007,11 @@ async function routeChecks() {
     const taskCalls = () =>
       server.state.requests.filter((r) => /\/task$/.test(r.path));
     const sentCount = () => server.state.sent.length;
+    const asked = () => server.state.sent.map((m) => m.text);
+    // След запросов: по нему видно порядок ручки и обмена.
+    const trail = () => server.state.requests
+      .filter((r) => /\/(task|messages)$/.test(r.path))
+      .map((r) => r.path.slice(r.path.lastIndexOf("/")));
     const headLines = () =>
       $("#task-head").children.map((n) => n.textContent);
     const hintText = () => $("#composer-hint").textContent;
@@ -2073,29 +2079,55 @@ async function routeChecks() {
       taskCalls().length === 3 && /ожидаем/.test(hintText()),
       JSON.stringify([taskCalls().length, hintText()]));
 
-    // ── /task-next: смена этапа возвращает к умолчанию ──
+    // ── /task-next: двигает этап и сразу спрашивает модель ──
+    //
+    // Молчащий переход человек принимал за «ничего не произошло»: этап
+    // сменился, а в ленте пусто. Порядок здесь и есть инвариант — ручка
+    // раньше обмена, иначе промпт соберётся с правилом прошлого этапа.
     await type("/task-next");
-    check("«/task-next» шлёт ручку и **не** шлёт обмен",
-      taskCalls().length === 4 && sentCount() === 2,
+    check("«/task-next» шлёт и ручку, и обмен",
+      taskCalls().length === 4 && sentCount() === 3,
       JSON.stringify([taskCalls().length, sentCount()]));
+    check("и ручку раньше обмена: этап сменился до сборки промпта",
+      trail().slice(-2).join(" → ") === "/task → /messages",
+      trail().join(" → "));
+    check("обменом уехал текст перехода, а не сама команда",
+      asked()[2] === "Приступай к работе.", asked()[2]);
     check("этап в шапке сменился",
       headLines()[0] === "Задача · выполнение", JSON.stringify(headLines()));
     check("а «ожидается» вернулось к умолчанию нового этапа",
       headLines().slice(-1)[0] === "ожидается: сделать текущий шаг, затем /task-next",
       JSON.stringify(headLines()));
 
-    // ── пауза выглядит иначе, чем работа ──
+    // Промпт этого обмена — с правилом нового этапа: ради этого ручка
+    // и стоит раньше.
+    {
+      const card = $("#feed").querySelectorAll(".card").slice(-1)[0];
+      cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+      await settle(20);
+      const first = card.querySelector(".prompt-view")
+        .querySelectorAll(".prompt-text").map((n) => n.textContent)[0];
+      check("промпт этого обмена несёт правило нового этапа, а не прошлого",
+        first.includes("Делай текущий шаг и только его.") &&
+          !first.includes("Разложи задачу на шаги"),
+        JSON.stringify(first));
+    }
+
+    // ── пауза выглядит иначе, чем работа, и модель не зовёт ──
     await type("/task-pause");
     check("пауза различима не только цветом: словом в шапке и своим классом",
       headLines()[0] === "Задача · пауза" &&
         $("#task-head").className.split(" ").includes("paused"),
       JSON.stringify([headLines()[0], $("#task-head").className]));
+    check("«/task-pause» обмена не шлёт: остановка модели ничего не поручает",
+      sentCount() === 3, String(sentCount()));
 
     // ── команда не к месту: не ушло ничего, сказано что не так ──
     const beforeBad = taskCalls().length;
     await type("/task-next");
-    check("«/task-next» на паузе обмена не шлёт",
-      sentCount() === 2, String(sentCount()));
+    check("отказ ручки: обмена нет вовсе",
+      sentCount() === 3 && trail().slice(-1)[0] === "/task",
+      JSON.stringify([sentCount(), trail().slice(-2)]));
     check("и под полем сказано, что не так и что можно",
       /так не ходят/.test(hintText()) && /resume/.test(hintText()), hintText());
     check("состояние при этом цело: шапка та же",
@@ -2105,10 +2137,22 @@ async function routeChecks() {
     check("ручку она всё же спросила: таблица переходов живёт на сервере",
       taskCalls().length === beforeBad + 1, String(taskCalls().length));
 
-    // ── снятие паузы возвращает туда же ──
+    // ── снятие паузы возвращает туда же и зовёт продолжать ──
     await type("/task-resume");
     check("«/task-resume» вернул на тот же этап, с которого вставали",
       headLines()[0] === "Задача · выполнение", JSON.stringify(headLines()));
+    check("и позвал модель продолжать",
+      sentCount() === 4 && asked()[3] === "Продолжай.",
+      JSON.stringify([sentCount(), asked()[3]]));
+
+    // ── остальные два перехода: у каждого свой текст ──
+    await type("/task-next");
+    await type("/task-next");
+    check("этапы дошли до последнего",
+      headLines()[0] === "Задача · готово", JSON.stringify(headLines()));
+    check("четыре перехода дали четыре разных текста",
+      asked().length === 6 && new Set(asked().slice(2)).size === 4,
+      JSON.stringify(asked().slice(2)));
 
     // ── /task-off: шапки нет вовсе ──
     await type("/task-off");
@@ -2116,13 +2160,44 @@ async function routeChecks() {
       $("#task-head").classList.contains("hidden") && headLines().length === 0,
       JSON.stringify(headLines()));
     check("и обмена не случилось ни одного лишнего",
-      sentCount() === 2, String(sentCount()));
+      sentCount() === 6, String(sentCount()));
 
     // ── после выключения слеш снова просто текст ──
     await type("обычное сообщение");
     check("обычное сообщение уходит обменом, как и раньше",
-      sentCount() === 3 && server.state.sent[2].text === "обычное сообщение",
-      JSON.stringify([sentCount(), server.state.sent[2].text]));
+      sentCount() === 7 && server.state.sent[6].text === "обычное сообщение",
+      JSON.stringify([sentCount(), server.state.sent[6].text]));
+  }
+
+  // ── отказ ручки: обмена нет вовсе ──
+  //
+  // Утверждение об отсутствии стоит там, где присутствие достижимо: у этого
+  // перехода текст обмена есть, и молчит он только потому, что после отказа
+  // ручки `runCommand` дальше не идёт. Пауза, которой некуда возвращаться,
+  // — такая же строка в базе, как всякая другая.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "пауза без возврата" }],
+      tasks: { "пауза без возврата": { stage: "paused" } },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    $("#input").value = "/task-resume";
+    $("#composer").requestSubmit();
+    await settle(60);
+    check("ручка отказала — обмена нет, хотя текст у этого перехода есть",
+      server.state.sent.length === 0 &&
+        server.state.requests.filter((r) => /\/messages$/.test(r.path)).length === 0,
+      JSON.stringify(server.state.sent));
+    check("и под полем сказано, что не так",
+      /так не ходят/.test($("#composer-hint").textContent),
+      $("#composer-hint").textContent);
+    check("состояние цело: этап прежний",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · пауза",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
   }
 
   // ── врезка задачи подписана в просмотре промпта ──

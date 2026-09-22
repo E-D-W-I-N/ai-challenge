@@ -944,16 +944,33 @@ function stopStream() {
 // одно значение, сообщение человека.
 //
 // `need` — обязательный текст: без него не уходит ничего, под полем подсказка.
-// `asks` стоит у одной команды: только `/task` отправляет обмен, остальные
-// меняют состояние и молчат — писать модели человек будет сам.
+// `asks` — что уедет обменом после **успешной** ручки; нет его — команда
+// двигает состояние и молчит.
+
+// Текст обмена — на **переход**, а не на этап: «дальше» с планирования значит
+// не то же, что с выполнения. Правило этапа модель и так получит системным
+// сообщением, и пересказывать его здесь нечего. Нет строки — нет и обмена:
+// у паузы её и не должно быть, а «дальше» и «продолжай» покрыты все.
+const MOVE_ASKS = {
+  "planning:next": "Приступай к работе.",
+  "execution:next": "Проверь сделанное.",
+  "validation:next": "Подведи итог.",
+  "paused:resume": "Продолжай.",
+};
+
+// Переход: ручка двигает этап, а текст обмена берётся по этапу **до** неё.
+const moveCommand = (move) => ({
+  asks: (arg, stage) => MOVE_ASKS[stage + ":" + move],
+  run: () => taskApi(json("PATCH", { move })),
+});
 
 const COMMANDS = {
   "/task": {
     need: "описание задачи",
-    asks: true,
+    asks: (arg) => arg,
     run: (arg) => taskApi(json("POST", { description: arg })),
   },
-  "/task-next": { run: () => taskApi(json("PATCH", { move: "next" })) },
+  "/task-next": moveCommand("next"),
   "/task-step": {
     need: "текст шага",
     run: (arg) => taskApi(json("PATCH", { step: arg })),
@@ -962,8 +979,8 @@ const COMMANDS = {
     need: "ожидаемое действие",
     run: (arg) => taskApi(json("PATCH", { expects: arg })),
   },
-  "/task-pause": { run: () => taskApi(json("PATCH", { move: "pause" })) },
-  "/task-resume": { run: () => taskApi(json("PATCH", { move: "resume" })) },
+  "/task-pause": moveCommand("pause"),
+  "/task-resume": moveCommand("resume"),
   "/task-off": { run: () => taskApi({ method: "DELETE" }) },
 };
 
@@ -988,6 +1005,8 @@ async function runCommand(parsed) {
     hint("После " + parsed.name + " нужен текст: " + parsed.cmd.need + ".", true);
     return;
   }
+  // Этап до ручки: по нему выбран текст обмена, а ручка его уже сменит.
+  const from = (state.current.task || {}).stage;
   try {
     await parsed.cmd.run(parsed.arg);
   } catch (err) {
@@ -1003,10 +1022,12 @@ async function runCommand(parsed) {
   const input = $("#input");
   input.value = "";
   autoGrow(input);
-  // Описание задачи уезжает обменом: с него разговор и начинается.
-  if (parsed.cmd.asks && state.hasKey) {
+  // Ручка уже прошла — промпт соберётся с правилом **нового** этапа.
+  // Молчащий переход человек принимал за «ничего не произошло».
+  const ask = parsed.cmd.asks && parsed.cmd.asks(parsed.arg, from);
+  if (ask && state.hasKey) {
     await exchange("/api/agents/" + state.current.id + "/messages",
-      { text: parsed.arg }, parsed.arg);
+      { text: ask }, ask);
   }
 }
 
