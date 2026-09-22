@@ -527,6 +527,10 @@ async function routeChecks() {
     check("в шапке стоит номер этого дня",
       $(".brand-sub").textContent === "чат · день 13", $(".brand-sub").textContent);
 
+    // Подсказка поля — единственное место, откуда человек узнаёт про /task.
+    check("в подсказке поля ввода названа команда /task",
+      $("#input").placeholder.includes("/task"), $("#input").placeholder);
+
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
       empty["Входные токены"].v === "—", empty["Входные токены"].v);
