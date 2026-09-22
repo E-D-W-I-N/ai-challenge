@@ -784,26 +784,28 @@ class Agent:
         return list(taskplan.TOOLS) if self.plan_on(spec) else []
 
     def turn_tools(
-        self, spec: AgentSpec, turn: int, stage: str | None = None
+        self, spec: AgentSpec, turn: int, entry: dict | None = None
     ) -> list[dict] | None:
         """Что объявить модели на этом обороте: инструменты чата — или ничего
-        на последнем разрешённом (`MAX_TURNS`) и ничего после смены этапа.
+        на последнем разрешённом (`MAX_TURNS`) и ничего после движения плана.
 
         **Одно названное место** на решение «объявлять ли»: у предела два
         сторожа, и проверить второй можно лишь в мире, где первый снят.
         Первый и есть эта строка: предел обязан упираться в слова, а не
-        в тишину. Третье условие — **один этап, один обмен**: обрывать цикл
-        на месте нельзя по тому же доводу, поэтому инструменты гаснут, модель
-        договаривает словами, и цикл кончается сам.
+        в тишину. Третье условие — **один шаг, один обмен**: сдвинулся план
+        (`plan.moved`) — инструменты гаснут, модель договаривает словами,
+        и цикл кончается сам. Обрывать его на месте нельзя: модель вернула бы
+        вызов и ни слова, и обмену нечего записать. `entry` — план на входе
+        в обмен, `None` — сравнивать не с чем.
         """
         if turn >= MAX_TURNS:
             return None
-        if stage is not None and stage != self.plan_stage(spec):
+        if entry is not None and taskplan.moved(entry, self.plan):
             return None
         return self.tool_specs(spec) or None
 
     def turn_choice(
-        self, spec: AgentSpec, turn: int, stage: str | None = None
+        self, spec: AgentSpec, turn: int, entry: dict | None = None
     ) -> dict | None:
         """Принуждать ли модель к вызову на этом обороте и к какому; `None` —
         не принуждать.
@@ -813,12 +815,13 @@ class Agent:
         Именно `update_plan`, а не `"required"`: это единственное действие,
         которое `apply` здесь не отказывает. Первой строкой спрашивает
         `turn_tools` — поле без `tools` провайдер отвергнет, и отсюда сразу
-        три следствия: нет принуждения на последнем обороте, после смены
-        этапа и при выключенном процессе.
+        три следствия: нет принуждения на последнем обороте, после движения
+        плана и при выключенном процессе. Этап берётся нынешний: план
+        не двигался, значит и этап тот же.
         """
-        if not self.turn_tools(spec, turn, stage):
+        if not self.turn_tools(spec, turn, entry):
             return None
-        return taskplan.FORCE_UPDATE_PLAN if stage == "planning" else None
+        return taskplan.FORCE_UPDATE_PLAN if self.plan_stage(spec) == "planning" else None
 
     def _save_plan(self, plan: dict | None) -> None:
         """Пишет состояние задачи в хранилище; без хранилища — ничего,
@@ -1090,8 +1093,9 @@ class Agent:
         Оборотов бывает несколько, и это **условие видимости**: модель,
         которой объявили инструменты, возвращает вызов и ни слова текста.
         Кончаются они словами всегда — последний идёт без `tools`. Обмен
-        при этом **один этап**: сменился он, и следующий оборот идёт без
-        инструментов, а `done` называет `stage_from`/`stage_to`.
+        при этом **один шаг**: сдвинулся план, и следующий оборот идёт без
+        инструментов, а `done` называет `stage_from`/`stage_to`
+        и `plan_moved`.
 
         В историю пишется **одна** пара «вопрос — ответ», склеенная из всех
         оборотов. До конца обмена история не трогается, и откат выходит
@@ -1159,10 +1163,12 @@ class Agent:
             # `start`. Устаревающее переписывается на месте (`restage`).
             messages = list(prompt)
             turn = 0
-            # Этап, с которого обмен начался: сравнивать надо с ним, а не
-            # с прошлым оборотом — работа и проверка внутри одной карточки
-            # это и есть беда, которую чиним.
+            # План и этап, с которых обмен начался. Сравнивать надо с ними,
+            # а не с прошлым оборотом: пять шагов внутри одной карточки
+            # это и есть беда, которую чиним. Копия глубокая — `_move_plan`
+            # присваивает новый словарь, но шаги в нём те же объекты.
             entry_stage = self.plan_stage(spec)
+            entry_plan = copy.deepcopy(self.plan) if self.plan_on(spec) else None
 
             while True:
                 turn += 1
@@ -1171,9 +1177,9 @@ class Agent:
                 self.restage(messages, spec, profile, slots["plan_at"])
                 # Первый сторож предела: последний оборот идёт без
                 # инструментов. Второй, жёсткий, стоит ниже.
-                tools = self.turn_tools(spec, turn, entry_stage)
+                tools = self.turn_tools(spec, turn, entry_plan)
                 # Принуждение — тем же местом: поле без `tools` отвергнут.
-                choice = self.turn_choice(spec, turn, entry_stage)
+                choice = self.turn_choice(spec, turn, entry_plan)
                 turn_text = ""
                 turn_reasoning = ""
                 turn_metrics: dict | None = None
@@ -1322,11 +1328,15 @@ class Agent:
                 "cancelled": cancelled,
                 "error": failure,
                 "committed": committed,
-                # **Данными**, а не догадкой клиента. Полей два: текст
+                # **Данными**, а не догадкой клиента. Этапов два: текст
                 # продолжения привязан к **переходу** — проверка и работа
-                # обе ведут в `execution`, но просить надо разного.
+                # обе ведут в `execution`, но просить надо разного. А третьим
+                # полем — само движение плана: отметка шага этап не меняет,
+                # и по паре этапов клиент не отличил бы её от простого ответа.
                 "stage_from": entry_stage,
                 "stage_to": self.plan_stage(spec),
+                "plan_moved": entry_plan is not None
+                and taskplan.moved(entry_plan, self.plan),
             }
             if not committed:
                 # Обмена не было: вопрос вернётся в поле ввода клиента.

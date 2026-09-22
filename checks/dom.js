@@ -551,6 +551,17 @@ function buildServer(options) {
   // на оба конца кадра `done`, как `Agent.plan_stage` на сервере.
   const stageNow = (agent) => (agent.workflow === "plan" ? stageOf(agent.plan)[0] : null);
 
+  // План в сравнимом виде — шаги со статусами и три флажка, тем же составом,
+  // что у `plan.moved` на сервере. Стенд **считает** движение сам, по плану
+  // до вызовов и после: подставь он готовое `true`, «клиент продолжил
+  // на движении плана» стояло бы на значении, которое стенд и выдумал.
+  const planShape = (agent) => (agent.workflow === "plan"
+    ? JSON.stringify([
+      (((agent.plan || {}).steps) || []).map((s) => [s.title, s.status]),
+      ["approved", "finished", "paused"].map((f) => Boolean((agent.plan || {})[f])),
+    ])
+    : null);
+
   // Пять переходов человека — с теми же условиями, что у `plan.apply`, и тем
   // же кодом отказа: стенд, отвечающий 200 на `approve` не на том этапе,
   // оставил бы зелёной кнопку, которая в браузере краснеет. Текст отказа —
@@ -849,8 +860,15 @@ function buildServer(options) {
     // а не подставляются: иначе «клиент продолжил на смене этапа» стояло бы
     // на значении, которое сам стенд и выдумал.
     const stageFrom = stageNow(agent);
+    const shapeFrom = planShape(agent);
     const toolFrames = toolCalls(agent, index);
-    const stages = { stage_from: stageFrom, stage_to: stageNow(agent) };
+    const stages = {
+      stage_from: stageFrom,
+      stage_to: stageNow(agent),
+      // Отметка шага этап не меняет, и без этого поля клиент не отличил бы
+      // её от обычного ответа словами.
+      plan_moved: shapeFrom !== null && planShape(agent) !== shapeFrom,
+    };
     // Упавший обмен получает те же кадры до места падения: сервер сворачивает
     // и собирает промпт **до** вызова, и о том, что вызов потом упал, кадр
     // `start` знать не может. Подай стенд у падения пустой промпт — и клиент,

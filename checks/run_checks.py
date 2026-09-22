@@ -3817,7 +3817,7 @@ def check_tool_turn_loop():
     )
 
 
-@check("один этап — один обмен: правило свежее на каждом обороте, смена гасит вызовы")
+@check("правило свежее на каждом обороте, а движение плана гасит вызовы")
 def check_stage_per_exchange():
     """**Правило этапа протухало внутри обмена**: промпт собирался один раз,
     и модель, прошедшая за пять оборотов работу и проверку, всё это время
@@ -3825,11 +3825,11 @@ def check_stage_per_exchange():
     только результатом вызова.
 
     Чиним правилом и блоком задачи, пересобираемыми перед **каждым** оборотом
-    (`restage`), и сменой этапа, гасящей инструменты на следующем
+    (`restage`), и движением плана, гасящим инструменты на следующем
     (`turn_tools`). Разделы: свежее правило и свежий список; переписано
     на месте (системное сообщение по-прежнему одно, номера врезок из кадра
-    `start` показывают на те же врезки); смена этапа гасит инструменты,
-    а обмен всё равно записан; этап не сменился — цикл идёт дальше;
+    `start` показывают на те же врезки); движение плана гасит инструменты,
+    а обмен всё равно записан; **план не сдвинулся — цикл идёт дальше**;
     `execution` → `validation`; выключенный процесс.
     """
     import app.plan as taskplan
@@ -3889,7 +3889,7 @@ def check_stage_per_exchange():
         assert sent[started["working_at"]]["content"].startswith("[факты о разговоре]"), sent
         assert sent[plan_at]["content"].startswith("[задача]"), sent[plan_at]
 
-    # --- смена этапа гасит инструменты, но обмен записан --------------------
+    # --- движение плана гасит инструменты, но обмен записан -----------------
     assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
     assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
     done = frames[-1]
@@ -3897,13 +3897,17 @@ def check_stage_per_exchange():
     assert done["text"] == "план готов, начинаю", done["text"]
     assert [m["role"] for m in history] == ["user", "assistant"], history
     assert history[-1]["content"], history[-1]
-    # Каким этап был и каким стал — данными, а не догадкой клиента.
+    # Каким этап был и каким стал — данными, а не догадкой клиента. И через
+    # веб-слой целиком: кадр `done` уезжает клиенту как есть.
     assert (done["stage_from"], done["stage_to"]) == ("planning", "approval"), done
+    assert done["plan_moved"] is True, done
 
-    # --- этап не сменился — цикл идёт дальше --------------------------------
+    # --- план не сдвинулся — цикл идёт дальше -------------------------------
     # Обратная половина, рядом нарочно: та же заглушка и тот же инструмент
-    # только что погасили `tools`. Здесь план утверждён, этап не двигается —
-    # и инструменты объявлены снова.
+    # только что погасили `tools`. Здесь модель присылает **тот же самый**
+    # список, какой уже лежит в плане: ни шаг, ни флажок не двинулись —
+    # и инструменты объявлены снова. Гаси их всегда, и цикл умирал бы
+    # на любом вызове, даже ничего не изменившем.
     _stub.reset()
     _stub.install(
         reply=_word_on_second,
@@ -3951,14 +3955,153 @@ def check_stage_per_exchange():
     plain = _bare("обычный чат")
     events = asyncio.run(drain(plain.ask("просто вопрос")))
     assert events[-1]["stage_from"] is None and events[-1]["stage_to"] is None, events[-1]
+    assert events[-1]["plan_moved"] is False, events[-1]
 
     return (
         "правило этапа и блок задачи пересобраны на каждом обороте: "
         "planning → approval, системное сообщение осталось одно, лента "
         "выросла ровно на два сообщения, слоты сошлись на обоих оборотах; "
-        "смена этапа погасила tools, обмен записан и текст непуст; этап "
+        "движение плана погасило tools, обмен записан и текст непуст; план "
         "на месте — tools объявлены снова; execution → validation прошёл "
         "сменой правила; у выключенного процесса оба этапа пусты"
+    )
+
+
+FIVE_STEPS = [{"title": f"шаг {i}", "status": "pending"} for i in range(1, 6)]
+"""Задача, на которой беда и видна: пять шагов одним обменом и одной
+карточкой. Заголовки разные — правило этапа называет заголовок текущего."""
+
+
+def _marched(done: int) -> list[dict]:
+    """Первые `done` шагов сделаны, следующий — в работе: так план выглядит
+    после отметки, которую модель шлёт одним `update_plan`."""
+    return [
+        {
+            "title": step["title"],
+            "status": "done" if i < done else ("in_progress" if i == done else "pending"),
+        }
+        for i, step in enumerate(FIVE_STEPS)
+    ]
+
+
+@check("один шаг — один обмен: отметка гасит вызовы, у каждого шага свой промпт")
+def check_step_per_exchange():
+    """**Резали по смене этапа, а работа — это один этап**: пять шагов
+    проходили одним обменом. Правило внутри него менялось на каждом обороте
+    («шаг 1 из 5», «шаг 2 из 5»…), и человек не видел ни одного: кнопка
+    показывает промпт, с которого обмен начался.
+
+    Режем по движению плана (`plan.moved`): отметка шага, возврат в
+    `pending`, новый список, флажок. Разделы: отметка внутри `execution`
+    гасит инструменты при **том же** этапе, и `done` называет движение
+    полем; пять шагов — пять обменов, у каждого свой промпт и в нём своё
+    «шаг k из 5»; ответ словами план не двигает.
+    """
+    # --- отметка шага гасит инструменты, а этап тот же ----------------------
+    # Заглушка просит вызов на **каждом** обороте: режь код по смене этапа,
+    # и обмен крутился бы до `MAX_TURNS`, потому что работа — один этап.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=lambda messages, index: [
+            _call("update_plan", {"steps": _marched(1)}, f"call_{index}")
+        ],
+    )
+    stepper = _bare("отметка шага", workflow="plan")
+    stepper.plan = _approved(FIVE_STEPS)
+    events = asyncio.run(drain(stepper.ask("работай")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert "tools" in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"].keys()
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    done = events[-1]
+    # Этап **не сменился** — и в этом вся суть: по паре этапов клиент
+    # не отличил бы отметку шага от обычного ответа словами.
+    assert (done["stage_from"], done["stage_to"]) == ("execution", "execution"), done
+    assert done["plan_moved"] is True, done
+    assert done["committed"] is True and done["error"] is None, done
+    assert [s["status"] for s in stepper.plan["steps"]][:2] == ["done", "in_progress"], (
+        stepper.plan
+    )
+
+    # --- пять шагов — пять обменов, и в каждом своё «шаг k из 5» ------------
+    # Обмены шлёт сама проверка: на экране их шлёт цепочка клиента, а здесь
+    # считается то, что видит модель, — промпт каждого обмена.
+    march = _bare("пять шагов", workflow="plan")
+    march.plan = _approved(FIVE_STEPS)
+    rules: list[str] = []
+    prompts: list[str] = []
+    endings: list[tuple] = []
+    for step in range(len(FIVE_STEPS)):
+        _stub.reset()
+        _stub.install(
+            reply=_word_on_second,
+            tool_calls=lambda messages, index, _steps=_marched(step + 1): [
+                _call("update_plan", {"steps": _steps}, f"call_{index}")
+            ],
+        )
+        events = asyncio.run(drain(march.ask("работай")))
+        # Два оборота на обмен: вызов и слово. Больше значило бы, что отметка
+        # инструменты не погасила.
+        assert len(_stub.CALLS) == 2, (step, len(_stub.CALLS))
+        rules.append(_stub.CALLS[0]["messages"][0]["content"])
+        started = next(e for e in events if e["type"] == "start")
+        prompts.append(json.dumps(started["resolved_messages"], ensure_ascii=False))
+        endings.append((events[-1]["stage_from"], events[-1]["stage_to"],
+                        events[-1]["plan_moved"]))
+
+    assert len(march.history) == 10, len(march.history)
+    # Номер шага в правиле **у каждого свой**, и это ровно то, чего не видел
+    # человек: пять правил внутри одной карточки.
+    for index, rule in enumerate(rules):
+        assert f"шаг {index + 1} из 5" in rule, (index, rule)
+    assert len(set(prompts)) == 5, [len(p) for p in prompts]
+    # Первые четыре отметки этап не двигают, последняя уводит в проверку.
+    assert endings[:4] == [("execution", "execution", True)] * 4, endings
+    assert endings[4] == ("execution", "validation", True), endings
+    assert march.plan_view()["stage"] == "validation", march.plan_view()
+
+    # --- флажок — тоже движение, хотя список шагов не тронут ----------------
+    # `finish_task` меняет один `finished`, и сравнивай `moved` одни шаги —
+    # инструменты остались бы объявленными до самого предела.
+    _stub.reset()
+    _stub.install(
+        reply=_word_on_second,
+        tool_calls=lambda messages, index: [
+            _call("finish_task", {"problems": []}, f"call_{index}")
+        ],
+    )
+    closing = _bare("флажок", workflow="plan")
+    closing.plan = _approved(_marched(len(FIVE_STEPS)))
+    events = asyncio.run(drain(closing.ask("закрывай")))
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    assert "tools" not in _stub.CALLS[1]["payload"], _stub.CALLS[1]["payload"].keys()
+    assert events[-1]["plan_moved"] is True, events[-1]
+    assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
+        "validation", "done",
+    ), events[-1]
+    # Шаги не тронуты ни одним статусом: двинулся ровно флажок.
+    assert [s["status"] for s in closing.plan["steps"]] == ["done"] * 5, closing.plan
+    assert closing.plan["finished"] is True, closing.plan
+
+    # --- ответ словами план не двигает --------------------------------------
+    # Утверждение об отсутствии — там, где присутствие достижимо: тот же чат,
+    # следующий обмен, вызовов у заглушки нет.
+    _stub.reset()
+    _stub.install(reply="просто отвечаю")
+    events = asyncio.run(drain(march.ask("а расскажи")))
+    assert events[-1]["plan_moved"] is False, events[-1]
+    assert (events[-1]["stage_from"], events[-1]["stage_to"]) == (
+        "validation", "validation",
+    ), events[-1]
+
+    return (
+        "отметка шага погасила tools при том же этапе execution, обмен "
+        "записан и plan_moved назван; пять шагов дали пять обменов по два "
+        "оборота, пять разных промптов и правила «шаг 1 из 5» … «шаг 5 "
+        "из 5», последний обмен ушёл в validation; finish_task двинул один "
+        "флажок и тоже погасил tools; ответ словами план не двинул"
     )
 
 
