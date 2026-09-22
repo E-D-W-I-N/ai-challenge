@@ -2206,7 +2206,9 @@ async function routeChecks() {
     check("пока идёт ответ, кнопки шапки погашены",
       $("#task").querySelectorAll(".task-btn").every((b) => b.disabled === true),
       JSON.stringify($("#task").querySelectorAll(".task-btn").map((b) => b.disabled)));
-    await settle(400);
+    // План сдвинулся — клиент шлёт продолжение сам, и ждать надо его тоже.
+    // Второй обмен несёт тот же вызов, план не двигается, и цепочка встаёт.
+    await settle(800);
     check("обмен дошёл до конца, и шапка осталась новой",
       client.state.busy === false && JSON.stringify(taskMarks($)) === JSON.stringify(["✓", "▶"]),
       JSON.stringify(taskMarks($)));
@@ -2219,16 +2221,22 @@ async function routeChecks() {
       JSON.stringify($("#task").querySelectorAll(".task-btn").map((b) => b.disabled)));
   }
 
-  // ══════════════ цепочка этапов: один этап — один обмен ══════════════
+  // ══════════════ цепочка: один шаг — один обмен ══════════════
   //
-  // Сервер кончает обмен на первой же смене этапа, и дальше ход клиента.
-  // Отсюда главное — у каждого этапа своя карточка в ленте и своя кнопка
+  // Сервер кончает обмен на первом же движении плана, и дальше ход клиента.
+  // Отсюда главное — у каждого шага своя карточка в ленте и своя кнопка
   // промпта. Тексты продолжений держим отдельными значениями: «у переходов
-  // они разные» обязано стоять на сравнении двух строк.
+  // они разные» обязано стоять на сравнении трёх строк.
+  const SAY_STEP =
+    "Шаг в плане отмечен — берись за следующий и веди отметки как прежде.";
   const SAY_TO_VALIDATION =
     "Все шаги отмечены сделанными — перечитай результат и проверь работу.";
   const SAY_TO_EXECUTION =
     "Проверка нашла проблемы — исправь их, начиная с возвращённого в работу шага.";
+  // Потолок цепочки, тот же, что в `MAX_CHAIN` у клиента. Число здесь
+  // списано, а не выведено: клиент своих констант наружу не отдаёт, и
+  // утверждение обязано стоять на числе обменов, которые он правда отправил.
+  const CEILING = 12;
 
   // Планы, которыми вызов инструмента двигает этап. Шагов в каждом два:
   // на плане из одного шага «все сделаны» и «один в работе» неотличимы.
@@ -2242,17 +2250,112 @@ async function routeChecks() {
   };
   // Докуда стенд качает этап в сцене потолка — вдвое выше самого потолка:
   // снятый потолок обязан дать красное утверждение, а не бесконечный обмен.
-  const SWINGS = 12;
+  const SWINGS = CEILING * 2;
   const copyPlan = (plan) => JSON.parse(JSON.stringify(plan));
   const moveTo = (plan) =>
     [{ name: "update_plan", ok: true, message: "План записан.", plan: copyPlan(plan) }];
 
-  // ── цепочка идёт сама, тексты по переходу, и встаёт на потолке ──
+  // ── шаг за шагом: обмен на каждую отметку, и у каждого свой промпт ──
+  // Ровно то, чего не хватало на живом прогоне: работа шла одной карточкой
+  // на все пять шагов, и ни один промпт, кроме первого, человек не видел.
+  {
+    const THREE = (a, b, c) => ({
+      steps: [STEP("собрать требования", a), STEP("накидать структуру", b),
+              STEP("свести вместе", c)],
+      approved: true, finished: false, paused: false,
+    });
+    // Три отметки подряд: этап у первых двух **не меняется**, и режь клиент
+    // по смене этапа — продолжения не было бы вовсе.
+    const MARCH = [
+      THREE("done", "in_progress", "pending"),
+      THREE("done", "done", "in_progress"),
+      THREE("done", "done", "done"),
+    ];
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "по шагам", workflow: "plan",
+                plan: THREE("in_progress", "pending", "pending") }],
+      // Четвёртый обмен вызовов не несёт: план не двигается, и цепочка
+      // встаёт сама — её главный ограничитель, а не потолок.
+      tools: (i) => (i < MARCH.length ? moveTo(MARCH[i]) : []),
+      // Числа у каждого обмена свои: обменов стало вчетверо больше, и цена
+      // этого обязана быть на экране, а не в счёте от провайдера.
+      usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100,
+               cost_usd: 0.001 },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    $("#input").value = "делай";
+    $("#composer").requestSubmit();
+    await settle(900);
+
+    const said = server.state.sent.map((x) => x.text);
+    check("отметка шага внутри работы продолжает цепочку: обмен на каждый шаг",
+      said.length === 4, JSON.stringify(said));
+    check("текст продолжения — на переход: шаг, шаг, «проверяй»",
+      JSON.stringify(said.slice(1)) ===
+        JSON.stringify([SAY_STEP, SAY_STEP, SAY_TO_VALIDATION]),
+      JSON.stringify(said));
+    check("три текста продолжения — три разные строки",
+      SAY_STEP !== SAY_TO_VALIDATION && SAY_TO_VALIDATION !== SAY_TO_EXECUTION &&
+        SAY_STEP !== SAY_TO_EXECUTION, "одна константа на разные переходы");
+    check("план не сдвинулся — цепочка встала сама, без потолка",
+      client.state.busy === false && said.length === 4 &&
+        !$("#composer-hint").textContent.includes("дальше не иду"),
+      $("#composer-hint").textContent);
+
+    const cards = $("#feed").querySelectorAll(".card");
+    const titles = (c) => c.querySelectorAll(".icon-btn").map((b) => b.title);
+    check("у каждого шага своя карточка в ленте",
+      cards.length === 4, cards.length + " карточек");
+    // Цена цепочки видна: под каждым обменом свои числа, а в плитках — сумма
+    // по чату. Восемь реплик на три шага — это решение человека, и оно
+    // обязано быть посчитанным у него на глазах.
+    check("под каждым обменом цепочки свои числа",
+      cards.every((c) => usageText(c, ".usage-tokens").includes("$0.001")),
+      JSON.stringify(cards.map((c) => usageText(c, ".usage-tokens"))));
+    check("а в плитках — сумма по чату за все четыре обмена",
+      tileOf($, "Стоимость").v === "$0.004000" && tileOf($, "Сообщений").v === "8",
+      tileOf($, "Стоимость").v + " за " + tileOf($, "Сообщений").v + " сообщений");
+    check("и у каждой своя кнопка «Показать промпт запроса»",
+      cards.length === 4 &&
+        cards.every((c) => titles(c).includes("Показать промпт запроса")),
+      JSON.stringify(cards.map((c) => titles(c).join(","))));
+
+    // И промпты у карточек **разные**: блок задачи в каждом показывает тот
+    // список, с которым уехал её обмен. Одна карточка на все шаги давала бы
+    // один промпт — беда, ради которой всё и затеяно.
+    // Пропавшая карточка — красное утверждение, а не исключение: упавший
+    // маршрут унёс бы все проверки после себя.
+    const taskBlock = (card) => {
+      const shown = card && card.querySelector(".prompt-view");
+      const texts = shown
+        ? shown.querySelectorAll(".prompt-text").map((t) => t.textContent) : [];
+      return texts.find((t) => t.startsWith("[задача]")) || "";
+    };
+    cards.forEach((c) =>
+      cardButton(c, "Показать промпт запроса").dispatchEvent(new Evt("click")));
+    await settle(20);
+    const roles = (card) =>
+      (card ? card.querySelectorAll(".prompt-role") : []).map((r) => r.textContent);
+    check("в промпте карточки врезка задачи подписана по слоту",
+      roles(cards[3]).includes("план задачи"), JSON.stringify(roles(cards[3])));
+    const blocks = cards.map(taskBlock);
+    check("у каждой карточки в промпте свой список шагов: четыре разных",
+      blocks.every(Boolean) && new Set(blocks).size === 4 &&
+        blocks[0].includes("собрать требования — in_progress") &&
+        blocks[2].includes("свести вместе — in_progress") &&
+        blocks[3].includes("свести вместе — done"),
+      JSON.stringify(blocks));
+  }
+
+  // ── потолок держит цепочку, и выход из него назван словами ──
   {
     const { client, server, $, settle, Evt } = freshClient({
       chats: [{ label: "работа идёт", workflow: "plan", plan: copyPlan(WORKING) }],
-      // Этап качается: работа → проверка → работа. Ограничитель «этап
-      // не сменился» на кругах не срабатывает **никогда**, и упереться
+      // Этап качается: работа → проверка → работа. Ограничитель «план
+      // не сдвинулся» на кругах не срабатывает **никогда**, и упереться
       // цепочка обязана в потолок. Качается до `SWINGS`: со снятым потолком
       // мутация дала бы повисший node вместо красного утверждения.
       tools: (i) => (i < SWINGS ? moveTo(i % 2 === 0 ? CHECKED : WORKING) : []),
@@ -2263,41 +2366,22 @@ async function routeChecks() {
     await settle(40);
     $("#input").value = "доделывай";
     $("#composer").requestSubmit();
-    await settle(900);
+    await settle(2000);
 
     const said = server.state.sent.map((x) => x.text);
-    check("цепочка идёт сама: один обмен человека и четыре своих",
-      said.length === 5, JSON.stringify(said));
+    check("потолок: один обмен человека и " + CEILING + " своих, дальше стоп",
+      client.state.busy === false && said.length === CEILING + 1,
+      said.length + " обменов, идёт: " + client.state.busy);
     check("текст продолжения — на переход, а не на целевой этап",
-      JSON.stringify(said.slice(1)) === JSON.stringify(
-        [SAY_TO_VALIDATION, SAY_TO_EXECUTION, SAY_TO_VALIDATION, SAY_TO_EXECUTION]),
-      JSON.stringify(said));
-    check("у «в проверку» и «назад в работу» тексты разные",
-      SAY_TO_VALIDATION !== SAY_TO_EXECUTION, "константа одна на оба перехода");
-    check("потолок: цепочка встала",
-      client.state.busy === false && said.length === 5, "обмен всё ещё идёт");
+      JSON.stringify(said.slice(1, 3)) ===
+        JSON.stringify([SAY_TO_VALIDATION, SAY_TO_EXECUTION]),
+      JSON.stringify(said.slice(0, 3)));
     check("и выход из потолка назван словами, а не молчанием",
       $("#composer-hint").textContent.includes("дальше не иду"),
       $("#composer-hint").textContent);
-    // Ровно то, чего не хватало на живом прогоне: этапов пять — карточек
-    // пять, и промпт у каждой свой.
-    const cards = $("#feed").querySelectorAll(".card");
-    const titles = (c) => c.querySelectorAll(".icon-btn").map((b) => b.title);
-    check("у каждого этапа своя карточка в ленте",
-      cards.length === 5, cards.length + " карточек");
-    check("и у каждой своя кнопка «Показать промпт запроса»",
-      cards.length === 5 &&
-        cards.every((c) => titles(c).includes("Показать промпт запроса")),
-      JSON.stringify(cards.map((c) => titles(c).join(","))));
-    // А блок задачи в показанном промпте подписан именно как блок задачи:
-    // подпись берётся из номера слота, а не из слов внутри сообщения.
-    cardButton(cards[cards.length - 1], "Показать промпт запроса")
-      .dispatchEvent(new Evt("click"));
-    await settle(20);
-    check("в промпте последней карточки врезка задачи подписана по слоту",
-      $("#feed").querySelectorAll(".prompt-role").map((r) => r.textContent)
-        .includes("план задачи"),
-      JSON.stringify($("#feed").querySelectorAll(".prompt-role").map((r) => r.textContent)));
+    check("у каждого обмена цепочки своя карточка в ленте",
+      $("#feed").querySelectorAll(".card").length === CEILING + 1,
+      $("#feed").querySelectorAll(".card").length + " карточек");
   }
 
   // ── этапы, которые ждут человека, цепочку не продолжают ──
@@ -2318,7 +2402,7 @@ async function routeChecks() {
         { label: "в готово", workflow: "plan", plan: copyPlan(CHECKED) },
         { label: "в проверку", workflow: "plan", plan: copyPlan(WORKING) },
       ],
-      // Продолжение (пятый обмен) вызовов уже не несёт: этап на нём
+      // Продолжение (пятый обмен) вызовов уже не несёт: план на нём
       // не двигается, и цепочка встаёт сама — её ограничитель, а не потолок.
       tools: (i) => (i < TARGETS.length ? moveTo(TARGETS[i]) : []),
     });

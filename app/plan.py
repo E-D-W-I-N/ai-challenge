@@ -17,12 +17,17 @@ STAGES = ("planning", "approval", "execution", "validation", "done", "paused")
 этапа. Ни один не хранится: этап это ответ `stage_of`."""
 
 
+FLAGS = ("approved", "finished", "paused")
+"""Три флажка состояния. Одним списком, а не тремя именами по месту: по ним
+же сравниваются планы (`moved`), и забытый там флажок стоил бы обмена."""
+
+
 def empty() -> dict:
     """Пустое состояние задачи. Флажки хранятся, а не вычисляются: «план
     утверждён» обязано пережить возврат шага в `pending`. Поля «с какого
     этапа приостановлено» рядом нет намеренно: сняли флажок — этап
     восстановился сам, список не менялся."""
-    return {"steps": [], "approved": False, "finished": False, "paused": False}
+    return {"steps": [], **{flag: False for flag in FLAGS}}
 
 
 def _steps(plan) -> list[dict]:
@@ -30,6 +35,21 @@ def _steps(plan) -> list[dict]:
     и инструмент, и подъём из базы, а падать на чужой форме нельзя."""
     steps = (plan or {}).get("steps")
     return [step for step in steps if isinstance(step, dict)] if isinstance(steps, list) else []
+
+
+def _shape(plan) -> tuple:
+    """План в сравнимом виде: шаги со статусами и три флажка — ровно то,
+    из чего вычисляется этап. Лишнее в словаре не в счёт."""
+    steps = tuple((step.get("title"), step.get("status")) for step in _steps(plan))
+    return steps, tuple(bool((plan or {}).get(flag)) for flag in FLAGS)
+
+
+def moved(before, after) -> bool:
+    """Сдвинулся ли план — **единственное** место, где планы сравниваются.
+    Отметка шага, возврат в `pending`, новый список, поднятый или снятый
+    флажок: этим обмен и кончается. Смена этапа здесь частный случай —
+    этап вычисляется из плана, и без движения плана он не меняется."""
+    return _shape(before) != _shape(after)
 
 
 def current_step(plan) -> int | None:
