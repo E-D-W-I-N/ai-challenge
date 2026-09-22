@@ -2091,6 +2091,10 @@ async function routeChecks() {
     check("и ручку раньше обмена: этап сменился до сборки промпта",
       trail().slice(-2).join(" → ") === "/task → /messages",
       trail().join(" → "));
+    // Ход назван относительно вершины, которую человек видел: иначе вторая
+    // вкладка уводит этап, а эта получает 200 на ход, которого не выбирала.
+    check("ход назван относительно этапа, из которого его выбирали",
+      taskCalls()[3].body.from === "planning", JSON.stringify(taskCalls()[3].body));
     check("обменом уехал текст перехода, а не сама команда",
       asked()[2] === "Приступай к работе.", asked()[2]);
     check("этап в шапке сменился",
@@ -2197,6 +2201,81 @@ async function routeChecks() {
       $("#composer-hint").textContent);
     check("состояние цело: этап прежний",
       $("#task-head").children.map((n) => n.textContent)[0] === "Задача · пауза",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+  }
+
+  // ── двойной Enter проводит один переход, а не два ──
+  //
+  // Один «/task-next» уводит на два этапа, а назад таблица не ходит: вернуться
+  // нечем, «/task» сбрасывает в планирование и теряет шаг, и уезжают заодно
+  // два обмена. Замок на время команды снимается в `finally`.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "двойной Enter" }],
+      tasks: { "двойной Enter": { stage: "planning" } },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const taskCalls = () => server.state.requests.filter((r) => /\/task$/.test(r.path));
+    $("#input").value = "/task-next";
+    $("#composer").requestSubmit();
+    $("#composer").requestSubmit();
+    await settle(140);
+    check("двойной Enter спросил ручку один раз, а не два",
+      taskCalls().length === 1, JSON.stringify(taskCalls().map((r) => r.body)));
+    check("и обмен уехал один",
+      server.state.sent.length === 1, JSON.stringify(server.state.sent));
+    check("этап сдвинулся на один, а не на два",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · выполнение",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+  }
+
+  // ── чат переключили, пока летела ручка ──
+  //
+  // `runCommand` снимает id до запроса и сверяет после: иначе реплика перехода
+  // уедет к модели в **чужой** разговор и останется в его истории навсегда.
+  // Ручка отвечает не сразу — этим и видно, куда уйдёт обмен.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "свой чат" }],
+      tasks: { "свой чат": { stage: "planning" } },
+      slow: "/task",
+    });
+    client.init();
+    await settle(30);
+    const open = (i) => $("#agent-list").querySelectorAll(".item-open")[i]
+      .dispatchEvent(new Evt("click"));
+    open(2);
+    await settle(40);
+    const mine = server.state.agents[2].id;
+
+    $("#input").value = "/task-next";
+    $("#composer").requestSubmit();
+    await settle(10);
+    // Ручка ещё в полёте — открываем другой чат.
+    open(0);
+    await settle(160);
+
+    const moved = server.state.requests.filter((r) => /\/task$/.test(r.path));
+    check("ход записался в тот чат, где команду набрали",
+      moved.length === 1 && moved[0].path.includes(mine),
+      JSON.stringify(moved.map((r) => r.path)));
+    check("а обмена не случилось ни одного: чужому чату перехода не поручали",
+      server.state.sent.length === 0 &&
+        server.state.requests.filter((r) => /\/messages$/.test(r.path)).length === 0,
+      JSON.stringify(server.state.requests.map((r) => r.path)));
+    check("шапка открытого чата цела: своей задачи у него нет",
+      $("#task-head").classList.contains("hidden") &&
+        $("#task-head").children.length === 0,
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+    // А вернёшься — этап тот, что записала ручка: он лежит на сервере.
+    open(2);
+    await settle(60);
+    check("вернулись в свой чат — этап тот, который ручка записала",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · выполнение",
       JSON.stringify($("#task-head").children.map((n) => n.textContent)));
   }
 

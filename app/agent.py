@@ -682,7 +682,7 @@ class Agent:
         # оно всегда первое, и клиент подписывает его по позиции. А вот
         # на номера **остальных** врезок оно влияет прямо, и потому собрано
         # здесь же, где они берутся, — одним `system_message`.
-        task = self.task_items(spec)
+        task = self.task_items()
         head = system_message(
             spec.system, self.profile_items(profile), task.get("stage", "")
         )
@@ -847,22 +847,22 @@ class Agent:
 
     # --- состояние задачи: двигает только человек ------------------------------
 
-    def task_items(self, spec: AgentSpec | None = None) -> dict:
+    def task_items(self) -> dict:
         """Что из состояния задачи уедет в промпт и встанет в шапку — или
         пустой словарь.
 
-        Пусто здесь значит одно и то же в трёх случаях: режим выключен,
-        состояния нет, этап незнакомый. Условие поэтому одно: **выключенный
-        режим обязан быть неотличим от невключавшегося** — иначе всякая
-        последовательность ролей сдвинулась бы на сообщение, а системное
-        сообщение сдвинуло бы номера всех врезок разом.
+        Пусто здесь значит одно и то же в двух случаях: состояния нет, этап
+        незнакомый. Условие поэтому одно: **выключенный режим обязан быть
+        неотличим от невключавшегося** — иначе всякая последовательность ролей
+        сдвинулась бы на сообщение, а системное сообщение сдвинуло бы номера
+        всех врезок разом. Спрашивается одна строка состояния: поле конфига
+        о том же расходилось бы с ней.
 
         Подпись этапа и умолчание ожидаемого действия подставляются здесь —
         одним местом на врезку и на шапку.
         """
-        spec = spec if spec is not None else self.spec
         stage = (self.task or {}).get("stage")
-        if spec.workflow != "plan" or stage not in STAGES:
+        if stage not in STAGES:
             return {}
         return {
             "stage": stage,
@@ -874,22 +874,21 @@ class Agent:
             "description": self.task["description"],
         }
 
-    def _task_save(self) -> dict:
-        """Пишет состояние и отдаёт его показанным. Из базы возвращается
-        **записанное**: `redact()` чистит текст по дороге."""
+    def _task_save(self, task: dict) -> dict:
+        """Пишет кандидата и ставит его в память **после** успеха базы: иначе
+        человек получает отказ, а обмен уезжает с правилом нового этапа. Из
+        базы приходит записанное: `redact()` чистит текст по дороге."""
         if self.store is not None:
-            self.task = self.store.save_task(self.id, self.task)
+            task = self.store.save_task(self.id, task)
+        self.task = task
         return self.task_items()
 
     def start_task(self, description: str) -> dict:
         """Включает режим задачи: этап планирования, шаг и действие пусты."""
-        self.task = {
+        return self._task_save({
             "stage": "planning", "step": "", "expects": "",
             "description": description, "paused_from": "",
-        }
-        self.spec.workflow = "plan"
-        self.save_config()
-        return self._task_save()
+        })
 
     def move_task(self, move: str) -> dict | None:
         """Переход по таблице. `None` — такого перехода нет, и состояние
@@ -907,32 +906,30 @@ class Agent:
             target = (self.task or {}).get("paused_from")
             if target not in STAGES:
                 return None
-        self.task = {
+        return self._task_save({
             **self.task,
             "stage": target,
             "paused_from": stage if target == "paused" else "",
             # Смена этапа сбрасывает заданное человеком действие: оставленное,
             # оно называло бы действие прошлого этапа.
             "expects": "",
-        }
-        return self._task_save()
+        })
 
     def write_task(self, values: dict) -> dict | None:
         """Пишет названные поля состояния (`step`, `expects`). `None` — режима
         задачи в этом чате нет."""
         if not self.task_items():
             return None
-        self.task = {**self.task, **values}
-        return self._task_save()
+        return self._task_save({**self.task, **values})
 
     def stop_task(self) -> None:
         """Выход из режима: состояние стирается, врезки и правила этапа больше
-        нет. Незавершённая задача не тянется в следующий разговор."""
-        self.task = None
-        self.spec.workflow = "off"
-        self.save_config()
+        нет. Незавершённая задача не тянется в следующий разговор. База первой,
+        память после: флаг, прятавший недоудалённую строку, воскрешал задачу
+        перезапуском."""
         if self.store is not None:
             self.store.clear_task(self.id)
+        self.task = None
 
     # --- рабочая память: записи человека --------------------------------------
     #
