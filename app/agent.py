@@ -26,6 +26,12 @@ from .schema import (
     MEMORY_LABELS,
     PROFILE_FIELDS,
     PROFILE_LABELS,
+    RESUME,
+    STAGE_EXPECTS,
+    STAGE_LABELS,
+    STAGE_RULES,
+    STAGES,
+    TRANSITIONS,
     WORKING_LABELS,
     AgentSpec,
 )
@@ -185,7 +191,28 @@ def profile_block(values: dict) -> str:
     return "[как отвечать]\n" + "\n".join(lines)
 
 
-def system_message(system: str, profile: dict) -> dict | None:
+def task_message(task: dict) -> dict:
+    """Состояние задачи так, как оно встаёт в промпт: роль `user` с подписью.
+
+    Три оси задания — этап, шаг, ожидаемое действие — плюс описание, ради
+    которого всё затеяно. Пустой шаг строкой не едет: «шаг: » занял бы место,
+    не сказав ничего, — как пустое поле профиля."""
+    lines = [f"описание: {task['description']}", f"этап: {task['label']}"]
+    if task["step"]:
+        lines.append(f"шаг: {task['step']}")
+    lines.append(f"ожидается: {task['expects']}")
+    return {
+        "role": "user",
+        "content": "[задача]\n" + "\n".join(lines) + "\n[конец задачи]",
+    }
+
+
+def stage_block(stage: str) -> str:
+    """Правило этапа для системного сообщения."""
+    return f"[этап задачи: {STAGE_LABELS[stage]}]\n{STAGE_RULES[stage]}"
+
+
+def system_message(system: str, profile: dict, stage: str = "") -> dict | None:
     """Системное сообщение промпта — или `None`, если его нет вовсе.
 
     Здесь меняется правило, прожившее четыре дня: «системный промпт живёт
@@ -207,13 +234,16 @@ def system_message(system: str, profile: dict) -> dict | None:
     значит «ни системного промпта, ни профиля».
     """
     block = profile_block(profile) if profile else ""
-    parts = [part for part in (system, block) if part]
+    # Правило этапа — третьей частью: системным едет то, что задал человек,
+    # а этап он и двигает. Второго системного сообщения у чата не бывает.
+    rule = stage_block(stage) if stage else ""
+    parts = [part for part in (system, block, rule) if part]
     if not parts:
         return None
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
-PROMPT_SLOTS = ("memory_at", "working_at", "summary_at")
+PROMPT_SLOTS = ("memory_at", "working_at", "task_at", "summary_at")
 """Врезки, которые встают перед историей, — в том порядке, в каком их кладёт
 `Agent.prompt_head`, и теми именами, какими они уезжают в кадре `start`.
 
@@ -403,6 +433,14 @@ class Agent:
         просто запоминается наибольший выданный: правило у обоих одно —
         только вперёд, номер удалённой записи заново не выдаётся."""
 
+        self.task: dict | None = None
+        """Состояние задачи: `{stage, step, expects, description, paused_from}`
+        — или `None`, если режим задачи в этом чате не включали.
+
+        Двигает его только человек, командами: ни одного метода, которым
+        состояние менял бы ответ модели, у агента нет.
+        """
+
         self.branch: dict | None = None
         """Происхождение чата: `{parent_id, forked_at}` — или `None`, если чат
         заведён сам по себе.
@@ -457,6 +495,10 @@ class Agent:
                 self._working_seq = max(
                     (item["seq"] for item in self.working), default=0
                 )
+                # Состояние задачи — тем же порядком: этап переживает
+                # перезапуск, иначе «продолжение без повторных объяснений»
+                # держалось бы на том, что сервер не перезапускали.
+                self.task = store.load_task(self.id)
                 # И происхождение: ветка остаётся веткой и после перезапуска,
                 # и после вытеснения из памяти — пометка в списке и в панели
                 # берётся отсюда.
@@ -624,9 +666,10 @@ class Agent:
         единственный источник обоих ответов.
 
         Порядок от общего к частному: системное сообщение (системный промпт
-        чата и профиль — всё, что задал человек), долговременная память
-        (что знали до чата), рабочая (что знаем про эту задачу), врезка
-        стратегии (чем свёрнут сам чат). Ноль — законное значение любого
+        чата, профиль и правило этапа — всё, что задал человек),
+        долговременная память (что знали до чата), рабочая (что знаем про эту
+        задачу), состояние задачи (чем заняты сейчас), врезка стратегии (чем
+        свёрнут сам чат). Ноль — законное значение любого
         номера: у чата без системного промпта первая же врезка стоит нулевым
         сообщением, и «врезки нет» — это только `None`.
         """
@@ -639,7 +682,10 @@ class Agent:
         # оно всегда первое, и клиент подписывает его по позиции. А вот
         # на номера **остальных** врезок оно влияет прямо, и потому собрано
         # здесь же, где они берутся, — одним `system_message`.
-        head = system_message(spec.system, self.profile_items(profile))
+        task = self.task_items(spec)
+        head = system_message(
+            spec.system, self.profile_items(profile), task.get("stage", "")
+        )
         if head is not None:
             messages.append(head)
 
@@ -653,6 +699,12 @@ class Agent:
             slots["working_at"] = len(messages)
             messages.append(working_message(items))
 
+        # Состояние задачи — после памяти, до врезки стратегии: сперва то,
+        # что знали до чата, потом чем заняты сейчас, потом чем свёрнут чат.
+        if task:
+            slots["task_at"] = len(messages)
+            messages.append(task_message(task))
+
         cut, insert = self.context_cut(spec)
         if insert is not None:
             slots["summary_at"] = len(messages)
@@ -663,7 +715,7 @@ class Agent:
     def build_prompt(
         self, user_text: str, *, spec: AgentSpec | None = None, memory=None, profile=None
     ) -> list[dict]:
-        """Системный промпт + долговременная память + рабочая память + начало
+        """Системное сообщение + обе памяти + состояние задачи + начало
         истории по стратегии + хвост + вопрос.
 
         Единственное место, где решается состав промпта. Обрезка бывает только
@@ -689,7 +741,7 @@ class Agent:
         self, spec: AgentSpec | None = None, memory=None, profile=None
     ) -> dict[str, int | None]:
         """Номера всех врезок промпта разом: `memory_at`, `working_at`,
-        `summary_at`. `None` у любого — врезки в промпте нет вовсе.
+        `task_at`, `summary_at`. `None` у любого — врезки в промпте нет вовсе.
 
         Отдаёт их **одним** ответом, а не тремя методами по одному, и это
         не удобство вызывающего: три ответа считались бы по трём копиям одной
@@ -792,6 +844,95 @@ class Agent:
         а гадать по тексту сообщений он не вправе.
         """
         return ["summary"] if self.compress_plan(spec) is not None else []
+
+    # --- состояние задачи: двигает только человек ------------------------------
+
+    def task_items(self, spec: AgentSpec | None = None) -> dict:
+        """Что из состояния задачи уедет в промпт и встанет в шапку — или
+        пустой словарь.
+
+        Пусто здесь значит одно и то же в трёх случаях: режим выключен,
+        состояния нет, этап незнакомый. Условие поэтому одно: **выключенный
+        режим обязан быть неотличим от невключавшегося** — иначе всякая
+        последовательность ролей сдвинулась бы на сообщение, а системное
+        сообщение сдвинуло бы номера всех врезок разом.
+
+        Подпись этапа и умолчание ожидаемого действия подставляются здесь —
+        одним местом на врезку и на шапку.
+        """
+        spec = spec if spec is not None else self.spec
+        stage = (self.task or {}).get("stage")
+        if spec.workflow != "plan" or stage not in STAGES:
+            return {}
+        return {
+            "stage": stage,
+            "label": STAGE_LABELS[stage],
+            "step": self.task["step"],
+            # Заданное человеком перебивает умолчание этапа; не задавал —
+            # едет умолчание, и в базе при этом пусто.
+            "expects": self.task["expects"] or STAGE_EXPECTS[stage],
+            "description": self.task["description"],
+        }
+
+    def _task_save(self) -> dict:
+        """Пишет состояние и отдаёт его показанным. Из базы возвращается
+        **записанное**: `redact()` чистит текст по дороге."""
+        if self.store is not None:
+            self.task = self.store.save_task(self.id, self.task)
+        return self.task_items()
+
+    def start_task(self, description: str) -> dict:
+        """Включает режим задачи: этап планирования, шаг и действие пусты."""
+        self.task = {
+            "stage": "planning", "step": "", "expects": "",
+            "description": description, "paused_from": "",
+        }
+        self.spec.workflow = "plan"
+        self.save_config()
+        return self._task_save()
+
+    def move_task(self, move: str) -> dict | None:
+        """Переход по таблице. `None` — такого перехода нет, и состояние
+        осталось прежним: обрезка автомата бывает только описанная."""
+        task = self.task_items()
+        if not task:
+            return None
+        stage = task["stage"]
+        target = TRANSITIONS.get((stage, move))
+        if target is None:
+            return None
+        if target == RESUME:
+            # Снятие паузы возвращает туда же, откуда встали, — в начало
+            # автомата оно не бросает.
+            target = (self.task or {}).get("paused_from")
+            if target not in STAGES:
+                return None
+        self.task = {
+            **self.task,
+            "stage": target,
+            "paused_from": stage if target == "paused" else "",
+            # Смена этапа сбрасывает заданное человеком действие: оставленное,
+            # оно называло бы действие прошлого этапа.
+            "expects": "",
+        }
+        return self._task_save()
+
+    def write_task(self, values: dict) -> dict | None:
+        """Пишет названные поля состояния (`step`, `expects`). `None` — режима
+        задачи в этом чате нет."""
+        if not self.task_items():
+            return None
+        self.task = {**self.task, **values}
+        return self._task_save()
+
+    def stop_task(self) -> None:
+        """Выход из режима: состояние стирается, врезки и правила этапа больше
+        нет. Незавершённая задача не тянется в следующий разговор."""
+        self.task = None
+        self.spec.workflow = "off"
+        self.save_config()
+        if self.store is not None:
+            self.store.clear_task(self.id)
 
     # --- рабочая память: записи человека --------------------------------------
     #
@@ -944,6 +1085,10 @@ class Agent:
                 if isinstance(item.get("upto"), int) and item["upto"] <= at
             ],
             "working": [copy.deepcopy(item) for item in self.working],
+            # Состояние задачи едет целиком: ветка продолжает ту же задачу,
+            # с того же этапа. Резать его по точке ветвления нечем — это
+            # не история, а одно значение.
+            "task": copy.deepcopy(self.task),
         }
 
     def take_branch(self, carried: dict, *, parent_id: str, forked_at: int) -> None:
@@ -956,6 +1101,7 @@ class Agent:
         """
         self.history = carried["history"]
         self.summaries = carried["summaries"]
+        self.task = carried["task"]
         self.branch = {"parent_id": parent_id, "forked_at": forked_at}
 
         # Записи памяти заводятся заново, а не переносятся с номерами: номер
@@ -970,6 +1116,8 @@ class Agent:
         with self.store.tx():
             self.store.save_branch(self.id, parent_id=parent_id, forked_at=forked_at)
             self.store.save_summaries(self.id, self.summaries)
+            if self.task is not None:
+                self.store.save_task(self.id, self.task)
             for item in carried["working"]:
                 self._working_add(item["kind"], item["content"], item["at"])
             self.persist()
@@ -1018,6 +1166,10 @@ class Agent:
         оставил бы свои цели и ограничения следующему, и тот отвечал бы
         по ним.
 
+        Состояние задачи уносится тем же порядком: правило этапа уезжает
+        **системным** сообщением, и забытый разговор оставил бы следующему
+        чужое «не продолжай, даже если просят».
+
         А долговременная память не трогается: чат ей не владелец, а читатель,
         и «забыть этот разговор» не значит «забыть, кто с тобой говорит».
 
@@ -1030,9 +1182,11 @@ class Agent:
         self.history.clear()
         self.summaries = []
         self.working = []
+        self.task = None
         if self.store is not None:
             self.store.save_summaries(self.id, [])
             self.store.clear_working(self.id)
+            self.store.clear_task(self.id)
         self.persist()
 
     def usage_summary(self) -> dict | None:
@@ -1101,6 +1255,7 @@ class Agent:
             last_used_at=self.last_used_at,
             busy=self.busy,
             branch=self.branch,
+            task=self.task_items() or None,
         )
         if with_transcript:
             data["transcript"] = self.transcript()
@@ -1341,6 +1496,7 @@ def spec_as_dict(
     busy: bool = False,
     usage_total: dict | None = None,
     branch: dict | None = None,
+    task: dict | None = None,
 ) -> dict:
     """Конфиг чата так, как его ждут список слева и панель справа.
 
@@ -1369,6 +1525,9 @@ def spec_as_dict(
         # имя по нему находит тот, кто рисует список, у него все чаты и так
         # на руках, и переименование родителя видно сразу.
         "branch": branch,
+        # Состояние задачи показанным: этап с подписью, шаг и ожидаемое
+        # действие. `None` — режим выключен, и шапки над лентой нет вовсе.
+        "task": task,
         "created_at": created_at,
         "last_used_at": last_used_at,
     }

@@ -525,7 +525,7 @@ async function routeChecks() {
     // уже поднятом клиенте, а не отдельным сценарием: свой запуск стенда ради
     // одной строки текста дороже самой строки.
     check("в шапке стоит номер этого дня",
-      $(".brand-sub").textContent === "чат · день 12", $(".brand-sub").textContent);
+      $(".brand-sub").textContent === "чат · день 13", $(".brand-sub").textContent);
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
@@ -1987,6 +1987,173 @@ async function routeChecks() {
           JSON.stringify([wasKind, kinds()]));
       }
     }
+  }
+
+  // ── режим задачи: команды в поле ввода, шапка над лентой ──
+  //
+  // Команды разбираются на клиенте: сервер про слеши не знает. Главное здесь
+  // — что уходит: только `/task` шлёт обмен, остальные двигают состояние
+  // и молчат, а команда не к месту не шлёт вообще ничего.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "по этапам" }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const taskCalls = () =>
+      server.state.requests.filter((r) => /\/task$/.test(r.path));
+    const sentCount = () => server.state.sent.length;
+    const headLines = () =>
+      $("#task-head").children.map((n) => n.textContent);
+    const hintText = () => $("#composer-hint").textContent;
+    const type = async (text) => {
+      $("#input").value = text;
+      $("#composer").requestSubmit();
+      await settle(60);
+    };
+
+    check("режим выключен — шапки задачи нет вовсе",
+      $("#task-head").classList.contains("hidden") && headLines().length === 0,
+      JSON.stringify(headLines()));
+
+    // ── /taskfoo — слово, а не команда ──
+    //
+    // После имени команды обязателен пробел или конец строки. Иначе любое
+    // слово, начавшееся со слеша, уходило бы в ручку вместо модели.
+    await type("/taskfoo это просто слово");
+    check("«/taskfoo» ушло обычным сообщением, а не командой",
+      sentCount() === 1 && taskCalls().length === 0 &&
+        server.state.sent[0].text === "/taskfoo это просто слово",
+      JSON.stringify([sentCount(), taskCalls().length]));
+
+    // ── команда без обязательного текста ──
+    await type("/task");
+    check("«/task» без описания не шлёт ничего",
+      sentCount() === 1 && taskCalls().length === 0,
+      JSON.stringify([sentCount(), taskCalls().map((r) => r.method)]));
+    check("и под полем сказано, чего не хватает",
+      /описание/.test(hintText()), hintText());
+    check("а набранное осталось в поле — его видно и можно дописать",
+      $("#input").value === "/task", $("#input").value);
+
+    // ── /task <описание>: включает режим и отправляет обмен ──
+    await type("/task собрать ТЗ на приложение");
+    check("«/task <описание>» шлёт и ручку, и обмен",
+      taskCalls().length === 1 && taskCalls()[0].method === "POST" && sentCount() === 2,
+      JSON.stringify([taskCalls().map((r) => [r.method, r.body]), sentCount()]));
+    check("обменом уехало само описание, без слеша",
+      server.state.sent[1].text === "собрать ТЗ на приложение",
+      server.state.sent[1].text);
+    check("шапка встала: этап назван словом, а не только цветом",
+      headLines()[0] === "Задача · планирование", JSON.stringify(headLines()));
+    check("и в ней видно ожидаемое действие — умолчание этапа",
+      headLines().slice(-1)[0] === "ожидается: разложить задачу на шаги, затем /task-next",
+      JSON.stringify(headLines()));
+    check("шага человек не задавал — строки шага в шапке нет",
+      headLines().length === 2, JSON.stringify(headLines()));
+
+    // ── /task-step: пишет шаг и молчит ──
+    await type("/task-step набрасываю разделы");
+    check("«/task-step» шлёт ручку и **не** шлёт обмен",
+      taskCalls().length === 2 && taskCalls()[1].method === "PATCH" && sentCount() === 2,
+      JSON.stringify([taskCalls().map((r) => r.method), sentCount()]));
+    check("и шаг виден в шапке",
+      headLines()[1] === "шаг: набрасываю разделы", JSON.stringify(headLines()));
+
+    // ── /task-expect: заданное перебивает умолчание ──
+    await type("/task-expect показать черновик списком");
+    check("заданное человеком действие перебило умолчание этапа",
+      headLines().slice(-1)[0] === "ожидается: показать черновик списком",
+      JSON.stringify(headLines()));
+    await type("/task-expect");
+    check("«/task-expect» без текста не шлёт ничего и говорит, чего ждёт",
+      taskCalls().length === 3 && /ожидаем/.test(hintText()),
+      JSON.stringify([taskCalls().length, hintText()]));
+
+    // ── /task-next: смена этапа возвращает к умолчанию ──
+    await type("/task-next");
+    check("«/task-next» шлёт ручку и **не** шлёт обмен",
+      taskCalls().length === 4 && sentCount() === 2,
+      JSON.stringify([taskCalls().length, sentCount()]));
+    check("этап в шапке сменился",
+      headLines()[0] === "Задача · выполнение", JSON.stringify(headLines()));
+    check("а «ожидается» вернулось к умолчанию нового этапа",
+      headLines().slice(-1)[0] === "ожидается: сделать текущий шаг, затем /task-next",
+      JSON.stringify(headLines()));
+
+    // ── пауза выглядит иначе, чем работа ──
+    await type("/task-pause");
+    check("пауза различима не только цветом: словом в шапке и своим классом",
+      headLines()[0] === "Задача · пауза" &&
+        $("#task-head").className.split(" ").includes("paused"),
+      JSON.stringify([headLines()[0], $("#task-head").className]));
+
+    // ── команда не к месту: не ушло ничего, сказано что не так ──
+    const beforeBad = taskCalls().length;
+    await type("/task-next");
+    check("«/task-next» на паузе обмена не шлёт",
+      sentCount() === 2, String(sentCount()));
+    check("и под полем сказано, что не так и что можно",
+      /так не ходят/.test(hintText()) && /resume/.test(hintText()), hintText());
+    check("состояние при этом цело: шапка та же",
+      headLines()[0] === "Задача · пауза", JSON.stringify(headLines()));
+    check("а отказанная команда осталась в поле",
+      $("#input").value === "/task-next", $("#input").value);
+    check("ручку она всё же спросила: таблица переходов живёт на сервере",
+      taskCalls().length === beforeBad + 1, String(taskCalls().length));
+
+    // ── снятие паузы возвращает туда же ──
+    await type("/task-resume");
+    check("«/task-resume» вернул на тот же этап, с которого вставали",
+      headLines()[0] === "Задача · выполнение", JSON.stringify(headLines()));
+
+    // ── /task-off: шапки нет вовсе ──
+    await type("/task-off");
+    check("«/task-off» стёр состояние: шапки снова нет",
+      $("#task-head").classList.contains("hidden") && headLines().length === 0,
+      JSON.stringify(headLines()));
+    check("и обмена не случилось ни одного лишнего",
+      sentCount() === 2, String(sentCount()));
+
+    // ── после выключения слеш снова просто текст ──
+    await type("обычное сообщение");
+    check("обычное сообщение уходит обменом, как и раньше",
+      sentCount() === 3 && server.state.sent[2].text === "обычное сообщение",
+      JSON.stringify([sentCount(), server.state.sent[2].text]));
+  }
+
+  // ── врезка задачи подписана в просмотре промпта ──
+  {
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "с задачей" }],
+      tasks: { "с задачей": { stage: "execution", step: "пишу проверку" } },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("шапка поднялась вместе с чатом, а не после первой команды",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · выполнение",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(80);
+    const card = $("#feed").querySelectorAll(".card").slice(-1)[0];
+    cardButton(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    await settle(20);
+    const view = card.querySelector(".prompt-view");
+    const roles = view ? view.querySelectorAll(".prompt-role").map((r) => r.textContent) : [];
+    const texts = view ? view.querySelectorAll(".prompt-text").map((r) => r.textContent) : [];
+    check("в промпте подписаны правило этапа и врезка состояния",
+      roles.join(" | ") === "системный промпт | состояние задачи | сообщение пользователя",
+      roles.join(" | "));
+    check("и врезка — та самая, с этапом и шагом",
+      texts[1].startsWith("[задача]") && texts[1].includes("шаг: пишу проверку"),
+      JSON.stringify(texts[1]));
   }
 }
 

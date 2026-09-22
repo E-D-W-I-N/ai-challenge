@@ -286,6 +286,37 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg);
   position: relative;
 }
+/* Шапка задачи над лентой: этап, текущий шаг и ожидаемое действие.
+   Этапы различимы не только цветом — этап назван словом, а у паузы вдобавок
+   штриховая рамка: по одному цвету их не различил бы ни дальтоник,
+   ни чёрно-белый экран. */
+.task-head {
+  flex: 0 0 auto;
+  padding: 10px 28px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.task-stage {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.task-line {
+  color: var(--muted);
+  font-size: 13px;
+}
+/* Работа и пауза выглядят по-разному и без цвета: у паузы рамка штриховая
+   и слева, поперёк ленты. */
+.task-head.paused {
+  border-left: 3px dashed var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+.task-head.paused .task-line { color: var(--warn-text); }
+.task-head.done { border-left: 3px solid var(--ok); }
+
 /* `min-height: 0` стоит и на самой ленте: без него чат не даёт ей сжаться,
    и вместо прокрутки лента растягивает его, унося композер за край. */
 .feed {

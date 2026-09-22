@@ -539,6 +539,7 @@ async function openAgent(agentId) {
   // а числа — только его собственные.
   resetMetrics(agent);
   renderList();
+  renderTaskHead();
   renderFeed(agent);
   fillPanel(agent);
   renderTiles();
@@ -602,6 +603,24 @@ function renderFeed(agent) {
 
 function userBubble(text) {
   return el("div", "msg-user", text);
+}
+
+// Шапка над лентой: этап, текущий шаг и ожидаемое действие — три оси
+// состояния задачи. Режим выключен — шапки нет вовсе.
+//
+// Кнопок здесь нет намеренно: состояние двигают командами в поле ввода,
+// и второй способ на экране читался бы как другое действие. Этап назван
+// словом, а не только цветом: по цвету его не различить ни дальтонику,
+// ни на чёрно-белом экране.
+function renderTaskHead() {
+  const box = $("#task-head");
+  const task = state.current && state.current.task;
+  box.innerHTML = "";
+  box.className = "task-head" + (task ? " " + task.stage : " hidden");
+  if (!task) return;
+  box.appendChild(el("div", "task-stage", "Задача · " + task.label));
+  if (task.step) box.appendChild(el("div", "task-line", "шаг: " + task.step));
+  box.appendChild(el("div", "task-line", "ожидается: " + task.expects));
 }
 
 // Шапка карточки: одна на готовый ответ и на тот, в который ещё стримят.
@@ -826,6 +845,8 @@ function promptRole(msg, index, prompt) {
   // обрезке, стратегией не заказывается и ни одну не отменяет. Подпись берётся
   // из того же индекса, что и строка состояния её вызова.
   if (index === prompt.workingAt) return SERVICE_CALLS.facts.role;
+  // Состояние задачи — третьей врезкой, тем же порядком, что в промпте.
+  if (index === prompt.taskAt) return "состояние задачи";
   // Врезки стратегии может не быть вовсе — окно и «Вся история» не вставляют
   // ничего, и `summary_at` приходит пустым; память не едет, когда её нет или
   // выключатель чата в «выключено». Сравнение строгое именно поэтому:
@@ -917,6 +938,78 @@ function stopStream() {
   setBusy(false);
 }
 
+// ─────────────────── команды режима задачи ────────────────────
+//
+// Разбираются здесь, в поле ввода: сервер про слеши не знает — у поля `text`
+// одно значение, сообщение человека.
+//
+// `need` — обязательный текст: без него не уходит ничего, под полем подсказка.
+// `asks` стоит у одной команды: только `/task` отправляет обмен, остальные
+// меняют состояние и молчат — писать модели человек будет сам.
+
+const COMMANDS = {
+  "/task": {
+    need: "описание задачи",
+    asks: true,
+    run: (arg) => taskApi(json("POST", { description: arg })),
+  },
+  "/task-next": { run: () => taskApi(json("PATCH", { move: "next" })) },
+  "/task-step": {
+    need: "текст шага",
+    run: (arg) => taskApi(json("PATCH", { step: arg })),
+  },
+  "/task-expect": {
+    need: "ожидаемое действие",
+    run: (arg) => taskApi(json("PATCH", { expects: arg })),
+  },
+  "/task-pause": { run: () => taskApi(json("PATCH", { move: "pause" })) },
+  "/task-resume": { run: () => taskApi(json("PATCH", { move: "resume" })) },
+  "/task-off": { run: () => taskApi({ method: "DELETE" }) },
+};
+
+// Команда или null — обычное сообщение. После имени обязателен пробел или
+// конец строки: «/taskfoo» это слово, а не команда, и уйдёт в модель как есть.
+// Отдельной функцией без DOM — разбор проверяется без браузера.
+function parseCommand(text) {
+  const m = /^(\/\S+)(?:\s+([\s\S]*))?$/.exec(String(text || ""));
+  const cmd = m && COMMANDS[m[1]];
+  return cmd ? { name: m[1], cmd, arg: (m[2] || "").trim() } : null;
+}
+
+async function taskApi(options) {
+  const answer = await api("/api/agents/" + state.current.id + "/task", options);
+  state.current.task = answer.task;
+  renderTaskHead();
+  return answer;
+}
+
+async function runCommand(parsed) {
+  if (parsed.cmd.need && !parsed.arg) {
+    hint("После " + parsed.name + " нужен текст: " + parsed.cmd.need + ".", true);
+    return;
+  }
+  try {
+    await parsed.cmd.run(parsed.arg);
+  } catch (err) {
+    // Команда не к месту: состояние на сервере не тронуто, в модель не ушло
+    // ничего, а что можно сделать отсюда — сказано в отказе. Набранное
+    // остаётся в поле: его видно и можно поправить.
+    hint(String(err.message || err), true);
+    return;
+  }
+  const task = state.current.task;
+  hint(task ? "Задача · " + task.label + " · ожидается: " + task.expects
+            : "Режим задачи выключен.");
+  const input = $("#input");
+  input.value = "";
+  autoGrow(input);
+  // Описание задачи уезжает обменом: с него разговор и начинается.
+  if (parsed.cmd.asks && state.hasKey) {
+    await exchange("/api/agents/" + state.current.id + "/messages",
+      { text: parsed.arg }, parsed.arg);
+  }
+}
+
 async function send() {
   if (state.busy) {
     // Кнопка стала «Стоп»: рвём поток и просим агента прекратить генерацию.
@@ -928,8 +1021,13 @@ async function send() {
   }
   const input = $("#input");
   const text = (input.value || "").trim();
-  if (!text || !state.current || !state.hasKey) return;
+  if (!text || !state.current) return;
 
+  // Команда состояние двигает, а в модель не ходит: ключ ей не нужен.
+  const parsed = parseCommand(text);
+  if (parsed) return runCommand(parsed);
+
+  if (!state.hasKey) return;
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
@@ -1031,12 +1129,12 @@ async function exchange(path, body, questionText) {
             if (e.resolved_messages) {
               prompt = {
                 messages: e.resolved_messages,
-                // Слотов три: врезка долговременной памяти, врезка рабочей
-                // и врезка стратегии. Все три называет сервер, все три бывают
-                // пустыми, и в одном промпте они встречаются вместе — обе
-                // памяти едут при любой обрезке и ни одну не отменяют.
+                // Слотов четыре: обе памяти, состояние задачи и врезка
+                // стратегии. Все называет сервер, все бывают пустыми
+                // и в одном промпте встречаются вместе.
                 memoryAt: e.memory_at,
                 workingAt: e.working_at,
+                taskAt: e.task_at,
                 summaryAt: e.summary_at,
                 strategy: e.strategy,
               };
@@ -1132,6 +1230,7 @@ async function refreshCurrent(prompt) {
     const listed = state.agents.find((a) => a.id === fresh.id);
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
+    renderTaskHead();
     renderFeed(fresh);
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
     // перерисовываем, иначе панель отстаёт на один обмен.
@@ -2362,6 +2461,7 @@ function init() {
 
   setBusy(false);
   renderTiles();
+  renderTaskHead();
   renderMemory();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
@@ -2377,6 +2477,7 @@ if (typeof module === "undefined") {
     layoutFor,
     escapeAction,
     readStopLines,
+    parseCommand,
     parseResponseFormat,
     paramWarnings,
     fmt,

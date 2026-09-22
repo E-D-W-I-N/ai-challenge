@@ -139,6 +139,30 @@ CREATE TABLE IF NOT EXISTS working_memory (
 
 CREATE INDEX IF NOT EXISTS working_by_session ON working_memory(session_id);
 
+-- Состояние задачи: этап, текущий шаг и ожидаемое действие. Строка на чат —
+-- у разговора ровно одна задача.
+--
+-- Своя таблица, а не поля в `config`: конфиг это «чем один чат отличается
+-- от другого», а шаг задачи пишут посреди разговора. В конфиге остался только
+-- выключатель режима (`workflow`) — он и правда настройка.
+--
+-- `stage` хранится, а не вычисляется: выводить его не из чего — состояние
+-- двигает человек. `expects` пустой значит «человек не задавал»: тогда едет
+-- умолчание этапа (`STAGE_EXPECTS`). `paused_from` — куда вернуться из паузы.
+--
+-- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: удаление
+-- чата, очистка базы, `forget()`. Забытый разговор не вправе оставить
+-- следующему свой этап: правило этапа уезжает системным сообщением.
+CREATE TABLE IF NOT EXISTS task_state (
+    session_id  TEXT PRIMARY KEY,
+    stage       TEXT NOT NULL,
+    step        TEXT NOT NULL DEFAULT '',
+    expects     TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    paused_from TEXT NOT NULL DEFAULT '',
+    at          REAL NOT NULL
+);
+
 -- Происхождение чата: чей он потомок и сколько первых сообщений унёс.
 -- Ветка — обычный чат, отдельная строка в `sessions` с копией истории до
 -- точки ветвления; схему `messages` ветвление не трогает вовсе, изоляция
@@ -275,6 +299,19 @@ def _memory_row(row: sqlite3.Row) -> dict:
         "kind": row["kind"],
         "content": row["content"],
         "at": row["at"],
+    }
+
+
+def _task_row(row: sqlite3.Row) -> dict:
+    """Состояние задачи — одна форма на все чтения, как у `_working_row`.
+    Подписи этапа и умолчания `expects` здесь нет: это показ, и собирает его
+    `Agent.task_items` — одним местом на промпт и на шапку."""
+    return {
+        "stage": row["stage"],
+        "step": row["step"],
+        "expects": row["expects"],
+        "description": row["description"],
+        "paused_from": row["paused_from"],
     }
 
 
@@ -621,6 +658,7 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM branches WHERE session_id = ?", (session_id,))
             return bool(cursor.rowcount)
 
@@ -643,6 +681,7 @@ class Store:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM summaries")
             conn.execute("DELETE FROM working_memory")
+            conn.execute("DELETE FROM task_state")
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM profile")
@@ -844,6 +883,55 @@ class Store:
         в памяти есть хоть одна запись."""
         with self.tx() as conn:
             conn.execute("DELETE FROM working_memory WHERE session_id = ?", (session_id,))
+
+    # --- состояние задачи -----------------------------------------------------
+
+    def load_task(self, session_id: str) -> dict | None:
+        """Состояние задачи чата или `None` — задачи в нём нет."""
+        with self.reading() as conn:
+            row = conn.execute(
+                "SELECT stage, step, expects, description, paused_from "
+                "FROM task_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else _task_row(row)
+
+    def save_task(self, session_id: str, task: dict, at: float | None = None) -> dict:
+        """Записывает состояние целиком и отдаёт **записанное**: параметры
+        едут через `tx()`, и `redact()` чистит их по дороге. Целиком, а не
+        по полю, — как `update_working`: у вызывающего оно уже на руках."""
+        stamp = time.time() if at is None else at
+        with self.tx() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO task_state
+                    (session_id, stage, step, expects, description, paused_from, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    stage       = excluded.stage,
+                    step        = excluded.step,
+                    expects     = excluded.expects,
+                    description = excluded.description,
+                    paused_from = excluded.paused_from,
+                    at          = excluded.at
+                RETURNING stage, step, expects, description, paused_from
+                """,
+                (
+                    session_id,
+                    task["stage"],
+                    task.get("step", ""),
+                    task.get("expects", ""),
+                    task.get("description", ""),
+                    task.get("paused_from", ""),
+                    stamp,
+                ),
+            ).fetchone()
+        return _task_row(row)
+
+    def clear_task(self, session_id: str) -> None:
+        """Стирает состояние задачи чата."""
+        with self.tx() as conn:
+            conn.execute("DELETE FROM task_state WHERE session_id = ?", (session_id,))
 
     # --- происхождение чата ---------------------------------------------------
 
