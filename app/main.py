@@ -542,11 +542,17 @@ async def fork_agent(agent_id: str, payload: dict = Body(default=None)) -> dict:
 # быть не может, а исправлять надо не запрос, а этап.
 
 
-def _plan_move(agent: Agent, move: Callable[[], dict]) -> dict:
+def _plan_move(agent: Agent, move: Callable[[], dict], busy_ok: bool = False) -> dict:
     """Один переход по кнопке: занятость — 409, не тот этап — тоже 409.
     Занятого не двигаем: план обмен читает живой, и утверждение посреди
-    него дало бы промпт одного этапа с правилом другого."""
-    if agent.busy:
+    него дало бы промпт одного этапа с правилом другого.
+
+    Исключение ровно одно — пауза (`busy_ok`): нажимают её именно тогда,
+    когда агент работает, и спорить ей не с чем. Правило этапа и блок задачи
+    пересобираются перед каждым оборотом (`Agent.restage`), так что следующий
+    оборот увидит `paused`, инструменты на нём погаснут, и агент договорит
+    словами."""
+    if agent.busy and not busy_ok:
         raise HTTPException(
             status_code=409,
             detail=f"агент {agent.id} уже занят: дождитесь текущего ответа",
@@ -575,10 +581,11 @@ async def reopen_plan(agent_id: str) -> dict:
 
 @app.post("/api/agents/{agent_id}/plan/pause")
 async def pause_plan(agent_id: str) -> dict:
-    """Кнопка «Пауза»: на любом этапе, кроме завершённого. Ставит только
-    человек, а держится пауза на отказе обоих инструментов модели."""
+    """Кнопка «Пауза»: на любом этапе, кроме завершённого, и **на занятом
+    агенте тоже** — остановить просят работающего. Ставит только человек,
+    а держится пауза на отказе обоих инструментов модели."""
     agent = _agent(agent_id)
-    return {"plan": _plan_move(agent, agent.pause_plan)}
+    return {"plan": _plan_move(agent, agent.pause_plan, busy_ok=True)}
 
 
 @app.post("/api/agents/{agent_id}/plan/resume")

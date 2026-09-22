@@ -894,6 +894,10 @@ const PLAN_ACTIONS = [
     action: "pause",
     label: "Пауза",
     stages: ["planning", "approval", "execution", "validation"],
+    // Единственная кнопка, живая **во время обмена**: нажимают её именно
+    // тогда, когда агент работает. Остальным четырём занятость отказывает
+    // и сервер: они спорят с тем, что уже уехало в модель.
+    busy: true,
   },
   {
     action: "resume",
@@ -999,8 +1003,9 @@ function renderTask(agent) {
     btn.type = "button";
     // Пока идёт ответ, переходы запрещены и на сервере: обмен читает план
     // живым. Кнопка поэтому гаснет, а не молчит в ответ на нажатие:
-    // молчаливый отказ читается как поломка.
-    btn.disabled = state.busy || state.planMoving;
+    // молчаливый отказ читается как поломка. Исключение — «Пауза»
+    // (`entry.busy`): её ручка занятому не отказывает.
+    btn.disabled = (state.busy && !entry.busy) || state.planMoving;
     btn.onclick = () => planMove(entry);
     actions.appendChild(btn);
   });
@@ -1059,7 +1064,8 @@ async function planMove(entry) {
   // щелчком и ответом ручки ещё ложь. Без замка второй запрос получает 409
   // и перечитывает чат **посреди** потока: лента перерисовывается, а куски
   // капают в отцепленный узел. Образец — замок `settled` у правки памяти.
-  if (state.busy || state.planMoving || !state.current) return;
+  if (state.planMoving || !state.current) return;
+  if (state.busy && !entry.busy) return;
   const id = state.current.id;
   state.planMoving = true;
   // Перерисовка не украшение: замок обязан быть виден, иначе кнопка молчит

@@ -2201,11 +2201,16 @@ async function routeChecks() {
     check("кадр tool: карточка говорит дословно, чем занята пауза",
       usageText($("#feed"), ".card-status-text") === "Модель работает по плану…",
       usageText($("#feed"), ".card-status-text"));
-    // Пока идёт ответ, переходы отказаны и на сервере. Кнопка обязана гаснуть,
-    // а не молчать: молчаливый отказ читается как поломка.
-    check("пока идёт ответ, кнопки шапки погашены",
-      $("#task").querySelectorAll(".task-btn").every((b) => b.disabled === true),
-      JSON.stringify($("#task").querySelectorAll(".task-btn").map((b) => b.disabled)));
+    // Пока идёт ответ, переходы отказаны и на сервере — кроме паузы: её
+    // нажимают именно тогда, когда агент работает, и ручка занятому
+    // не отказывает. Остальные гаснут, а не молчат в ответ на нажатие:
+    // молчаливый отказ читается как поломка.
+    const alive = $("#task").querySelectorAll(".task-btn")
+      .filter((b) => b.disabled === false).map((b) => b.textContent);
+    check("пока идёт ответ, из кнопок шапки жива одна «Пауза»",
+      JSON.stringify(alive) === JSON.stringify(["Пауза"]),
+      JSON.stringify($("#task").querySelectorAll(".task-btn")
+        .map((b) => [b.textContent, b.disabled])));
     // План сдвинулся — клиент шлёт продолжение сам, и ждать надо его тоже.
     // Второй обмен несёт тот же вызов, план не двигается, и цепочка встаёт.
     await settle(800);
@@ -2219,6 +2224,48 @@ async function routeChecks() {
       $("#task").querySelectorAll(".task-btn").every((b) => b.disabled === false) &&
         taskButtons($).length > 0,
       JSON.stringify($("#task").querySelectorAll(".task-btn").map((b) => b.disabled)));
+  }
+
+  // ── «Пауза» нажата на работающем агенте и доезжает ──
+  // Живой кнопке мало быть живой: замок `planMoving` и ручка стенда обязаны
+  // пропустить её ровно тогда, когда чат занят. Занятость стенду взводим
+  // руками — обмен он ведёт, а флажок чата не поднимает, и без этого ручка
+  // отказала бы не потому, что мы просили.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      delay: 60,
+      chats: [withPlan("в работе", "execution")],
+    });
+    client.init();
+    await settle(40);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(60);
+    $("#input").value = "делай";
+    $("#composer").requestSubmit();
+    await settle(80);
+    server.state.agents[2].busy = true;
+    check("обмен в этот момент ещё идёт", client.state.busy === true,
+      "окно поймано не то");
+    taskButton($, "Пауза").dispatchEvent(new Evt("click"));
+    await settle(120);
+    check("«Пауза» уехала на сервер прямо посреди обмена",
+      postedPlan(server, "pause") >= 0,
+      JSON.stringify(server.state.requests.map((r) => r.path)));
+    check("и не отказом: задача встала на паузу",
+      server.state.agents[2].plan.paused === true &&
+        $("#task").classList.contains("stage-paused"),
+      JSON.stringify(server.state.agents[2].plan));
+    // Утверждение об отсутствии — там, где присутствие достижимо: обе кнопки
+    // в одной шапке, и «Выйти» погашена ровно потому, что чат занят.
+    check("а «Выйти из режима задачи» в тот же момент погашена",
+      taskButton($, "Выйти из режима задачи").disabled === true,
+      JSON.stringify($("#task").querySelectorAll(".task-btn")
+        .map((b) => [b.textContent, b.disabled])));
+    server.state.agents[2].busy = false;
+    await settle(600);
+    check("обмен при этом дошёл до конца, а продолжения не было",
+      client.state.busy === false && server.state.sent.length === 1,
+      JSON.stringify(server.state.sent.map((x) => x.text)));
   }
 
   // ══════════════ цепочка: один сделанный шаг — один обмен ══════════════
