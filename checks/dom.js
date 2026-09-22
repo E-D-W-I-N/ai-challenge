@@ -517,6 +517,9 @@ function buildServer(options) {
     // Собери стенд их заново в каждом ответе — правка исчезала бы к следующему
     // чтению, и проверка правки прошла бы на подложном равенстве.
     working: {},
+    // Состояние задачи по чатам: `{stage, step, expects, description,
+    // paused_from}`. Сеется по имени чата, дальше двигают только команды.
+    tasks: {},
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
       { id: "вторая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -532,7 +535,64 @@ function buildServer(options) {
   // панель обязана отличать пустое окно памяти («не режем») от нуля. Здесь
   // это карта «поле → умолчание»: у стратегии умолчание не пустое, а `full`,
   // как в `AgentSpec`, — «не выбрано» у неё состояния нет.
-  const CONTEXT = { strategy: "full", keep_last: null, compress_every: null };
+  const CONTEXT = {
+    strategy: "full", keep_last: null, compress_every: null, workflow: "off",
+  };
+
+  // Автомат задачи — своя копия, как и всё в стенде: он нарочно независим
+  // от сервера. Внутри стенда копия одна — по ней ходят и ручки, и промпт.
+  const STAGE_LABELS = {
+    planning: "планирование", execution: "выполнение", validation: "проверка",
+    done: "готово", paused: "пауза",
+  };
+  const STAGE_RULES = {
+    planning: "Разложи задачу на шаги и ничего не выполняй.",
+    execution: "Делай текущий шаг и только его.",
+    validation: "Перечитай сделанное и назови конкретные недостатки.",
+    done: "Отвечай на вопросы по сделанному, нового не начинай.",
+    paused: "Работа приостановлена человеком: не продолжай её, даже если просят. "
+      + "Снимает паузу только он, командой.",
+  };
+  const STAGE_EXPECTS = {
+    planning: "разложить задачу на шаги, затем /task-next",
+    execution: "сделать текущий шаг, затем /task-next",
+    validation: "перечитать сделанное и назвать недостатки, затем /task-next",
+    done: "задача закончена: дальше только вопросы по сделанному",
+    paused: "продолжить можно только командой /task-resume",
+  };
+  const TRANSITIONS = {
+    "planning:next": "execution",
+    "execution:next": "validation",
+    "validation:next": "done",
+    "planning:pause": "paused",
+    "execution:pause": "paused",
+    "validation:pause": "paused",
+    "paused:resume": "@resume",
+  };
+  const MOVES = ["next", "pause", "resume"];
+
+  // Состояние задачи показанным: подпись этапа и умолчание ожидаемого
+  // действия подставляются здесь, одним местом на промпт и на ответ ручки.
+  const taskView = (agent) => {
+    const raw = state.tasks[agent.id];
+    if (agent.workflow !== "plan" || !raw || !STAGE_LABELS[raw.stage]) return null;
+    return {
+      stage: raw.stage,
+      label: STAGE_LABELS[raw.stage],
+      step: raw.step,
+      expects: raw.expects || STAGE_EXPECTS[raw.stage],
+      description: raw.description,
+    };
+  };
+
+  const taskInsert = (agent) => {
+    const task = taskView(agent);
+    if (!task) return null;
+    const lines = ["описание: " + task.description, "этап: " + task.label];
+    if (task.step) lines.push("шаг: " + task.step);
+    lines.push("ожидается: " + task.expects);
+    return "[задача]\n" + lines.join("\n") + "\n[конец задачи]";
+  };
 
   const blank = (id, label) => ({
     id,
@@ -580,7 +640,7 @@ function buildServer(options) {
   });
 
   // Чат так, как его отдаёт сервер.
-  const view = (agent) => ({ ...agent });
+  const view = (agent) => ({ ...agent, task: taskView(agent) });
 
   // Рабочая память чата, которому её не сеяли: слой есть у каждого, просто
   // пустой — ровно как на сервере.
@@ -614,8 +674,16 @@ function buildServer(options) {
   }
 
   // Чаты, заведённые заранее, — как если бы их создали руками до открытия.
+  const seededTasks = (options && options.tasks) || {};
   ((options && options.chats) || [{ label: "чат" }]).forEach((seed) => {
     const agent = Object.assign(blank(nextId(), seed.label), seed);
+    if (seededTasks[seed.label]) {
+      state.tasks[agent.id] = {
+        stage: "planning", step: "", expects: "", description: "задача",
+        paused_from: "", ...seededTasks[seed.label],
+      };
+      agent.workflow = "plan";
+    }
     if (!("usage_total" in seed)) agent.usage_total = sumUsage(agent.transcript);
     // Число сообщений считает сервер — это длина истории, реплика к реплике.
     // Заданное в seed не трогаем: им проверяется, что клиент показывает
@@ -698,8 +766,16 @@ function buildServer(options) {
   // обрезки, ни одну из них не отменяя.
   function promptHead(agent, service) {
     const messages = [];
-    const slots = { memory_at: null, working_at: null, summary_at: null };
-    if (agent.system) messages.push({ role: "system", content: agent.system });
+    const slots = { memory_at: null, working_at: null, task_at: null, summary_at: null };
+    // Системным едет то, что задал человек: промпт чата и правило этапа.
+    // Правило заводит системное сообщение и у чата без промпта — и сдвигает
+    // этим номера всех врезок разом.
+    const task = taskView(agent);
+    const head = [
+      agent.system,
+      task ? "[этап задачи: " + task.label + "]\n" + STAGE_RULES[task.stage] : "",
+    ].filter(Boolean).join("\n\n");
+    if (head) messages.push({ role: "system", content: head });
 
     const memory = memoryInsert();
     if (memory) {
@@ -710,6 +786,11 @@ function buildServer(options) {
     if (facts) {
       slots.working_at = messages.length;
       messages.push({ role: "user", content: facts });
+    }
+    const insert = taskInsert(agent);
+    if (insert) {
+      slots.task_at = messages.length;
+      messages.push({ role: "user", content: insert });
     }
     // Окно — единственная стратегия, которая режет **без** врезки: вместо
     // отброшенного начала не встаёт ничего, слот у неё пуст, и в промпте
@@ -933,6 +1014,8 @@ function buildServer(options) {
       child.history_len = child.transcript.length;
       child.usage_total = sumUsage(child.transcript);
       child.branch = { parent_id: agent.id, forked_at: at };
+      // Состояние задачи ветка уносит целиком: та же задача, тот же этап.
+      if (state.tasks[agent.id]) state.tasks[child.id] = { ...state.tasks[agent.id] };
       state.agents.push(child);
       return json({ created: 1, live: state.agents.length, agents: [view(child)] });
     }
@@ -991,6 +1074,74 @@ function buildServer(options) {
       if (i < 0) return fail(404, "записи рабочей памяти " + seq + " в этом чате нет");
       working.records.splice(i, 1);
       return json({ deleted: seq });
+    }
+    // ── состояние задачи: ручки под чатом, автомат по таблице ──
+    //
+    // Границы те же, что на сервере: тело только из известных полей, пустое
+    // тело правки 400, ход не из таблицы 409 и состояние цело. Стенд, щедрее
+    // серверного, оставил бы зелёной команду, получающую в браузере отказ.
+    if (tail === "/task" && method === "GET") return json({ task: taskView(agent) });
+    if (tail === "/task" && method === "POST") {
+      const keys = Object.keys(body || {});
+      const unknown = keys.filter((k) => k !== "description");
+      if (unknown.length) return fail(400, "лишние поля: " + unknown.join(", "));
+      const text = body && body.description;
+      if (typeof text !== "string" || !text.trim()) {
+        return fail(400, "description: непустая строка");
+      }
+      agent.workflow = "plan";
+      state.tasks[agent.id] = {
+        stage: "planning", step: "", expects: "",
+        description: clean(text), paused_from: "",
+      };
+      return json({ task: taskView(agent) });
+    }
+    if (tail === "/task" && method === "PATCH") {
+      const keys = Object.keys(body || {});
+      const unknown = keys.filter((k) => !["move", "step", "expects"].includes(k));
+      if (unknown.length) return fail(400, "лишние поля: " + unknown.join(", "));
+      if (!keys.length) return fail(400, "тело правки пустое: назовите move, step, expects");
+      const raw = state.tasks[agent.id];
+      if (agent.workflow !== "plan" || !raw) {
+        return fail(409, "режим задачи в этом чате не включён: начните с /task");
+      }
+      // Тело разбирается до первой правки: кривой текст рядом с законным
+      // ходом оставил бы состояние наполовину сдвинутым.
+      const texts = {};
+      for (const name of ["step", "expects"]) {
+        if (!keys.includes(name)) continue;
+        const value = body[name];
+        if (typeof value !== "string" || !value.trim()) {
+          return fail(400, name + ": непустая строка");
+        }
+        texts[name] = clean(value);
+      }
+      if (keys.includes("move")) {
+        const move = body.move;
+        if (typeof move !== "string" || !MOVES.includes(move)) {
+          return fail(400, "move: одно из " + MOVES.join(", "));
+        }
+        let target = TRANSITIONS[raw.stage + ":" + move];
+        if (target === "@resume") target = raw.paused_from;
+        if (!target || !STAGE_LABELS[target]) {
+          const allowed = MOVES.filter((m) => TRANSITIONS[raw.stage + ":" + m]);
+          return fail(409, allowed.length
+            ? "с этапа «" + STAGE_LABELS[raw.stage] + "» так не ходят: отсюда можно "
+              + allowed.join(", ")
+            : "этап «" + STAGE_LABELS[raw.stage] + "» завершающий: отсюда не ходят никуда");
+        }
+        raw.paused_from = target === "paused" ? raw.stage : "";
+        raw.stage = target;
+        // Смена этапа сбрасывает заданное человеком действие.
+        raw.expects = "";
+      }
+      Object.assign(raw, texts);
+      return json({ task: taskView(agent) });
+    }
+    if (tail === "/task" && method === "DELETE") {
+      agent.workflow = "off";
+      delete state.tasks[agent.id];
+      return json({ task: null });
     }
     if (tail === "/cancel") return json({ cancelled: agent.id });
     if (!tail && method === "GET") return json(view(agent));

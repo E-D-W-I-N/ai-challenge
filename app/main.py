@@ -31,8 +31,12 @@ from .schema import (
     CONTEXT_FIELDS,
     CONTEXT_NUMBERS,
     MEMORY_KINDS,
+    MOVES,
     PROFILE_FIELDS,
     STRATEGIES,
+    TASK_FIELDS,
+    TRANSITIONS,
+    WORKFLOW_MODES,
     WORKING_KINDS,
     AgentSpec,
 )
@@ -262,6 +266,9 @@ def _context_fields(payload: dict, where: str = "") -> dict:
     """
     values: dict = {
         "strategy": _choice_field(payload, "strategy", STRATEGIES, "full", where),
+        # Режим задачи — поле конфига, но в панели его нет: включает режим
+        # только команда `/task`, своей ручкой.
+        "workflow": _choice_field(payload, "workflow", WORKFLOW_MODES, "off", where),
     }
     for name in CONTEXT_NUMBERS:
         values[name] = _optional_field(payload, name, (int,), "целое число или null", where)
@@ -367,6 +374,24 @@ def _kind_field(payload: dict, kinds: tuple = MEMORY_KINDS) -> str:
     return kind
 
 
+def _move_field(payload: dict) -> str:
+    """Переход автомата: обязателен и только из списка. Не `_choice_field`:
+    тот подставляет умолчание на отсутствующий ключ, а умолчания у хода нет —
+    состояние двигает человек, сервер за него не двигает."""
+    move = payload.get("move")
+    if not isinstance(move, str) or move not in MOVES:
+        raise HTTPException(
+            status_code=400, detail=f"move: одно из {', '.join(MOVES)}, а не {move!r}"
+        )
+    return move
+
+
+def _allowed_from(stage: str) -> str:
+    """Какие ходы законны с этого этапа — по той же таблице, для текста
+    отказа. Пусто — этап завершающий."""
+    return ", ".join(move for (where, move) in TRANSITIONS if where == stage)
+
+
 def _record_body(payload, allowed: tuple) -> dict:
     """Тело запроса к записи памяти или к профилю: объект и только известные
     поля, список полей — параметром.
@@ -395,15 +420,17 @@ def _record_body(payload, allowed: tuple) -> dict:
     return payload
 
 
-def _content_field(payload: dict) -> str:
-    """Текст записи памяти: непустая строка. Образец — `_label_field`.
+def _content_field(payload: dict, name: str = "content") -> str:
+    """Непустая строка свободного текста: запись памяти, шаг задачи, её
+    описание. Пустая уехала бы в промпт строкой «шаг: » и заняла бы место,
+    ничего не сказав, — это 400, а не молчаливый пропуск.
 
-    Пустая запись уехала бы в промпт строкой «о собеседнике: » и заняла бы место
-    врезки, ничего не сказав, — это 400, а не молчаливый пропуск.
+    Имя поля параметром: правило у них одно, и вторая копия разошлась бы
+    с первой — довод тот же, что у `_record_body`.
     """
-    content = payload.get("content")
+    content = payload.get(name)
     if not isinstance(content, str) or not content.strip():
-        raise HTTPException(status_code=400, detail="content: непустая строка")
+        raise HTTPException(status_code=400, detail=f"{name}: непустая строка")
     return content.strip()
 
 
@@ -839,6 +866,75 @@ async def delete_working(agent_id: str, seq: int) -> dict:
             detail=f"записи рабочей памяти {seq} в этом чате нет: её уже удалили",
         )
     return {"deleted": seq}
+
+
+# --- состояние задачи ---------------------------------------------------------
+#
+# Ручки под чатом: задача живёт в разговоре и умирает вместе с ним. Двигает
+# состояние **только человек** — командами в поле ввода; сервер про слеши
+# не знает, их разбирает клиент.
+
+
+@app.get("/api/agents/{agent_id}/task")
+async def get_task(agent_id: str) -> dict:
+    """Состояние задачи или `null` — режим выключен."""
+    return {"task": _agent(agent_id).task_items() or None}
+
+
+@app.post("/api/agents/{agent_id}/task")
+async def start_task(agent_id: str, payload: dict = Body(...)) -> dict:
+    """Включает режим: `{"description": "..."}`, этап — планирование."""
+    agent = _agent(agent_id)
+    _record_body(payload, ("description",))
+    return {"task": agent.start_task(_content_field(payload, "description"))}
+
+
+@app.patch("/api/agents/{agent_id}/task")
+async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
+    """Ход автомата или правка текста: `{"move": ...}`, `{"step": "..."}`,
+    `{"expects": "..."}`. Названное меняется, неназванное не трогается.
+
+    Переход не из таблицы — 409, и состояние остаётся прежним: отказать
+    честнее, чем сделать соседний ход за человека.
+    """
+    agent = _agent(agent_id)
+    _record_body(payload, ("move", *TASK_FIELDS))
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail=f"тело правки пустое: назовите move, {', '.join(TASK_FIELDS)} или часть",
+        )
+    task = agent.task_items()
+    if not task:
+        raise HTTPException(
+            status_code=409, detail="режим задачи в этом чате не включён: начните с /task"
+        )
+    # Всё тело разбирается до первой правки: иначе кривой `step` рядом
+    # с законным `move` оставил бы состояние наполовину сдвинутым.
+    values = {name: _content_field(payload, name) for name in TASK_FIELDS if name in payload}
+    if "move" in payload:
+        moved = agent.move_task(_move_field(payload))
+        if moved is None:
+            allowed = _allowed_from(task["stage"])
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"с этапа «{task['label']}» так не ходят: отсюда можно {allowed}"
+                    if allowed
+                    else f"этап «{task['label']}» завершающий: отсюда не ходят никуда"
+                ),
+            )
+        task = moved
+    if values:
+        task = agent.write_task(values)
+    return {"task": task}
+
+
+@app.delete("/api/agents/{agent_id}/task")
+async def stop_task(agent_id: str) -> dict:
+    """Выход из режима: состояние стирается целиком."""
+    _agent(agent_id).stop_task()
+    return {"task": None}
 
 
 # --- каталог моделей ----------------------------------------------------------

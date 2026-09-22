@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 12</span>
+            <span class="brand-sub">чат · день 13</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -36,12 +36,18 @@
 
     <!-- ── по центру: лента ──────────────────────────────────────────── -->
     <main class="chat">
+      <!-- Шапка задачи: этап, текущий шаг и ожидаемое действие. Пуста
+           в разметке — наполняет её `renderTaskHead` по полю `task` агента,
+           и при выключенном режиме её нет вовсе. Кнопок здесь нет: состояние
+           двигают командами в поле ввода. -->
+      <div class="task-head hidden" id="task-head" role="status"></div>
+
       <div class="feed" id="feed"></div>
 
       <form class="composer" id="composer">
         <div class="composer-box">
           <textarea id="input" class="composer-input" rows="1"
-                    placeholder="Напишите сообщение… (Shift+Enter — новая строка)"></textarea>
+                    placeholder="Напишите сообщение… (/task — работа по этапам, Shift+Enter — новая строка)"></textarea>
           <button class="send-btn" id="send" type="submit" title="Отправить"
                   aria-label="Отправить"></button>
         </div>

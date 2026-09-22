@@ -33,7 +33,15 @@ import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
 from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
-from app.schema import AgentSpec  # noqa: E402
+from app.schema import (  # noqa: E402
+    MOVES,
+    RESUME,
+    STAGE_EXPECTS,
+    STAGE_LABELS,
+    STAGES,
+    TRANSITIONS,
+    AgentSpec,
+)
 from app.store import Store  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -260,7 +268,7 @@ def _restarted(store, agent_id: str):
 
 ALL_TABLES = (
     "sessions", "messages", "meta", "summaries", "branches", "memory",
-    "working_memory", "profile",
+    "working_memory", "task_state", "profile",
 )
 """Все таблицы схемы: перебор идёт по ним целиком и по всем колонкам каждой,
 чтобы ключ искался и в колонках, которых ещё не придумали."""
@@ -308,6 +316,7 @@ CLEANUP_TABLE = {
     # слой              forget delete_session clear
     "summaries":       (True,  True,  True),
     "working":         (True,  True,  True),
+    "task":            (True,  True,  True),
     "branches":        (False, True,  True),
     "long_term":       (False, False, True),
     "profile":         (False, False, True),
@@ -316,7 +325,9 @@ CLEANUP_TABLE = {
 `DELETE` обязан стоять руками: каскада нет, внешние ключи не объявлены.
 
 `False` — не пробелы в таблице, а вторая её половина, и такая же
-обязательная. Родство переживает `forget()`: это не содержимое разговора,
+обязательная. Состояние задачи уносится со всех трёх: правило этапа уезжает **системным**
+сообщением, и забытый разговор оставил бы следующему чужое «не продолжай».
+Родство переживает `forget()`: это не содержимое разговора,
 а то, откуда чат взялся, и ветка, забывшая историю, осталась веткой того же
 родителя. Долговременная память переживает и `forget()`, и удаление чата:
 чат ей не владелец, а читатель, — и стирает её ровно один путь, `clear()`,
@@ -331,12 +342,12 @@ CLEANUP_TABLE = {
 
 
 def _filled_chat(store, label: str):
-    """Чат, у которого непусты **все пять** слоёв сразу: сводка, рабочая
-    память, родство, долговременная память и профиль.
+    """Чат, у которого непусты **все шесть** слоёв сразу: сводка, рабочая
+    память, состояние задачи, родство, долговременная память и профиль.
 
     Обменов три: порог сжатия при `keep_last=2` и `compress_every=2`
-    набирается только на третьем. Запись рабочей памяти кладётся руками —
-    других записей в этом слое не бывает. Родство пишется прямо
+    набирается только на третьем. Запись рабочей памяти и задачу кладёт
+    человек — других путей в эти слои нет. Родство пишется прямо
     в хранилище: ветвить настоящего родителя ради одной строки незачем,
     а `parent_id` тут и не разглядывается.
     """
@@ -347,6 +358,7 @@ def _filled_chat(store, label: str):
     )
     _ask(chat, 3, label + " {i}")
     chat.add_working_record("goal", f"цель чата {label}")
+    chat.start_task(f"задача чата {label}")
     store.save_branch(chat.id, parent_id="ag_00001", forked_at=2)
     store.add_memory("knowledge", f"запись рядом с чатом {label}")
     store.save_profile({"style": f"кратко, рядом с чатом {label}"})
@@ -358,6 +370,7 @@ def _leftovers(store, session_id: str) -> dict:
     return {
         "summaries": store.load_summaries(session_id),
         "working": store.list_working(session_id),
+        "task": store.load_task(session_id),
         "branches": store.load_branch(session_id),
         "long_term": store.list_memory(),
         "profile": store.load_profile(),
@@ -984,12 +997,12 @@ def check_summary_apart_and_cleanup():
     и обмен уже после него: сводка та же, история полная, `seq` без дыр,
     и текста сводки в репликах нет.
 
-    **Вторая** — плата за отдельную таблицу: каскада нет, и каждый слой
+    **Вторая** — плата за отдельные таблицы: каскада нет, и каждый слой
     обязан уноситься с каждого пути очистки руками. Пути и слои сведены
     в таблицу (`CLEANUP_TABLE`), там же записано, почему одни клетки
     уносят, а другие **оставляют**. Раньше клетки проверялись врозь, по одной
     в четырёх проверках; здесь они проходятся разом и на чате, у которого
-    непусты все пять слоёв, — утверждение об очистке обязано стоять
+    непусты все шесть слоёв, — утверждение об очистке обязано стоять
     на непустом значении, иначе оно показывает покрытие, которого нет.
     """
     from app.agent import Agent
@@ -1041,7 +1054,7 @@ def check_summary_apart_and_cleanup():
         for column, (path_name, wipe) in enumerate(CLEANUP_PATHS.items()):
             chat = _filled_chat(again, path_name)
             full = _leftovers(again, chat.id)
-            # Сцена непуста во всех пяти слоях: без этого «после очистки
+            # Сцена непуста во всех шести слоях: без этого «после очистки
             # пусто» держалось бы само собой и стерегло бы воздух.
             assert all(full.values()), (path_name, full)
             wipe(again, chat)
@@ -2428,6 +2441,276 @@ def check_profile_changes_answer():
         f"кратко — {short_answer!r}; подробно — {long_answer!r}; без профиля — "
         f"{empty_answer!r}; запросы различаются одним системным сообщением; "
         "профиль без системного промпта сдвинул врезки на 1, снятый — вернул"
+    )
+
+
+# --- День 13: состояние задачи — строгая машина, ручное управление ------------
+
+
+def _task_url(agent_id: str) -> str:
+    return f"/api/agents/{agent_id}/task"
+
+
+def _at_stage(client, stage: str, label: str = "задача"):
+    """Чат, доведённый до нужного этапа **командами** — других путей нет.
+
+    Утверждений здесь нет: на какой этап он встал, проверяет сама проверка.
+    Пауза берётся с планирования, значит снятие вернёт туда же.
+    """
+    agent_id = new_agent(client, label=f"{label} {stage}")
+    client.post(_task_url(agent_id), json={"description": f"{label} — собрать ТЗ"})
+    moves = {
+        "planning": (),
+        "execution": ("next",),
+        "validation": ("next", "next"),
+        "done": ("next", "next", "next"),
+        "paused": ("pause",),
+    }[stage]
+    for move in moves:
+        client.patch(_task_url(agent_id), json={"move": move})
+    return agent_id
+
+
+@check("этап меняется только переходом из таблицы, и двигает его человек")
+def check_task_machine():
+    """Автомат Дня 13: планирование → выполнение → проверка → готово, пауза
+    с любого незавершённого этапа.
+
+    Ходов три и все три — нажатия человека: у модели нет ни одного рычага.
+    Таблица переходов одна, и проходится она целиком: пятнадцать клеток
+    «этап × ход», где семь ведут дальше, а восемь обязаны отказать, оставив
+    состояние прежним.
+
+    Ожидаемое действие — третья ось задания, хранится наравне с этапом
+    и шагом: не задавали — едет умолчание этапа, задали — своё, сменили
+    этап — снова умолчание.
+    """
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        # --- 1. Вся таблица переходов, клетка за клеткой --------------------
+        walked, refused = [], []
+        for stage in STAGES:
+            for move in MOVES:
+                agent_id = _at_stage(client, stage, "обход")
+                before = client.get(_task_url(agent_id)).json()["task"]
+                assert before["stage"] == stage, (stage, before)
+                answer = client.patch(_task_url(agent_id), json={"move": move})
+                target = TRANSITIONS.get((stage, move))
+                if target is None:
+                    # Незаконный ход: отказ, и состояние цело. Сделать
+                    # соседний ход за человека было бы хуже отказа.
+                    assert answer.status_code == 409, (stage, move, answer.text)
+                    assert client.get(_task_url(agent_id)).json()["task"] == before, (
+                        f"{stage} + {move}: отказали, а состояние сдвинулось"
+                    )
+                    refused.append((stage, move))
+                    continue
+                # Снятие паузы возвращает туда, откуда встали: помощник
+                # ставил её с планирования.
+                expected = "planning" if target == RESUME else target
+                assert answer.status_code == 200, (stage, move, answer.text)
+                assert answer.json()["task"]["stage"] == expected, (stage, move, answer.json())
+                walked.append((stage, move))
+        assert len(walked) == 7 and len(refused) == 8, (walked, refused)
+        # «Готово» терминально: с него не уводит ни один ход.
+        assert [m for (s, m) in refused if s == "done"] == list(MOVES), refused
+
+        # --- 2. Пауза с каждого незавершённого этапа, и возврат туда же -----
+        for stage in ("planning", "execution", "validation"):
+            agent_id = _at_stage(client, stage, "пауза")
+            paused = client.patch(_task_url(agent_id), json={"move": "pause"})
+            assert paused.status_code == 200, (stage, paused.text)
+            assert paused.json()["task"]["stage"] == "paused", paused.json()
+            back = client.patch(_task_url(agent_id), json={"move": "resume"})
+            assert back.status_code == 200, (stage, back.text)
+            assert back.json()["task"]["stage"] == stage, (stage, back.json())
+
+        # --- 3. Ожидаемое действие: умолчание, своё, снова умолчание --------
+        #
+        # Смена этапа заданное сбрасывает: оставленное, оно называло бы
+        # действие прошлого этапа.
+        agent_id = _at_stage(client, "execution", "ожидание")
+        default = client.get(_task_url(agent_id)).json()["task"]["expects"]
+        assert default == STAGE_EXPECTS["execution"], default
+        mine = client.patch(_task_url(agent_id), json={"expects": "показать черновик"})
+        assert mine.status_code == 200, mine.text
+        assert mine.json()["task"]["expects"] == "показать черновик", mine.json()
+        # Шаг правится тем же телом и в одиночку: оси разные.
+        stepped = client.patch(_task_url(agent_id), json={"step": "пишу проверку"})
+        assert stepped.json()["task"] == {
+            **mine.json()["task"], "step": "пишу проверку",
+        }, stepped.json()
+        moved = client.patch(_task_url(agent_id), json={"move": "next"})
+        assert moved.json()["task"]["expects"] == STAGE_EXPECTS["validation"], moved.json()
+        assert moved.json()["task"]["step"] == "пишу проверку", "смена этапа съела шаг"
+
+        # --- 4. Границы ручек ------------------------------------------------
+        url = _task_url(agent_id)
+        for body in ({}, {"move": "назад"}, {"move": None}, {"stage": "done"},
+                     {"step": "   "}, {"expects": ""}, {"move": "next", "step": 5}):
+            assert client.patch(url, json=body).status_code == 400, body
+        assert client.post(url, json={"description": "  "}).status_code == 400
+        assert client.post(url, json={"description": "х", "stage": "done"}).status_code == 400
+        # Кривой текст рядом с законным ходом состояние не двигает: тело
+        # разбирается целиком до первой правки.
+        assert client.get(url).json()["task"]["stage"] == "validation", client.get(url).json()
+
+        # --- 5. Режим выключается, и тогда двигать нечего ---------------------
+        assert client.delete(url).json() == {"task": None}, "режим не выключился"
+        assert client.get(url).json() == {"task": None}, client.get(url).json()
+        assert client.get(f"/api/agents/{agent_id}").json()["workflow"] == "off"
+        assert client.patch(url, json={"move": "next"}).status_code == 409, "двинули выключенный"
+        assert client.patch(url, json={"step": "х"}).status_code == 409, "вписали в выключенный"
+
+        # --- 6. К модели за состоянием не ходят ни разу -----------------------
+        #
+        # Ни вызова, определяющего этап, ни разбора ответа: состояние двигает
+        # человек, и чат от режима задачи не дорожает ни на токен.
+        before_calls = len(_stub.CALLS)
+        _talk(client, agent_id, 2)
+        assert len(_stub.CALLS) == before_calls + 2, len(_stub.CALLS)
+        assert not _service_calls(), "за состоянием задачи сходили к модели"
+
+    return (
+        f"{len(walked)} законных перехода прошли, {len(refused)} незаконных "
+        "отказаны и состояние цело; «готово» терминально; пауза берётся с трёх "
+        "этапов и возвращает туда же; умолчание этапа перебивается заданным, "
+        "а смена этапа возвращает к умолчанию"
+    )
+
+
+@check("этап едет системным сообщением, состояние задачи — врезкой")
+def check_task_in_prompt():
+    """Что из состояния задачи видит модель.
+
+    Правило этапа — **системным** сообщением: это распоряжение, которому
+    модель следует. Само состояние — врезкой ролью `user` с подписью
+    `[задача]`: это сведения, на которые она опирается. Разделение то же,
+    что у профиля и памяти.
+
+    Пять правил и пять «ожидается» собираются из пяти настоящих запросов,
+    а не читаются из таблиц в коде: одно правило на все этапы так и покраснеет.
+    """
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        # --- 1. Пять этапов — пять разных правил и пять разных «ожидается» ---
+        rules, expects = {}, {}
+        for stage in STAGES:
+            agent_id = _at_stage(client, stage, "промпт")
+            start = _frame(_frames(client, agent_id, "вопрос"), "start")
+            prompt = start["resolved_messages"]
+            head = prompt[0]
+            assert head["role"] == "system", (stage, head)
+            # Сравнивается само правило, а не сообщение целиком: подпись
+            # этапа в заголовке различает блоки и без разных правил — и одно
+            # правило на все пять прошло бы незамеченным.
+            title, _, rule = head["content"].partition("\n")
+            assert title == f"[этап задачи: {STAGE_LABELS[stage]}]", (stage, title)
+            rules[stage] = rule
+            # Номер врезки сверяется до обращения по нему: пустой или
+            # посчитанный «суммой предыдущих» слот обязан краснеть
+            # утверждением, а не падением по индексу.
+            at = start["task_at"]
+            assert isinstance(at, int) and at < len(prompt), (stage, at, len(prompt))
+            insert = prompt[at]
+            assert insert["role"] == "user", (stage, insert)
+            assert insert["content"].startswith("[задача]"), (stage, insert)
+            expects[stage] = next(
+                line for line in insert["content"].splitlines()
+                if line.startswith("ожидается: ")
+            )
+        assert len(set(rules.values())) == len(STAGES), rules
+        assert all(text.strip() for text in rules.values()), rules
+        assert len(set(expects.values())) == len(STAGES), expects
+        assert "не продолжай" in rules["paused"], rules["paused"]
+
+        # --- 2. Врезка едет при включённом режиме, даже с пустым шагом -------
+        agent_id = _at_stage(client, "execution", "врезка")
+        start = _frame(_frames(client, agent_id, "вопрос"), "start")
+        empty = start["resolved_messages"][start["task_at"]]["content"]
+        assert "шаг:" not in empty, empty
+        assert "описание: врезка — собрать ТЗ" in empty, empty
+        client.patch(_task_url(agent_id), json={"step": "пишу проверку"})
+        start = _frame(_frames(client, agent_id, "вопрос"), "start")
+        filled = start["resolved_messages"][start["task_at"]]["content"]
+        assert "шаг: пишу проверку" in filled, filled
+
+        # --- 3. Выключенный режим неотличим от невключавшегося ---------------
+        #
+        # Ни врезки, ни правила, ни системного сообщения: иначе всякая
+        # последовательность ролей сдвинулась бы на сообщение.
+        bare = new_agent(client, label="без задачи")
+        start = _frame(_frames(client, bare, "вопрос"), "start")
+        assert start["resolved_messages"] == [{"role": "user", "content": "вопрос"}], start
+        assert start["task_at"] is None, start
+        client.delete(_task_url(agent_id))
+        after = _frame(_frames(client, agent_id, "вопрос"), "start")
+        assert after["task_at"] is None, after
+        assert not any("[задача]" in m["content"] for m in after["resolved_messages"]), after
+        assert after["resolved_messages"][0]["role"] == "user", after["resolved_messages"][0]
+
+        # --- 4. Все четыре врезки разом: номера сходятся с промптом ----------
+        #
+        # Номера берутся из длины собранного начала промпта, а не считаются
+        # суммой: сумма, переписанная вторым местом, расходится молча.
+        full = new_agent(client, label="все врезки", system="СИС",
+                         strategy="summary", keep_last=2, compress_every=2)
+        client.post(_task_url(full), json={"description": "собрать ТЗ"})
+        client.post("/api/memory", json={"kind": "profile", "content": "пишу на Kotlin"})
+        client.post(f"/api/agents/{full}/working", json={"kind": "goal", "content": "ТЗ"})
+        _talk(client, full, 3)
+        start = _frame(_frames(client, full, "вопрос"), "start")
+        prompt = start["resolved_messages"]
+        assert [start[name] for name in agent_module.PROMPT_SLOTS] == [1, 2, 3, 4], start
+        assert prompt[0]["content"].startswith("СИС\n\n[этап задачи"), prompt[0]
+        assert prompt[1]["content"].startswith("[долговременная память]"), prompt[1]
+        assert prompt[2]["content"].startswith("[факты о разговоре]"), prompt[2]
+        assert prompt[3]["content"].startswith("[задача]"), prompt[3]
+        assert prompt[4]["content"].startswith("[пересказ начала разговора"), prompt[4]
+        assert len([m for m in prompt if m["role"] == "system"]) == 1, prompt
+
+        # Сжатию состояние задачи не досталось: пересказ пересказывает
+        # разговор, а не то, чем человек занят.
+        compress = _service_calls("summary")[-1]["messages"]
+        assert not any("[задача]" in m["content"] for m in compress), compress
+
+        # --- 5. Ветка уносит состояние и живёт своей копией -------------------
+        parent = client.get(_task_url(full)).json()["task"]
+        branch = client.post(f"/api/agents/{full}/fork", json={"at": 2}).json()["agents"][0]
+        assert branch["task"] == parent, (parent, branch["task"])
+        assert branch["workflow"] == "plan", branch["workflow"]
+        client.patch(_task_url(branch["id"]), json={"move": "next"})
+        assert client.get(_task_url(branch["id"])).json()["task"]["stage"] == "execution"
+        assert client.get(_task_url(full)).json()["task"] == parent, "ход в ветке двинул родителя"
+
+    # --- 6. Перезапуск: продолжение без повторных объяснений ----------------
+    _stub.reset()
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    path = _temp_db("task-restart")
+    store = Store(path).init()
+    chat = agent_module.Agent(AgentSpec(label="с задачей", model="stub/model"), store=store)
+    chat.start_task("собрать ТЗ")
+    chat.move_task("next")
+    chat.write_task({"step": "пишу проверку"})
+    _ask(chat, 4)
+    before = chat.task_items()
+    chat_id = chat.id
+    assert before["stage"] == "execution" and before["step"] == "пишу проверку", before
+
+    with _restarted(store, chat_id) as (again, revived):
+        assert revived.task_items() == before, (before, revived.task_items())
+        assert revived.spec.workflow == "plan", revived.spec.workflow
+        prompt = revived.build_prompt("ещё")
+        assert prompt[0]["role"] == "system" and "выполнение" in prompt[0]["content"], prompt[0]
+        assert prompt[1]["content"].startswith("[задача]"), prompt[1]
+        # Состояние лежит в своей таблице, а не строкой в ленте: иначе его
+        # стирал бы каждый обмен — `save_history` начинается с `DELETE`.
+        assert not any("[задача]" in r[2] for r in again.message_rows(chat_id)), "врезка в ленте"
+    return (
+        "пять этапов — пять разных правил в системном сообщении и пять разных "
+        "«ожидается» во врезке; врезка едет и с пустым шагом; выключенный режим "
+        f"уходит без единого сообщения; {len(agent_module.PROMPT_SLOTS)} врезки "
+        "встали номерами 1–4; ветка унесла состояние копией, перезапуск его сохранил"
     )
 
 
