@@ -167,6 +167,24 @@ def _profile_aware(messages, index):
     return "С чего вам удобнее начать?"
 
 
+def _invariant_aware(messages, index):
+    """Ответ, который зависит от **инварианта** в запросе, а не от его номера.
+
+    Инвариант заглушка читает там же, где прочитала бы его модель, — в блоке
+    `[чего нельзя]` системного сообщения, — и этого довольно, чтобы «ассистент
+    отказывается предлагать запрещённое» стало утверждением об ответе, а не
+    о составе запроса. Довод тот же, что у `_memory_aware` и `_profile_aware`.
+
+    Вид назван **исключительным** для слоя: «решение» лежит и в долговременной
+    памяти, и в рабочей, и узнавай заглушка его — она отвечала бы так же
+    на чужую запись, а проверка была бы зелена по неверной причине.
+    """
+    head = messages[0].get("content", "") if messages else ""
+    if "ограничение стека: бэкенд только на Python" in head:
+        return "Только Python: нарушается инвариант «ограничение стека»."
+    return "Возьмите Java со Spring — обычный выбор под такую задачу."
+
+
 def _temp_db(name: str) -> str:
     """Свежий файл базы под одну проверку. Каталога заранее нет — его создаёт Store."""
     import tempfile
@@ -269,7 +287,7 @@ def _restarted(store, agent_id: str):
 
 ALL_TABLES = (
     "sessions", "messages", "meta", "summaries", "branches", "memory",
-    "working_memory", "task_state", "profile",
+    "working_memory", "task_state", "profile", "invariants",
 )
 """Все таблицы схемы: перебор идёт по ним целиком и по всем колонкам каждой,
 чтобы ключ искался и в колонках, которых ещё не придумали."""
@@ -321,6 +339,7 @@ CLEANUP_TABLE = {
     "branches":        (False, True,  True),
     "long_term":       (False, False, True),
     "profile":         (False, False, True),
+    "invariants":      (False, False, True),
 }
 """Чего после какого пути очистки не остаётся. Каждый `True` — место, где
 `DELETE` обязан стоять руками: каскада нет, внешние ключи не объявлены.
@@ -334,17 +353,20 @@ CLEANUP_TABLE = {
 чат ей не владелец, а читатель, — и стирает её ровно один путь, `clear()`,
 потому что он не «ещё одна таблица чата», а вся база разом. Профиль — тем же
 рядом и по тому же доводу: он один на всю базу и про человека, а не про чат,
-и забытый разговор своего собеседника не меняет. `clear()` его всё-таки
-стирает, и это критично вдвойне: профиль заводит **системное** сообщение,
-и утёкший в чужую проверку сдвинул бы там номера всех врезок разом. Проверка,
+и забытый разговор своего собеседника не меняет. Инварианты — третьим тем же
+рядом: архитектура продукта не меняется от того, в каком чате о ней спросили,
+и забытый разговор её не отменяет. `clear()` все три всё-таки стирает, и это
+критично вдвойне: и профиль, и инварианты заводят **системное** сообщение,
+и утёкшее в чужую проверку сдвинуло бы там номера всех врезок разом. Проверка,
 потребовавшая бы чистки везде, сломала бы задуманное так же, как забытый
 `DELETE`.
 """
 
 
 def _filled_chat(store, label: str):
-    """Чат, у которого непусты **все шесть** слоёв сразу: сводка, рабочая
-    память, состояние задачи, родство, долговременная память и профиль.
+    """Чат, у которого непусты **все семь** слоёв сразу: сводка, рабочая
+    память, состояние задачи, родство, долговременная память, профиль
+    и инварианты.
 
     Обменов три: порог сжатия при `keep_last=2` и `compress_every=2`
     набирается только на третьем. Запись рабочей памяти и задачу кладёт
@@ -363,6 +385,7 @@ def _filled_chat(store, label: str):
     store.save_branch(chat.id, parent_id="ag_00001", forked_at=2)
     store.add_memory("knowledge", f"запись рядом с чатом {label}")
     store.save_profile({"style": f"кратко, рядом с чатом {label}"})
+    store.add_invariant("stack", f"инвариант рядом с чатом {label}", ["Java"])
     return chat
 
 
@@ -375,6 +398,7 @@ def _leftovers(store, session_id: str) -> dict:
         "branches": store.load_branch(session_id),
         "long_term": store.list_memory(),
         "profile": store.load_profile(),
+        "invariants": store.list_invariants(),
     }
 
 
@@ -1003,7 +1027,7 @@ def check_summary_apart_and_cleanup():
     в таблицу (`CLEANUP_TABLE`), там же записано, почему одни клетки
     уносят, а другие **оставляют**. Раньше клетки проверялись врозь, по одной
     в четырёх проверках; здесь они проходятся разом и на чате, у которого
-    непусты все шесть слоёв, — утверждение об очистке обязано стоять
+    непусты все семь слоёв, — утверждение об очистке обязано стоять
     на непустом значении, иначе оно показывает покрытие, которого нет.
     """
     from app.agent import Agent
@@ -1055,7 +1079,7 @@ def check_summary_apart_and_cleanup():
         for column, (path_name, wipe) in enumerate(CLEANUP_PATHS.items()):
             chat = _filled_chat(again, path_name)
             full = _leftovers(again, chat.id)
-            # Сцена непуста во всех шести слоях: без этого «после очистки
+            # Сцена непуста во всех семи слоях: без этого «после очистки
             # пусто» держалось бы само собой и стерегло бы воздух.
             assert all(full.values()), (path_name, full)
             wipe(again, chat)
@@ -2445,6 +2469,354 @@ def check_profile_changes_answer():
     )
 
 
+# --- День 14: инварианты — чего ассистент не вправе предлагать ----------------
+
+
+@check("инварианты: слой глобальный, едет системным, запрещённых слов в промпте нет")
+def check_invariants_layer():
+    """День 14: то, что ассистент не вправе нарушать, — отдельно от диалога.
+
+    Слой устроен как долговременная память: своя таблица **без** `session_id`,
+    записи с идентичностью, пишет только человек. Отличий от неё ровно два,
+    и оба принципиальные.
+
+    **Первое — роль.** Инвариант едет **системным** сообщением, четвёртой
+    частью к промпту чата, профилю и правилу этапа: системным едет то, что
+    задал человек, а инвариант это распоряжение, которому модель следует,
+    а не сведения, на которые она опирается. Своего слота он поэтому
+    не заводит вовсе — номера врезок памяти от него не сдвигаются.
+
+    **Второе — запрещённые слова.** Они хранятся, правятся и отдаются
+    ручкой, но в промпт не уезжают ни одним символом: перечисленный запрет
+    сам по себе подсказка его употребить, а законный отказ («почему
+    не Java?») без запрещённого слова не написать. Это знание сторожа,
+    который смотрит на ответ, и модели оно не показывается.
+
+    Отсюда и ловушка, ровно та же, что у профиля: пустой слой обязан быть
+    неотличим от отсутствующего, иначе у чата **без** системного промпта
+    и **без** профиля блок заведёт собой системное сообщение и сдвинет
+    номера всех врезок разом.
+    """
+    from app.agent import Agent, PROMPT_SLOTS
+
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        # --- 1. Пустой слой неотличим от отсутствующего ----------------------
+        assert client.get("/api/invariants").json() == {"total": 0, "records": []}
+        bare = new_agent(client, system="")
+        start = _frame(_frames(client, bare, "первый"), "start")
+        assert _stub.CALLS[-1]["messages"] == [
+            {"role": "user", "content": "первый"}
+        ], _stub.CALLS[-1]["messages"]
+        assert start["memory_at"] is None, start["memory_at"]
+
+        # --- 2. Ручки: вид обязателен и без умолчания ------------------------
+        #
+        # Подставь сервер «architecture» на пропущенный ключ — и «человек явно
+        # выбирает» стало бы «сервер выбрал за него», ровно как в памяти.
+        bad = [
+            {"content": "вид не назван"},
+            {"kind": None, "content": "вид снят"},
+            {"kind": "stak", "content": "вид с опечаткой"},
+            {"kind": "decision", "content": "вид из чужого слоя"},
+            {"kind": "stack"},
+            {"kind": "stack", "content": "   "},
+            {"kind": "stack", "content": "лишнее поле", "seq": 5},
+            {"kind": "stack", "content": "слова строкой", "banned": "Java"},
+            {"kind": "stack", "content": "слова словарём", "banned": {"1": "Java"}},
+            {"kind": "stack", "content": "пустое слово", "banned": ["Java", "  "]},
+            {"kind": "stack", "content": "слово числом", "banned": [7]},
+        ]
+        for payload in bad:
+            answer = client.post("/api/invariants", json=payload)
+            assert answer.status_code == 400, (payload, answer.status_code, answer.text)
+        # «решение» есть и в памяти, и в рабочей памяти — но не здесь: виды
+        # слоёв нарочно не пересекаются ни одним словом.
+        assert "stack" in client.post("/api/invariants", json={"content": "х"}).json()["detail"]
+
+        # Пустой список слов законен: у большинства инвариантов сторожить
+        # нечего, их держит сам текст.
+        stack = client.post("/api/invariants", json={
+            "kind": "stack", "content": "  бэкенд только на Python  ",
+            "banned": ["Java", " Groovy "],
+        }).json()
+        plain = client.post("/api/invariants", json={
+            "kind": "architecture", "content": "монолит, микросервисов не предлагать",
+        }).json()
+        assert stack["content"] == "бэкенд только на Python", stack
+        assert stack["banned"] == ["Java", "Groovy"], stack
+        assert plain["banned"] == [], plain
+        assert plain["seq"] > stack["seq"], (stack, plain)
+        assert client.get("/api/invariants").json()["total"] == 2
+
+        # --- 3. Врезка: системным, четвёртой частью, и системное одно --------
+        _stub.reset()
+        client.patch("/api/profile", json={"style": "кратко, на ты"})
+        talky = new_agent(client, system="СИС")
+        client.post(f"/api/agents/{talky}/task", json={"description": "собрать ТЗ"})
+        client.post(f"/api/agents/{talky}/messages", json={"text": "вопрос"})
+        sent = _stub.CALLS[-1]["messages"]
+        assert len([m for m in sent if m["role"] == "system"]) == 1, sent
+        head = sent[0]
+        assert head["role"] == "system", head
+        assert head["content"] == (
+            "СИС\n\n"
+            "[как отвечать]\nстиль: кратко, на ты\n\n"
+            "[этап задачи: планирование]\n"
+            "Разложи задачу на шаги и ничего не выполняй.\n\n"
+            "[чего нельзя]\n"
+            "1. ограничение стека: бэкенд только на Python\n"
+            "2. архитектура: монолит, микросервисов не предлагать\n"
+            "Соблюдай это. Если просьба противоречит любому пункту — откажись "
+            "и назови, какой именно нарушается."
+        ), head["content"]
+        # Врезкой ролью `user` блок не едет ни одним экземпляром: своего места
+        # в промпте у инвариантов нет вовсе.
+        assert not any(
+            m["role"] != "system" and "[чего нельзя]" in m["content"] for m in sent
+        ), sent
+
+        # --- 4. Запрещённых слов в промпте нет ни одного символа -------------
+        #
+        # Главное решение дня после роли. Список слов — знание сторожа,
+        # который смотрит на **ответ**; модели он не показывается вовсе:
+        # перечисленный запрет это подсказка его употребить, а на «почему
+        # не Java?» без слова «Java» не ответить.
+        for word in ("Java", "Groovy"):
+            assert not any(word in m["content"] for m in sent), (word, sent)
+
+        # --- 5. Слота у инвариантов нет: номера врезок не сдвинулись ---------
+        assert PROMPT_SLOTS == ("memory_at", "working_at", "task_at", "summary_at"), PROMPT_SLOTS
+
+        # --- 6. Ловушка: пустой слой против непустого у голого чата ----------
+        #
+        # Та же, что у профиля, и молчит она так же: промпт остаётся собранным
+        # верно, а подписи ролей в просмотре запроса встают над чужими
+        # сообщениями. Профиль снимаем — голый теперь значит «ни промпта,
+        # ни профиля, ни инвариантов».
+        client.patch("/api/profile", json={"style": ""})
+        assert client.get("/api/profile").json() == {"profile": {}}, "профиль не снялся"
+        naked = new_agent(client, system="")
+        client.post("/api/memory", json={"kind": "profile", "content": "пишу на бэкенде"})
+        shifted = _frame(_frames(client, naked, "вопрос"), "start")
+        assert shifted["memory_at"] == 1, shifted["memory_at"]
+        assert shifted["resolved_messages"][0]["role"] == "system", shifted["resolved_messages"][0]
+
+        # И обратно: убрали записи — системного сообщения снова нет, номера
+        # вернулись на место.
+        for record in client.get("/api/invariants").json()["records"]:
+            assert client.delete(f"/api/invariants/{record['seq']}").status_code == 200
+        back = _frame(_frames(client, naked, "вопрос"), "start")
+        assert back["memory_at"] == 0, back["memory_at"]
+        assert back["resolved_messages"][0]["role"] == "user", back["resolved_messages"][0]
+
+        # --- 7. Правка и удаление по номеру ----------------------------------
+        one = client.post("/api/invariants", json={
+            "kind": "business", "content": "оплата только картой", "banned": ["наличные"],
+        }).json()
+        # Неназванное поле не трогается, названное записывается.
+        typed = client.patch(f"/api/invariants/{one['seq']}", json={"kind": "technical"})
+        assert typed.json()["kind"] == "technical", typed.json()
+        assert typed.json()["content"] == "оплата только картой", typed.json()
+        assert typed.json()["banned"] == ["наличные"], typed.json()
+        # Пустой список снимает все слова — и это не то же, что не назвать их.
+        cleared = client.patch(f"/api/invariants/{one['seq']}", json={"banned": []})
+        assert cleared.json()["banned"] == [], cleared.json()
+        assert client.patch(f"/api/invariants/{one['seq']}", json={}).status_code == 400
+        assert client.patch(
+            f"/api/invariants/{one['seq']}", json={"content": "х", "seq": 5}
+        ).status_code == 400
+        assert client.patch(
+            f"/api/invariants/{one['seq']}", json={"banned": "наличные"}
+        ).status_code == 400
+        assert client.patch("/api/invariants/9999", json={"content": "нет"}).status_code == 404
+        assert client.delete("/api/invariants/9999").status_code == 404
+        # Номер удалённой заново не выдаётся: AUTOINCREMENT, как у `memory`.
+        assert client.delete(f"/api/invariants/{one['seq']}").status_code == 200
+        again = client.post("/api/invariants", json={
+            "kind": "stack", "content": "бэкенд только на Python", "banned": ["Java"],
+        }).json()
+        assert again["seq"] > one["seq"], (again, one)
+
+        # --- 8. Читается один раз за обмен -----------------------------------
+        #
+        # Слой заводит **системное** сообщение, и прочитанный дважды развёл бы
+        # промпт с номерами врезок сильнее любой врезки: запись, добавленная
+        # соседней вкладкой между двумя чтениями, сдвинула бы их все разом.
+        store = REGISTRY.store
+        real_list, reads = store.list_invariants, []
+
+        def counted():
+            reads.append(1)
+            return real_list()
+
+        _stub.reset()
+        with patch.object(store, "list_invariants", counted):
+            client.post(f"/api/agents/{naked}/messages", json={"text": "сколько раз читали"})
+        assert len(reads) == 1, f"чтений слоя за обмен: {len(reads)}, а должно быть одно"
+        assert any(
+            "[чего нельзя]" in m["content"] for m in _stub.CALLS[-1]["messages"]
+        ), _stub.CALLS[-1]["messages"]
+
+        # --- 9. Сжатию инварианты не достаются, и это даром ------------------
+        #
+        # `build_compress_prompt` собирает свои сообщения сам и `spec.system`
+        # не читает вовсе. Записано утверждением, а не надеждой: почини это
+        # кто-нибудь завтра — инвариант попал бы в пересказ и вернулся бы
+        # в промпт вторым экземпляром, да ещё и искажённым.
+        _stub.install(reply=_service_aware)
+        folding = new_agent(
+            client, system="СИС", strategy="summary", keep_last=2, compress_every=2
+        )
+        _talk(client, folding, 3)
+        call = _service_calls("summary")[-1]["messages"]
+        assert not any("[чего нельзя]" in m["content"] for m in call), call
+        assert not any("бэкенд только на Python" in m["content"] for m in call), call
+        assert not any("Java" in m["content"] for m in call), call
+
+        # --- 10. Ветвление слой не копирует ----------------------------------
+        #
+        # Слой глобальный, и ветка видит его через то же хранилище — не свою
+        # копию. «Видна ли ветке запись» — вопрос не тот: дубли видны так же,
+        # поэтому считаем **число** записей, и считаем на непустом списке.
+        before = client.get("/api/invariants").json()["total"]
+        assert before, "слой пуст — копировать нечего, проверять тоже"
+        branch = client.post(
+            f"/api/agents/{folding}/fork", json={"at": 2}
+        ).json()["agents"][0]["id"]
+        _stub.install(reply=lambda m, i: f"ответ {i}")
+        _stub.reset()
+        client.post(f"/api/agents/{branch}/messages", json={"text": "вопрос ветки"})
+        assert any(
+            "[чего нельзя]" in m["content"] for m in _stub.CALLS[-1]["messages"]
+        ), _stub.CALLS[-1]["messages"]
+        assert client.get("/api/invariants").json()["total"] == before, (
+            "ветвление завело копии инвариантов"
+        )
+
+    # --- 11. Чат уходит, инвариант остаётся; clear() замыкает круг -----------
+    #
+    # Видимое следствие таблицы очистки: чат, забывший разговор, по-прежнему
+    # знает, чего ему нельзя предлагать, и говорит это в промпте. Что записи
+    # при этом целы в базе, держит `check_summary_apart_and_cleanup`.
+    path = _temp_db("invariants")
+    store = Store(path).init()
+    agent = Agent(AgentSpec(label="с инвариантом", model="stub/model"), store=store)
+    store.add_invariant("stack", "бэкенд только на Python", ["Java"])
+    asyncio.run(drain(agent.ask("вопрос")))
+    assert "[чего нельзя]" in agent.build_prompt("ещё")[0]["content"], "врезки нет"
+    agent.forget()
+    assert len(store.list_invariants()) == 1, store.list_invariants()
+    assert "[чего нельзя]" in agent.build_prompt("после forget")[0]["content"]
+
+    with _restarted(store, agent.id) as (fresh, revived):
+        assert len(fresh.list_invariants()) == 1, fresh.list_invariants()
+        assert "[чего нельзя]" in revived.build_prompt("после перезапуска")[0]["content"]
+
+        # Агент без хранилища не падает — слой у него просто пуст.
+        homeless = Agent(AgentSpec(label="без базы", model="stub/model"))
+        assert homeless.invariant_items() == [], homeless.invariant_items()
+        assert homeless.build_prompt("вопрос") == [{"role": "user", "content": "вопрос"}]
+
+        # Единственный путь, который слой стирает, — служебная очистка базы.
+        # Забудь его там, и `kill_all()` перед каждой проверкой оставлял бы
+        # следующей системное сообщение, сдвигая ей номера всех врезок.
+        fresh.clear()
+        assert fresh.list_invariants() == [], fresh.list_invariants()
+        assert revived.build_prompt("после очистки") == [
+            {"role": "user", "content": "после очистки"}
+        ], revived.build_prompt("после очистки")
+
+    return (
+        "пустой слой неотличим от отсутствующего; вид без умолчания и список "
+        "слов разбором — одиннадцать кривых тел дали 400; блок едет четвёртой "
+        "частью единственного системного сообщения, запрещённых слов в промпте "
+        "нет ни одного; слота у него нет — врезки остались на своих номерах, "
+        "а у голого чата сдвинулись на 1 и вернулись; за обмен слой прочитан "
+        "один раз; сжатию он не достался; ветвление копий не завело"
+    )
+
+
+@check("инварианты меняют ответ: тот же вопрос с записью и без неё расходится")
+def check_invariants_change_answer():
+    """Единственный пункт задания Дня 14, который просили именно **проверить**:
+    «отказывается предлагать решения, которые их нарушают».
+
+    Все прочие проверки слоя смотрят на **запрос** — что уехало в модель,
+    каким сообщением, с какой ролью. Здесь смотрим на **ответ**: тот же
+    вопрос, те же настройки, пустой слой против непустого — и два разных
+    ответа, причём во втором отказ назван своим инвариантом.
+
+    Заглушка не модель и моделью не притворяется: обещать, что живая модель
+    ответит этими словами, проверка не вправе. Она обещает ровно то, что
+    можно обещать и здесь, и на живом прогоне: разница доезжает до ответа,
+    а не теряется по дороге. Довод и устройство те же, что
+    у `_memory_aware` и `_profile_aware`.
+    """
+    _stub.install(reply=_invariant_aware)
+    question = "на чём писать бэкенд?"
+
+    def answer(agent_id, client) -> tuple[str, list[dict]]:
+        done = _frame(_frames(client, agent_id, question), "done")
+        return done["text"], _stub.CALLS[-1]["messages"]
+
+    with TestClient(main.app) as client:
+        # --- 1. Слой пуст: ни блока, ни системного сообщения ------------------
+        assert client.get("/api/invariants").json()["total"] == 0, "слой не пуст"
+        blank = new_agent(client, label="без инвариантов")
+        free_answer, blank_prompt = answer(blank, client)
+        assert blank_prompt == [{"role": "user", "content": question}], blank_prompt
+
+        # --- 2. Инвариант вписал человек — и только человек -------------------
+        #
+        # Другого пути сюда нет: агент инварианты не выводит из разговора,
+        # это распоряжение. Ровно это и делает пользователь на экране.
+        written = client.post("/api/invariants", json={
+            "kind": "stack", "content": "бэкенд только на Python",
+            "banned": ["Java", "Groovy"],
+        })
+        assert written.status_code == 200, written.text
+        bound = new_agent(client, label="с инвариантом")
+        strict_answer, strict_prompt = answer(bound, client)
+
+        # --- 3. Главное: ответ разошёлся, и отказ назвал инвариант ------------
+        assert strict_answer != free_answer, f"ответ не изменился: {strict_answer!r}"
+        assert "ограничение стека" in strict_answer, strict_answer
+        assert "Java" in free_answer, free_answer
+        assert "Java" not in strict_answer, strict_answer
+
+        # --- 4. И разошёлся **от инварианта**, а не от чего-нибудь ещё --------
+        #
+        # Разные ответы сами по себе не доказывают ничего: разойтись они могли
+        # бы и от разного вопроса, и от номера вызова. Поэтому сверяем сами
+        # запросы: всё, кроме системного сообщения, совпадает слово в слово.
+        assert strict_prompt[1:] == blank_prompt, (strict_prompt, blank_prompt)
+        assert strict_prompt[0]["role"] == "system", strict_prompt[0]
+        assert strict_prompt[0]["content"].startswith("[чего нельзя]"), strict_prompt[0]
+
+        # --- 5. Запрещённых слов нет ни в одном сообщении ни одного промпта ---
+        #
+        # Они лежат в той же записи и в том же ответе ручки — и всё равно
+        # не уезжают: в блок едут только вид и текст.
+        assert client.get("/api/invariants").json()["records"][0]["banned"] == [
+            "Java", "Groovy"
+        ], client.get("/api/invariants").json()
+        for word in ("Java", "Groovy"):
+            assert not any(word in m["content"] for m in strict_prompt), (word, strict_prompt)
+
+        # --- 6. Ответ разный, а счёт обменов одинаковый -----------------------
+        #
+        # Блок — часть промпта, а не лишний вызов: разницу в ответе он даёт,
+        # не добавляя обращений к модели.
+        assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+        assert not _service_calls(), "за инвариантами сходили к модели"
+
+    return (
+        f"с инвариантом — {strict_answer!r}; без него — {free_answer!r}; "
+        "запросы различаются одним системным сообщением, запрещённых слов "
+        "в промпте нет ни одного"
+    )
+
 # --- День 13: состояние задачи — строгая машина, ручное управление ------------
 
 
@@ -3722,6 +4094,11 @@ def check_every_write_path_redacts():
             conn.execute(
                 "INSERT INTO profile (field, content, at) VALUES ('style', ?, 0)",
                 (key,),
+            )
+            conn.execute(
+                "INSERT INTO invariants (kind, content, banned, at) "
+                "VALUES ('stack', ?, ?, 0)",
+                (key, key),
             )
         leaked = _columns_holding(store.conn, key)
         assert not leaked, f"ключ уехал в базу через tx(): {leaked}"

@@ -25,6 +25,7 @@ const state = {
   prompts: new Map(),  // промпты обменов этой вкладки (см. promptKey)
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
+  invariants: null,    // инварианты — ответ ручки, прочитанный на открытие вкладки
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -1278,7 +1279,7 @@ async function refreshCurrent(prompt) {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory", "profile"];
+const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -1725,6 +1726,30 @@ const workingKindLabel = (kind) =>
 // что показано.
 const workingLine = (record) => workingKindLabel(record.kind) + ": " + record.content;
 
+// Виды инвариантов: токен для сервера и русская подпись. Карта та же, что
+// `INVARIANT_LABELS` на сервере, — ею же инвариант подписан и в промпте.
+//
+// Ни одно слово не совпадает со словом соседних слоёв: «решение» уже занято
+// и долговременной памятью, и рабочей, и назови мы вид инварианта тем же
+// словом, утверждение «это запись из слоя инвариантов» стало бы зелёным
+// и на чужой записи. Поэтому «техническое решение», а не «решение».
+const INVARIANT_KINDS = [
+  ["architecture", "архитектура"],
+  ["technical", "техническое решение"],
+  ["stack", "ограничение стека"],
+  ["business", "бизнес-правило"],
+];
+
+const invariantKindLabel = (kind) =>
+  (INVARIANT_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
+
+// Запрещённые слова: список — на экране, строка через запятую — в поле.
+// Разбор и сборка одной парой на форму и на правку: две копии разошлись бы
+// на первом же слове с пробелом внутри.
+const bannedText = (words) => (words || []).join(", ");
+const parseBanned = (text) =>
+  String(text || "").split(",").map((w) => w.trim()).filter(Boolean);
+
 // Правка записи прямо в списке: Enter сохраняет, Escape отменяет, потеря
 // фокуса — тоже сохраняет. Идиом тот же, что у переименования чата слева:
 // второй способ правки на той же странице читался бы как другое действие.
@@ -1740,7 +1765,12 @@ const workingLine = (record) => workingKindLabel(record.kind) + ": " + record.co
 // Предвыбери мы здесь нынешний тип, правка текста молча пересылала бы его
 // обратно — и запись, которой тип поправили в соседней вкладке, вернулась бы
 // к старому.
-function startRecordEdit(row, record, kinds, commit) {
+function startRecordEdit(row, record, kinds, commit, opts) {
+  // `opts` — чем этот слой отличается от соседних: есть ли у записи третье
+  // поле (`banned`) и чем перерисовывать список после правки. Два слоя
+  // памяти отличий не имеют вовсе и зовут функцию без него.
+  const withBanned = Boolean(opts && opts.banned);
+  const redraw = (opts && opts.redraw) || renderMemory;
   const shown = row.querySelector(".mem-text");
   // Поле и список — в одном блоке: уход фокуса с поля на список это не конец
   // правки, а её продолжение, и различить их можно только на общем родителе.
@@ -1750,6 +1780,17 @@ function startRecordEdit(row, record, kinds, commit) {
   const kind = el("select", "mem-edit-kind control");
   fillKinds(kind, kinds, "— оставить тип —");
   box.append(input, kind);
+  // Третье поле — только у инвариантов, у которых оно и есть: слова
+  // правятся тем же нажатием, что текст и вид. Второй функции правки
+  // на третий слой не заводим — правила у них одни, и вторая копия
+  // разошлась бы с первой на первом же исправлении.
+  let banned = null;
+  if (withBanned) {
+    banned = el("input", "mem-edit-banned control");
+    banned.value = bannedText(record.banned);
+    banned.title = "Запрещённые слова через запятую";
+    box.appendChild(banned);
+  }
   row.replaceChild(box, shown);
   input.focus();
   input.select();
@@ -1765,8 +1806,15 @@ function startRecordEdit(row, record, kinds, commit) {
     // и невыбранный тип тоже не едут: ручке нечего было бы делать.
     if (text && text !== record.content) patch.content = text;
     if (kind.value && kind.value !== record.kind) patch.kind = kind.value;
+    // Слова — тем же правилом: уезжают только тронутые. Пустое поле здесь
+    // законно и значит «ничего не запрещено», в отличие от пустого текста:
+    // сторожить нечего — не то же самое, что записывать нечего.
+    if (banned) {
+      const words = parseBanned(banned.value);
+      if (words.join("\u0000") !== (record.banned || []).join("\u0000")) patch.banned = words;
+    }
     if (save && Object.keys(patch).length) await commit(patch);
-    renderMemory();
+    redraw();
   };
 
   const keys = (ev) => {
@@ -1775,6 +1823,7 @@ function startRecordEdit(row, record, kinds, commit) {
   };
   input.onkeydown = keys;
   kind.onkeydown = keys;
+  if (banned) banned.onkeydown = keys;
   // `focusout` всплывает, `blur` — нет: слушаем блок и смотрим, куда фокус
   // ушёл. Остался внутри — правка продолжается; ушёл наружу — сохраняем,
   // ровно как раньше сохранял уход фокуса с поля. Вешай мы это на само поле,
@@ -2212,6 +2261,133 @@ async function saveProfile(name) {
   }
 }
 
+// ───────────────────────── инварианты ─────────────────────────
+//
+// Чего ассистент не вправе предлагать: архитектура, технические решения,
+// ограничения стека, бизнес-правила. Слой глобальный, как долговременная
+// память и профиль, и пишет в него только человек: инвариант это
+// распоряжение, а распоряжений из разговора агент не выводит.
+//
+// От профиля он отличается наклонением наоборот: профиль про **форму**
+// ответа («отвечай кратко»), инвариант про его **суть** («Java не
+// предлагать»). Оба едут системным сообщением, и оба задал человек.
+//
+// Запрещённые слова видны и правятся здесь — и только здесь: в промпт они
+// не уезжают ни одним символом. Перечисленный запрет сам по себе подсказка
+// его употребить, а законный отказ («почему не Java?») без запрещённого
+// слова не написать. Смотрит на них сторож ответа, а не модель.
+//
+// Запрашивается лениво, на открытие вкладки, ровно как слои памяти
+// и профиль: панель перерисовывается на каждый обмен, и запрос внутри
+// отрисовки превратил бы один поход на сервер в поток.
+
+function invariantStatus(text, isError) {
+  const box = $("#inv-status");
+  box.className = "hint" + (isError ? " error" : "");
+  box.textContent = text || "";
+}
+
+async function loadInvariants() {
+  try {
+    const answer = await api("/api/invariants");
+    state.invariants = answer.records || [];
+    invariantStatus("");
+  } catch (err) {
+    state.invariants = null;
+    invariantStatus(String(err.message || err), true);
+  }
+  renderInvariants();
+}
+
+function renderInvariants() {
+  const box = $("#inv-list");
+  box.innerHTML = "";
+  const records = state.invariants;
+  if (!records) { box.appendChild(memNote($("#inv-status").textContent || "Читаю…")); return; }
+  if (!records.length) { box.appendChild(memNote("Инвариантов нет.")); return; }
+  records.forEach((record) => {
+    const row = el("div", "mem-item");
+    row.append(
+      el("div", "mem-kind", invariantKindLabel(record.kind)),
+      el("div", "mem-text", record.content),
+      iconButton("pencil", "Поправить инвариант",
+        () => startRecordEdit(row, record, INVARIANT_KINDS,
+          (patch) => editInvariant(record, patch),
+          { banned: true, redraw: renderInvariants }), "mini"),
+      iconButton("trash", "Убрать инвариант", () => dropInvariant(record), "mini danger")
+    );
+    // Слова видны только тут: строка под инвариантом говорит, чем сторож
+    // будет проверять ответ. В промпт она не уезжает.
+    const words = record.banned || [];
+    const note = memNote(
+      words.length ? "запрещённые слова: " + bannedText(words) : "запрещённых слов нет"
+    );
+    note.className = "mem-note banned";
+    row.appendChild(note);
+    box.appendChild(row);
+  });
+}
+
+// Новый инвариант: список пополняется **ответом ручки**, а не присланным
+// телом — номер выдаёт база, а текст по дороге чистит `redact()`. Довод
+// и форма те же, что у долговременной памяти.
+async function addInvariant(kind, content, banned) {
+  const text = (content || "").trim();
+  if (!text) {
+    invariantStatus("Текст инварианта пуст: записывать нечего.", true);
+    return false;
+  }
+  try {
+    const record = await api("/api/invariants", json("POST", { kind, content: text, banned }));
+    state.invariants = [...(state.invariants || []), record];
+    renderInvariants();
+    invariantStatus("Записано: " + invariantKindLabel(record.kind) + ".");
+    return true;
+  } catch (err) {
+    invariantStatus(String(err.message || err), true);
+    return false;
+  }
+}
+
+async function editInvariant(record, patch) {
+  try {
+    const updated = await api("/api/invariants/" + record.seq, json("PATCH", patch));
+    state.invariants = (state.invariants || [])
+      .map((item) => (item.seq === updated.seq ? updated : item));
+    invariantStatus("Инвариант поправлен.");
+  } catch (err) {
+    invariantStatus(String(err.message || err), true);
+  }
+}
+
+async function dropInvariant(record) {
+  try {
+    await api("/api/invariants/" + record.seq, { method: "DELETE" });
+  } catch (err) {
+    invariantStatus(String(err.message || err), true);
+    return;
+  }
+  state.invariants = (state.invariants || []).filter((item) => item.seq !== record.seq);
+  renderInvariants();
+  invariantStatus("Инвариант убран.");
+}
+
+// Вид обязателен и здесь: умолчания у него нет ни в форме, ни на сервере —
+// правило то же, что у обоих слоёв памяти. А вот пустой список слов законен:
+// у большинства инвариантов сторожить нечего, их держит сам текст.
+async function addInvariantFromForm() {
+  const kind = $("#inv-kind").value;
+  if (!kind) {
+    invariantStatus("Вид инварианта не выбран: архитектура, техническое решение, "
+      + "ограничение стека или бизнес-правило.", true);
+    return;
+  }
+  const field = $("#inv-content");
+  const words = $("#inv-banned");
+  const saved = await addInvariant(kind, field.value, parseBanned(words.value));
+  if (saved) { field.value = ""; words.value = ""; }
+}
+
 // ─────────────────────────── плитки ───────────────────────────
 
 // Плитки справа — про весь диалог, а не про последний ответ: сколько всего
@@ -2466,6 +2642,9 @@ function init() {
       // Профиль — тем же порядком и по тому же доводу: лениво, на открытие
       // вкладки. Он глобальный, и перечитывать его на смену чата незачем.
       if (which === "profile") loadProfile();
+      // Инварианты — тем же порядком и по тому же доводу: лениво, на открытие
+      // вкладки. Слой глобальный, и перечитывать его на смену чата незачем.
+      if (which === "invariants") loadInvariants();
     };
   });
 
@@ -2485,8 +2664,10 @@ function init() {
 
   fillKinds($("#mem-kind"), MEMORY_KINDS);
   fillKinds($("#mem-work-kind"), WORKING_KINDS);
+  fillKinds($("#inv-kind"), INVARIANT_KINDS, "— выберите вид —");
   $("#mem-add").onclick = () => addFromForm();
   $("#mem-work-add").onclick = () => addWorkingFromForm();
+  $("#inv-add").onclick = () => addInvariantFromForm();
 
   setBusy(false);
   renderTiles();

@@ -752,6 +752,10 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   text-transform: uppercase;
   color: var(--faint);
 }
+/* Запрещённые слова инварианта — своей строкой под текстом: `.mem-item`
+   переносит, и полная основа уводит их вниз целиком. Их видно здесь и нигде
+   больше — в промпт они не уезжают ни одним символом. */
+.mem-note.banned { flex: 1 1 100%; }
 /* Правка записи на месте: поле встаёт ровно туда, где стоял текст. */
 /* Поле текста и список типов — один блок на месте показанной строки: правится
    и то и другое разом, а уход фокуса с поля на список — не конец правки.
@@ -761,9 +765,13 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   display: flex;
   flex: 1 1 55%;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
 }
+/* Третье поле — только у инвариантов: слова уезжают на свою строку, чтобы
+   в узкой панели не делить ширину с текстом и списком видов. */
+.mem-edit-banned { flex: 1 1 100%; min-width: 0; font-size: 11.5px; }
 .mem-edit {
   flex: 1 1 auto;
   min-width: 0;

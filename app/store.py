@@ -1,13 +1,14 @@
 """Хранилище чатов и сообщений: SQLite из стандартной библиотеки.
 
-Восемь таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
+Десять таблиц: `sessions` (id, имя и **конфиг одним JSON-полем** — новое поле
 сохраняется само, а не ждёт, пока вспомнят про колонку), `messages`, `meta`
 (счётчики, общие на всю базу), `summaries` (сводки начала разговора),
 `working_memory` (рабочая память чата — записи о состоянии задачи, которые
-вписал человек), `branches` (чей потомок этот чат и сколько сообщений он унёс),
-`memory` (долговременная память) и `profile` (как отвечать этому человеку:
-стиль, формат и контекст, строка на поле). Последние две — **без**
-`session_id`: оба слоя общие на всю базу и переживают любой чат.
+вписал человек), `task_state` (этап задачи), `branches` (чей потомок этот чат
+и сколько сообщений он унёс), `memory` (долговременная память), `profile`
+(как отвечать этому человеку: стиль, формат и контекст, строка на поле)
+и `invariants` (чего ассистент не вправе предлагать). Последние три — **без**
+`session_id`: все они общие на всю базу и переживают любой чат.
 Пять свойств, за которыми стоит следить:
 
 * **`session_id` в первичном ключе сообщений**: без него два чата из базы
@@ -245,6 +246,31 @@ CREATE TABLE IF NOT EXISTS profile (
     content TEXT NOT NULL,
     at      REAL NOT NULL
 );
+
+-- Инварианты: чего ассистент не вправе предлагать. Третья таблица **без**
+-- `session_id` и по тому же доводу, что у `memory` и `profile`: архитектура
+-- продукта не меняется от того, в каком чате о ней спросили. Чистит её ровно
+-- один путь — `clear()`; `delete_session` и `Agent.forget` не трогают, чат
+-- слою читатель, а не владелец.
+--
+-- `seq` — AUTOINCREMENT, как у `memory`: слой это список записей
+-- с идентичностью, правится по одной, и номер удалённой не выдаётся заново —
+-- иначе правка из второй вкладки попала бы в чужую запись.
+--
+-- `banned` — список запрещённых слов **одной колонкой**, JSON-массивом
+-- строк (`_dumps`/`_loads`, прецедент — `metrics` у сводок). Второй таблицей
+-- «слово → запись» здесь платить не за что: список читается только целиком
+-- и только вместе со своей записью. В промпт он не уезжает ни одним
+-- символом: это знание сторожа ответа, а не модели.
+--
+-- Индекса нет: таблица читается целиком, отбирать не по чему.
+CREATE TABLE IF NOT EXISTS invariants (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind    TEXT NOT NULL,
+    content TEXT NOT NULL,
+    banned  TEXT NOT NULL,
+    at      REAL NOT NULL
+);
 """
 
 _ID_RE = re.compile(r"^ag_(\d+)$")
@@ -298,6 +324,22 @@ def _memory_row(row: sqlite3.Row) -> dict:
         "seq": row["seq"],
         "kind": row["kind"],
         "content": row["content"],
+        "at": row["at"],
+    }
+
+
+def _invariant_row(row: sqlite3.Row) -> dict:
+    """Инвариант в том виде, в каком его ждут и ручка, и врезка в промпт.
+    Одна форма на все чтения — довод тот же, что у `_memory_row`.
+
+    `banned` разбирается из JSON здесь же: колонкой он лежит строкой, а
+    наружу обязан выходить списком — разбирай его вызывающий, разборов
+    стало бы столько же, сколько чтений."""
+    return {
+        "seq": row["seq"],
+        "kind": row["kind"],
+        "content": row["content"],
+        "banned": _loads(row["banned"], []),
         "at": row["at"],
     }
 
@@ -677,8 +719,8 @@ class Store:
         начало разговора, а оставленная строка родства сделала бы свежий чат
         веткой мёртвого.
 
-        Память и профиль здесь **обязаны** стираться, хотя удаление чата их
-        не трогает: это не «ещё одна таблица чата», а вся база разом.
+        Память, профиль и инварианты здесь **обязаны** стираться, хотя удаление
+        чата их не трогает: это не «ещё одна таблица чата», а вся база разом.
         `kill_all()` зовёт `clear()` перед каждой проверкой — забытая строка
         утекла бы из одной проверки в другую врезкой в промпт и сдвинула бы
         там роли. Оставленный профиль сделал бы хуже: он заводит **системное**
@@ -693,6 +735,7 @@ class Store:
             conn.execute("DELETE FROM branches")
             conn.execute("DELETE FROM memory")
             conn.execute("DELETE FROM profile")
+            conn.execute("DELETE FROM invariants")
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM meta")
 
@@ -1058,6 +1101,65 @@ class Store:
         """
         with self.tx() as conn:
             cursor = conn.execute("DELETE FROM memory WHERE seq = ?", (int(seq),))
+            return bool(cursor.rowcount)
+
+    # --- инварианты: чего ассистент не вправе предлагать ----------------------
+    #
+    # Набор тот же, что у долговременной памяти, и по тому же доводу: слой
+    # глобальный, список записей с идентичностью, правится по одной. Разница
+    # ровно в одной колонке — `banned`, список запрещённых слов, который
+    # хранится, отдаётся ручке и **никогда** не уезжает в промпт.
+
+    def add_invariant(
+        self, kind: str, content: str, banned=None, at: float | None = None
+    ) -> dict:
+        """Добавляет инвариант и отдаёт его целиком — с номером от базы.
+
+        Номер приезжает через `RETURNING`, как у `add_memory`: вторым
+        запросом между `INSERT` и `SELECT` пролез бы чужой писатель.
+        """
+        stamp = time.time() if at is None else at
+        with self.tx() as conn:
+            row = conn.execute(
+                "INSERT INTO invariants (kind, content, banned, at) VALUES (?, ?, ?, ?) "
+                "RETURNING seq, kind, content, banned, at",
+                (kind, content, _dumps(list(banned or [])), stamp),
+            ).fetchone()
+        return _invariant_row(row)
+
+    def update_invariant(
+        self, seq: int, *, kind: str, content: str, banned, at: float | None = None
+    ) -> dict | None:
+        """Переписывает один инвариант по номеру. `None` — записи нет.
+
+        Значения приходят все сразу, а не «только изменённые», — довод тот же,
+        что у `update_memory`: у вызывающего запись уже на руках, и `COALESCE`
+        завёл бы второе место, где решается, чем пустое поле отличается
+        от неназванного.
+        """
+        stamp = time.time() if at is None else at
+        with self.tx() as conn:
+            row = conn.execute(
+                "UPDATE invariants SET kind = ?, content = ?, banned = ?, at = ? "
+                "WHERE seq = ? RETURNING seq, kind, content, banned, at",
+                (kind, content, _dumps(list(banned or [])), stamp, int(seq)),
+            ).fetchone()
+        return None if row is None else _invariant_row(row)
+
+    def list_invariants(self) -> list[dict]:
+        """Все инварианты по порядку добавления. Целиком и всегда: слой
+        глобальный, отбирать не по чему."""
+        with self.reading() as conn:
+            rows = conn.execute(
+                "SELECT seq, kind, content, banned, at FROM invariants ORDER BY seq"
+            ).fetchall()
+        return [_invariant_row(row) for row in rows]
+
+    def delete_invariant(self, seq: int) -> bool:
+        """Стирает один инвариант. False — записи с таким номером не было.
+        Номер после этого не достанется никому: у `seq` стоит AUTOINCREMENT."""
+        with self.tx() as conn:
+            cursor = conn.execute("DELETE FROM invariants WHERE seq = ?", (int(seq),))
             return bool(cursor.rowcount)
 
     # --- профиль: как отвечать этому человеку --------------------------------
