@@ -151,6 +151,11 @@ CREATE INDEX IF NOT EXISTS working_by_session ON working_memory(session_id);
 -- двигает человек. `expects` пустой значит «человек не задавал»: тогда едет
 -- умолчание этапа (`STAGE_EXPECTS`). `paused_from` — куда вернуться из паузы.
 --
+-- `stage_at` — когда вошли в нынешний этап, и меняется она ровно на переходе.
+-- Своей колонкой, а не общим `at`: тот двигает всякая правка текста
+-- (`/task-step`, `/task-expect`), и ворота на выход с пустого этапа открывались
+-- бы набранным шагом. По ней считаются записанные ответы этого этапа.
+--
 -- Каскада нет, FK не объявлены — чистить руками на всех трёх путях: удаление
 -- чата, очистка базы, `forget()`. Забытый разговор не вправе оставить
 -- следующему свой этап: правило этапа уезжает системным сообщением.
@@ -161,6 +166,7 @@ CREATE TABLE IF NOT EXISTS task_state (
     expects     TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     paused_from TEXT NOT NULL DEFAULT '',
+    stage_at    REAL NOT NULL DEFAULT 0,
     at          REAL NOT NULL
 );
 
@@ -354,6 +360,7 @@ def _task_row(row: sqlite3.Row) -> dict:
         "expects": row["expects"],
         "description": row["description"],
         "paused_from": row["paused_from"],
+        "stage_at": row["stage_at"],
     }
 
 
@@ -655,7 +662,7 @@ class Store:
                 SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id
             ) AS history_len,
             b.parent_id AS branch_parent_id, b.forked_at AS branch_forked_at,
-            t.stage, t.step, t.expects, t.description, t.paused_from
+            t.stage, t.step, t.expects, t.description, t.paused_from, t.stage_at
             FROM sessions s
             LEFT JOIN branches b ON b.session_id = s.id
             LEFT JOIN task_state t ON t.session_id = s.id
@@ -941,7 +948,7 @@ class Store:
         """Состояние задачи чата или `None` — задачи в нём нет."""
         with self.reading() as conn:
             row = conn.execute(
-                "SELECT stage, step, expects, description, paused_from "
+                "SELECT stage, step, expects, description, paused_from, stage_at "
                 "FROM task_state WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
@@ -956,16 +963,18 @@ class Store:
             row = conn.execute(
                 """
                 INSERT INTO task_state
-                    (session_id, stage, step, expects, description, paused_from, at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, stage, step, expects, description, paused_from,
+                     stage_at, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     stage       = excluded.stage,
                     step        = excluded.step,
                     expects     = excluded.expects,
                     description = excluded.description,
                     paused_from = excluded.paused_from,
+                    stage_at    = excluded.stage_at,
                     at          = excluded.at
-                RETURNING stage, step, expects, description, paused_from
+                RETURNING stage, step, expects, description, paused_from, stage_at
                 """,
                 (
                     session_id,
@@ -974,6 +983,7 @@ class Store:
                     task.get("expects", ""),
                     task.get("description", ""),
                     task.get("paused_from", ""),
+                    task.get("stage_at", 0.0),
                     stamp,
                 ),
             ).fetchone()

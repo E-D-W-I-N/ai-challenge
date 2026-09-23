@@ -526,7 +526,10 @@ function buildServer(options) {
     // чтению, и проверка правки прошла бы на подложном равенстве.
     working: {},
     // Состояние задачи по чатам: `{stage, step, expects, description,
-    // paused_from}`. Сеется по имени чата, дальше двигают только команды.
+    // paused_from, stage_len}`. Сеется по имени чата, дальше двигают только
+    // команды. `stage_len` — длина стенограммы на входе в этап: по ней ворота
+    // считают, была ли на этапе работа (на сервере то же самое отметкой
+    // времени — у реплик стенда её нет).
     tasks: {},
     models: [
       { id: "первая/модель", supported_parameters: [], prompt_price_per_m: 0, completion_price_per_m: 0 },
@@ -576,6 +579,7 @@ function buildServer(options) {
     "paused:resume": "@resume",
   };
   const MOVES = ["next", "pause", "resume"];
+  const GATED_MOVES = ["next"];
   const MOVE_LABELS = { next: "дальше", pause: "пауза", resume: "продолжить" };
   const MOVE_COMMANDS = {
     next: "/task-next", pause: "/task-pause", resume: "/task-resume",
@@ -719,7 +723,8 @@ function buildServer(options) {
     if (seededTasks[seed.label]) {
       state.tasks[agent.id] = {
         stage: "planning", step: "", expects: "", description: "задача",
-        paused_from: "", ...seededTasks[seed.label],
+        paused_from: "", stage_len: (agent.transcript || []).length,
+        ...seededTasks[seed.label],
       };
     }
     if (!("usage_total" in seed)) agent.usage_total = sumUsage(agent.transcript);
@@ -1201,6 +1206,7 @@ function buildServer(options) {
       state.tasks[agent.id] = {
         stage: "planning", step: "", expects: "",
         description: clean(text), paused_from: "",
+        stage_len: agent.transcript.length,
       };
       return json({ task: taskView(agent) });
     }
@@ -1250,8 +1256,17 @@ function buildServer(options) {
               + allowed.join(", ")
             : "этап «" + STAGE_LABELS[raw.stage] + "» завершающий: отсюда не ходят никуда");
         }
+        // Ворота: уйти с этапа «дальше» можно, когда на нём была работа.
+        // Пауза и снятие паузы не ограничены никогда. Стенд, щедрее
+        // серверного, оставил бы зелёной команду, получающую в браузере отказ.
+        if (GATED_MOVES.includes(move) && agent.transcript.length <= raw.stage_len) {
+          return fail(409, "на этапе «" + STAGE_LABELS[raw.stage]
+            + "» не было ни одного обмена: "
+            + (raw.expects || STAGE_EXPECTS[raw.stage]));
+        }
         raw.paused_from = target === "paused" ? raw.stage : "";
         raw.stage = target;
+        raw.stage_len = agent.transcript.length;
         // Смена этапа сбрасывает заданное человеком действие.
         raw.expects = "";
       }

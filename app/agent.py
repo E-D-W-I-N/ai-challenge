@@ -24,6 +24,7 @@ from typing import AsyncIterator
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import (
     CONTEXT_FIELDS,
+    GATED_MOVES,
     INVARIANT_LABELS,
     MEMORY_LABELS,
     MOVE_COMMANDS,
@@ -588,8 +589,10 @@ class Agent:
         только вперёд, номер удалённой записи заново не выдаётся."""
 
         self.task: dict | None = None
-        """Состояние задачи: `{stage, step, expects, description, paused_from}`
-        — или `None`, если режим задачи в этом чате не включали.
+        """Состояние задачи: `{stage, step, expects, description, paused_from,
+        stage_at}` — или `None`, если режим задачи в этом чате не включали.
+        `stage_at` — когда вошли в нынешний этап: по ней ворота считают,
+        была ли на нём работа.
 
         Двигает его только человек, командами: ни одного метода, которым
         состояние менял бы ответ модели, у агента нет.
@@ -1052,6 +1055,7 @@ class Agent:
         return self._task_save({
             "stage": "planning", "step": "", "expects": "",
             "description": description, "paused_from": "",
+            "stage_at": time.time(),
         })
 
     def move_task(self, move: str) -> dict | None:
@@ -1077,7 +1081,35 @@ class Agent:
             # Смена этапа сбрасывает заданное человеком действие: оставленное,
             # оно называло бы действие прошлого этапа.
             "expects": "",
+            # Отметка входа в этап двигается ровно здесь и больше нигде:
+            # правки текста (`write_task`) несут её дальше нетронутой.
+            "stage_at": time.time(),
         })
+
+    def stage_worked(self) -> bool:
+        """Была ли на нынешнем этапе работа: хотя бы один **записанный** ответ
+        позже отметки входа. Обмен, который не записался — модель не прислала
+        ни слова, — работой не был, и в истории его нет."""
+        since = (self.task or {}).get("stage_at") or 0.0
+        return any(turn.role == "assistant" and turn.at > since for turn in self.history)
+
+    def gate_shut(self, move: str) -> bool:
+        """Закрыты ли ворота перед этим ходом: с этапа, на котором не было
+        ни одного обмена, «дальше» не ходят — иначе план утверждают,
+        не составив.
+
+        Ловят ворота **пустоту, а не спешку**: обмен, открывающий их, шлёт
+        сам переход, и три `/task-next` подряд пройдут. Человек нажал трижды
+        — значит решил трижды.
+
+        Пауза и снятие паузы не ограничены никогда. Ход, которого нет
+        в таблице, воротам не достаётся: про него отказывает сама таблица,
+        и словами точнее.
+        """
+        stage = (self.task or {}).get("stage")
+        if move not in GATED_MOVES or TRANSITIONS.get((stage, move)) is None:
+            return False
+        return not self.stage_worked()
 
     def write_task(self, values: dict) -> dict | None:
         """Пишет названные поля состояния (`step`, `expects`). `None` — режима
