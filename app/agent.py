@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -241,6 +242,14 @@ def stage_block(stage: str) -> str:
     return f"[этап задачи: {STAGE_LABELS[stage]}]\n{STAGE_RULES[stage]}"
 
 
+def invariant_line(record: dict) -> str:
+    """Инвариант одной строкой «подпись вида: текст».
+
+    Одна форма на промпт, на вкладку и на отметку сторожа: второй картой
+    модель читала бы одно правило, а человек видел бы другое."""
+    return f"{INVARIANT_LABELS.get(record['kind'], record['kind'])}: {record['content']}"
+
+
 def invariant_block(records: list[dict]) -> str:
     """Инварианты нумерованным списком «подпись вида: текст» под заголовком
     `[чего нельзя]` — и одно повелительное предложение под ним.
@@ -257,16 +266,44 @@ def invariant_block(records: list[dict]) -> str:
     Нумерация не украшение: отказ обязан назвать, какой именно инвариант
     нарушен, и номер — самый короткий способ на него сослаться.
     """
-    lines = [
-        f"{i}. {INVARIANT_LABELS.get(record['kind'], record['kind'])}: {record['content']}"
-        for i, record in enumerate(records, 1)
-    ]
+    lines = [f"{i}. {invariant_line(record)}" for i, record in enumerate(records, 1)]
     return (
         "[чего нельзя]\n"
         + "\n".join(lines)
         + "\nСоблюдай это. Если просьба противоречит любому пункту — откажись "
         "и назови, какой именно нарушается."
     )
+
+
+_EDGE = r"[^\W_]"
+r"""Что считается буквой или цифрой на границе слова: `\w` без подчёркивания.
+Кириллица и латиница попадают сюда обе — правило на оба алфавита одно."""
+
+
+def banned_hits(text: str, invariants: list[dict]) -> list[dict]:
+    r"""Запрещённые слова, найденные в ответе: `{"word", "rule"}` на совпадение.
+
+    Слово целиком, а не подстрока: `Java` внутри `JavaScript` не совпадение.
+    Граница — **не** `\b`: та держится на `\w` с обеих сторон и рвётся на
+    словах со знаками (`C++`, `.NET`); здесь по краям просто не буква
+    и не цифра. Регистр не важен.
+
+    Словоформы сторож **не ловит** («Котлином» при запрете «Котлин»):
+    морфологии у нас нет. Это пробел, а не свойство.
+
+    Одна отметка на слово, а не на вхождение: сторож показывает совпадение,
+    а не считает срабатывания.
+    """
+    hits = []
+    for record in invariants:
+        rule = invariant_line(record)
+        for word in record.get("banned") or []:
+            if not str(word).strip():
+                continue
+            pattern = f"(?<!{_EDGE}){re.escape(str(word))}(?!{_EDGE})"
+            if re.search(pattern, text, re.IGNORECASE):
+                hits.append({"word": word, "rule": rule})
+    return hits
 
 
 def system_message(
@@ -328,6 +365,13 @@ N сообщений». Слово на все случаи одно совра�
 сводка начало **заменила** — её видно в промпте запроса, — а окно его
 **отбросило** совсем. У полной истории ключа нет вовсе: срезать нечего.
 В суммы по чату ключ не идёт — их считает USAGE_FIELDS."""
+
+BANNED_METRIC = "banned_hits"
+"""Каким ключом обмен говорит, что ответ задел запрет: список совпадений
+`{"word", "rule"}`. Образец — `CUT_METRIC`: это знание агента, а не
+провайдера, и место ему в метриках обмена. В суммы по чату ключ не идёт.
+Второго экземпляра факта — счётчика срабатываний — нет намеренно: он лежит
+здесь, в метриках, и пересчитывается из них."""
 
 
 _last_id = 0
@@ -1496,6 +1540,23 @@ class Agent:
             # про какой-нибудь из них.
             if cut and isinstance(final_metrics, dict):
                 final_metrics = {**final_metrics, CUT_METRIC[spec.strategy]: cut}
+
+            # Сторож: запрещённые слова ищутся в **готовом** ответе — слово,
+            # разорванное между кусками потока, по кускам не нашлось бы.
+            # До записи — значит отметка уедет в базу той же транзакцией, что
+            # и сама реплика, и будет видна в старых обменах после перезапуска.
+            # Судят те инварианты, что уехали в промпт (слой прочитан один раз
+            # на обмен): перечитанные осудили бы ответ правилом, которого
+            # модель не видела.
+            #
+            # Ответ при этом не прячется, не режется и не переспрашивается:
+            # он случился и оплачен, а сторож только ставит отметку. Ложные
+            # срабатывания здесь штатны — законный отказ содержит запрещённое
+            # слово («почему не Java?» → «Java здесь не подойдёт»), — и стоят
+            # они одной лишней строки, тогда как пропуск стоит решения.
+            hits = banned_hits(text, invariants)
+            if hits:
+                final_metrics = {**(final_metrics or {}), BANNED_METRIC: hits}
 
             committed = self._commit(user_text, text, failure, reasoning, final_metrics)
 

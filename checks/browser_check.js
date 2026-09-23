@@ -726,6 +726,73 @@ async function routeChecks() {
       usageText($("#feed"), ".usage-tokens"));
   }
 
+  // ── сторож нашёл в ответе запрещённое слово ──
+  //
+  // Строка **своя**, а не приписка к числам: задетый запрет весомее пометки
+  // про обрезку. И потому же она обязана пережить пустые числа — провайдер
+  // молчит о токенах чаще, чем хотелось бы, а условие показа подвала
+  // карточки проглотило бы отметку вместе с ними.
+  //
+  // Говорит она и слово, и правило: отметка без правила оставила бы читателя
+  // гадать, чем «Java» плоха именно в этом чате.
+  {
+    const hit = { word: "Java", rule: "ограничение стека: бэкенд только на Python" };
+    const caught = [
+      { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 200, completion_tokens: 50, total_tokens: 250,
+                   cost_usd: 0.0001, banned_hits: [hit] },
+      },
+      { role: "user", content: "ещё", error: null, reasoning: "", metrics: null },
+      // Провайдер смолчал о числах — строки с токенами у этой карточки нет
+      // вовсе, а отметка есть.
+      {
+        role: "assistant", content: "и ещё ответ", error: null, reasoning: "",
+        metrics: { banned_hits: [hit, { word: "Kotlin", rule: "архитектура: монолит" }] },
+      },
+      { role: "user", content: "чисто", error: null, reasoning: "", metrics: null },
+      {
+        role: "assistant", content: "чистый ответ", error: null, reasoning: "",
+        metrics: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost_usd: 0.00001 },
+      },
+    ];
+    const { client, $, settle, Evt } = freshClient({
+      chats: [{ label: "со сторожем", transcript: caught, history_len: caught.length }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const answers = $("#feed").querySelectorAll(".card");
+    const guardText = (card) => usageText(card, ".card-guard");
+    check("под ответом сказано и слово, и правило, которое оно задело",
+      guardText(answers[0]) === "«Java» задело запрет — ограничение стека: бэкенд только на Python",
+      guardText(answers[0]));
+    check("и формулировка про найденное слово, а не приговор: «нарушило» нигде нет",
+      !guardText(answers[0]).includes("наруш"), guardText(answers[0]));
+    check("строка сторожа отдельная, а к числам приписки не добавилось",
+      usageText(answers[0], ".usage-tokens") ===
+        "входные токены 200 · выходные токены 50 · всего токенов 250 · $0.000100",
+      usageText(answers[0], ".usage-tokens"));
+
+    check("у ответа без чисел строки с токенами нет вовсе",
+      answers[1].querySelector(".usage-tokens") === null,
+      usageText(answers[1], ".usage-tokens"));
+    check("а отметка сторожа у него есть — и по строке на каждое совпадение",
+      answers[1].querySelectorAll(".guard-hit").map((r) => r.textContent).join(" | ") ===
+        "«Java» задело запрет — ограничение стека: бэкенд только на Python" +
+        " | «Kotlin» задело запрет — архитектура: монолит",
+      answers[1].querySelectorAll(".guard-hit").map((r) => r.textContent).join(" | "));
+
+    check("а у ответа без совпадений строки сторожа нет",
+      answers[2].querySelector(".card-guard") === null,
+      guardText(answers[2]));
+    check("плиток от сторожа не прибавилось — счётчика срабатываний нет",
+      $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
+  }
+
   // ── итог берётся с сервера, а не складывается в браузере ──
   //
   // Инвариант дня: сумму считает агент, клиент её только показывает. Сервер

@@ -396,6 +396,21 @@ button, input, select, textarea { font: inherit; color: inherit; }
   overflow-wrap: anywhere;
 }
 .usage-how { margin-top: 2px; opacity: .85; }
+
+/* Отметка сторожа: в ответе нашлось запрещённое слово. Своя строка, а не
+   приписка к числам, — у ответа без чисел их строки нет вовсе. */
+.card-guard {
+  margin: 0 16px 12px;
+  padding: 8px 11px;
+  border: 1px solid var(--warn-line);
+  border-radius: 9px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.guard-hit + .guard-hit { margin-top: 3px; }
 .card.failed { border-color: var(--danger); }
 .card-error {
   margin: 0 16px 14px;
