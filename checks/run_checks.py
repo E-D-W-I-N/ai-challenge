@@ -2817,6 +2817,196 @@ def check_invariants_change_answer():
         "в промпте нет ни одного"
     )
 
+# --- День 14, второй PR: сторож смотрит на готовый ответ ----------------------
+
+
+def _marks(metrics) -> list[dict]:
+    """Отметки сторожа в метриках обмена — их может не быть вовсе."""
+    return (metrics or {}).get("banned_hits") or []
+
+
+def _guard_answers(table: dict):
+    """Заглушка, отвечающая по вопросу, а не по номеру вызова: сторож смотрит
+    на **текст ответа**, и каждый случай задаётся своей парой «вопрос → ответ»."""
+    return lambda messages, index: table[messages[-1]["content"]]
+
+
+@check("сторож ловит запрещённое слово целиком — и только его")
+def check_guard_finds_banned_words():
+    """Слова лежали в базе с прошлого PR и ждали, кто на них посмотрит.
+    Смотрит сторож — в **готовый** ответ, собранный целиком: слово,
+    разорванное между кусками потока, по кускам не нашлось бы.
+
+    Граница слова здесь не `\\b`: та держится на `\\w` с обеих сторон и рвётся
+    на `C++`. Проверяются оба края сразу — `Java` внутри `JavaScript`
+    не отмечается, а `C++` посреди фразы отмечается.
+
+    Словоформы не ловятся, и это записано утверждением, а не умолчанием:
+    пробел, названный проверкой, завтра не сойдёт за свойство.
+    """
+    answers = {
+        "стек?": "Берите Java и Kotlin.",
+        "фронт?": "JavaScript и TypeScript — обычный выбор.",
+        "точно?": "java тоже сойдёт",
+        "язык?": "Лучше Котлин.",
+        "плюсы?": "Возьмите C++ и не думайте.",
+        "формы?": "Пишите Котлином, не пожалеете.",
+        "чисто?": "Возьмите Python, он тут к месту.",
+    }
+    _stub.install(reply=_guard_answers(answers))
+
+    with TestClient(main.app) as client:
+        written = client.post("/api/invariants", json={
+            "kind": "stack", "content": "бэкенд только на Python",
+            "banned": ["Java", "Котлин", "C++"],
+        })
+        assert written.status_code == 200, written.text
+        agent_id = new_agent(client, label="сторож")
+        marks = {
+            question: _marks(_frame(_frames(client, agent_id, question), "done")["metrics"])
+            for question in answers
+        }
+
+    # --- 1. Слово из списка в ответе — отметка есть, и она называет оба ----
+    #
+    # И слово, и правило: отметка без правила оставила бы читателя гадать,
+    # чем именно «Java» плоха в этом чате.
+    assert marks["стек?"] == [
+        {"word": "Java", "rule": "ограничение стека: бэкенд только на Python"}
+    ], marks["стек?"]
+
+    # --- 2. Слова нет — отметки нет вовсе ----------------------------------
+    assert marks["чисто?"] == [], marks["чисто?"]
+
+    # --- 3. Слово целиком: `Java` внутри `JavaScript` не отмечается ---------
+    assert marks["фронт?"] == [], marks["фронт?"]
+
+    # --- 4. Регистр не важен ------------------------------------------------
+    assert [m["word"] for m in marks["точно?"]] == ["Java"], marks["точно?"]
+
+    # --- 5. Кириллическое слово ловится тем же правилом ---------------------
+    assert [m["word"] for m in marks["язык?"]] == ["Котлин"], marks["язык?"]
+
+    # --- 6. Слово со знаком ловится: граница не `\b` ------------------------
+    assert [m["word"] for m in marks["плюсы?"]] == ["C++"], marks["плюсы?"]
+
+    # --- 7. Словоформы не ловятся — это пробел, и он назван -----------------
+    assert marks["формы?"] == [], marks["формы?"]
+
+    # --- 8. Сторож ничего не запускает: обменов столько же, сколько вопросов -
+    assert len(_stub.CALLS) == len(answers), len(_stub.CALLS)
+    assert not _service_calls(), "за сторожем сходили к модели"
+    return (
+        f"задели запрет {sum(1 for m in marks.values() if m)} ответа из {len(answers)}; "
+        "`Java` в `JavaScript` и «Котлином» — нет"
+    )
+
+
+@check("отметка сторожа живёт с репликой: поток, база, суммы, сжатие")
+def check_guard_mark_lives_with_turn():
+    """Отметка кладётся в метрики обмена — тем же образцом, что `dropped`.
+    Отсюда три свойства разом, и каждое проверяется своим утверждением.
+
+    Колонки под отметку нет: метрики пишутся с репликой одной транзакцией,
+    значит отметка видна и в старых обменах после перезапуска.
+    """
+    from app.agent import Agent
+
+    word = "Kafka"
+    text = f"Поставьте {word} и живите спокойно."
+    path = _temp_db("guard-restart")
+    store = Store(path).init()
+    store.add_invariant("technical", "очередь — Redis", [word])
+
+    def answer_and_rewrite(messages, index):
+        """Соседняя вкладка правит инвариант, пока модель отвечает. Ответ
+        обязан судиться тем правилом, что уехало в промпт: перечитанное
+        осудило бы его правилом, которого модель не видела."""
+        store.update_invariant(
+            1, kind="technical", content="очередь — теперь Kafka", banned=["живите"]
+        )
+        return text
+
+    # Каждый кусок потока — один символ: слово, собранное только целиком,
+    # ни в одной дельте не лежит. Искал бы сторож в кусках — не нашёл бы.
+    _stub.install(reply=answer_and_rewrite, chunks=len(text))
+
+    async def one_turn():
+        agent = Agent(AgentSpec(label="сторож", model="stub/model"), store=store)
+        return agent.id, await drain(agent.ask("чем очередь?"))
+
+    agent_id, frames = asyncio.run(one_turn())
+    deltas = [f["text"] for f in frames if f["type"] == "delta"]
+    done = next(f for f in frames if f["type"] == "done")
+
+    # --- 1. Ответ разрезан на символы, а слово всё равно найдено -----------
+    assert max(len(d) for d in deltas) == 1, max(len(d) for d in deltas)
+    assert not any(word in d for d in deltas), deltas[:5]
+    assert _marks(done["metrics"]) == [
+        {"word": word, "rule": "техническое решение: очередь — Redis"}
+    ], done["metrics"]
+
+    # --- 2. Правило в отметке — то, что уехало в промпт ---------------------
+    #
+    # Слой переписан посреди обмена, и новое слово в ответе есть («живите»):
+    # перечитай сторож слой — отметка назвала бы его и чужое правило.
+    assert store.list_invariants()[0]["content"] == "очередь — теперь Kafka", (
+        store.list_invariants()
+    )
+
+    # --- 3. Отметка пережила перезапуск: она лежит в базе, а не в памяти ---
+    with _restarted(store, agent_id) as (again, revived):
+        answer = revived.history[-1]
+        assert _marks(answer.metrics) == [
+            {"word": word, "rule": "техническое решение: очередь — Redis"}
+        ], answer.metrics
+        # --- 4. Суммы по чату от отметки не изменились --------------------
+        #
+        # Сверяются они с числами **заглушки**, а не с копией тех же метрик:
+        # копия сдвинулась бы вместе с ними, и утверждение было бы зелёным
+        # при любом слагаемом. Слагаемых в итоге ровно столько, сколько
+        # полей в USAGE_FIELDS — и ключа отметки среди них нет.
+        total = revived.usage_summary()
+        assert agent_module.BANNED_METRIC not in total, sorted(total)
+        assert total["total_tokens"] == 100, total
+        assert total["cost_usd"] == 0.000123, total
+        assert total["completion_tokens"] == len(text) // 4, total
+        assert again.list_invariants()[0]["content"] == "очередь — теперь Kafka", (
+            again.list_invariants()
+        )
+
+    # --- 5. Сжатие сторож не трогает ---------------------------------------
+    #
+    # Служебный вызов пересказывает разговор, а не отвечает собеседнику:
+    # запрещённое слово в пересказе — это слово из истории, а не предложение
+    # его употребить. Инварианты сжатию не достаются вовсе, и судить его
+    # было бы нечем.
+    _stub.install(reply=lambda messages, index: text)
+    with TestClient(main.app) as client:
+        client.post("/api/invariants", json={
+            "kind": "technical", "content": "очередь — Redis", "banned": [word],
+        })
+        folded = new_agent(
+            client, label="со сжатием", strategy="summary",
+            keep_last=KEEP, compress_every=EVERY,
+        )
+        _talk(client, folded, 11)
+        agent = REGISTRY.require(folded)
+        assert agent.summaries, "сворачивания не было — проверять нечего"
+        for item in agent.summaries:
+            assert _marks(item["metrics"]) == [], item["metrics"]
+        # А у ответов того же чата отметка есть: слово одно и то же,
+        # и отсутствие у сводки — решение, а не совпадение.
+        answers = [t for t in agent.history if t.role == "assistant"]
+        assert all(_marks(t.metrics) for t in answers), [t.metrics for t in answers]
+
+    return (
+        f"слово собрано из {len(deltas)} дельт по одному символу; отметка пережила "
+        f"перезапуск с прежним правилом; сумм не изменила; "
+        f"у сводок ({len(agent.summaries)}) отметок нет"
+    )
+
+
 # --- День 13: состояние задачи — строгая машина, ручное управление ------------
 
 

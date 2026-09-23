@@ -671,6 +671,10 @@ function answerCard(agent, turn, index) {
   body.innerHTML = renderMarkdown(turn.content);
   card.appendChild(body);
 
+  // Отметка сторожа — выше чисел: задетый запрет весомее приписки про обрезку.
+  const guard = guardLine(turn);
+  if (guard) card.appendChild(guard);
+
   const usage = usageLine(turn);
   if (usage) card.appendChild(usage);
 
@@ -741,6 +745,24 @@ const SERVICE_CALLS = {
   summary: { status: "Сворачиваю начало разговора…", role: "сводка начала разговора" },
   facts: { role: "факты о разговоре" },
 };
+
+// Сторож нашёл в ответе слово из списка запрещённых. Строка **своя**, а не
+// приписка к числам: у ответа без чисел строки с токенами нет вовсе, а эта
+// обязана быть, — и задетый запрет весомее приписки про обрезку.
+//
+// Формулировка про найденное слово, а не приговор: код показывает совпадение,
+// судит человек. Ложные срабатывания штатны и неустранимы — законный отказ
+// содержит запрещённое слово («почему не Java?» → «Java здесь не подойдёт»),
+// цитата вопроса, слово в имени пакета; словоформы сторож не ловит вовсе.
+function guardLine(turn) {
+  const hits = (turn.metrics && turn.metrics.banned_hits) || [];
+  if (!hits.length) return null;
+  const box = el("div", "card-guard");
+  for (const hit of hits) {
+    box.appendChild(el("div", "guard-hit", "«" + hit.word + "» задело запрет — " + hit.rule));
+  }
+  return box;
+}
 
 function usageLine(turn) {
   const m = turn.metrics;
