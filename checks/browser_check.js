@@ -2267,6 +2267,15 @@ async function routeChecks() {
     }
   }
 
+  // Обмен, уже случившийся на нынешнем этапе. Ворота на выход с пустого этапа
+  // открывает записанный ответ, и сцена, которая проверяет не их, обязана его
+  // иметь; `stage_len: 0` у сеянного состояния значит «вошли в этап до него».
+  // Функцией, а не общим массивом: стенограмму стенд дописывает на обмене.
+  const worked = () => [
+    { role: "user", content: "разложи на шаги", error: null, reasoning: "", metrics: null },
+    { role: "assistant", content: "шаги", error: null, reasoning: "", metrics: null },
+  ];
+
   // ── режим задачи: команды в поле ввода, шапка над лентой ──
   //
   // Команды разбираются на клиенте: сервер про слеши не знает. Главное здесь
@@ -2482,6 +2491,50 @@ async function routeChecks() {
       JSON.stringify($("#task-head").children.map((n) => n.textContent)));
   }
 
+  // ── ворота: с пустого этапа «дальше» не уходит ──
+  //
+  // Отказ тот же по форме, что у хода не из таблицы, а по смыслу другой: ход
+  // законный, не хватает работы. Видно это только под полем ввода — сервер
+  // прислал `detail`, обмена не случилось, команда осталась набранной.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      chats: [{ label: "пустой этап" }],
+      tasks: { "пустой этап": { stage: "planning" } },
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    $("#input").value = "/task-next";
+    $("#composer").requestSubmit();
+    await settle(60);
+    check("ворота отказали — обмена нет вовсе",
+      server.state.sent.length === 0 &&
+        server.state.requests.filter((r) => /\/messages$/.test(r.path)).length === 0,
+      JSON.stringify(server.state.sent));
+    check("под полем сказано, чего не хватает и что делать",
+      /не было ни одного обмена/.test($("#composer-hint").textContent) &&
+        /разложить задачу на шаги/.test($("#composer-hint").textContent),
+      $("#composer-hint").textContent);
+    check("этап прежний: отказали, а состояние цело",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · планирование",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+    check("а отказанная команда осталась в поле",
+      $("#input").value === "/task-next", $("#input").value);
+
+    // Обмен на этом этапе ворота открывает — и тот же «/task-next» проходит.
+    $("#input").value = "разложи на шаги";
+    $("#composer").requestSubmit();
+    await settle(80);
+    $("#input").value = "/task-next";
+    $("#composer").requestSubmit();
+    await settle(80);
+    check("после обмена тот же ход прошёл",
+      $("#task-head").children.map((n) => n.textContent)[0] === "Задача · выполнение",
+      JSON.stringify($("#task-head").children.map((n) => n.textContent)));
+  }
+
   // ── двойной Enter проводит один переход, а не два ──
   //
   // Один «/task-next» уводит на два этапа, а назад таблица не ходит: вернуться
@@ -2489,8 +2542,8 @@ async function routeChecks() {
   // два обмена. Замок на время команды снимается в `finally`.
   {
     const { client, server, $, settle, Evt } = freshClient({
-      chats: [{ label: "двойной Enter" }],
-      tasks: { "двойной Enter": { stage: "planning" } },
+      chats: [{ label: "двойной Enter", transcript: worked() }],
+      tasks: { "двойной Enter": { stage: "planning", stage_len: 0 } },
     });
     client.init();
     await settle(30);
@@ -2518,8 +2571,8 @@ async function routeChecks() {
   // Ручка отвечает не сразу — этим и видно, куда уйдёт обмен.
   {
     const { client, server, $, settle, Evt } = freshClient({
-      chats: [{ label: "свой чат" }],
-      tasks: { "свой чат": { stage: "planning" } },
+      chats: [{ label: "свой чат", transcript: worked() }],
+      tasks: { "свой чат": { stage: "planning", stage_len: 0 } },
       slow: "/task",
     });
     client.init();

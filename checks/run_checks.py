@@ -3057,8 +3057,12 @@ def _task_of(client, agent_id: str) -> dict | None:
     return client.get(f"/api/agents/{agent_id}").json()["task"]
 
 
-def _at_stage(client, stage: str, label: str = "задача"):
+def _at_stage(client, stage: str, label: str = "задача", *, worked: bool = True):
     """Чат, доведённый до нужного этапа **командами** — других путей нет.
+
+    Перед каждым «дальше» — обмен: ворота не выпускают с этапа, на котором
+    не было работы. `worked=False` оставляет последний этап пустым — ровно
+    таким, каким его видят ворота.
 
     Утверждений здесь нет: на какой этап он встал, проверяет сама проверка.
     Пауза берётся с планирования, значит снятие вернёт туда же.
@@ -3073,7 +3077,11 @@ def _at_stage(client, stage: str, label: str = "задача"):
         "paused": ("pause",),
     }[stage]
     for move in moves:
+        if move == "next":
+            _talk(client, agent_id, 1, "работа этапа")
         client.patch(_task_url(agent_id), json={"move": move})
+    if worked:
+        _talk(client, agent_id, 1, "работа этапа")
     return agent_id
 
 
@@ -3177,7 +3185,9 @@ def check_task_machine():
         assert "планирование" in stale.json()["detail"], stale.text
         assert "выполнение" in stale.json()["detail"], stale.text
         assert _task_of(client, picked)["stage"] == "execution", "отказали, а этап сдвинулся"
-        # Не названный `from` по-прежнему проходит: он необязателен.
+        # Не названный `from` по-прежнему проходит: он необязателен, — но
+        # ворота на пустом этапе стоят и без него.
+        _talk(client, picked, 1, "работа этапа")
         assert client.patch(_task_url(picked), json={"move": "next"}).status_code == 200
         assert _task_of(client, picked)["stage"] == "validation", _task_of(client, picked)
         # Незнакомый этап отсекается на границе, а не совпадением: подпись
@@ -3555,12 +3565,14 @@ def check_task_lifecycle():
         # на планировании заглушка отклоняет, называя этап и ход, — и оба
         # слова взяты ею из самого блока.
         before = len(_stub.CALLS)
-        asking = _at_stage(client, "planning", "отказ")
+        # Пустой этап: с планирования здесь никуда не ходят, а лишний обмен
+        # развёл бы два промпта номером ответа заглушки.
+        asking = _at_stage(client, "planning", "отказ", worked=False)
         refused = _frame(_frames(client, asking, "напиши код"), "done")["text"]
         knowing = _stub.CALLS[-1]["messages"]
         # Тот же ярлык — тот же промпт: два чата различает только блок.
         with patch.object(agent_module, "lifecycle_block", lambda stage: ""):
-            blind = _at_stage(client, "planning", "отказ")
+            blind = _at_stage(client, "planning", "отказ", worked=False)
             obeyed = _frame(_frames(client, blind, "напиши код"), "done")["text"]
         ignorant = _stub.CALLS[-1]["messages"]
         assert "«выполнение»" in refused and "/task-next" in refused, refused
@@ -3583,6 +3595,132 @@ def check_task_lifecycle():
         f"новое ребро в таблице блок назвал; врезок по-прежнему "
         f"{len(agent_module.PROMPT_SLOTS)}, системное сообщение одно; "
         f"на планировании ответ — {refused!r}, без блока — {obeyed!r}"
+    )
+
+
+@check("ворота: «дальше» не выпускает с этапа, на котором не было обменов")
+def check_task_gate():
+    """Задание дня просит не пускать в реализацию до утверждённого плана.
+    Таблица переходов о работе не знает ничего — знают ворота: ход `next`
+    отказывает, пока на этапе не записалось ни одного ответа.
+
+    Ловят они **пустоту, а не спешку**: обмен, открывающий ворота, шлёт сам
+    переход, и три `/task-next` подряд пройдут. Человек нажал трижды — значит
+    решил трижды.
+
+    Пауза и снятие паузы не ограничены никогда, и утверждение об этом стоит
+    рядом с утверждением про `next`: остановиться человек вправе всегда.
+    """
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    with TestClient(main.app) as client:
+        store = main.REGISTRY.store
+
+        # --- 1. Пустой этап не выпускает, обмен выпускает -------------------
+        shut = []
+        for stage in ("planning", "execution", "validation"):
+            agent_id = _at_stage(client, stage, "ворота", worked=False)
+            before = store.load_task(agent_id)
+            answer = client.patch(_task_url(agent_id), json={"move": "next"})
+            assert answer.status_code == 409, (stage, answer.text)
+            detail = answer.json()["detail"]
+            assert "не было ни одного обмена" in detail, detail
+            # Текст говорит и что делать: ожидаемое действие этапа.
+            assert STAGE_EXPECTS[stage] in detail, detail
+            # Состояние прежнее **целиком**, вместе с отметкой входа: наружу
+            # она не едет, и сверить её можно только со строкой в базе.
+            assert store.load_task(agent_id) == before, (stage, store.load_task(agent_id))
+            _talk(client, agent_id, 1, "поработали")
+            went = client.patch(_task_url(agent_id), json={"move": "next"})
+            assert went.status_code == 200, (stage, went.text)
+            assert went.json()["task"]["stage"] == TRANSITIONS[(stage, "next")], went.json()
+            shut.append(stage)
+
+        # --- 2. Пауза и снятие паузы воротами не ограничены -----------------
+        #
+        # Утверждение об отсутствии — там, где присутствие достижимо: этапы
+        # те же самые, и на них `next` только что отказал.
+        for stage in shut:
+            agent_id = _at_stage(client, stage, "пауза без работы", worked=False)
+            off = client.patch(_task_url(agent_id), json={"move": "pause"})
+            assert off.status_code == 200, (stage, off.text)
+            assert off.json()["task"]["stage"] == "paused", off.json()
+            back = client.patch(_task_url(agent_id), json={"move": "resume"})
+            assert back.status_code == 200, (stage, back.text)
+            assert back.json()["task"]["stage"] == stage, (stage, back.json())
+            # И ворота на месте: постояв на паузе, работой этого не сделаешь.
+            again = client.patch(_task_url(agent_id), json={"move": "next"})
+            assert again.status_code == 409, (stage, again.text)
+
+        # --- 3. Отметку входа двигает только переход -------------------------
+        #
+        # Двигай её всякая запись — и набранный шаг закрывал бы ворота,
+        # которые открыл обмен.
+        agent_id = _at_stage(client, "execution", "отметка", worked=False)
+        mark = store.load_task(agent_id)["stage_at"]
+        _talk(client, agent_id, 1, "поработали")
+        for body in ({"step": "пишу проверку"}, {"expects": "показать черновик"}):
+            assert client.patch(_task_url(agent_id), json=body).status_code == 200, body
+            assert store.load_task(agent_id)["stage_at"] == mark, (body, store.load_task(agent_id))
+        went = client.patch(_task_url(agent_id), json={"move": "next"})
+        assert went.status_code == 200, went.text
+        assert store.load_task(agent_id)["stage_at"] > mark, store.load_task(agent_id)
+
+        # --- 4. Обмен, который не записался, ворота не открывает -------------
+        #
+        # Вопрос без ответа работой не был: в истории его нет вовсе.
+        agent_id = _at_stage(client, "planning", "упавший", worked=False)
+        _stub.install(fail=True)
+        _talk(client, agent_id, 1, "вопрос без ответа")
+        assert client.get(f"/api/agents/{agent_id}").json()["history_len"] == 0, "обмен записался"
+        fell = client.patch(_task_url(agent_id), json={"move": "next"})
+        assert fell.status_code == 409, fell.text
+        _stub.install(reply=lambda m, i: f"ответ {i}")
+        _talk(client, agent_id, 1, "теперь с ответом")
+        assert client.patch(_task_url(agent_id), json={"move": "next"}).status_code == 200
+
+        # --- 5. Ветка уносит отметку вместе с состоянием ---------------------
+        #
+        # Ветвимся **до** работы нынешнего этапа: этап у ветки тот же, а в её
+        # ленте работы на нём нет — значит и ворота у неё закрыты. Не унеси
+        # ветка отметку, реплики прошлого этапа сошли бы у неё за работу.
+        parent = new_agent(client, label="ветка от этапа")
+        client.post(_task_url(parent), json={"description": "собрать ТЗ"})
+        _talk(client, parent, 1, "планирую")
+        assert client.patch(_task_url(parent), json={"move": "next"}).status_code == 200
+        _talk(client, parent, 1, "выполняю")
+        forked = client.post(f"/api/agents/{parent}/fork", json={"at": 2}).json()["agents"][0]
+        assert forked["task"]["stage"] == "execution", forked["task"]
+        assert store.load_task(forked["id"]) == store.load_task(parent), forked["task"]
+        blocked = client.patch(_task_url(forked["id"]), json={"move": "next"})
+        assert blocked.status_code == 409, blocked.text
+        # А родитель выпускает: работа на этом этапе у него есть.
+        assert client.patch(_task_url(parent), json={"move": "next"}).status_code == 200
+
+    # --- 6. Отметка переживает перезапуск процесса ---------------------------
+    _stub.reset()
+    _stub.install(reply=lambda m, i: f"ответ {i}")
+    path = _temp_db("task-gate")
+    store = Store(path).init()
+    chat = agent_module.Agent(AgentSpec(label="ворота", model="stub/model"), store=store)
+    chat.start_task("собрать ТЗ")
+    _ask(chat, 1)
+    assert chat.gate_shut("next") is False, "обмен ворота не открыл"
+    with _restarted(store, chat.id) as (fresh, again):
+        assert again.gate_shut("next") is False, "отметка входа не пережила перезапуск"
+        assert again.move_task("next")["stage"] == "execution", again.task
+        assert again.gate_shut("next") is True, "новый этап выпустил без работы"
+        with _restarted(fresh, chat.id) as (last, third):
+            assert third.gate_shut("next") is True, "после перезапуска пустой этап стал рабочим"
+            _ask(third, 1)
+            assert third.gate_shut("next") is False, "обмен ворота не открыл"
+            last.close()
+
+    return (
+        f"на трёх этапах «дальше» отказало на пустом и прошло после обмена; "
+        f"пауза и возврат прошли на всех трёх; шаг и ожидание отметку "
+        f"не двинули, а переход двинул; упавший обмен ворота не открыл; "
+        f"ветка от точки до работы унесла отметку и закрытые ворота; "
+        f"отметка пережила два перезапуска"
     )
 
 

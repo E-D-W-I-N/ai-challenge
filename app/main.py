@@ -1000,8 +1000,9 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     `{"expects": "..."}`. Названное меняется, неназванное не трогается.
 
     Переход не из таблицы — 409, и состояние остаётся прежним: отказать
-    честнее, чем сделать соседний ход за человека. Необязательный `from`
-    называет этап, из которого ход выбирали: он только сверяет, не двигая.
+    честнее, чем сделать соседний ход за человека. Ход «дальше» с этапа, где
+    не было ни одного обмена, — тоже 409: ворота ловят пустоту. Необязательный
+    `from` называет этап, из которого ход выбирали: он только сверяет, не двигая.
     """
     agent = _agent(agent_id)
     _record_body(payload, ("move", "from", *TASK_FIELDS))
@@ -1028,7 +1029,18 @@ async def patch_task(agent_id: str, payload: dict = Body(...)) -> dict:
     # с законным `move` оставил бы состояние наполовину сдвинутым.
     values = {name: _content_field(payload, name) for name in TASK_FIELDS if name in payload}
     if "move" in payload:
-        moved = agent.move_task(_move_field(payload))
+        move = _move_field(payload)
+        # Ворота: уйти с этапа «дальше» можно, когда на нём была работа —
+        # хотя бы один записанный обмен. Спрашиваем **до** хода: отказ обязан
+        # оставить состояние прежним. Что делать, говорит само ожидаемое
+        # действие этапа — второй формулировки того же заводить незачем.
+        if agent.gate_shut(move):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"на этапе «{task['label']}» не было ни одного обмена: "
+                        f"{task['expects']}"),
+            )
+        moved = agent.move_task(move)
         if moved is None:
             allowed = _allowed_from(task["stage"])
             raise HTTPException(
