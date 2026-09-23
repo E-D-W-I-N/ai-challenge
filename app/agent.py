@@ -26,6 +26,8 @@ from .schema import (
     CONTEXT_FIELDS,
     INVARIANT_LABELS,
     MEMORY_LABELS,
+    MOVE_COMMANDS,
+    MOVE_LABELS,
     PROFILE_FIELDS,
     PROFILE_LABELS,
     RESUME,
@@ -242,6 +244,45 @@ def stage_block(stage: str) -> str:
     return f"[этап задачи: {STAGE_LABELS[stage]}]\n{STAGE_RULES[stage]}"
 
 
+def moves_from(stage: str) -> str:
+    """Куда ведут ходы с этого этапа и какой командой — по-русски, по той же
+    `TRANSITIONS`, по которой ходят команды и ручки. Пусто здесь невозможно:
+    у завершающего этапа строка своя."""
+    moves = [
+        f"{MOVE_LABELS[move]} ({MOVE_COMMANDS[move]}) → "
+        + ("туда, откуда встали" if target == RESUME else STAGE_LABELS[target])
+        for (where, move), target in TRANSITIONS.items()
+        if where == stage
+    ]
+    return "; ".join(moves) if moves else "ходов отсюда нет, задача закончена"
+
+
+def lifecycle_block(stage: str) -> str:
+    """Автомат задачи так, как его читает модель: весь граф, отметка «сейчас
+    здесь» и запрет работать за другой этап.
+
+    Собран **из `TRANSITIONS`**, а не выписан руками: таблица остаётся
+    единственным источником правды, и добавленное ребро доезжает до модели
+    само — иначе она звала бы ход, которого нет, или молчала бы о том,
+    который есть.
+
+    Граф целиком, а не одни ходы отсюда: чтобы назвать, чья это работа,
+    модель обязана знать все этапы, а не только соседние.
+    """
+    lines = [
+        f"{STAGE_LABELS[where]}{' — сейчас здесь' if where == stage else ''}: "
+        + moves_from(where)
+        for where in STAGES
+    ]
+    return (
+        "[жизненный цикл задачи]\n"
+        + "\n".join(lines)
+        + "\nЭтап двигает только человек, этими командами. Просят работу "
+        "другого этапа — не делай её: назови, чей это этап и каким ходом "
+        "туда перейти."
+    )
+
+
 def invariant_line(record: dict) -> str:
     """Инвариант одной строкой «подпись вида: текст».
 
@@ -334,12 +375,16 @@ def system_message(
     # Правило этапа — третьей частью: системным едет то, что задал человек,
     # а этап он и двигает. Второго системного сообщения у чата не бывает.
     rule = stage_block(stage) if stage else ""
-    # Инварианты — четвёртой и последней, и тоже системным: это распоряжение,
-    # которому модель следует, а не сведения, на которые она опирается.
+    # Жизненный цикл — рядом с правилом этапа и на том же условии: режим
+    # выключен — нет ни того, ни другого. Своей врезки блок не заводит,
+    # номера врезок от него не сдвигаются.
+    machine = lifecycle_block(stage) if stage else ""
+    # Инварианты — пятым слагаемым и последним, и тоже системным: это
+    # распоряжение, которому модель следует, а не сведения, на которые она опирается.
     # Своего места в промпте они не занимают вовсе — номера врезок памяти
     # от них не сдвигаются.
     rules = invariant_block(invariants) if invariants else ""
-    parts = [part for part in (system, block, rule, rules) if part]
+    parts = [part for part in (system, block, rule, machine, rules) if part]
     if not parts:
         return None
     return {"role": "system", "content": "\n\n".join(parts)}

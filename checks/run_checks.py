@@ -34,6 +34,7 @@ import app.main as main  # noqa: E402
 from app.llm import Metrics  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import (  # noqa: E402
+    MOVE_COMMANDS,
     MOVES,
     RESUME,
     STAGE_EXPECTS,
@@ -183,6 +184,36 @@ def _invariant_aware(messages, index):
     if "ограничение стека: бэкенд только на Python" in head:
         return "Только Python: нарушается инвариант «ограничение стека»."
     return "Возьмите Java со Spring — обычный выбор под такую задачу."
+
+
+def _stage_aware(messages, index):
+    """Ответ, который зависит от **блока жизненного цикла** в запросе.
+
+    Заглушка читает автомат там же, где прочитала бы его модель, — в блоке
+    `[жизненный цикл задачи]` системного сообщения, — и отказ собирает
+    из него же: этап берёт из строки «сейчас здесь», команду — из хода,
+    ведущего к «выполнению». Этого довольно, чтобы «ассистент не делает
+    работу чужого этапа» стало утверждением об **ответе**, а не о составе
+    запроса. Довод тот же, что у `_memory_aware` и `_invariant_aware`.
+
+    Блока нет — работа делается: знание машины и есть вся разница между
+    двумя ответами.
+    """
+    head = messages[0].get("content", "") if messages else ""
+    asked = messages[-1].get("content", "") if messages else ""
+    here = next((line for line in head.splitlines() if " — сейчас здесь: " in line), "")
+    stage, _, moves = here.partition(" — сейчас здесь: ")
+    if "напиши код" not in asked or stage == "выполнение":
+        return f"ответ {index}"
+    if not here:
+        return "Держи код: def main(): ..."
+    way = next((m for m in moves.split("; ") if m.endswith("→ выполнение")), "")
+    command = way.partition("(")[2].partition(")")[0]
+    return (
+        f"Кода сейчас не будет: это работа этапа «выполнение», "
+        f"а мы на этапе «{stage}». "
+        + (f"Перейдите {command}." if command else "Отсюда туда хода нет.")
+    )
 
 
 def _temp_db(name: str) -> str:
@@ -2549,7 +2580,7 @@ def check_invariants_layer():
         assert plain["seq"] > stack["seq"], (stack, plain)
         assert client.get("/api/invariants").json()["total"] == 2
 
-        # --- 3. Врезка: системным, четвёртой частью, и системное одно --------
+        # --- 3. Врезка: системным, последней частью, и системное одно --------
         _stub.reset()
         client.patch("/api/profile", json={"style": "кратко, на ты"})
         talky = new_agent(client, system="СИС")
@@ -2559,17 +2590,22 @@ def check_invariants_layer():
         assert len([m for m in sent if m["role"] == "system"]) == 1, sent
         head = sent[0]
         assert head["role"] == "system", head
-        assert head["content"] == (
-            "СИС\n\n"
-            "[как отвечать]\nстиль: кратко, на ты\n\n"
-            "[этап задачи: планирование]\n"
-            "Разложи задачу на шаги и ничего не выполняй.\n\n"
+        # Слагаемые сверяются по заголовкам, а сам блок — целиком: граф
+        # автомата у соседа свой, и списывать его сюда значило бы краснеть
+        # этой проверкой на каждое новое ребро в чужой таблице.
+        blocks = head["content"].split("\n\n")
+        assert [part.partition("\n")[0] for part in blocks] == [
+            "СИС", "[как отвечать]", "[этап задачи: планирование]",
+            "[жизненный цикл задачи]", "[чего нельзя]",
+        ], blocks
+        assert blocks[1] == "[как отвечать]\nстиль: кратко, на ты", blocks[1]
+        assert blocks[4] == (
             "[чего нельзя]\n"
             "1. ограничение стека: бэкенд только на Python\n"
             "2. архитектура: монолит, микросервисов не предлагать\n"
             "Соблюдай это. Если просьба противоречит любому пункту — откажись "
             "и назови, какой именно нарушается."
-        ), head["content"]
+        ), blocks[4]
         # Врезкой ролью `user` блок не едет ни одним экземпляром: своего места
         # в промпте у инвариантов нет вовсе.
         assert not any(
@@ -3296,7 +3332,11 @@ def check_task_in_prompt():
             # Сравнивается само правило, а не сообщение целиком: подпись
             # этапа в заголовке различает блоки и без разных правил — и одно
             # правило на все пять прошло бы незамеченным.
-            title, _, rule = head["content"].partition("\n")
+            block = next(
+                part for part in head["content"].split("\n\n")
+                if part.startswith("[этап задачи: ")
+            )
+            title, _, rule = block.partition("\n")
             assert title == f"[этап задачи: {STAGE_LABELS[stage]}]", (stage, title)
             rules[stage] = rule
             # Номер врезки сверяется до обращения по нему: пустой или
@@ -3401,6 +3441,148 @@ def check_task_in_prompt():
         "«ожидается» во врезке; врезка едет и с пустым шагом; выключенный режим "
         f"уходит без единого сообщения; {len(agent_module.PROMPT_SLOTS)} врезки "
         "встали номерами 1–4; ветка унесла состояние копией, перезапуск его сохранил"
+    )
+
+
+def _lifecycle(client, agent_id: str, text: str = "вопрос") -> tuple[dict, str]:
+    """Кадр `start` обмена и блок жизненного цикла из его системного
+    сообщения — пустая строка, если блока в промпте нет вовсе."""
+    start = _frame(_frames(client, agent_id, text), "start")
+    head = start["resolved_messages"][0] if start["resolved_messages"] else {}
+    parts = head.get("content", "").split("\n\n") if head.get("role") == "system" else []
+    return start, next((p for p in parts if p.startswith("[жизненный цикл задачи]")), "")
+
+
+@check("модель знает автомат: блок собран из таблицы, чужой работы не делает")
+def check_task_lifecycle():
+    """Что модель знает о машине состояний, и что из этого доезжает до ответа.
+
+    Блок `[жизненный цикл задачи]` собран **из `TRANSITIONS`**, а не выписан
+    руками: таблица остаётся единственным источником правды, и добавленное
+    ребро доезжает до модели само. Ходы в блоке — те же, что законны у ручки:
+    считает их одна и та же таблица.
+
+    Едет блок **системным** сообщением, рядом с правилом этапа: это
+    распоряжение, а не сведения. Своей врезки он не заводит — номера врезок
+    памяти от него не сдвигаются, и выключенный режим по-прежнему
+    неотличим от невключавшегося.
+
+    Последнее утверждение — про **ответ**: заглушка читает блок там же, где
+    прочитала бы его модель, и на просьбу о работе чужого этапа отвечает
+    отказом, называя этап и ход. Словами живой модели заглушка не
+    притворяется: обещать она вправе только то, что знание машины доезжает
+    до ответа, а не теряется по дороге.
+    """
+    _stub.install(reply=_stage_aware)
+    with TestClient(main.app) as client:
+        # --- 1. Ходы в блоке — те же, что законны у ручки -------------------
+        lines, blocks = {}, {}
+        for stage in STAGES:
+            agent_id = _at_stage(client, stage, "цикл")
+            _, blocks[stage] = _lifecycle(client, agent_id)
+            # Отметка «сейчас здесь» берётся с запасным пустым значением:
+            # её отсутствие обязано краснеть утверждением, а не падением.
+            lines[stage] = next(
+                (line for line in blocks[stage].splitlines() if " — сейчас здесь: " in line),
+                "",
+            )
+            assert lines[stage].startswith(f"{STAGE_LABELS[stage]} — сейчас здесь: "), (
+                stage, lines[stage]
+            )
+            # Законные ходы сверяются с теми, что называет отказ ручки:
+            # обоих считает одна таблица, и разойтись им негде.
+            allowed = [move for move in main._allowed_from(stage).split(", ") if move]
+            named = re.findall(r"\((/[a-z-]+)\)", lines[stage])
+            assert named == [MOVE_COMMANDS[move] for move in allowed], (stage, lines[stage])
+            for move in MOVES:
+                if move not in allowed:
+                    assert MOVE_COMMANDS[move] not in lines[stage], (stage, move, lines[stage])
+            # Все пять этапов названы: чтобы назвать чужой этап, модель
+            # обязана его знать, а не догадаться по соседям.
+            assert all(STAGE_LABELS[s] in blocks[stage] for s in STAGES), (stage, blocks[stage])
+        assert len(set(blocks.values())) == len(STAGES), blocks
+        assert "ходов отсюда нет" in lines["done"], lines["done"]
+        assert not any("ходов отсюда нет" in lines[s] for s in STAGES if s != "done"), lines
+
+        # --- 2. Новое ребро в таблице доезжает до модели само ----------------
+        #
+        # Выпиши блок руками — и здесь он назвал бы прежнее: модель звала бы
+        # ход, которого нет, или молчала бы о том, который есть.
+        closed = _at_stage(client, "done", "ребро")
+        with patch.dict(TRANSITIONS, {("done", "next"): "planning"}):
+            _, block = _lifecycle(client, closed)
+            assert "готово — сейчас здесь: дальше (/task-next) → планирование" in block, block
+        _, block = _lifecycle(client, closed)
+        assert "ходов отсюда нет" in block, block
+
+        # --- 3. Выключенный режим уходит без блока и без системного ---------
+        #
+        # Проверяется до врезок памяти: непустой слой встаёт в промпт и
+        # голому чату — и «уходит ни с чем» держалось бы уже не блоком.
+        bare = new_agent(client, label="без задачи")
+        start, block = _lifecycle(client, bare)
+        assert block == "", block
+        assert start["resolved_messages"] == [{"role": "user", "content": "вопрос"}], start
+
+        # --- 4. Системным, одним сообщением, и врезок не прибавилось --------
+        full = new_agent(client, label="все врезки", system="СИС",
+                         strategy="summary", keep_last=2, compress_every=2)
+        client.post(_task_url(full), json={"description": "собрать ТЗ"})
+        client.post("/api/memory", json={"kind": "profile", "content": "пишу на Kotlin"})
+        client.post(f"/api/agents/{full}/working", json={"kind": "goal", "content": "ТЗ"})
+        _talk(client, full, 3)
+        start, block = _lifecycle(client, full)
+        prompt = start["resolved_messages"]
+        assert block and prompt[0]["role"] == "system", prompt[0]
+        assert prompt[0]["content"].startswith("СИС\n\n[этап задачи"), prompt[0]
+        assert len([m for m in prompt if m["role"] == "system"]) == 1, prompt
+        assert not any(
+            m["role"] != "system" and "[жизненный цикл" in m["content"] for m in prompt
+        ), prompt
+        assert agent_module.PROMPT_SLOTS == (
+            "memory_at", "working_at", "task_at", "summary_at"
+        ), agent_module.PROMPT_SLOTS
+        assert [start[name] for name in agent_module.PROMPT_SLOTS] == [1, 2, 3, 4], start
+
+        # Сжатию блок не достаётся: служебный вызов пересказывает разговор,
+        # а не отвечает собеседнику.
+        compress = _service_calls("summary")[-1]["messages"]
+        assert not any("[жизненный цикл" in m["content"] for m in compress), compress
+
+        # --- 5. Главное: ассистент не делает работу чужого этапа -------------
+        #
+        # Утверждение об **ответе**, а не о составе запроса: просьбу о коде
+        # на планировании заглушка отклоняет, называя этап и ход, — и оба
+        # слова взяты ею из самого блока.
+        before = len(_stub.CALLS)
+        asking = _at_stage(client, "planning", "отказ")
+        refused = _frame(_frames(client, asking, "напиши код"), "done")["text"]
+        knowing = _stub.CALLS[-1]["messages"]
+        # Тот же ярлык — тот же промпт: два чата различает только блок.
+        with patch.object(agent_module, "lifecycle_block", lambda stage: ""):
+            blind = _at_stage(client, "planning", "отказ")
+            obeyed = _frame(_frames(client, blind, "напиши код"), "done")["text"]
+        ignorant = _stub.CALLS[-1]["messages"]
+        assert "«выполнение»" in refused and "/task-next" in refused, refused
+        assert "def main" not in refused, refused
+        assert "def main" in obeyed and "выполнение" not in obeyed, obeyed
+        assert refused != obeyed, refused
+
+        # И разошлись они **от блока**: всё остальное в двух запросах
+        # совпадает слово в слово, а обращений к модели поровну.
+        stripped = [dict(m) for m in knowing]
+        stripped[0]["content"] = "\n\n".join(
+            part for part in stripped[0]["content"].split("\n\n")
+            if not part.startswith("[жизненный цикл задачи]")
+        )
+        assert stripped == ignorant, (stripped, ignorant)
+        assert len(_stub.CALLS) == before + 2, (before, len(_stub.CALLS))
+
+    return (
+        f"пять этапов — пять разных блоков, ходы в каждом те же, что у ручки; "
+        f"новое ребро в таблице блок назвал; врезок по-прежнему "
+        f"{len(agent_module.PROMPT_SLOTS)}, системное сообщение одно; "
+        f"на планировании ответ — {refused!r}, без блока — {obeyed!r}"
     )
 
 
