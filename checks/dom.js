@@ -497,6 +497,14 @@ function buildServer(options) {
     records: ((options && options.records) || []).map((seed, i) => ({
       seq: i + 1, at: i, ...seed,
     })),
+    // Инварианты: слой глобальный, как долговременная память, и живёт он
+    // так же — записи материализуются один раз и дальше **живут**, их правит
+    // и удаляет вкладка. Собери стенд их заново в каждом ответе — правка
+    // исчезала бы к следующему чтению, и проверка правки прошла бы
+    // на подложном равенстве.
+    invariants: ((options && options.invariants) || []).map((seed, i) => ({
+      seq: i + 1, at: i, banned: [], ...seed,
+    })),
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
     // на «***» — и только когда секрет задан, ровно как сервер без ключа
@@ -624,6 +632,16 @@ function buildServer(options) {
   let issuedMemory = state.records.length;
   const MEMORY_KINDS = ["profile", "decision", "knowledge"];
   const WORKING_KINDS = ["goal", "limit", "decision", "question"];
+  const INVARIANT_KINDS = ["architecture", "technical", "stack", "business"];
+  // Подписи видов — своя копия карты, как и всё в стенде: он нарочно
+  // независим от сервера. Слова те же, что в `INVARIANT_LABELS`.
+  const INVARIANT_LABELS = {
+    architecture: "архитектура",
+    technical: "техническое решение",
+    stack: "ограничение стека",
+    business: "бизнес-правило",
+  };
+  let issuedInvariants = state.invariants.length;
 
   // Номера рабочих записей — один счётчик на всю базу, как на сервере:
   // у `working_memory` первичный ключ AUTOINCREMENT, а чат в ней колонкой.
@@ -715,9 +733,10 @@ function buildServer(options) {
   // пустое тело правки 400. Вторая копия правил на втором слое разошлась бы
   // с первой молча, а слой с разбором щедрее серверного прятал бы дыру:
   // форма осталась бы зелёной, получая в браузере 400.
-  function recordBody(body, kinds, patch) {
+  function recordBody(body, kinds, patch, withBanned) {
     const keys = Object.keys(body || {});
-    const unknown = keys.filter((k) => k !== "kind" && k !== "content");
+    const allowed = withBanned ? ["kind", "content", "banned"] : ["kind", "content"];
+    const unknown = keys.filter((k) => !allowed.includes(k));
     if (unknown.length) return { error: fail(400, "лишние поля: " + unknown.join(", ")) };
     if (patch && !keys.length) {
       return { error: fail(400, "тело правки пустое: назовите kind, content или оба") };
@@ -737,6 +756,20 @@ function buildServer(options) {
       }
       out.content = clean(content);
     }
+    // Список слов — только у инвариантов, и только здесь он необязателен:
+    // пустой законен, а не-список 400, ровно как `_banned_field` на сервере.
+    // Стенд, принимающий то, чего не принимает сервер, оставил бы зелёной
+    // форму, получающую в браузере 400.
+    if (withBanned && keys.includes("banned")) {
+      const words = body.banned;
+      if (!Array.isArray(words)) return { error: fail(400, "banned: список строк") };
+      if (words.some((w) => typeof w !== "string" || !w.trim())) {
+        return { error: fail(400, "banned: каждое слово — непустая строка") };
+      }
+      out.banned = words.map((w) => clean(w));
+    } else if (withBanned && !patch) {
+      out.banned = [];
+    }
     return { value: out };
   }
 
@@ -751,6 +784,18 @@ function buildServer(options) {
 
   const factsInsert = () => state.facts;
 
+  // Блок инвариантов — своя копия формулы, как и всё в стенде. Пустой слой
+  // неотличим от отсутствующего: ни блока, ни системного сообщения.
+  const invariantBlock = () => {
+    if (!state.invariants.length) return "";
+    const lines = state.invariants.map(
+      (r, i) => (i + 1) + ". " + (INVARIANT_LABELS[r.kind] || r.kind) + ": " + r.content
+    );
+    return "[чего нельзя]\n" + lines.join("\n")
+      + "\nСоблюдай это. Если просьба противоречит любому пункту — откажись "
+      + "и назови, какой именно нарушается.";
+  };
+
   // Начало промпта — сообщения **до** истории и номер каждой врезки в них,
   // одним ответом. Формула слота здесь не считается, а берётся из длины уже
   // собранного начала: сервер делает так же (`Agent.prompt_head`), и по той же
@@ -764,13 +809,18 @@ function buildServer(options) {
   function promptHead(agent, service) {
     const messages = [];
     const slots = { memory_at: null, working_at: null, task_at: null, summary_at: null };
-    // Системным едет то, что задал человек: промпт чата и правило этапа.
-    // Правило заводит системное сообщение и у чата без промпта — и сдвигает
-    // этим номера всех врезок разом.
+    // Системным едет то, что задал человек: промпт чата, правило этапа
+    // и инварианты. Любое из трёх заводит системное сообщение и у чата
+    // без промпта — и сдвигает этим номера всех врезок разом.
+    //
+    // Своего слота у инвариантов нет: они дописываются в то же сообщение,
+    // а не встают врезкой. И запрещённых слов здесь нет ни одного символа —
+    // ровно как на сервере: в блок едут только вид и текст.
     const task = taskView(agent);
     const head = [
       agent.system,
       task ? "[этап задачи: " + task.label + "]\n" + STAGE_RULES[task.stage] : "",
+      invariantBlock(),
     ].filter(Boolean).join("\n\n");
     if (head) messages.push({ role: "system", content: head });
 
@@ -987,6 +1037,40 @@ function buildServer(options) {
         return { ok: false, status: 404, json: async () => ({ detail: "записи памяти " + seq + " нет" }) };
       }
       state.records.splice(i, 1);
+      return json({ deleted: seq });
+    }
+
+    // ── инварианты: ручки глобальные, без agent_id, как у памяти ──
+    //
+    // Границы те же, что на сервере: вид обязателен и без умолчания, текст
+    // непустой, лишние поля 400, пустое тело правки 400, чужой номер 404,
+    // номера от AUTOINCREMENT и заново не выдаются.
+    if (path === "/api/invariants" && method === "GET") {
+      return json({ total: state.invariants.length, records: state.invariants });
+    }
+    if (path === "/api/invariants" && method === "POST") {
+      const parsed = recordBody(body, INVARIANT_KINDS, false, true);
+      if (parsed.error) return parsed.error;
+      const record = { seq: (issuedInvariants += 1), ...parsed.value,
+                       at: state.invariants.length };
+      state.invariants.push(record);
+      return json(record);
+    }
+    const invariantMatch = /^\/api\/invariants\/(\d+)$/.exec(path);
+    if (invariantMatch && method === "PATCH") {
+      const seq = Number(invariantMatch[1]);
+      const record = state.invariants.find((r) => r.seq === seq);
+      if (!record) return fail(404, "инварианта " + seq + " нет");
+      const parsed = recordBody(body, INVARIANT_KINDS, true, true);
+      if (parsed.error) return parsed.error;
+      Object.assign(record, parsed.value);
+      return json(record);
+    }
+    if (invariantMatch && method === "DELETE") {
+      const seq = Number(invariantMatch[1]);
+      const i = state.invariants.findIndex((r) => r.seq === seq);
+      if (i < 0) return fail(404, "инварианта " + seq + " нет");
+      state.invariants.splice(i, 1);
       return json({ deleted: seq });
     }
 

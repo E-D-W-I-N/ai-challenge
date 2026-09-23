@@ -1363,6 +1363,217 @@ async function routeChecks() {
       $("#branch-note").classList.contains("hidden"), $("#branch-note").textContent);
   }
 
+  // ── вкладка «Инварианты»: чего ассистент не вправе предлагать ──
+  //
+  // Слой глобальный, как долговременная память, и правится тем же набором:
+  // список с подписью вида, правка на месте, удаление, форма добавления
+  // с пустым первым пунктом. Отличий два, и оба видны только здесь:
+  // у записи третье поле — запрещённые слова, — и оно **показывается
+  // и правится**, хотя в промпт не уезжает ни одним символом.
+  //
+  // У профиля таких утверждений нет ни одного, и это был пробел: вкладка,
+  // не проверенная ничем, ломается молча. Повторять его нельзя.
+  {
+    const SECRET = "sk-стенд-секрет-длинный-достаточно";
+    const { client, server, $, settle, Evt } = freshClient({
+      secret: SECRET,
+      // Посев с непустым списком слов: правка ниже его меняет, и утверждение
+      // о ней на пустом списке стояло бы на пустом месте.
+      invariants: [
+        { kind: "stack", content: "бэкенд только на Python", banned: ["Java", "Groovy"] },
+        { kind: "business", content: "оплата только картой" },
+      ],
+    });
+    client.init();
+    await settle(30);
+
+    const openTab = (which) =>
+      document.querySelectorAll(".tab").find((t) => t.dataset.tab === which)
+        .dispatchEvent(new Evt("click"));
+    const requests = (method, re) =>
+      server.state.requests.filter((r) => r.method === method && re.test(r.path));
+    const calls = () => requests("GET", /^\/api\/invariants$/);
+    const texts = () => $("#inv-list").querySelectorAll(".mem-text").map((n) => n.textContent);
+    const kinds = () => $("#inv-list").querySelectorAll(".mem-kind").map((n) => n.textContent);
+    const words = () => $("#inv-list").querySelectorAll(".banned").map((n) => n.textContent);
+    const rows = () => $("#inv-list").querySelectorAll(".mem-item");
+    const seqOf = (i) => server.state.invariants[i].seq;
+
+    // Лениво: вкладка закрыта — за слоем не ходят вовсе, ровно как за памятью
+    // и профилем. Панель перерисовывается на каждый обмен, и запрос внутри
+    // отрисовки превратил бы один поход в поток.
+    $("#input").value = "вопрос при закрытой вкладке";
+    $("#composer").requestSubmit();
+    await settle(120);
+    check("пока вкладка «Инварианты» закрыта, за слоем не ходят вовсе",
+      calls().length === 0, JSON.stringify(calls().map((r) => r.path)));
+
+    openTab("invariants");
+    await settle(40);
+    check("пятая вкладка открылась",
+      !$("#tab-invariants").classList.contains("hidden"), "она спрятана");
+    check("и спрятала остальные четыре",
+      ["model", "agent", "memory", "profile"]
+        .every((n) => $("#tab-" + n).classList.contains("hidden")),
+      ["model", "agent", "memory", "profile"]
+        .map((n) => n + ":" + $("#tab-" + n).classList.contains("hidden")).join(" "));
+    check("за слоем сходили ровно один раз — на открытие вкладки",
+      calls().length === 1, JSON.stringify(calls().map((r) => r.path)));
+
+    check("инварианты показаны текстом и подписью вида",
+      texts().join(" | ") === "бэкенд только на Python | оплата только картой" &&
+        kinds().join("|") === "ограничение стека|бизнес-правило",
+      JSON.stringify([texts(), kinds()]));
+    // Слова видно здесь — и нигде больше: в промпт они не уезжают. Пустой
+    // список назван словами, а не пустым местом: «сторожить нечего»
+    // и «не доехало» — разные новости, ровно как у слоёв памяти.
+    check("запрещённые слова видны строкой под инвариантом",
+      words()[0] === "запрещённые слова: Java, Groovy", JSON.stringify(words()));
+    check("а их отсутствие названо, а не показано пустым местом",
+      words()[1] === "запрещённых слов нет", JSON.stringify(words()));
+
+    // ── форма: вид выбирает человек, и до выбора не уходит ничего ──
+    const adds = () => requests("POST", /^\/api\/invariants$/);
+    check("вид в форме не предвыбран, и первый пункт зовёт выбрать",
+      $("#inv-kind").value === "" &&
+        $("#inv-kind").children[0].textContent === "— выберите вид —",
+      JSON.stringify([$("#inv-kind").value, $("#inv-kind").children[0].textContent]));
+    $("#inv-content").value = "фронтенд без сборки";
+    $("#inv-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("без выбранного вида инвариант не уходит вовсе",
+      adds().length === 0, JSON.stringify(adds().map((r) => r.body)));
+    check("и форма говорит, чего не хватает",
+      /Вид инварианта не выбран/.test($("#inv-status").textContent), $("#inv-status").textContent);
+
+    $("#inv-kind").value = "technical";
+    $("#inv-kind").dispatchEvent(new Evt("change"));
+    $("#inv-content").value = "   ";
+    $("#inv-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("с пустым текстом инвариант тоже не уходит",
+      adds().length === 0, JSON.stringify(adds().map((r) => r.body)));
+    check("и причина названа: записывать нечего",
+      /Текст инварианта пуст/.test($("#inv-status").textContent), $("#inv-status").textContent);
+
+    // Выбор вида — не настройка чата: поля вкладки нарочно без приставки
+    // `f-`, и общий слушатель `change` отличает по ней одно от другого.
+    const chatPatches = () => requests("PATCH", /^\/api\/agents\/[^/]+$/).length;
+    const before = chatPatches();
+    $("#inv-kind").value = "stack";
+    $("#inv-kind").dispatchEvent(new Evt("change"));
+    await settle(40);
+    check("выбор вида конфиг чата не трогает: PATCH'ей не прибавилось",
+      chatPatches() === before, chatPatches() + " против " + before);
+
+    // Пустое поле слов законно: у большинства инвариантов сторожить нечего.
+    // И текст по дороге чистится — список пополняется **ответом ручки**,
+    // а не присланным телом.
+    $("#inv-content").value = "фронтенд без сборки, ключ " + SECRET;
+    $("#inv-banned").value = "  ";
+    $("#inv-add").dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("с выбранным видом инвариант уходит телом «вид, текст и слова»",
+      adds().length === 1 && JSON.stringify(adds()[0].body) === JSON.stringify({
+        kind: "stack", content: "фронтенд без сборки, ключ " + SECRET, banned: [],
+      }),
+      JSON.stringify(adds().map((r) => r.body)));
+    check("в списке стоит записанное, а не набранное: ключ по дороге вырезан",
+      texts().slice(-1)[0] === "фронтенд без сборки, ключ ***", JSON.stringify(texts()));
+    check("пустое поле слов — законный пустой список, и он назван",
+      words().slice(-1)[0] === "запрещённых слов нет", JSON.stringify(words()));
+    check("поля после успеха пусты — второй клик не заведёт ту же запись молча",
+      $("#inv-content").value === "" && $("#inv-banned").value === "",
+      JSON.stringify([$("#inv-content").value, $("#inv-banned").value]));
+
+    // ── правка на месте: текст, вид и слова одним движением ──
+    //
+    // Функция правки одна на все три слоя — второй не заводим, — и третье
+    // поле у неё появляется ровно там, где оно у записи есть.
+    const patched = () => requests("PATCH", /^\/api\/invariants\//);
+    const pencil = rows()[0].querySelectorAll(".mini").find((b) => b.title === "Поправить инвариант");
+    if (!pencil) check("у инварианта есть кнопка правки", false, "кнопки нет");
+    else {
+      pencil.dispatchEvent(new Evt("click"));
+      await settle(20);
+      const field = $("#inv-list").querySelector(".mem-edit");
+      const kindBox = $("#inv-list").querySelector(".mem-edit-kind");
+      const bannedBox = $("#inv-list").querySelector(".mem-edit-banned");
+      check("правка открывает поле с прежним текстом, а не пустое",
+        Boolean(field) && field.value === "бэкенд только на Python",
+        field && JSON.stringify(field.value));
+      check("и список видов, открытый пустым: невыбранный значит «оставить прежний»",
+        Boolean(kindBox) && kindBox.value === "" &&
+          kindBox.children[0].textContent === "— оставить тип —",
+        kindBox && JSON.stringify([kindBox.value, kindBox.children[0].textContent]));
+      check("и третье поле — со словами через запятую, как они показаны",
+        Boolean(bannedBox) && bannedBox.value === "Java, Groovy",
+        bannedBox && JSON.stringify(bannedBox.value));
+
+      // Ничего не тронули — ничего и не уходит: ручке нечего было бы делать.
+      const quiet = patched().length;
+      field.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+      await settle(40);
+      check("правка без единого изменения запроса не шлёт",
+        patched().length === quiet, patched().length + " против " + quiet);
+
+      // Тронули одни слова — уезжают одни слова.
+      rows()[0].querySelectorAll(".mini").find((b) => b.title === "Поправить инвариант")
+        .dispatchEvent(new Evt("click"));
+      await settle(20);
+      const box = $("#inv-list").querySelector(".mem-edit-banned");
+      box.value = "Java, Kotlin , Scala";
+      box.dispatchEvent(new Evt("keydown", { key: "Enter" }));
+      await settle(40);
+      check("тронутые слова уезжают одни, разобранные по запятой и без пробелов",
+        patched().length === quiet + 1 &&
+          JSON.stringify(patched().slice(-1)[0].body) ===
+            JSON.stringify({ banned: ["Java", "Kotlin", "Scala"] }),
+        JSON.stringify(patched().slice(-1).map((r) => [r.path, r.body])));
+      check("и строка под инвариантом показывает записанное",
+        words()[0] === "запрещённые слова: Java, Kotlin, Scala", JSON.stringify(words()));
+
+      // Вид — **исключительный для слоя**: «архитектура» есть в видах
+      // инвариантов и нет ни в `MEMORY_KINDS`, ни в `WORKING_KINDS`.
+      // «Решение» подошло бы обоим соседям, и утверждение о том, что правке
+      // дали список **её** слоя, держалось бы на совпадении.
+      rows()[0].querySelectorAll(".mini").find((b) => b.title === "Поправить инвариант")
+        .dispatchEvent(new Evt("click"));
+      await settle(20);
+      const kindAgain = $("#inv-list").querySelector(".mem-edit-kind");
+      kindAgain.value = "architecture";
+      kindAgain.blur();
+      await settle(40);
+      check("вид правится её номером и одним полем",
+        patched().length === quiet + 2 &&
+          patched().slice(-1)[0].path.endsWith("/invariants/" + seqOf(0)) &&
+          JSON.stringify(patched().slice(-1)[0].body) === JSON.stringify({ kind: "architecture" }),
+        JSON.stringify(patched().slice(-1).map((r) => [r.path, r.body])));
+      check("и подпись вида в списке сменилась на выбранную",
+        kinds()[0] === "архитектура", JSON.stringify(kinds()));
+    }
+
+    // ── удаление: уходит номер именно той записи ──
+    const trash = rows()[1].querySelectorAll(".mini").find((b) => b.title === "Убрать инвариант");
+    if (!trash) check("у инварианта есть кнопка удаления", false, "кнопки нет");
+    else {
+      const seq = seqOf(1);
+      const was = texts().length;
+      trash.dispatchEvent(new Evt("click"));
+      await settle(40);
+      const dropped = requests("DELETE", /^\/api\/invariants\//);
+      check("удаление шлёт номер именно этого инварианта, а не соседнего",
+        dropped.length === 1 && dropped[0].path.endsWith("/invariants/" + seq),
+        JSON.stringify(dropped.map((r) => r.path)));
+      check("из списка ушёл он один, соседние остались",
+        texts().length === was - 1 && !texts().includes("оплата только картой"),
+        JSON.stringify(texts()));
+    }
+
+    check("правка, добавление и удаление за слоем не ходят: списком правят ответы ручек",
+      calls().length === 1, JSON.stringify(calls().map((r) => r.path)));
+  }
+
   // ── вкладка «Память»: три слоя видны и управляются ──
   //
   // Первое место в интерфейсе, где видны рабочий и долговременный слои: до

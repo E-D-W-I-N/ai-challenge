@@ -23,6 +23,7 @@ from typing import AsyncIterator
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
 from .schema import (
     CONTEXT_FIELDS,
+    INVARIANT_LABELS,
     MEMORY_LABELS,
     PROFILE_FIELDS,
     PROFILE_LABELS,
@@ -240,7 +241,37 @@ def stage_block(stage: str) -> str:
     return f"[этап задачи: {STAGE_LABELS[stage]}]\n{STAGE_RULES[stage]}"
 
 
-def system_message(system: str, profile: dict, stage: str = "") -> dict | None:
+def invariant_block(records: list[dict]) -> str:
+    """Инварианты нумерованным списком «подпись вида: текст» под заголовком
+    `[чего нельзя]` — и одно повелительное предложение под ним.
+
+    Заголовок обычным русским, как `[как отвечать]` у профиля: слово
+    «инвариант» живёт на экране, а в промпте модель читает, чего нельзя.
+
+    **Запрещённых слов здесь нет ни одного символа** — и это не экономия
+    места. Перечисленный запрет сам по себе подсказка его употребить; а
+    законный отказ стал бы невозможен: на «почему не Java?» ответить,
+    не сказав «Java», нельзя. Список слов — знание сторожа, который смотрит
+    на **ответ**, и модели он не показывается вовсе.
+
+    Нумерация не украшение: отказ обязан назвать, какой именно инвариант
+    нарушен, и номер — самый короткий способ на него сослаться.
+    """
+    lines = [
+        f"{i}. {INVARIANT_LABELS.get(record['kind'], record['kind'])}: {record['content']}"
+        for i, record in enumerate(records, 1)
+    ]
+    return (
+        "[чего нельзя]\n"
+        + "\n".join(lines)
+        + "\nСоблюдай это. Если просьба противоречит любому пункту — откажись "
+        "и назови, какой именно нарушается."
+    )
+
+
+def system_message(
+    system: str, profile: dict, stage: str = "", invariants: list[dict] | None = None
+) -> dict | None:
     """Системное сообщение промпта — или `None`, если его нет вовсе.
 
     Здесь меняется правило, прожившее четыре дня: «системный промпт живёт
@@ -256,16 +287,22 @@ def system_message(system: str, profile: dict, stage: str = "") -> dict | None:
     читаются как одно распоряжение.
 
     Ловушка здесь ровно одна, и она молчаливая: номера врезок берутся
-    из длины уже собранного начала промпта, а системное сообщение теперь
-    заводится и у чата **без** `spec.system` — если профиль непуст. Правило
-    «голый чат уходит без системной реплики» осталось прежним; голый теперь
-    значит «ни системного промпта, ни профиля».
+    из длины уже собранного начала промпта, а системное сообщение заводится
+    и у чата **без** `spec.system` — если непуст хоть один из остальных
+    слагаемых. Правило «голый чат уходит без системной реплики» осталось
+    прежним, но расширяется третий раз подряд: голый теперь значит «ни
+    системного промпта, ни профиля, ни инвариантов».
     """
     block = profile_block(profile) if profile else ""
     # Правило этапа — третьей частью: системным едет то, что задал человек,
     # а этап он и двигает. Второго системного сообщения у чата не бывает.
     rule = stage_block(stage) if stage else ""
-    parts = [part for part in (system, block, rule) if part]
+    # Инварианты — четвёртой и последней, и тоже системным: это распоряжение,
+    # которому модель следует, а не сведения, на которые она опирается.
+    # Своего места в промпте они не занимают вовсе — номера врезок памяти
+    # от них не сдвигаются.
+    rules = invariant_block(invariants) if invariants else ""
+    parts = [part for part in (system, block, rule, rules) if part]
     if not parts:
         return None
     return {"role": "system", "content": "\n\n".join(parts)}
@@ -676,8 +713,26 @@ class Agent:
             return {}
         return self.store.load_profile()
 
+    def invariant_items(self, invariants=None) -> list[dict]:
+        """Что из инвариантов уедет в промпт — записи или пустой список.
+
+        Условие одно на два случая, как у `memory_items` и `profile_items`:
+        слой пуст или хранилища у агента нет. **Пустой слой обязан быть
+        неотличим от отсутствующего** — и здесь это строго ровно так же,
+        как у профиля: инварианты заводят собой **системное** сообщение,
+        и пустой блок сдвинул бы не себя, а номера всех врезок разом.
+
+        `invariants` — уже прочитанный список: обмен читает слой один раз
+        и передаёт сюда и в сборку промпта, ровно как память и профиль.
+        """
+        if invariants is not None:
+            return list(invariants)
+        if self.store is None:
+            return []
+        return self.store.list_invariants()
+
     def prompt_head(
-        self, spec: AgentSpec | None = None, memory=None, profile=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None
     ) -> tuple[list[dict], dict[str, int | None], int]:
         """Начало промпта разом: сообщения **до** истории, номер каждой врезки
         в них и срез, с которого история уезжает дальше.
@@ -712,7 +767,10 @@ class Agent:
         # здесь же, где они берутся, — одним `system_message`.
         task = self.task_items()
         head = system_message(
-            spec.system, self.profile_items(profile), task.get("stage", "")
+            spec.system,
+            self.profile_items(profile),
+            task.get("stage", ""),
+            self.invariant_items(invariants),
         )
         if head is not None:
             messages.append(head)
@@ -741,7 +799,13 @@ class Agent:
         return messages, slots, cut
 
     def build_prompt(
-        self, user_text: str, *, spec: AgentSpec | None = None, memory=None, profile=None
+        self,
+        user_text: str,
+        *,
+        spec: AgentSpec | None = None,
+        memory=None,
+        profile=None,
+        invariants=None,
     ) -> list[dict]:
         """Системное сообщение + обе памяти + состояние задачи + начало
         истории по стратегии + хвост + вопрос.
@@ -760,13 +824,13 @@ class Agent:
         сообщения; `spec` передаёт обмен — он собирает промпт и тело запроса
         из одного слепка, и память читает один раз на обмен.
         """
-        messages, _, cut = self.prompt_head(spec, memory, profile)
+        messages, _, cut = self.prompt_head(spec, memory, profile, invariants)
         messages.extend(turn.as_message() for turn in self.history[cut:])
         messages.append({"role": "user", "content": user_text})
         return messages
 
     def prompt_slots(
-        self, spec: AgentSpec | None = None, memory=None, profile=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None
     ) -> dict[str, int | None]:
         """Номера всех врезок промпта разом: `memory_at`, `working_at`,
         `task_at`, `summary_at`. `None` у любого — врезки в промпте нет вовсе.
@@ -776,7 +840,7 @@ class Agent:
         формулы, и разошлись бы они молча. Уезжают они тоже разом — одним
         кадром `start`, — и спрашивать их порознь было бы неоткуда.
         """
-        return self.prompt_head(spec, memory, profile)[1]
+        return self.prompt_head(spec, memory, profile, invariants)[1]
 
     def compress_plan(self, spec: AgentSpec) -> tuple[int, int] | None:
         """Что предстоит свернуть этим обменом: `(свёрнуто, новая граница)` —
@@ -1339,9 +1403,18 @@ class Agent:
             # заводит собой системное сообщение, и прочитанный дважды
             # развёл бы промпт с номерами сильнее любой врезки.
             profile = self.profile_items()
+            # Инварианты — тем же порядком и по тому же доводу: прочитаны
+            # один раз на обмен и уезжают и в промпт, и в номера врезок.
+            # Они дописываются в системное сообщение, и прочитанные дважды
+            # развели бы промпт с номерами так же, как профиль.
+            invariants = self.invariant_items()
 
             prompt = self.build_prompt(
-                user_text, spec=spec, memory=memory, profile=profile
+                user_text,
+                spec=spec,
+                memory=memory,
+                profile=profile,
+                invariants=invariants,
             )
 
             # `summary_at` — место врезки стратегии в промпте, `memory_at`
@@ -1361,7 +1434,7 @@ class Agent:
                 "type": "start",
                 "resolved_messages": prompt,
                 "question": user_text,
-                **self.prompt_slots(spec, memory, profile),
+                **self.prompt_slots(spec, memory, profile, invariants),
                 "strategy": spec.strategy,
             }
 

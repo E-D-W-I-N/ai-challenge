@@ -65,6 +65,8 @@
                   role="tab">Память</button>
           <button class="tab" id="tab-btn-profile" data-tab="profile" type="button"
                   role="tab">Профиль</button>
+          <button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button"
+                  role="tab">Инварианты</button>
         </div>
         <button class="icon-btn" id="panel-toggle" type="button"
                 title="Свернуть настройки" aria-label="Свернуть настройки"></button>
@@ -293,6 +295,44 @@
                       placeholder="например: собираю ТЗ на мобильное приложение"></textarea>
           </label>
           <p class="hint" id="profile-status"></p>
+        </section>
+
+        <!-- Инварианты: чего ассистент не вправе предлагать. Слой глобальный,
+             как память и профиль, и наполняет его только человек.
+
+             Поля тоже **без** приставки `f-`: инвариант не настройка чата —
+             он один на всю базу, у него своя ручка, и PATCH чата при правке
+             запрещённых слов был бы запросом ни о чём.
+
+             Запрещённые слова видны здесь и правятся здесь, но в промпт
+             не уезжают ни одним символом: это знание сторожа, который
+             смотрит на ответ, а не подсказка модели. -->
+        <section class="tab-page hidden" id="tab-invariants">
+          <div class="mem-layer">
+            <h3 class="mem-title">Инварианты — чего нельзя предлагать</h3>
+            <div class="mem-body" id="inv-list"></div>
+
+            <label class="field">
+              <span class="field-label">Инвариант</span>
+              <textarea id="inv-content" class="control area" rows="2"
+                        placeholder="например: бэкенд только на Python"></textarea>
+            </label>
+            <label class="field">
+              <span class="field-label">Запрещённые слова</span>
+              <input id="inv-banned" class="control" type="text"
+                     placeholder="через запятую; можно пусто — например: Java, Kotlin">
+            </label>
+            <div class="mem-add-row">
+              <label class="field">
+                <span class="field-label">Вид инварианта</span>
+                <!-- Опции пусты в разметке: их строит `fillKinds` из той же
+                     карты видов, которой подписаны записи в списке. -->
+                <select id="inv-kind" class="control"></select>
+              </label>
+              <button class="mem-add" id="inv-add" type="button">Записать</button>
+            </div>
+            <p class="hint" id="inv-status"></p>
+          </div>
         </section>
       </div>
 

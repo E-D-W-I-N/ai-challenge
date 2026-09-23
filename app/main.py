@@ -30,6 +30,8 @@ from .registry import REGISTRY, UnknownAgentError
 from .schema import (
     CONTEXT_FIELDS,
     CONTEXT_NUMBERS,
+    INVARIANT_FIELDS,
+    INVARIANT_KINDS,
     MEMORY_KINDS,
     MOVES,
     PROFILE_FIELDS,
@@ -450,6 +452,43 @@ def _profile_field(payload: dict, name: str) -> str:
     return value.strip()
 
 
+def _no_invariant(seq: int) -> str:
+    """Текст «такого нет» — один на три места: правка по номеру спрашивает
+    его дважды, удаление один раз, и разойтись им негде."""
+    return f"инварианта {seq} нет: его уже удалили или номера такого не было"
+
+
+def _banned_field(payload: dict) -> list[str]:
+    """Запрещённые слова инварианта: список строк, пустой законен.
+
+    Пустой — самое обычное значение: у большинства инвариантов сторожить
+    нечего, их держит сам текст. А не-список — 400: пришедшая строка
+    «Java, Kotlin» значит «одно слово с запятой», и молча резать её здесь
+    значило бы решать за клиента, где у него границы слов.
+
+    Слово непустое, как текст записи (`_content_field`): пустое ничего
+    не сторожит, а сторожу дало бы совпадение с любым ответом. Присланный
+    `null` читается как пустой список — «слов нет» у списка одно.
+    """
+    value = payload.get("banned")
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=400,
+            detail="banned: список строк (пустой — ничего не запрещено), а не "
+            f"{type(value).__name__}",
+        )
+    words = []
+    for word in value:
+        if not isinstance(word, str) or not word.strip():
+            raise HTTPException(
+                status_code=400, detail=f"banned: каждое слово — непустая строка, а не {word!r}"
+            )
+        words.append(word.strip())
+    return words
+
+
 def _parse_spec(payload: dict, where: str) -> AgentSpec:
     """Конфиг агента из JSON. Все ошибки — 400 с текстом, а не 500."""
     if not isinstance(payload, dict):
@@ -746,6 +785,80 @@ async def patch_profile(payload: dict = Body(...)) -> dict:
         )
     values = {name: _profile_field(payload, name) for name in payload}
     return {"profile": REGISTRY.store.save_profile(values)}
+
+
+# ── инварианты: чего ассистент не вправе предлагать ───────────────────────
+#
+# Ручки по образцу долговременной памяти: слой глобальный, `agent_id` в пути
+# нет — архитектура продукта не меняется от того, в каком чате о ней спросили.
+# Пишет в него **только человек**: инвариант это распоряжение, и выводить
+# распоряжения из разговора агент не вправе — довод тот же, что у профиля.
+#
+# Разбор тела — теми же общими помощниками: вид обязателен и без умолчания
+# (`_kind_field` со своим списком), текст непустой (`_content_field`), лишние
+# поля — 400 (`_record_body`). Своё здесь одно — `_banned_field`.
+
+
+@app.get("/api/invariants")
+async def list_invariants() -> dict:
+    """Все инварианты целиком. Запрещённые слова отдаются вместе с записью:
+    на экране их правят, и скрывать от человека то, что он сам вписал,
+    незачем. В **промпт** они при этом не уезжают ни одним символом."""
+    records = REGISTRY.store.list_invariants()
+    return {"total": len(records), "records": records}
+
+
+@app.post("/api/invariants")
+async def add_invariant(payload: dict = Body(...)) -> dict:
+    """Новый инвариант. Тело: `{"kind": ..., "content": "...",
+    "banned": [...]}` — вид и текст обязательны, список слов необязателен
+    и по умолчанию пуст.
+
+    Ответ — записанная строка целиком, с номером от базы и уже чистым
+    текстом: `redact()` работает по дороге в базу.
+    """
+    _record_body(payload, INVARIANT_FIELDS)
+    return REGISTRY.store.add_invariant(
+        _kind_field(payload, INVARIANT_KINDS),
+        _content_field(payload),
+        _banned_field(payload),
+    )
+
+
+@app.patch("/api/invariants/{seq}")
+async def edit_invariant(seq: int, payload: dict = Body(...)) -> dict:
+    """Правка инварианта по номеру: любое подмножество трёх полей.
+    Разбор тела общий с памятью: пустое тело 400, лишнее поле 400, вид
+    без умолчания. Неназванное поле не трогается."""
+    _record_body(payload, INVARIANT_FIELDS)
+    if not payload:
+        raise HTTPException(
+            status_code=400,
+            detail=f"тело правки пустое: назовите {', '.join(INVARIANT_FIELDS)} или часть",
+        )
+    current = next(
+        (r for r in REGISTRY.store.list_invariants() if r["seq"] == seq), None
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail=_no_invariant(seq))
+    record = REGISTRY.store.update_invariant(
+        seq,
+        kind=_kind_field(payload, INVARIANT_KINDS) if "kind" in payload else current["kind"],
+        content=_content_field(payload) if "content" in payload else current["content"],
+        banned=_banned_field(payload) if "banned" in payload else current["banned"],
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail=_no_invariant(seq))
+    return record
+
+
+@app.delete("/api/invariants/{seq}")
+async def delete_invariant(seq: int) -> dict:
+    """Удаляет один инвариант. Нет такого — 404, а не тихое «ок»: вторая
+    вкладка показывает список с прошлой минуты."""
+    if not REGISTRY.store.delete_invariant(seq):
+        raise HTTPException(status_code=404, detail=_no_invariant(seq))
+    return {"deleted": seq}
 
 
 @app.get("/api/agents/{agent_id}/memory")
