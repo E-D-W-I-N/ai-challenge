@@ -576,6 +576,29 @@ function buildServer(options) {
     "paused:resume": "@resume",
   };
   const MOVES = ["next", "pause", "resume"];
+  const MOVE_LABELS = { next: "дальше", pause: "пауза", resume: "продолжить" };
+  const MOVE_COMMANDS = {
+    next: "/task-next", pause: "/task-pause", resume: "/task-resume",
+  };
+
+  // Блок жизненного цикла — своя копия формулы, как и всё в стенде, но
+  // собранная так же: из таблицы переходов, а не выписанная руками.
+  const movesFrom = (where) => {
+    const moves = MOVES.filter((m) => TRANSITIONS[where + ":" + m]).map((m) => {
+      const target = TRANSITIONS[where + ":" + m];
+      return MOVE_LABELS[m] + " (" + MOVE_COMMANDS[m] + ") → "
+        + (target === "@resume" ? "туда, откуда встали" : STAGE_LABELS[target]);
+    });
+    return moves.length ? moves.join("; ") : "ходов отсюда нет, задача закончена";
+  };
+  const lifecycleBlock = (stage) => "[жизненный цикл задачи]\n"
+    + Object.keys(STAGE_LABELS).map(
+      (where) => STAGE_LABELS[where] + (where === stage ? " — сейчас здесь" : "")
+        + ": " + movesFrom(where)
+    ).join("\n")
+    + "\nЭтап двигает только человек, этими командами. Просят работу "
+    + "другого этапа — не делай её: назови, чей это этап и каким ходом "
+    + "туда перейти.";
 
   // Состояние задачи показанным: подпись этапа и умолчание ожидаемого
   // действия подставляются здесь, одним местом на промпт и на ответ ручки.
@@ -820,6 +843,7 @@ function buildServer(options) {
     const head = [
       agent.system,
       task ? "[этап задачи: " + task.label + "]\n" + STAGE_RULES[task.stage] : "",
+      task ? lifecycleBlock(task.stage) : "",
       invariantBlock(),
     ].filter(Boolean).join("\n\n");
     if (head) messages.push({ role: "system", content: head });
