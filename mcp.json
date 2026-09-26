@@ -1,0 +1,1 @@
+{"servers": {"echo": {"module": "app.mcp_servers.echo", "timeout_s": 10}}}

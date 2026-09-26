@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import catalog, llm
+from . import catalog, llm, mcp
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
@@ -74,7 +74,12 @@ def _next_branch_label() -> str:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # MCP — до yield: к первому запросу список инструментов уже на руках.
+    # Пустой менеджер (нет конфига, MCP_DISABLED=1) неотличим от дня 15.
+    await mcp.MANAGER.start()
     yield
+    # Остановка MCP — до закрытия httpx: terminate, через две секунды kill.
+    await mcp.MANAGER.stop()
     # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
     # руками: без этого uvicorn на остановке ругается на незакрытый пул.
     await llm.aclose()
@@ -1206,6 +1211,17 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
             "message": f"{type(exc).__name__}: {exc}",
             "metrics": None,
         }
+
+
+# --- MCP ------------------------------------------------------------------
+
+
+@app.get("/api/mcp")
+async def list_mcp() -> dict:
+    """Подключённые MCP-серверы: имя, статус и инструменты с описанием
+    и схемой. Пустой список — MCP не подключён (нет конфига или
+    MCP_DISABLED=1), и это неотличимо от приложения без MCP."""
+    return mcp.MANAGER.view()
 
 
 # --- служебное ----------------------------------------------------------------

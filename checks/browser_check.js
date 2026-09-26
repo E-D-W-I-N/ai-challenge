@@ -525,7 +525,7 @@ async function routeChecks() {
     // уже поднятом клиенте, а не отдельным сценарием: свой запуск стенда ради
     // одной строки текста дороже самой строки.
     check("в шапке стоит номер этого дня",
-      $(".brand-sub").textContent === "чат · день 15", $(".brand-sub").textContent);
+      $(".brand-sub").textContent === "чат · день 16", $(".brand-sub").textContent);
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
@@ -1639,6 +1639,78 @@ async function routeChecks() {
 
     check("правка, добавление и удаление за слоем не ходят: списком правят ответы ручек",
       calls().length === 1, JSON.stringify(calls().map((r) => r.path)));
+  }
+
+  // ── вкладка «Инструменты»: серверы MCP и их инструменты ──
+  //
+  // Вкладка только показывает: сервер, статус, инструменты с описанием
+  // и свёрнутой схемой. Пустой менеджер назван словами, а не показан
+  // пустым экраном. Запрос ленивый, на открытие вкладки — как у памяти.
+  {
+    const { client, server, $, settle, Evt } = freshClient({
+      mcp: [
+        { name: "echo", status: "ok", tools: [
+          { name: "ping", description: "проверка связи",
+            schema: { type: "object", properties: { text: { type: "string" } } } },
+        ] },
+        { name: "grok", status: "down", tools: [] },
+      ],
+    });
+    client.init();
+    await settle(30);
+
+    const openTab = (which) =>
+      document.querySelectorAll(".tab").find((t) => t.dataset.tab === which)
+        .dispatchEvent(new Evt("click"));
+    const calls = () =>
+      server.state.requests.filter((r) => r.method === "GET" && r.path === "/api/mcp");
+
+    check("пока вкладка «Инструменты» закрыта, за списком не ходят вовсе",
+      calls().length === 0, JSON.stringify(calls().map((r) => r.path)));
+
+    openTab("mcp");
+    await settle(40);
+    check("шестая вкладка открылась",
+      !$("#tab-mcp").classList.contains("hidden"), "она спрятана");
+    check("и спрятала остальные пять",
+      ["model", "agent", "memory", "profile", "invariants"]
+        .every((n) => $("#tab-" + n).classList.contains("hidden")),
+      ["model", "agent", "memory", "profile", "invariants"]
+        .map((n) => n + ":" + $("#tab-" + n).classList.contains("hidden")).join(" "));
+    check("за списком сходили ровно один раз — на открытие вкладки",
+      calls().length === 1, JSON.stringify(calls().map((r) => r.path)));
+
+    const rows = $("#mcp-list").querySelectorAll(".mem-item");
+    const kinds = $("#mcp-list").querySelectorAll(".mem-kind").map((n) => n.textContent);
+    const shown = $("#mcp-list").querySelectorAll(".mem-text").map((n) => n.textContent);
+    check("серверы показаны со статусом",
+      rows.length === 2 && kinds.join(" | ") === "echo · подключён | grok · не отвечает",
+      JSON.stringify(kinds));
+    check("инструмент показан с описанием",
+      shown.join(" | ") === "ping — проверка связи", JSON.stringify(shown));
+    // Схема свёрнута, но доезжает: «что умеет инструмент» читают из неё.
+    const folded = $("#mcp-list").querySelector("details");
+    const schema = folded && folded.querySelector("pre");
+    check("схема параметров показана, хоть и свёрнутая",
+      Boolean(schema) && schema.textContent.includes('"text"'),
+      schema ? schema.textContent : "(схемы нет)");
+    check("у лежачего сервера сказано, что инструментов нет",
+      $("#mcp-list").textContent.includes("инструментов нет"), $("#mcp-list").textContent);
+  }
+
+  // ── вкладка «Инструменты»: пустой менеджер назван словами ──
+  //
+  // MCP не подключён — не пустой экран, а честная подпись: «не подключён»
+  // и «не доехало» — разные новости, ровно как у слоёв памяти.
+  {
+    const { client, $, settle, Evt } = freshClient();
+    client.init();
+    await settle(30);
+    document.querySelectorAll(".tab").find((t) => t.dataset.tab === "mcp")
+      .dispatchEvent(new Evt("click"));
+    await settle(40);
+    check("без серверов вкладка говорит «MCP не подключён», а не пустой экран",
+      $("#mcp-list").textContent.includes("MCP не подключён"), $("#mcp-list").textContent);
   }
 
   // ── вкладка «Память»: три слоя видны и управляются ──

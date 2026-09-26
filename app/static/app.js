@@ -26,6 +26,7 @@ const state = {
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
   invariants: null,    // инварианты — ответ ручки, прочитанный на открытие вкладки
+  mcp: null,           // серверы MCP — ответ ручки, прочитанный на открытие вкладки
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -1301,7 +1302,7 @@ async function refreshCurrent(prompt) {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants"];
+const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp"];
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -2410,6 +2411,49 @@ async function addInvariantFromForm() {
   if (saved) { field.value = ""; words.value = ""; }
 }
 
+// ───────────────────────── инструменты MCP ─────────────────────────
+//
+// Вкладка только показывает: серверы, их статус и инструменты с описанием
+// и схемой. Запрашивается лениво, на открытие вкладки — ровно как слои
+// памяти, профиль и инварианты: панель перерисовывается на каждый обмен,
+// и запрос внутри отрисовки превратил бы один поход на сервер в поток.
+
+async function loadMcp() {
+  try {
+    const answer = await api("/api/mcp");
+    state.mcp = answer.servers || [];
+  } catch (err) {
+    state.mcp = null;
+  }
+  renderMcp();
+}
+
+function renderMcp() {
+  const box = $("#mcp-list");
+  box.innerHTML = "";
+  const servers = state.mcp;
+  // Пустой менеджер назван словами, а не показан пустым экраном: «не
+  // подключён» и «не доехало» — разные новости, ровно как у слоёв памяти.
+  if (!servers) { box.appendChild(memNote("Не читается: ручка ответила ошибкой.")); return; }
+  if (!servers.length) { box.appendChild(memNote("MCP не подключён.")); return; }
+  servers.forEach((server) => {
+    const row = el("div", "mem-item");
+    row.appendChild(el("div", "mem-kind",
+      server.name + " · " + (server.status === "ok" ? "подключён" : "не отвечает")));
+    const tools = server.tools || [];
+    if (!tools.length) row.appendChild(memNote("инструментов нет"));
+    tools.forEach((tool) => {
+      row.appendChild(el("div", "mem-text", tool.name + " — " + (tool.description || "")));
+      // Схема свёрнута: она нужна, когда спрашивают «что умеет», а не всегда.
+      const schema = el("details", "mem-note");
+      schema.appendChild(el("summary", "", "схема параметров"));
+      schema.appendChild(el("pre", "", JSON.stringify(tool.schema || {}, null, 2)));
+      row.appendChild(schema);
+    });
+    box.appendChild(row);
+  });
+}
+
 // ─────────────────────────── плитки ───────────────────────────
 
 // Плитки справа — про весь диалог, а не про последний ответ: сколько всего
@@ -2667,6 +2711,9 @@ function init() {
       // Инварианты — тем же порядком и по тому же доводу: лениво, на открытие
       // вкладки. Слой глобальный, и перечитывать его на смену чата незачем.
       if (which === "invariants") loadInvariants();
+      // Инструменты MCP — тем же порядком и по тому же доводу: лениво,
+      // на открытие вкладки. Вкладка только показывает, править тут нечего.
+      if (which === "mcp") loadMcp();
     };
   });
 

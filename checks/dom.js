@@ -505,6 +505,9 @@ function buildServer(options) {
     invariants: ((options && options.invariants) || []).map((seed, i) => ({
       seq: i + 1, at: i, banned: [], ...seed,
     })),
+    // Серверы MCP: список, как его отдаёт ручка. Слой глобальный, чату
+    // не принадлежит, поэтому у стенда он один на всех, как инварианты.
+    mcpServers: (options && options.mcp) || [],
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
     // на «***» — и только когда секрет задан, ровно как сервер без ключа
@@ -1101,6 +1104,15 @@ function buildServer(options) {
       if (i < 0) return fail(404, "инварианта " + seq + " нет");
       state.invariants.splice(i, 1);
       return json({ deleted: seq });
+    }
+
+    // ── MCP: список серверов и их инструментов, ручка одна и только GET ──
+    //
+    // Формат ровно серверный: {servers: [{name, status, tools: [{name,
+    // description, schema}]}]}, пустой менеджер — пустой список. Стенд не
+    // щедрее сервера: других методов и полей здесь нет.
+    if (path === "/api/mcp" && method === "GET") {
+      return json({ servers: state.mcpServers });
     }
 
     const match = /^\/api\/agents\/([^/]+)(\/.*)?$/.exec(path);

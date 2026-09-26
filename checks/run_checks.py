@@ -29,9 +29,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _stub.install_offline()
 
+# MCP в наборе выключен по умолчанию: проверки Дней 6–15 обязаны пройти
+# в точности как были, без процесса на каждый TestClient. Проверки MCP
+# включают его сами, с фикстурным конфигом (`_mcp_env`).
+os.environ.setdefault("MCP_DISABLED", "1")
+
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
 from app.llm import Metrics  # noqa: E402
+from app.mcp import McpManager  # noqa: E402
 from app.registry import REGISTRY  # noqa: E402
 from app.schema import (  # noqa: E402
     MOVE_COMMANDS,
@@ -4630,6 +4636,218 @@ def check_no_cdn():
     assert html.count("<script") == 1 and 'src="/static/app.js"' in html
     assert html.count("<link") == 1 and 'href="/static/style.css"' in html
     return "в статике только относительные пути и w3.org-неймспейс SVG"
+
+
+# --- день 16: MCP — соединение и список инструментов -------------------------
+#
+# Проверки поднимают настоящий subprocess через тот же McpManager, что носит
+# приложение, с фикстурным MCP_CONFIG_PATH. Заглушки вместо сервера здесь не
+# бывает: соединение проверяется соединением.
+
+
+def _mcp_env(config_path: str, **extra):
+    """Окружение проверки MCP: фикстурный конфиг и включённый менеджер —
+    набор по умолчанию держит MCP_DISABLED=1."""
+    return patch.dict(
+        os.environ, {"MCP_CONFIG_PATH": config_path, "MCP_DISABLED": "0", **extra}
+    )
+
+
+def _mcp_config(tmp: str, servers: dict) -> str:
+    path = os.path.join(tmp, "mcp.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"servers": servers}, fh)
+    return path
+
+
+ECHO = {"module": "app.mcp_servers.echo", "timeout_s": 10}
+PROBE = {"module": "checks._mcp_probe"}
+
+
+@check("MCP: соединение устанавливается, список инструментов доезжает целиком")
+def check_mcp_connects():
+    """Настоящий процесс, настоящее рукопожатие: echo поднимается, `ping`
+    приезжает с описанием и схемой и отвечает на вызов. Захардкоженный
+    список здесь не прожил бы: описание и схему отдаёт живой сервер,
+    и утверждения бьют по ним."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"echo": ECHO})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()
+                try:
+                    assert len(manager.servers) == 1, manager.servers
+                    server = manager.servers[0]
+                    assert server.status == "ok", server.error
+                    tools = {tool["name"]: tool for tool in server.view}
+                    assert "ping" in tools, f"ping нет в списке: {list(tools)}"
+                    assert tools["ping"]["description"], "у ping нет описания"
+                    props = tools["ping"]["schema"].get("properties", {})
+                    assert "text" in props, f"в схеме ping нет text: {props}"
+                    result = await manager.call("ping", {"text": "связь"})
+                    assert result.content[0].text == "pong связь", result.content
+                finally:
+                    await manager.stop()
+
+        asyncio.run(scenario())
+        # И через ручку: приложение с таким конфигом отдаёт тот же список.
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                answer = client.get("/api/mcp")
+                assert answer.status_code == 200, answer.text
+                servers = answer.json()["servers"]
+                assert [s["name"] for s in servers] == ["echo"], servers
+                assert servers[0]["status"] == "ok", servers
+                names = [t["name"] for t in servers[0]["tools"]]
+                assert names == ["ping"], names
+        return "echo поднялся процессом, ping приехал с описанием и схемой и ответил"
+
+
+@check("MCP: коллизия имён двух серверов превращает оба в «сервер__инструмент»")
+def check_mcp_name_collision():
+    """Два сервера несут один инструмент `ping`: голого имени в реестре
+    не остаётся, оба получают префикс — иначе второй молча затёр бы
+    первого, и вызов ушёл бы не туда."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"one": ECHO, "two": ECHO})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()
+                try:
+                    assert sorted(manager.tools) == ["one__ping", "two__ping"], (
+                        f"реестр: {sorted(manager.tools)}"
+                    )
+                    for server in manager.servers:
+                        assert server.status == "ok", (server.name, server.error)
+                        assert [t["name"] for t in server.view] == [f"{server.name}__ping"], (
+                            server.view
+                        )
+                    result = await manager.call("two__ping", {"text": "второй"})
+                    assert result.content[0].text == "pong второй", result.content
+                finally:
+                    await manager.stop()
+
+        asyncio.run(scenario())
+        return "голого ping нет, оба с префиксом, вызов по префиксу работает"
+
+
+@check("MCP: stop() гасит процессы — terminate, и только непослушным kill")
+def check_mcp_stop_kills_processes():
+    """После stop() exitcode не None. И это не kill: terminate снимает
+    процесс сигналом, kill остался бы -9 — так мутация «не terminate»
+    не спрятана за запасным kill."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"echo": ECHO})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()
+                process = manager.servers[0].process
+                assert process is not None and process.returncode is None
+                await manager.stop()
+                assert process.returncode is not None, "процесс пережил stop()"
+                assert process.returncode != -9, (
+                    f"процесс убит kill'ом ({process.returncode}): terminate не сработал"
+                )
+
+        asyncio.run(scenario())
+        return "после stop() exitcode не None, и это SIGTERM, а не SIGKILL"
+
+
+@check("MCP: сервер, упавший на initialize, — down, приложение стартует дальше")
+def check_mcp_down_server_starts_anyway():
+    """Зонд отвечает на initialize ошибкой протокола. Менеджер обязан
+    пометить его down и доехать до конца старта: соседний сервер при
+    этом ok, а в реестре его инструменты."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"probe": PROBE, "echo": ECHO})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()  # упасть целиком — значит не пройти
+                try:
+                    by_name = {s.name: s for s in manager.servers}
+                    assert by_name["probe"].status == "down", by_name["probe"].status
+                    assert by_name["probe"].error, "у down-сервера названа причина"
+                    assert by_name["echo"].status == "ok", by_name["echo"].error
+                    assert list(manager.tools) == ["ping"], sorted(manager.tools)
+                finally:
+                    await manager.stop()
+
+        asyncio.run(scenario())
+        return "зонд down с причиной, echo ok, старт доехал до конца"
+
+
+@check("MCP: env дочернего процесса — белый список, ключа OpenRouter в нём нет")
+def check_mcp_child_env_whitelist():
+    """Зонд отвечает на initialize ошибкой со списком своего окружения.
+    В родителе выставлен фиктивный OPENROUTER_API_KEY: наследуй менеджер
+    os.environ целиком — ключ оказался бы в списке."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"probe": PROBE})
+
+        async def scenario():
+            with _mcp_env(cfg, OPENROUTER_API_KEY="sk-фиктивный-ключ-проверки"):
+                manager = McpManager()
+                await manager.start()
+                try:
+                    server = manager.servers[0]
+                    assert server.status == "down", server.status
+                    return server.error
+                finally:
+                    await manager.stop()
+
+        error = asyncio.run(scenario())
+    assert "env: " in error, f"зонд не назвал своё окружение: {error}"
+    keys = json.loads(error.split("env: ", 1)[1])
+    assert "OPENROUTER_API_KEY" not in keys, f"ключ уехал в subprocess: {keys}"
+    assert "PATH" in keys, f"даже PATH не доехал — процесс не поднялся бы: {keys}"
+    return f"в окружении subprocess'а только белый список: {keys}"
+
+
+@check("MCP: без конфига менеджер пуст, и ручка отдаёт пустой список")
+def check_mcp_empty_without_config():
+    """Нет файла — ни процессов, ни инструментов, ни ошибки: приложение
+    работает в точности как в день 15. То же и с MCP_DISABLED=1."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        missing = os.path.join(tmp, "нет-такого-файла.json")
+
+        async def scenario():
+            with _mcp_env(missing):
+                manager = McpManager()
+                await manager.start()
+                assert manager.servers == [] and manager.tools == {}
+                await manager.stop()
+            with _mcp_env(missing, MCP_DISABLED="1"):
+                manager = McpManager()
+                await manager.start()
+                assert manager.servers == [] and manager.tools == {}
+
+        asyncio.run(scenario())
+        with _mcp_env(missing):
+            with TestClient(main.app) as client:
+                answer = client.get("/api/mcp")
+                assert answer.status_code == 200, answer.text
+                assert answer.json() == {"servers": []}, answer.json()
+        return "ни процессов, ни инструментов, ручка отдаёт пустой список"
 
 
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
