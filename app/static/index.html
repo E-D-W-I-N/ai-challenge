@@ -16,7 +16,7 @@
           <span class="brand-mark" aria-hidden="true">◆</span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 15</span>
+            <span class="brand-sub">чат · день 16</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -67,6 +67,8 @@
                   role="tab">Профиль</button>
           <button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button"
                   role="tab">Инварианты</button>
+          <button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button"
+                  role="tab">Инструменты</button>
         </div>
         <button class="icon-btn" id="panel-toggle" type="button"
                 title="Свернуть настройки" aria-label="Свернуть настройки"></button>
@@ -332,6 +334,18 @@
               <button class="mem-add" id="inv-add" type="button">Записать</button>
             </div>
             <p class="hint" id="inv-status"></p>
+          </div>
+        </section>
+
+        <!-- Инструменты MCP: серверы, их статус и инструменты с описанием
+             и схемой. Вкладка только показывает — полей здесь нет вовсе.
+             Запрашивается лениво, на открытие вкладки (`loadMcp`), ровно
+             как слои памяти, профиль и инварианты. Пустой менеджер назван
+             словами, а не показан пустым экраном. -->
+        <section class="tab-page hidden" id="tab-mcp">
+          <div class="mem-layer">
+            <h3 class="mem-title">Инструменты MCP</h3>
+            <div class="mem-body" id="mcp-list"></div>
           </div>
         </section>
       </div>
