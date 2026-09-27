@@ -135,6 +135,9 @@ async def execution(config, git_root, restart_service):
                 assert [run["name"] for run in capture_agent.history[-1].metrics["tool_calls"]] == ["git_log", "git_diff_stat"]
                 assert captured[2]["messages"][-1]["role"] == "tool"
                 assert captured[3]["messages"][-1]["role"] == "tool"
+                print(f"Actual JSON capture: 1 acknowledgement + 3 delayed rounds; due={due:.6f}, "
+                      f"first_delayed={sent_at[1]:.6f}, lag_ms={(sent_at[1] - due) * 1000:.1f}; "
+                      "all delayed bodies equal the committed assistant snapshot")
         timestamps = []
 
         def actions(messages, index):
@@ -222,7 +225,9 @@ async def execution(config, git_root, restart_service):
                 if operation == "cancel":
                     await manager.call("cancel", {"id": rid}, chat_id=target.id)
                 elif operation == "forget":
+                    revision = target.history_revision
                     target.forget()
+                    assert target.history_revision != revision
                 elif operation == "delete":
                     registry.kill(target.id)
                 elif operation == "reconfigure":
@@ -321,6 +326,15 @@ def lifespan_acceptance(config, directory):
             while client.get(f"/api/agents/{original}").json()["busy"]:
                 assert time.monotonic() < end
                 time.sleep(.02)
+            revision = body["history_revision"]
+            tiny = client.get(f"/api/agents/{original}", params={"known_history_revision": revision}).json()
+            assert set(tiny) == {"unchanged", "history_revision", "busy"} and tiny["unchanged"]
+            _stub.install(reply="Заменённый итог", tool_calls=None)
+            regenerated = client.post(f"/api/agents/{original}/regenerate")
+            assert regenerated.status_code == 200, regenerated.text
+            replacement = client.get(f"/api/agents/{original}", params={"known_history_revision": revision}).json()
+            assert replacement["history_len"] == 4 and replacement["history_revision"] != revision
+            assert replacement["transcript"][-1]["content"] == "Заменённый итог"
 
             # The real Tools route and cancel action remain responsive while
             # a delayed model stream owns the manager lease and chat reserve.
@@ -338,6 +352,9 @@ def lifespan_acceptance(config, directory):
             tools = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()
             job = next(item for item in tools["servers"][0]["reminders"]["items"] if item["text"] == "cancel active occurrence")
             assert job["can_cancel"] and job["status"] == "running", job
+            current = client.get(f"/api/agents/{original}").json()
+            busy_poll = client.get(f"/api/agents/{original}", params={"known_history_revision": current["history_revision"]}).json()
+            assert busy_poll["unchanged"] and busy_poll["busy"] and "transcript" not in busy_poll
             cancelled = client.post(f"/api/agents/{original}/reminders/remind/{job['id']}/cancel", json={})
             assert cancelled.status_code == 200 and cancelled.json()["cancelled"], cancelled.text
             assert time.monotonic() - started < 1.0, "cancel waited for the model exchange lease"
