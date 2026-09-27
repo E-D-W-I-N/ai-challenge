@@ -2784,7 +2784,10 @@ function setCollapsed(which, collapsed) {
   if (!NARROW.matches) store(KEYS.sidebar, collapsed ? "1" : "0");
   applyCollapsed(which, collapsed);
   if (collapsed) $("#restore-sidebar").focus();
-  else if (NARROW.matches) { closeProfileMenu(); $("#sidebar-toggle").focus(); }
+  else {
+    if (NARROW.matches) closeProfileMenu();
+    $("#sidebar-toggle").focus();
+  }
 }
 
 function openDrawers() {
@@ -2812,8 +2815,10 @@ function layoutFor(narrow, stored) {
 function applyWidth() {
   const want = layoutFor(NARROW.matches, { sidebar: read(KEYS.sidebar, "0") });
   const wasInside = $("#sidebar").contains(document.activeElement);
+  const wasRestore = document.activeElement === $("#restore-sidebar");
   applyCollapsed("sidebar", want.sidebar);
   if (want.sidebar && wasInside) $("#restore-sidebar").focus();
+  else if (!want.sidebar && wasRestore) $("#sidebar-toggle").focus();
   $(".tabs").setAttribute("aria-orientation", NARROW.matches ? "horizontal" : "vertical");
 }
 
