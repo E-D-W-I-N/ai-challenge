@@ -20,6 +20,23 @@ class ReminderScheduler:
         self.loop = None
         self.running = {}
         self.claims = {}
+        self.invalidating = {}
+
+    async def invalidate(self, names):
+        for name in names:
+            self.invalidating[name] = self.invalidating.get(name, 0) + 1
+        tasks = [task for (name, _), task in self.running.items() if name in names]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def resume(self, names):
+        for name in names:
+            remaining = self.invalidating.get(name, 0) - 1
+            if remaining > 0:
+                self.invalidating[name] = remaining
+            else:
+                self.invalidating.pop(name, None)
 
     def start(self):
         # Opaque host namespace prevents unrelated application databases sharing ids.
@@ -61,12 +78,13 @@ class ReminderScheduler:
                    {"id": rid, "server": server.name} for t in agent.history)
 
     async def tick(self):
-        live = {s.name for s in self.manager.servers if s.status == "ok" and self.manager.schedules(s)}
+        live = {s.name for s in self.manager.servers if s.status == "ok" and self.manager.schedules(s)
+                and s.name not in self.invalidating}
         for (owner, _), task in list(self.running.items()):
             if owner not in live:
                 task.cancel()
         for server in list(self.manager.servers):
-            if server.status != "ok" or not self.manager.schedules(server):
+            if server.status != "ok" or not self.manager.schedules(server) or server.name in self.invalidating:
                 continue
             try:
                 data = await self.manager.reminder_protocol(server, "reminders", {})
@@ -114,6 +132,26 @@ class ReminderScheduler:
                 self.running[key] = task
                 task.add_done_callback(lambda _, k=key: (self.running.pop(k, None), self.claims.pop(k, None)))
 
+    async def cancel(self, chat_id: str, server_name: str, rid: int) -> bool:
+        agent = self.registry.load(chat_id)
+        server = next((s for s in self.manager.servers if s.name == server_name and s.status == "ok"), None)
+        if agent is None or server is None or not self.manager.schedules(server):
+            return False
+        if not self.receipt(agent, server, rid):
+            return False
+        # The service enforces the exact origin context. This direct call to
+        # the pinned session must not await manager.lease: the delayed exchange
+        # owns that lease until its model stream exits.
+        result = await self.manager.reminder_protocol(server, "cancel", {
+            "id": rid, "context_id": self.manager.context_for(chat_id),
+        }, concurrent=True)
+        if "снято" not in result:
+            return False
+        running = self.running.get((server_name, rid))
+        if running is not None:
+            running.cancel()
+        return True
+
     async def _execute(self, server, item, token, agent):
         self.claims[(server.name, item["id"])]["started"] = True
         error = ""
@@ -121,6 +159,7 @@ class ReminderScheduler:
 
         async def valid():
             return (agent is not None and agent.store is self.registry.store
+                    and server.name not in self.invalidating
                     and any(s is server and s.status == "ok" for s in self.manager.servers)
                     and self.receipt(agent, server, item["id"])
                     and await self.manager.reminder_protocol(server, "_reminder_claim",
@@ -147,7 +186,8 @@ class ReminderScheduler:
                     error = error or "исчерпан лимит цикла инструментов"
                 if error and await valid() and not (done or {}).get("committed"):
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}})
+                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
+                                  request_bodies=(done or {}).get("request_bodies"))
         except asyncio.CancelledError:
             error = "исполнение остановлено; автоматического повтора нет"
             raise

@@ -16,14 +16,9 @@ is loopback (`REMIND_HOST` overrides it); default database is
 closing its connection does not stop the service. Authentication and remote
 deployment are outside this local service's contract. Keep it on loopback.
 
-For the current day-18 checkpoint, a config entry is:
-
-```json
-{"servers":{"remind":{"url":"http://127.0.0.1:8001/mcp","timeout_s":10}}}
-```
-
-The common day-16/17 change supplies persisted URL editing in Tools and default
-manual service ownership before this checkpoint can be merged. Legacy
+Enter that URL under any distinct name in Settings → Tools, save the app-wide
+configuration, and click Connect. The tracked `mcp.json` is empty; the app
+never launches this service. Legacy
 `app.mcp_servers.remind` remains a stdio entry point for existing configs and
 offline fixtures; the implementation and database belong to this service.
 
@@ -33,6 +28,9 @@ the model cannot choose it. A schedule returns JSON with `scheduled`, `id`,
 `due_at`, and a human acknowledgement. `reminders()` reports actual state and
 successful execution count, never an arithmetic count of elapsed periods.
 `cancel(id)` removes a job; the host scopes it to the originating context.
+The Tools page offers Cancel for pending/running jobs owned by the selected
+chat, even while its delayed model exchange is active. The host's scoped API
+route checks the original schedule receipt before calling the current service.
 
 Private `_reminder_claim` / `_reminder_finish` MCP tools implement the executor
 protocol and are not declared to the model or shown in Tools. Claims are atomic,

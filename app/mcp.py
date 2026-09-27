@@ -1,25 +1,17 @@
-"""Подключение MCP: соединение по stdio и список инструментов.
-
-По конфигу (`mcp.json` в корне или путь из `MCP_CONFIG_PATH`) менеджер
-поднимает по процессу на сервер, здоровается по протоколу и забирает
-`tools/list`. Сервер, упавший на рукопожатии, помечается down — приложение
-стартует дальше. Конфига нет или `MCP_DISABLED=1` — менеджер пуст,
-и приложение работает в точности как без него.
-
-Процессы запускаем сами (`anyio.open_process`), а не `stdio_client` из SDK:
-`stop()` обязан гасить их сам — terminate, через две секунды kill, — и без
-ручки на процесс ни это, ни проверка «exitcode не None» не выразить.
-Протокол при этом весь на SDK: `ClientSession` ведёт initialize, tools/list
-и tools/call.
-"""
+"""Generic MCP sessions: manual Streamable HTTP services and explicit stdio fixtures."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import json
 import os
+import re
+from urllib.parse import urlsplit
+from contextvars import ContextVar
+from copy import deepcopy
+
+import httpx
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -29,7 +21,7 @@ import anyio
 import anyio.abc
 import anyio.streams.text
 from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,44 +78,94 @@ async def _kill(process) -> None:
 
 @dataclass
 class McpServer:
-    """Один сервер из конфига: процесс, сессия и то, что про него известно."""
+    """A remote session (or an explicitly configured legacy stdio child)."""
 
     name: str
-    timeout_s: float
+    timeout_s: float = 10.0
     params: StdioServerParameters | None = None
     url: str = ""
-    status: str = "down"
+    status: str = "disconnected"
     error: str = ""
-    tools: list = field(default_factory=list)  # types.Tool, как ответил сервер
-    view: list = field(default_factory=list)  # [{name, description, schema}]
+    tools: list = field(default_factory=list)
+    view: list = field(default_factory=list)
     process: anyio.abc.Process | None = None
     session: ClientSession | None = None
-    stack: contextlib.AsyncExitStack | None = None
+    task: asyncio.Task | None = None
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
 class ToolRef:
-    """Инструмент в реестре: его имя на сервере (без префикса) и чей он."""
-
     server: McpServer
     tool: str
 
 
-class McpManager:
-    """Серверы MCP из конфига и реестр их инструментов.
+class McpConfigConflict(ValueError):
+    pass
 
-    Пустой менеджер — законное состояние: конфига нет, `MCP_DISABLED=1` или
-    все серверы лежат. Пустой менеджер неотличим от приложения без MCP.
+
+def validate_servers(rows) -> list[dict]:
+    """Only ordinary HTTP endpoints; credentials belong outside this UI."""
+    if not isinstance(rows, list) or len(rows) > 12:
+        raise ValueError("servers: список, максимум 12 серверов")
+    result, names, urls = [], set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) - {"name", "url", "enabled"}:
+            raise ValueError("сервер: только name, url, enabled")
+        name, url, enabled = row.get("name"), row.get("url"), row.get("enabled", False)
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) or "__" in name:
+            raise ValueError("name: 1–64 латинских буквы, цифры, _ или -; без __")
+        if not isinstance(url, str) or not url or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+            raise ValueError("url: непустой HTTP(S) URL без пробелов")
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("url: некорректный адрес или порт") from None
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment or port == 0:
+            raise ValueError("url: HTTP(S) endpoint без логина, пароля, query или fragment")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled: true или false")
+        if name in names or url in urls:
+            raise ValueError("имена и URL серверов должны быть уникальны")
+        names.add(name)
+        urls.add(url)
+        result.append({"name": name, "url": url, "enabled": enabled})
+    return result
+
+
+class McpManager:
+    """Generic MCP transport; never starts a service for a URL.
+
+    The connection owner enters/exits SDK task groups in one task. A lease
+    serializes tool exchanges against config changes, reconnect and shutdown.
     """
 
     def __init__(self) -> None:
         self.servers: list[McpServer] = []
         self.tools: dict[str, ToolRef] = {}
+        self.config = {"revision": 0, "servers": []}
+        self.store = None
+        self.disabled = False
+        self._lock = asyncio.Lock()
+        self._owner = ContextVar("mcp_lease", default=None)
         self.context_namespace = ""
+        self.before_change = None
+        self.after_change = None
+
+    async def _changing(self, names):
+        if self.before_change is not None:
+            await self.before_change(names)
+
+    def _changed(self, names):
+        if self.after_change is not None:
+            self.after_change(names)
 
     @staticmethod
     def schedules(server: McpServer) -> bool:
-        return {"_reminder_claim", "_reminder_finish"} <= {t.name for t in server.tools}
+        names = {tool.name for tool in server.tools if (tool.meta or {}).get("host_only")}
+        return {"_reminder_claim", "_reminder_finish"} <= names and "reminders" in {tool.name for tool in server.tools}
 
     def scheduling_tool(self, name: str) -> bool:
         ref = self.tools.get(name)
@@ -132,8 +174,29 @@ class McpManager:
     def context_for(self, chat_id: str) -> str:
         return self.context_namespace + "/" + chat_id
 
-    async def start(self) -> None:
-        if os.environ.get("MCP_DISABLED") == "1":
+    @contextlib.asynccontextmanager
+    async def lease(self):
+        task = asyncio.current_task()
+        if self._owner.get() is task:
+            yield self
+            return
+        async with self._lock:
+            token = self._owner.set(task)
+            try:
+                yield self
+            finally:
+                self._owner.reset(token)
+
+    async def start(self, store=None) -> None:
+        self.store = store
+        self.disabled = os.environ.get("MCP_DISABLED") == "1"
+        self.config = store.load_mcp_config() if store else {"revision": 0, "servers": []}
+        if self.disabled:
+            return
+        # Persisted UI config supersedes the explicit legacy file. The tracked
+        # default file is empty: no subprocess/demo is launched by default.
+        if self.config["revision"]:
+            await self._replace(self.config["servers"])
             return
         raw = os.environ.get("MCP_CONFIG_PATH")
         path = Path(raw) if raw else ROOT / "mcp.json"
@@ -141,173 +204,257 @@ class McpManager:
             return
         config = json.loads(path.read_text(encoding="utf-8"))
         for name, spec in config.get("servers", {}).items():
-            server = McpServer(
-                name=name,
-                timeout_s=float(spec.get("timeout_s", 10)),
-                url=spec.get("url", ""),
-                params=None if spec.get("url") else StdioServerParameters(
-                    # Команда — всегда тот интерпретатор, что крутит приложение:
-                    # системный python3.9 сервер не поднял бы.
-                    command=sys.executable,
-                    args=["-m", spec["module"]],
-                    env=_child_env(),
-                    cwd=ROOT,
-                ),
-            )
-            await self._connect(server)
-            self.servers.append(server)
+            server = McpServer(name=name, timeout_s=float(spec.get("timeout_s", 10)))
+            if "url" in spec:
+                row = validate_servers([{"name": name, "url": spec["url"], "enabled": spec.get("enabled", False)}])[0]
+                self.config["servers"].append(row)
+                server.url = row["url"]
+                self.servers.append(server)
+                if row["enabled"]:
+                    await self._connect(server)
+            else:
+                server.params = StdioServerParameters(command=sys.executable, args=["-m", spec["module"]], env=_child_env(), cwd=ROOT)
+                self.servers.append(server)
+                await self._connect(server)
         self._build_registry()
 
-    async def _connect(self, server: McpServer) -> None:
-        """Процесс, рукопожатие и список инструментов одного сервера.
+    async def _replace(self, rows) -> None:
+        for server in self.servers:
+            await self._disconnect(server)
+        self.servers = []
+        for row in rows:
+            server = McpServer(name=row["name"], url=row["url"])
+            self.servers.append(server)
+            if row["enabled"] and not self.disabled:
+                await self._connect(server)
+        self._build_registry()
 
-        Упал — status down и управление возвращается: старт приложения
-        не держится на чужом процессе.
-        """
-        if server.url:
-            stack = contextlib.AsyncExitStack()
-            try:
-                read, write, _ = await stack.enter_async_context(
-                    streamablehttp_client(server.url, timeout=server.timeout_s)
-                )
+    async def _connect(self, server) -> None:
+        server.ready = asyncio.Event()
+        server.closed = asyncio.Event()
+        server.status, server.error = "connecting", ""
+        server.task = asyncio.create_task(self._connection(server))
+        await server.ready.wait()
+
+    async def _connection(self, server) -> None:
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                if server.url:
+                    client = await stack.enter_async_context(httpx.AsyncClient(timeout=httpx.Timeout(30, read=300), trust_env=False))
+                    read, write, _ = await stack.enter_async_context(streamable_http_client(server.url, http_client=client))
+                else:
+                    params = server.params
+                    server.process = await anyio.open_process([params.command, *params.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, env=params.env, cwd=params.cwd)
+                    stack.push_async_callback(server.process.aclose)
+                    read_send, read = anyio.create_memory_object_stream(0)
+                    write, write_recv = anyio.create_memory_object_stream(0)
+                    group = await stack.enter_async_context(anyio.create_task_group())
+                    stack.callback(group.cancel_scope.cancel)
+                    group.start_soon(_pump_stdout, server.process, read_send)
+                    group.start_soon(_pump_stdin, server.process, write_recv)
                 server.session = await stack.enter_async_context(ClientSession(read, write))
                 await asyncio.wait_for(server.session.initialize(), CONNECT_TIMEOUT_S)
-                result = await asyncio.wait_for(server.session.list_tools(), CONNECT_TIMEOUT_S)
-                server.tools = list(result.tools)
-                server.status, server.stack = "ok", stack
-            except Exception as exc:
-                server.error = f"{type(exc).__name__}: {exc}"
-                with contextlib.suppress(Exception):
-                    await stack.aclose()
-            return
-        assert server.params is not None
-        process = await anyio.open_process(
-            [server.params.command, *server.params.args],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=sys.stderr,
-            env=server.params.env,
-            cwd=server.params.cwd,
-        )
-        server.process = process
-        stack = contextlib.AsyncExitStack()
-        try:
-            read_send, read_recv = anyio.create_memory_object_stream(0)
-            write_send, write_recv = anyio.create_memory_object_stream(0)
-            group = await stack.enter_async_context(anyio.create_task_group())
-            group.start_soon(_pump_stdout, process, read_send)
-            group.start_soon(_pump_stdin, process, write_recv)
-            server.session = await stack.enter_async_context(
-                ClientSession(read_recv, write_send)
-            )
-            await asyncio.wait_for(server.session.initialize(), CONNECT_TIMEOUT_S)
-            result = await asyncio.wait_for(server.session.list_tools(), CONNECT_TIMEOUT_S)
-            server.tools = list(result.tools)
-            server.status = "ok"
-            server.stack = stack
-        except Exception as exc:  # noqa: BLE001 — down, а не падение приложения
-            server.error = f"{type(exc).__name__}: {exc}"
-            await _kill(process)
-            with contextlib.suppress(Exception):
-                await stack.aclose()
-            with contextlib.suppress(Exception):
-                await process.aclose()
+                cursor = None
+                while True:
+                    result = await asyncio.wait_for(server.session.list_tools(cursor=cursor), CONNECT_TIMEOUT_S)
+                    server.tools.extend(result.tools)
+                    cursor = result.nextCursor
+                    if not cursor:
+                        break
+                server.status = "ok"
+                server.ready.set()
+                await server.closed.wait()
+                if not server.url:
+                    group.cancel_scope.cancel()
+        except Exception as exc:
+            # Exception groups/transport errors can contain request headers or
+            # remote content; show a useful class without copying that content.
+            server.status = "down"
+            leaf = exc
+            while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
+                leaf = leaf.exceptions[0]
+            if server.url:
+                detail = ("HTTP " + str(leaf.response.status_code)) if isinstance(leaf, httpx.HTTPStatusError) else type(leaf).__name__
+                server.error = "Не удалось подключиться к MCP: " + detail
+            else:
+                from .store import redact
+                server.error = redact(str(leaf))
+        finally:
+            if server.process is not None and server.process.returncode is None:
+                await _kill(server.process)
+            server.session = None
+            if server.status == "ok":
+                server.status = "disconnected"
+            server.ready.set()
+
+    async def _disconnect(self, server) -> None:
+        process = server.process
+        if process is not None and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), KILL_AFTER_S)
+            except asyncio.TimeoutError:
+                await _kill(process)
+        server.closed.set()
+        if server.task is not None:
+            # Bound cleanup even if the remote session DELETE never answers.
+            try:
+                await asyncio.wait_for(server.task, CONNECT_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                pass
+        server.tools, server.view = [], []
+        server.status, server.error = "disconnected", ""
 
     def _build_registry(self) -> None:
-        """Реестр `имя → инструмент`. Уникальное имя — как есть; коллизия —
-        оба с префиксом сервера, голого имени не остаётся."""
-        owners: dict[str, int] = {}
+        self.tools = {}
+        owners = {}
+        for server in self.servers:
+            server.view = []
+            if server.status == "ok":
+                for tool in server.tools:
+                    if not (tool.meta or {}).get("host_only"):
+                        owners[tool.name] = owners.get(tool.name, 0) + 1
+        qualified = {name for name, count in owners.items() if count > 1}
+        # A bare name can collide with another server's qualified name too.
         for server in self.servers:
             for tool in server.tools:
-                if self.schedules(server) and tool.name.startswith("_reminder_"):
-                    continue
-                owners[tool.name] = owners.get(tool.name, 0) + 1
+                if tool.name in qualified:
+                    candidate = f"{server.name}__{tool.name}"
+                    if candidate in owners:
+                        qualified.add(candidate)
         for server in self.servers:
+            if server.status != "ok":
+                continue
             for tool in server.tools:
-                if self.schedules(server) and tool.name.startswith("_reminder_"):
+                if (tool.meta or {}).get("host_only"):
                     continue
-                name = f"{server.name}__{tool.name}" if owners[tool.name] > 1 else tool.name
-                self.tools[name] = ToolRef(server=server, tool=tool.name)
-                schema = copy.deepcopy(tool.inputSchema)
+                name = f"{server.name}__{tool.name}" if tool.name in qualified else tool.name
+                self.tools[name] = ToolRef(server, tool.name)
+                schema = deepcopy(tool.inputSchema)
                 if self.schedules(server) and tool.name in {"remind", "cancel"}:
                     schema.get("properties", {}).pop("context_id", None)
-                server.view.append(
-                    {
-                        "name": name,
-                        "description": tool.description or "",
-                        "schema": schema,
-                    }
-                )
+                    if "context_id" in schema.get("required", []):
+                        schema["required"].remove("context_id")
+                server.view.append({"name": name, "description": tool.description or "", "schema": schema})
+
+    def _revision(self, revision):
+        current = self.store.load_mcp_config() if self.store else self.config
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision != current["revision"] or revision != self.config["revision"]:
+            raise McpConfigConflict("Настройки MCP изменились: обновите список перед повтором")
+
+    def _save(self, rows, revision):
+        self._revision(revision)
+        self.config = self.store.save_mcp_config(rows, revision) if self.store else {"revision": revision + 1, "servers": deepcopy(rows)}
+
+    async def status(self):
+        saved = self.store.load_mcp_config() if self.store is not None else self.config
+        names = {s.name for s in self.servers} if saved["revision"] != self.config["revision"] else set()
+        if names:
+            await self._changing(names)
+        try:
+            async with self.lease():
+                if self.store is not None:
+                    saved = self.store.load_mcp_config()
+                    if saved["revision"] != self.config["revision"]:
+                        self.config = saved
+                        await self._replace(saved["servers"])
+                return self.view()
+        finally:
+            if names:
+                self._changed(names)
+
+    async def configure(self, rows, revision):
+        rows = validate_servers(rows)
+        self._revision(revision)
+        names = {s.name for s in self.servers}
+        await self._changing(names)
+        try:
+            async with self.lease():
+                self._save(rows, revision)
+                await self._replace(rows)
+                return self.view()
+        finally:
+            self._changed(names)
+
+    async def connection(self, name, revision, enabled):
+        self._revision(revision)
+        if not any(r["name"] == name for r in self.config["servers"]):
+            raise ValueError("Сначала сохраните URL сервера")
+        names = {name}
+        await self._changing(names)
+        try:
+            async with self.lease():
+                self._revision(revision)
+                row = next((r for r in self.config["servers"] if r["name"] == name), None)
+                if row is None:
+                    raise ValueError("Сначала сохраните URL сервера")
+                if self.disabled and enabled:
+                    raise ValueError("MCP выключен через MCP_DISABLED=1")
+                rows = deepcopy(self.config["servers"])
+                next(r for r in rows if r["name"] == name)["enabled"] = enabled
+                self._save(rows, revision)
+                server = next(s for s in self.servers if s.name == name)
+                await self._disconnect(server)
+                if enabled:
+                    await self._connect(server)
+                self._build_registry()
+                return self.view()
+        finally:
+            self._changed(names)
 
     async def call(self, name: str, args: dict, *, chat_id: str | None = None):
-        """Вызов инструмента по имени из реестра, с таймаутом его сервера."""
-        ref = self.tools.get(name)
-        if ref is None:
-            raise KeyError(f"инструмента {name!r} нет ни на одном живом сервере")
-        assert ref.server.session is not None  # в реестре только живые серверы
-        if chat_id is not None and self.schedules(ref.server) and ref.tool in {"remind", "cancel"}:
-            args = {**args, "context_id": self.context_for(chat_id)}
-        return await asyncio.wait_for(
-            ref.server.session.call_tool(ref.tool, args), ref.server.timeout_s
-        )
+        async with self.lease():
+            ref = self.tools.get(name)
+            if ref is None or ref.server.status != "ok" or ref.server.session is None:
+                raise KeyError(f"инструмента {name!r} нет ни на одном живом сервере")
+            if chat_id is not None and self.schedules(ref.server) and ref.tool in {"remind", "cancel"}:
+                args = {**args, "context_id": self.context_for(chat_id)}
+            try:
+                return await asyncio.wait_for(ref.server.session.call_tool(ref.tool, args), ref.server.timeout_s)
+            except Exception as exc:
+                ref.server.status = "down"
+                ref.server.error = "Ошибка вызова MCP: " + type(exc).__name__
+                self._build_registry()
+                raise
 
-    async def reminder_protocol(self, server: McpServer, tool: str, args: dict):
-        result = await asyncio.wait_for(server.session.call_tool(tool, args), server.timeout_s)
-        if result.isError:
-            raise RuntimeError(result.content)
-        return json.loads(result.content[0].text)
+    async def reminder_protocol(self, server: McpServer, tool: str, args: dict, *, concurrent: bool = False):
+        async def invoke():
+            if (not any(s is server for s in self.servers) or server.status != "ok" or server.session is None
+                    or not self.schedules(server)):
+                raise RuntimeError("сервер напоминаний отключён")
+            allowed = {"reminders", "_reminder_claim", "_reminder_finish", "cancel"}
+            if tool not in allowed:
+                raise ValueError("неизвестная команда напоминаний")
+            result = await asyncio.wait_for(server.session.call_tool(tool, args), server.timeout_s)
+            if result.isError:
+                raise RuntimeError("ошибка сервера напоминаний")
+            content = result.content[0].text if result.content else ""
+            return content if tool == "cancel" else json.loads(content)
+
+        if concurrent:
+            # Cancellation must reach a pinned live session while Agent.ask
+            # owns the exchange lease; reconfiguration waits on that lease.
+            return await invoke()
+        async with self.lease():
+            return await invoke()
 
     async def stop(self) -> None:
-        """Гасит все процессы: terminate всем, через две секунды kill тем,
-        кто не послушался."""
-        alive = [
-            s
-            for s in self.servers
-            if s.process is not None and s.process.returncode is None
-        ]
-        for server in alive:
-            server.process.terminate()
-        for server in alive:
-            try:
-                await asyncio.wait_for(server.process.wait(), KILL_AFTER_S)
-            except asyncio.TimeoutError:
-                await _kill(server.process)
-        # Стеки — строго в обратном порядке: скоупы anyio выходят только
-        # LIFO, а два сервера входили в них по очереди, в одну задачу.
-        # Прямой порядок ломал стек скоупов **молча**, под suppress — и
-        # падал уже портал на своём выходе, далеко от причины.
-        for server in reversed(self.servers):
-            if server.stack is not None:
-                with contextlib.suppress(Exception):
-                    await server.stack.aclose()
-            if server.process is not None:
-                with contextlib.suppress(Exception):
-                    await server.process.aclose()
-        self.servers = []
-        self.tools = {}
+        names = {s.name for s in self.servers}
+        await self._changing(names)
+        try:
+            async with self.lease():
+                for server in self.servers:
+                    await self._disconnect(server)
+                self.servers, self.tools = [], {}
+        finally:
+            self._changed(names)
 
-    async def view(self) -> dict:
-        """Список серверов для ручки и вкладки: имя, статус, инструменты.
-
-        У живого сервера с инструментом `reminders` — и его свежий результат
-        полем `reminders`: напоминания показывают рядом с инструментами, и
-        второй ручки для этого не заводится. У лежачего сервера поля нет —
-        дёргать его нечем, а честнее молчащего поля — его отсутствие.
-        """
-        servers = []
-        for s in self.servers:
-            row = {"name": s.name, "status": s.status, "tools": s.view}
-            name = next(
-                (n for n, ref in self.tools.items() if ref.server is s and ref.tool == "reminders"),
-                None,
-            )
-            if s.status == "ok" and name is not None:
-                with contextlib.suppress(Exception):
-                    result = await self.call(name, {})
-                    row["reminders"] = json.loads(result.content[0].text)
-            servers.append(row)
-        return {"servers": servers}
+    def view(self) -> dict:
+        result = {"servers": [{"name": s.name, "url": s.url, "status": s.status, "error": s.error, "tools": s.view} for s in self.servers]}
+        if self.store is not None or self.config["servers"]:
+            result["config"] = deepcopy(self.config)
+            result["disabled"] = self.disabled
+        return result
 
 
 MANAGER = McpManager()
-"""Один на приложение: стартует и гаснет вместе с ним (`_lifespan` в main.py)."""

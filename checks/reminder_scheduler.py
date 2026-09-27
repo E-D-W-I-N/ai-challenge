@@ -15,13 +15,14 @@ import sys
 import tempfile
 import time
 from unittest.mock import patch
+import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from checks import _stub
 
 _stub.install_offline()
-from app import agent as agent_module, mcp
+from app import agent as agent_module, llm, mcp, store as store_module
 from app.main import app
 from app.registry import AgentRegistry
 from app.reminders import ReminderScheduler
@@ -87,6 +88,53 @@ async def execution(config, git_root, restart_service):
         neighbour = registry.create(AgentSpec(label="another", model="stub/neighbour"))
         scheduler = ReminderScheduler(manager, registry)
         scheduler.start()
+        # Real provider serialization with an offline HTTP stub: the initial
+        # request may schedule, but Git and all subsequent request JSON must
+        # appear only after the deadline in the same originating chat.
+        captured, sent_at = [], []
+        def provider(request):
+            body = json.loads(request.content)
+            captured.append(body); sent_at.append(time.time())
+            index = len(captured) - 1
+            if index < 3:
+                name, args = [
+                    ("remind", {"text": "Проверь пять коммитов", "in_seconds": .35}),
+                    ("git_log", {"n": 5}),
+                    ("git_diff_stat", {"ref": "HEAD~4"}),
+                ][index]
+                frame = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": f"cap_{index}",
+                    "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+                finish = "tool_calls"
+            else:
+                frame = {"choices": [{"delta": {"content": "Итог пяти коммитов готов"}}]}
+                finish = "stop"
+            ending = {"choices": [{"delta": {}, "finish_reason": finish}],
+                      "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+            return httpx.Response(200, text="data: " + json.dumps(frame) + "\n\n"
+                + "data: " + json.dumps(ending) + "\n\n" + "data: [DONE]\n\n")
+
+        capture_agent = registry.create(AgentSpec(label="exact delayed JSON", model="offline/any-provider"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as offline_client:
+            with patch.object(agent_module, "stream_completion", llm.stream_completion), \
+                    patch.object(llm, "shared_client", return_value=offline_client), \
+                    patch.object(llm, "api_key", return_value="offline-fixture"), \
+                    patch.object(store_module, "api_key", return_value="offline-fixture"), \
+                    patch.object(llm, "attribution_headers", return_value={}):
+                [event async for event in capture_agent.ask("Через срок проверь пять коммитов")]
+                listing = await manager.reminder_protocol(remote, "reminders", {})
+                capture_job = next(i for i in listing["items"] if i["context_id"] == manager.context_for(capture_agent.id))
+                due = capture_job["due_at"]
+                assert len(captured) == 1 and capture_agent.history[-1].request_bodies == captured[:1]
+                await asyncio.sleep(.08)
+                assert time.time() < due and len(captured) == 1
+                await until(lambda: len(capture_agent.history) == 4)
+                await until(lambda: not scheduler.running)
+                assert len(captured) == 4 and min(sent_at[1:]) >= due, (sent_at, due)
+                assert capture_agent.history[-1].request_bodies == captured[1:]
+                assert [turn.role for turn in capture_agent.history] == ["user", "assistant"] * 2
+                assert [run["name"] for run in capture_agent.history[-1].metrics["tool_calls"]] == ["git_log", "git_diff_stat"]
+                assert captured[2]["messages"][-1]["role"] == "tool"
+                assert captured[3]["messages"][-1]["role"] == "tool"
         timestamps = []
 
         def actions(messages, index):
@@ -161,7 +209,8 @@ async def execution(config, git_root, restart_service):
             assert len(origin.history) == last
 
             # A running cancellation and forget cannot publish or reschedule stale text.
-            for operation in ("cancel", "forget", "delete", "disabled"):
+            manager.before_change, manager.after_change = scheduler.invalidate, scheduler.resume
+            for operation in ("cancel", "forget", "delete", "disabled", "reconfigure"):
                 _stub.reset()
                 _stub.install(reply=lambda ms, i: "" if i == 0 else "blocked result",
                     delay=.2, chunks=6,
@@ -176,6 +225,9 @@ async def execution(config, git_root, restart_service):
                     target.forget()
                 elif operation == "delete":
                     registry.kill(target.id)
+                elif operation == "reconfigure":
+                    await manager.connection("remind", manager.config["revision"], False)
+                    await manager.connection("remind", manager.config["revision"], True)
                 else:
                     remote.status = "down"
                 await until(lambda: not scheduler.running)
@@ -183,6 +235,7 @@ async def execution(config, git_root, restart_service):
                 assert len(target.history) == (0 if operation == "forget" else 2)
                 if operation == "delete":
                     assert store.load_session(target.id) is None
+            manager.before_change = manager.after_change = None
 
             # Empty model error must be visible in both job state and original chat.
             _stub.reset()
@@ -264,6 +317,33 @@ def lifespan_acceptance(config, directory):
             assert body["transcript"][-1]["content"] == "Автоматический итог в исходном чате"
             assert client.get(f"/api/agents/{other}").json()["history_len"] == 0
             assert len(_stub.CALLS) == 2
+            end = time.monotonic() + 5
+            while client.get(f"/api/agents/{original}").json()["busy"]:
+                assert time.monotonic() < end
+                time.sleep(.02)
+
+            # The real Tools route and cancel action remain responsive while
+            # a delayed model stream owns the manager lease and chat reserve.
+            _stub.reset()
+            _stub.install(reply=lambda ms, i: "" if i == 0 else "cancelled result",
+                delay=.15, chunks=8,
+                tool_calls=lambda ms, i: [call("remind", {"text": "cancel active occurrence", "in_seconds": .1, "every": .2})] if i == 0 else None)
+            sent = client.post(f"/api/agents/{original}/messages", json={"text": "cancel this"})
+            assert sent.status_code == 200, sent.text
+            end = time.monotonic() + 5
+            while len(_stub.CALLS) < 2:
+                assert time.monotonic() < end
+                time.sleep(.02)
+            started = time.monotonic()
+            tools = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()
+            job = next(item for item in tools["servers"][0]["reminders"]["items"] if item["text"] == "cancel active occurrence")
+            assert job["can_cancel"] and job["status"] == "running", job
+            cancelled = client.post(f"/api/agents/{original}/reminders/remind/{job['id']}/cancel", json={})
+            assert cancelled.status_code == 200 and cancelled.json()["cancelled"], cancelled.text
+            assert time.monotonic() - started < 1.0, "cancel waited for the model exchange lease"
+            time.sleep(.6)
+            assert client.get(f"/api/agents/{original}").json()["history_len"] == 6
+            assert len(_stub.CALLS) == 2
     store.close()
 
 
@@ -277,15 +357,18 @@ def main():
         env.update(REMIND_DB_PATH=str(directory / "remote.db"), REMIND_PORT=str(port))
         process = subprocess.Popen([sys.executable, "-m", "services.reminders.server"], cwd=ROOT,
                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        def ready():
+        def ready_for(target, target_port):
             end = time.monotonic() + 5
             while True:
                 try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=.1):
+                    with socket.create_connection(("127.0.0.1", target_port), timeout=.1):
                         return
                 except OSError:
-                    assert process.poll() is None and time.monotonic() < end
+                    assert target.poll() is None and time.monotonic() < end
                     time.sleep(.05)
+
+        def ready():
+            ready_for(process, port)
 
         def restart_service():
             nonlocal process
@@ -293,6 +376,7 @@ def main():
             process = subprocess.Popen([sys.executable, "-m", "services.reminders.server"], cwd=ROOT,
                                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             ready()
+        git_process = None
         try:
             ready()
             for name in ("app", "checks", "services"):
@@ -304,20 +388,32 @@ def main():
                 subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
                 subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                                 "commit", "-qm", f"fixture-{n}"], cwd=repo, check=True)
-            (directory / "_git_fixture.py").write_text(
-                "from pathlib import Path\nfrom app.mcp_servers import git\ngit.ROOT=Path(" + repr(str(repo)) + ")\ngit.server.run()\n")
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0)); git_port = sock.getsockname()[1]
+            git_process = subprocess.Popen(
+                [sys.executable, "-m", "services.git", "--repo", str(repo), "--port", str(git_port)],
+                cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            ready_for(git_process, git_port)
             config = directory / "mcp.json"
-            config.write_text(json.dumps({"servers": {"remind": {"url": f"http://127.0.0.1:{port}/mcp"},
-                                                      "git": {"module": "_git_fixture"}}}))
+            config.write_text(json.dumps({"servers": {"remind": {"url": f"http://127.0.0.1:{port}/mcp", "enabled": True},
+                                                      "git": {"url": f"http://127.0.0.1:{git_port}/mcp", "enabled": True}}}))
             asyncio.run(execution(config, directory, restart_service))
             lifespan_acceptance(config, directory)
             assert process.poll() is None  # Application shutdown leaves service alive.
+            assert git_process.poll() is None
         finally:
             process.terminate()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill(); process.wait()
+            if git_process is not None:
+                git_process.terminate()
+                try:
+                    git_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    git_process.kill(); git_process.wait()
     print("HTTP MCP: deferred git + exact chat, repeat fresh runs, cancel/forget/delete, claims, error and restart OK")
 
 

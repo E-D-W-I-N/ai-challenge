@@ -756,30 +756,118 @@ async function addInvariantFromForm() {
 
 // ───────────────────────── инструменты MCP ─────────────────────────
 //
-// Вкладка только показывает: серверы, их статус и инструменты с описанием
-// и схемой. Запрашивается лениво, на открытие вкладки — ровно как слои
+// App-wide URL editor and server/tool state. Reading stays lazy, on opening
+// the visible Tools section, just like the other global records.
+// Запрашивается лениво, на открытие вкладки — ровно как слои
 // памяти, профиль и инварианты: панель перерисовывается на каждый обмен,
 // и запрос внутри отрисовки превратил бы один поход на сервер в поток.
 
+function mcpStatus(text, error = false) {
+  const box = $("#mcp-config-status");
+  box.textContent = text;
+  box.className = "hint" + (error ? " error" : "");
+}
+
+function acceptMcp(answer) {
+  if (answer.config && state.mcpConfig && answer.config.revision < state.mcpConfig.revision) return false;
+  state.mcp = answer.servers || [];
+  state.mcpDisabled = answer.disabled === true;
+  if (answer.config) state.mcpConfig = answer.config;
+  return true;
+}
+
+function mcpDraftRow(row = { name: "", url: "", enabled: false }) {
+  const line = el("div", "mcp-config-row");
+  line.dataset.enabled = String(row.enabled);
+  line.dataset.originalName = row.name;
+  line.dataset.originalUrl = row.url;
+  const nameLabel = el("label", "field", "Имя сервера");
+  const name = el("input", "control mcp-name");
+  name.value = row.name;
+  name.placeholder = "server";
+  name.setAttribute("aria-label", "Имя сервера MCP");
+  const urlLabel = el("label", "field", "Streamable HTTP URL");
+  const url = el("input", "control mcp-url");
+  url.type = "url";
+  url.value = row.url;
+  url.placeholder = "http://127.0.0.1:8016/mcp";
+  url.setAttribute("aria-label", "Streamable HTTP URL сервера MCP");
+  [name, url].forEach((input) => { input.oninput = () => { state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; }; });
+  nameLabel.appendChild(name); urlLabel.appendChild(url);
+  const remove = el("button", "mcp-button", "Убрать");
+  remove.type = "button";
+  remove.onclick = () => { line.remove(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
+  line.append(nameLabel, urlLabel, remove);
+  $("#mcp-config-rows").appendChild(line);
+}
+
+function renderMcpConfig() {
+  if (!state.mcpDirty) {
+    const rows = $("#mcp-config-rows");
+    rows.innerHTML = "";
+    const saved = (state.mcpConfig || {}).servers || [];
+    (saved.length ? saved : [{ name: "", url: "", enabled: false }]).forEach(mcpDraftRow);
+  }
+  $("#mcp-add").onclick = () => { mcpDraftRow(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
+  $("#mcp-config-form").onsubmit = (event) => {
+    event.preventDefault();
+    const rows = Array.from($("#mcp-config-rows").children).map((line) => {
+      const name = line.querySelector(".mcp-name").value.trim();
+      const url = line.querySelector(".mcp-url").value.trim();
+      return { name, url, enabled: line.dataset.enabled === "true" && name === line.dataset.originalName && url === line.dataset.originalUrl };
+    });
+    mutateMcp("/api/mcp/config", "PUT", { revision: (state.mcpConfig || {}).revision || 0, servers: rows });
+  };
+  $("#mcp-save").disabled = !!state.mcpMutation;
+}
+
+async function mutateMcp(path, method, body) {
+  if (state.mcpMutation) return;
+  if (method !== "PUT" && state.mcpDirty) { mcpStatus("Сначала сохраните изменённые URL.", true); return; }
+  stopMcpPolling();
+  const epoch = state.mcpEpoch;
+  const version = state.mcpDraftVersion || 0;
+  state.mcpMutation = true;
+  renderMcpConfig(); renderMcp();
+  mcpStatus("Ожидание текущих вызовов и обновление подключения…");
+  try {
+    const answer = await api(path, json(method, body));
+    acceptMcp(answer);
+    if (method === "PUT" && version === (state.mcpDraftVersion || 0)) state.mcpDirty = false;
+    if (epoch === state.mcpEpoch && toolsVisible()) {
+      mcpStatus(method === "PUT" ? "URL сохранены. Подключите нужный сервер." : "Состояние подключения обновлено.");
+    }
+  } catch (err) {
+    if (epoch === state.mcpEpoch && toolsVisible()) mcpStatus(String(err.message || err), true);
+  } finally {
+    state.mcpMutation = false;
+    if (epoch === state.mcpEpoch && toolsVisible()) { renderMcpConfig(); renderMcp(); }
+    else if (toolsVisible()) loadMcp();
+  }
+}
+
 async function loadMcp() {
-  if (!toolsVisible() || state.mcpRequest) return;
+  if (!toolsVisible() || state.mcpRequest || state.mcpMutation) return;
   if (state.mcpTimer !== null) clearTimeout(state.mcpTimer);
   state.mcpTimer = null;
   const epoch = state.mcpEpoch;
   const controller = new AbortController();
   state.mcpRequest = controller;
   try {
-    const answer = await api("/api/mcp", { signal: controller.signal });
+    const headers = state.current ? { "X-Chat-ID": state.current.id } : {};
+    const answer = await api("/api/mcp", { signal: controller.signal, headers });
     if (epoch !== state.mcpEpoch) return;
-    state.mcp = answer.servers || [];
+    acceptMcp(answer);
+    mcpStatus(state.mcpDisabled ? "MCP выключен через MCP_DISABLED=1." : "");
   } catch (err) {
     if (epoch !== state.mcpEpoch) return;
     state.mcp = null;
+    mcpStatus(String(err.message || err), true);
   } finally {
     if (state.mcpRequest === controller) state.mcpRequest = null;
   }
   if (epoch !== state.mcpEpoch || !toolsVisible()) return;
-  renderMcp();
+  renderMcpConfig(); renderMcp();
   // Один отложенный GET после завершения предыдущего: медленная ручка
   // не создаёт параллельных запросов, уход отменяет и таймер, и GET.
   state.mcpTimer = setTimeout(() => {
@@ -820,6 +908,25 @@ function remindersBlock(data) {
       + (item.state === "ждёт" || item.every ? " · следующее в " + deadline : " · срок " + deadline)
       + (item.error ? " · " + item.error : "");
     row.appendChild(el("div", "mem-note", line));
+    if (item.can_cancel) {
+      const cancel = el("button", "mcp-button", "Снять");
+      cancel.type = "button";
+      cancel.setAttribute("aria-label", "Снять напоминание №" + item.id);
+      cancel.onclick = async () => {
+        const chat = state.current && state.current.id;
+        if (!chat || cancel.disabled) return;
+        cancel.disabled = true;
+        try {
+          await api("/api/agents/" + encodeURIComponent(chat) + "/reminders/"
+            + encodeURIComponent(data.server_name) + "/" + item.id + "/cancel", json("POST", {}));
+          await loadMcp();
+        } catch (error) {
+          cancel.disabled = false;
+          mcpStatus(String(error.message || error), true);
+        }
+      };
+      row.appendChild(cancel);
+    }
     box.appendChild(row);
   }
   return box;
@@ -838,9 +945,23 @@ function renderMcp() {
     const row = el("article", "mcp-server");
     const head = el("header", "mcp-server-head");
     head.append(el("h3", "mcp-server-name", server.name),
-      el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : "Не отвечает"));
+      el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : server.status === "disconnected" ? "Отключён" : "Не отвечает"));
     row.appendChild(head);
+    if (server.url) {
+      row.appendChild(el("p", "mem-note", server.url));
+      const controls = el("div", "mcp-config-actions");
+      const connect = el("button", "mem-add", server.status === "ok" ? "Переподключить" : "Подключить");
+      connect.type = "button";
+      connect.disabled = !!state.mcpMutation || state.mcpDisabled;
+      connect.onclick = () => mutateMcp("/api/mcp/connect", "POST", { name: server.name, revision: state.mcpConfig.revision });
+      const disconnect = el("button", "mcp-button", "Отключить");
+      disconnect.type = "button";
+      disconnect.disabled = !!state.mcpMutation || server.status === "disconnected";
+      disconnect.onclick = () => mutateMcp("/api/mcp/disconnect", "POST", { name: server.name, revision: state.mcpConfig.revision });
+      controls.append(connect, disconnect); row.appendChild(controls);
+    }
     if (server.error) row.appendChild(el("p", "hint error", server.error));
+    if (server.reminders_error) row.appendChild(el("p", "hint error", server.reminders_error));
     const tools = server.tools || [];
     if (!tools.length) row.appendChild(memNote("инструментов нет"));
     tools.forEach((tool) => {
@@ -859,7 +980,7 @@ function renderMcp() {
       card.appendChild(schema);
       row.appendChild(card);
     });
-    if (server.reminders) row.appendChild(remindersBlock(server.reminders));
+    if (server.reminders) row.appendChild(remindersBlock({ ...server.reminders, server_name: server.name }));
     box.appendChild(row);
   });
 }

@@ -58,7 +58,7 @@ def make(
         гоняет настоящий `stream_completion` на подменённом транспорте.
         Умолчание `None` не меняет ничего: без него события `tool_calls` нет.
     """
-    from app.llm import Metrics, build_payload
+    from app.llm import Metrics, build_payload, record_request
 
     known = {f.name for f in dataclass_fields(Metrics)}
 
@@ -78,6 +78,8 @@ def make(
                 "payload": build_payload(session, prompt_override, tools=tools),
             }
         )
+
+        record_request(CALLS[-1]["payload"])
 
         if callable(reply):
             text = reply(messages, index)

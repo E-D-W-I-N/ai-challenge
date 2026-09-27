@@ -42,16 +42,15 @@ const state = {
   chatTimer: null,
   chatRequest: null,
   chatEpoch: 0,
+  mcpConfig: null,
+  mcpDirty: false,
+  mcpDraftVersion: 0,
+  mcpMutation: false,
+  mcpDisabled: false,
 };
 
-// Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
-//
-// Карта живёт только до перезагрузки страницы, и это не недоделка: промпт —
-// производная истории, которая и так лежит в базе. Записывать его туда значило
-// бы хранить копию разговора в каждой строке — и хранить её устаревшей, потому
-// что сводка со следующим сворачиванием меняется. Обновил страницу — кнопки
-// у старых ответов нет, и это честнее, чем показать промпт, собранный заново
-// и не тот, что уехал.
+// Legacy SSE prompt fallback only. Exact outbound request bodies are carried
+// by assistant transcript rows from the server and survive page/app restart.
 const promptKey = (agentId, index) => agentId + ":" + index;
 
 const $ = (sel) => document.querySelector(sel);
@@ -577,18 +576,8 @@ function answerCard(agent, turn, index) {
     // в переключателе оно не зависит.
     iconButton("branch", "Ветка отсюда", () => forkFrom(agent, index))
   );
-  // Кнопка появляется у всякого ответа, чей промпт клиент видел, — при любой
-  // стратегии. У окна это единственный способ прочитать отброшенное начало,
-  // а решать за читателя, что у «Всей истории» смотреть незачем, значит
-  // прятать от него ровно то, что уехало в модель. Промпт берётся из этой же
-  // вкладки — не сохранился (страницу перезагрузили), значит и показывать
-  // нечего.
   const prompt = state.prompts.get(promptKey(agent.id, index));
-  if (prompt) {
-    actions.appendChild(
-      iconButton("lines", "Показать промпт запроса", () => showPrompt(card, prompt))
-    );
-  }
+  actions.appendChild(iconButton("lines", "Информация о запросе", () => showRequestInfo(card, turn, prompt)));
   head.appendChild(actions);
   card.appendChild(head);
 
@@ -840,6 +829,29 @@ function promptRole(msg, index, prompt) {
   return "сообщение пользователя";
 }
 
+function showRequestInfo(card, turn, legacyPrompt) {
+  const shown = card.querySelector(".prompt-view");
+  if (shown) { shown.remove(); return; }
+  if (!turn.request_bodies || !turn.request_bodies.length) {
+    if (legacyPrompt) return showPrompt(card, legacyPrompt);
+    const missing = el("div", "prompt-view");
+    missing.appendChild(el("div", "prompt-title", "JSON запроса недоступен: у этого сообщения нет сохранённого тела запроса."));
+    card.insertBefore(missing, card.querySelector(".card-body"));
+    return;
+  }
+  const box = el("div", "prompt-view");
+  box.appendChild(el("div", "prompt-title", "Фактические JSON-запросы к модели · " + turn.request_bodies.length));
+  turn.request_bodies.forEach((body, index) => {
+    const row = el("div", "prompt-msg");
+    row.appendChild(el("div", "prompt-role", "Запрос " + (index + 1)));
+    const code = el("pre", "request-json", JSON.stringify(body, null, 2));
+    code.tabIndex = 0;
+    code.setAttribute("aria-label", "JSON запроса " + (index + 1));
+    row.appendChild(code); box.appendChild(row);
+  });
+  card.insertBefore(box, card.querySelector(".card-body"));
+}
+
 function showPrompt(card, prompt) {
   const shown = card.querySelector(".prompt-view");
   if (shown) {
@@ -847,7 +859,7 @@ function showPrompt(card, prompt) {
     return;
   }
   const box = el("div", "prompt-view");
-  box.appendChild(el("div", "prompt-title", "Промпт запроса — что уехало в модель"));
+  box.appendChild(el("div", "prompt-title", "JSON запроса недоступен. Промпт из события старого обмена (legacy)"));
   prompt.messages.forEach((msg, index) => {
     const row = el("div", "prompt-msg");
     row.append(
@@ -1287,9 +1299,17 @@ async function pollCurrentChat() {
   const controller = new AbortController();
   state.chatRequest = controller;
   try {
-    const fresh = await api("/api/agents/" + id, { signal: controller.signal });
+    const known = state.current.history_revision;
+    const path = "/api/agents/" + id + (known ? "?known_history_revision=" + encodeURIComponent(known) : "");
+    const fresh = await api(path, { signal: controller.signal });
     if (state.chatEpoch !== epoch || state.current?.id !== id || state.busy || document.visibilityState === "hidden") return;
-    const changed = JSON.stringify(fresh.transcript) !== JSON.stringify(state.current.transcript);
+    if (fresh.unchanged) {
+      $("#chat-status").textContent = fresh.busy ? "Выполняется задача…" : "";
+      return;
+    }
+    const changed = fresh.history_revision && state.current.history_revision
+      ? fresh.history_revision !== state.current.history_revision
+      : JSON.stringify(fresh.transcript) !== JSON.stringify(state.current.transcript);
     state.current = fresh;
     $("#chat-status").textContent = fresh.busy ? "Выполняется задача…" : "";
     if (changed) {

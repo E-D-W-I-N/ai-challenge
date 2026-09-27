@@ -77,13 +77,18 @@ def _next_branch_label() -> str:
 async def _lifespan(_app: FastAPI):
     # MCP — до yield: к первому запросу список инструментов уже на руках.
     # Пустой менеджер (нет конфига, MCP_DISABLED=1) неотличим от дня 15.
-    await mcp.MANAGER.start()
+    await mcp.MANAGER.start(REGISTRY.store)
     scheduler = ReminderScheduler(mcp.MANAGER, REGISTRY)
+    _app.state.reminder_scheduler = scheduler
+    mcp.MANAGER.before_change = scheduler.invalidate
+    mcp.MANAGER.after_change = scheduler.resume
     scheduler.start()
     try:
         yield
     finally:
         await scheduler.stop()
+        mcp.MANAGER.before_change = None
+        mcp.MANAGER.after_change = None
         # Close connections after executor outcomes; external services stay alive.
         await mcp.MANAGER.stop()
         await llm.aclose()
@@ -591,9 +596,12 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
 
 
 @app.get("/api/agents/{agent_id}")
-async def get_agent(agent_id: str) -> dict:
+async def get_agent(agent_id: str, known_history_revision: str | None = None) -> dict:
     """Конфиг агента со стенограммой: стартовый промпт и весь диалог."""
-    return _agent(agent_id).as_dict(with_transcript=True)
+    agent = _agent(agent_id)
+    if known_history_revision and known_history_revision == agent.history_revision:
+        return {"unchanged": True, "history_revision": agent.history_revision, "busy": agent.busy}
+    return agent.as_dict(with_transcript=True)
 
 
 @app.patch("/api/agents/{agent_id}")
@@ -1223,13 +1231,47 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
 
 
 @app.get("/api/mcp")
-async def list_mcp() -> dict:
+async def list_mcp(request: Request) -> dict:
     """Подключённые MCP-серверы: имя, статус и инструменты с описанием
     и схемой. У сервера с инструментом `reminders` — и свежий список
     напоминаний полем `reminders` (дёргается вызовом, только если сервер
-    жив). Пустой список — MCP не подключён (нет конфига или
-    MCP_DISABLED=1), и это неотличимо от приложения без MCP."""
-    return await mcp.MANAGER.view()
+    жив). Пустой список — нет настроенных серверов; при MCP_DISABLED=1
+    сохранённые URL остаются видимыми, но отключёнными."""
+    manager = mcp.MANAGER
+    # A delayed model exchange owns the manager lease. Read its stable
+    # connection snapshot and query the pinned reminder session concurrently
+    # so Tools and cancellation stay usable while that exchange is active.
+    active = manager._lock.locked()
+    view = manager.view() if active else await manager.status()
+    chat_id = request.headers.get("X-Chat-ID", "")
+    chat = REGISTRY.load(chat_id) if chat_id else None
+    for row in view["servers"]:
+        server = next((s for s in manager.servers if s.name == row["name"] and s.status == "ok"), None)
+        if server is None or not manager.schedules(server):
+            continue
+        try:
+            row["reminders"] = await manager.reminder_protocol(server, "reminders", {}, concurrent=True)
+            for item in row["reminders"]["items"]:
+                item["can_cancel"] = bool(chat and item["status"] in {"pending", "running"}
+                    and item["context_id"] == manager.context_for(chat_id)
+                    and ReminderScheduler.receipt(chat, server, item["id"]))
+        except Exception:
+            row["reminders_error"] = "Список напоминаний сейчас недоступен"
+    return view
+
+
+@app.post("/api/agents/{agent_id}/reminders/{server_name}/{reminder_id}/cancel")
+async def cancel_scheduled_reminder(agent_id: str, server_name: str, reminder_id: int) -> dict:
+    if reminder_id < 1:
+        raise HTTPException(400, "неверный номер напоминания")
+    scheduler: ReminderScheduler = app.state.reminder_scheduler
+    try:
+        cancelled = await scheduler.cancel(agent_id, server_name, reminder_id)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    if not cancelled:
+        raise HTTPException(404, "напоминание в этом чате не найдено")
+    return {"cancelled": True, "id": reminder_id, "server": server_name}
 
 
 # --- служебное ----------------------------------------------------------------
@@ -1246,3 +1288,36 @@ async def health() -> dict:
         "sessions_stored": REGISTRY.store.count_sessions(),
         "llm_max_concurrency": llm.max_concurrency(),
     }
+
+
+@app.put("/api/mcp/config")
+async def configure_mcp(payload: dict = Body(...)) -> dict:
+    if set(payload) != {"revision", "servers"}:
+        raise HTTPException(400, "тело: revision и servers")
+    try:
+        return await mcp.MANAGER.configure(payload["servers"], payload["revision"])
+    except mcp.McpConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+async def _mcp_connection(payload, enabled):
+    if set(payload) != {"revision", "name"} or not isinstance(payload.get("name"), str):
+        raise HTTPException(400, "тело: revision и name")
+    try:
+        return await mcp.MANAGER.connection(payload["name"], payload["revision"], enabled)
+    except mcp.McpConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/mcp/connect")
+async def connect_mcp(payload: dict = Body(...)) -> dict:
+    return await _mcp_connection(payload, True)
+
+
+@app.post("/api/mcp/disconnect")
+async def disconnect_mcp(payload: dict = Body(...)) -> dict:
+    return await _mcp_connection(payload, False)

@@ -179,12 +179,12 @@ def cancel(id: int, context_id: str = "") -> str:
 
 
 # Application protocol, filtered out of the model/UI registry by McpManager.
-@server.tool()
+@server.tool(meta={"host_only": True})
 def _reminder_claim(id: int, token: str, context_id: str, check: bool = False) -> str:
     return json.dumps(claim_reminder(id, token, context_id, check=check))
 
 
-@server.tool()
+@server.tool(meta={"host_only": True})
 def _reminder_finish(id: int, token: str, error: str = "") -> str:
     return json.dumps(finish_reminder(id, token, error))
 
