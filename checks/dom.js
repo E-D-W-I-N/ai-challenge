@@ -508,6 +508,12 @@ function buildServer(options) {
     // Серверы MCP: список, как его отдаёт ручка. Слой глобальный, чату
     // не принадлежит, поэтому у стенда он один на всех, как инварианты.
     mcpServers: (options && options.mcp) || [],
+    // Вызов инструмента на обмене: `{name, server, arguments, result, ms, ok}`
+    // или функция (номер обмена) → такой словарь/null. Задан — по дороге
+    // приходит кадр `tool_call`, а в метриках ответа лежит `tool_calls`
+    // той же формы, что пишет сервер. Стенд не щедрее сервера: полей ровно
+    // столько и таких же, сколько шлёт он.
+    toolCall: (options && options.toolCall) || null,
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
     // на «***» — и только когда секрет задан, ровно как сервер без ключа
@@ -930,6 +936,14 @@ function buildServer(options) {
     // до него в кадрах их нет, и плитки показывают прочерк.
     const usage = typeof state.usage === "function" ? state.usage(index) : state.usage;
     const metrics = { model: agent.model, provider: "стенд", ...(usage || {}) };
+    // Вызов инструмента: кадр по дороге и запись в метриках — как на сервере,
+    // где событие уходит сразу, а `tool_calls` лежит в метриках обмена.
+    const toolRun = typeof state.toolCall === "function" ? state.toolCall(index) : state.toolCall;
+    if (toolRun) {
+      metrics.tool_calls = [
+        { name: toolRun.name, server: toolRun.server, ms: toolRun.ms, ok: toolRun.ok },
+      ];
+    }
     agent.transcript.push({ role: "user", content: text, error: null, reasoning: "", metrics: null });
     agent.transcript.push({
       role: "assistant", content: state.reply, error: null, reasoning: "",
@@ -946,6 +960,14 @@ function buildServer(options) {
       // на сворачивание: служебный вызов на обмене остался один.
       ...(service ? [{ event: "compressing", agent: agent.id, strategy: serviceStrategy(service) }] : []),
       startFrame(agent, text, resolved, service),
+      // Кадр вызова — между `start` и `delta`, как на сервере: агент исполняет
+      // инструмент до того, как модель начала отвечать.
+      ...(toolRun ? [{
+        event: "tool_call", agent: agent.id,
+        name: toolRun.name, server: toolRun.server,
+        arguments: toolRun.arguments || {}, result: toolRun.result || "",
+        ms: toolRun.ms, ok: toolRun.ok,
+      }] : []),
       { event: "delta", text: state.reply, metrics: null },
       ...(usage ? [{ event: "metrics", metrics }] : []),
       { event: "done", text: state.reply, reasoning: "", metrics: usage ? metrics : null, committed: true },
