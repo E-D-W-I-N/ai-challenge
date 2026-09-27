@@ -327,13 +327,13 @@ ALL_TABLES = (
 чтобы ключ искался и в колонках, которых ещё не придумали."""
 
 
-def _columns_holding(conn, needle: str, tables=ALL_TABLES) -> list[str]:
+def _columns_holding(conn, needle: str, tables=ALL_TABLES, exclude=()) -> list[str]:
     """Колонки, в которых лежит `needle`, — списком `таблица.колонка`."""
     found = set()
     for table in tables:
         for row in conn.execute(f"SELECT * FROM {table}"):
             for name in row.keys():
-                if isinstance(row[name], str) and needle in row[name]:
+                if f"{table}.{name}" not in exclude and isinstance(row[name], str) and needle in row[name]:
                     found.add(f"{table}.{name}")
     return sorted(found)
 
@@ -923,7 +923,7 @@ def check_working_memory():
         assert "успеем к маю?" in revived.build_prompt("ещё")[0]["content"]
         _ask(revived, 1)
         assert fresh.list_working(revived.id) == before
-        assert not _columns_holding(fresh.conn, "успеем к маю?", ("messages", "summaries"))
+        assert not _columns_holding(fresh.conn, "успеем к маю?", ("messages", "summaries"), exclude=("messages.request_bodies",))
         revived.forget()
         assert fresh.list_working(revived.id) == [] and revived.working == []
         assert revived.build_prompt("после очистки") == [{"role": "user", "content": "после очистки"}]
@@ -1456,7 +1456,7 @@ def check_long_term_memory():
         }
         assert working_columns == {"seq", "session_id", "kind", "content", "at"}, working_columns
         spilled = _columns_holding(
-            store.conn, "пишу на Kotlin", ("messages", "summaries", "working_memory")
+            store.conn, "пишу на Kotlin", ("messages", "summaries", "working_memory"), exclude=("messages.request_bodies",)
         )
         assert not spilled, f"долговременная память утекла в чужие таблицы: {spilled}"
 
@@ -4689,17 +4689,15 @@ def check_mcp_empty_without_config():
             with TestClient(main.app) as client:
                 answer = client.get("/api/mcp")
                 assert answer.status_code == 200, answer.text
-                assert answer.json() == {"servers": []}, answer.json()
+                assert answer.json()["servers"] == [], answer.json()
         return "ни процессов, ни инструментов, ручка отдаёт пустой список"
 
 
 # --- День 18: напоминания — инструмент с отложенным выполнением --------------
 #
-# «Сработало» вычисляется при чтении из `due_at`, а не пишется фоновым
-# циклом. Хранение — своя база сервера (`data/reminders.db`), не стор
-# приложения. Механика проверяется in-process: декоратор FastMCP возвращает
-# функцию как есть, и инструменты зовутся напрямую, с REMIND_DB_PATH во
-# временный каталог. Связь — настоящим процессом через тот же McpManager.
+# `due_at` только разрешает claim; fired увеличивается после фактического
+# выполнения. Хранение — своя временная база сервера, не стор приложения.
+# Отдельная сквозная проверка запускает reminders и Git по HTTP.
 
 def _remind_fixture_config(tmp: str, extra: dict | None = None) -> str:
     """Test-only cwd/module adapter; production manager still filters child env.
@@ -4708,7 +4706,7 @@ def _remind_fixture_config(tmp: str, extra: dict | None = None) -> str:
     initialize, without passing arbitrary parent environment variables.
     """
     directory = Path(tmp)
-    for package in ("app", "checks"):
+    for package in ("app", "checks", "services"):
         (directory / package).symlink_to(Path(ROOT) / package, target_is_directory=True)
     (directory / "_isolated_remind.py").write_text(
         "import os\n"
@@ -4719,51 +4717,46 @@ def _remind_fixture_config(tmp: str, extra: dict | None = None) -> str:
     return _mcp_config(tmp, {"remind": {"module": "_isolated_remind", "timeout_s": 10}, **(extra or {})})
 
 
-@check("напоминание: граница одноразового срока и отказы без новых строк")
+@check("напоминание: срок разрешает claim, fired только после реального finish")
 def check_remind_one_shot_fires():
     import tempfile
-    from app.mcp_servers import remind as srv
-
+    from services.reminders import server as srv
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
         path = Path(tmp) / "r.db"
+        rid = srv.add_reminder("позвонить", 10, path=path, now=100, context_id="host/chat")
+        assert not srv.claim_reminder(rid, "a", "host/chat", path=path, now=109.999)
+        assert srv.list_reminders(path=path, now=110)["items"][0]["fired"] == 0
+        assert srv.claim_reminder(rid, "a", "host/chat", path=path, now=110)
+        assert not srv.claim_reminder(rid, "b", "host/chat", path=path, now=110)
+        assert not srv.finish_reminder(rid, "b", path=path, now=111)
+        assert srv.finish_reminder(rid, "a", path=path, now=111)
+        item = srv.list_reminders(path=path, now=300)["items"][0]
+        assert item["fired"] == 1 and item["state"] == "сработало", item
         with patch.dict(os.environ, {"REMIND_DB_PATH": str(path)}):
-            with patch.object(srv.time, "time", return_value=100):
-                made = srv.remind("  позвонить  ", 10)
-            assert made.startswith("напоминание №1"), made
             assert srv.remind("   ", 5).startswith("пустой текст")
             assert "прошлом" in srv.remind("текст", -1)
             assert "больше нуля" in srv.remind("текст", 5, every=0)
-            assert "больше нуля" in srv.remind("текст", 5, every=-2)
-        before = srv.list_reminders(path=path, now=109.999)
-        at = srv.list_reminders(path=path, now=110)
-        later = srv.list_reminders(path=path, now=300)
-    assert before["items"][0] == {"id": 1, "text": "позвонить", "every": None,
-        "due_at": 110.0, "fired": 0, "state": "ждёт"}, before
-    assert at["items"][0]["fired"] == later["items"][0]["fired"] == 1
-    assert at["items"][0]["state"] == "сработало", at
-    assert at["total"] == 1 and at["waiting"] == 0 and at["fired"] == 1, at
-    return "до 110 ждёт, ровно 110 и позже сработало один раз; текст очищен, отказы строк не добавили"
+            assert "больше нуля" in srv.remind("текст", 5, every=float("nan"))
+    return "до срока claim запрещён, один владелец, чужой finish не принят; fired после результата"
 
 
-@check("повторяющееся: точное число срабатываний, следующий срок, база не переписана")
+@check("повтор: фактические исполнения и фиксированный срок с пропуском опозданий")
 def check_remind_recurring():
-    import sqlite3
     import tempfile
-    from app.mcp_servers import remind as srv
-
+    from services.reminders import server as srv
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
         path = Path(tmp) / "r.db"
-        srv.add_reminder("встать", 10, every=3, path=path, now=100)
-        before = srv.list_reminders(path=path, now=109.999)["items"][0]
-        at = srv.list_reminders(path=path, now=110)["items"][0]
-        later = srv.list_reminders(path=path, now=119.25)["items"][0]
-        with sqlite3.connect(path) as conn:
-            stored = conn.execute("SELECT due_at, every FROM reminders").fetchall()
-    assert before["fired"] == 0 and before["due_at"] == 110, before
-    assert at["fired"] == 1 and at["due_at"] == 113, at
-    assert later["fired"] == 4 and later["due_at"] == 122 and later["state"] == "сработало", later
-    assert stored == [(110.0, 3.0)], stored
-    return "0 → 1 → 4 срабатывания, сроки 110 → 113 → 122; хранимый первый срок 110 не изменён"
+        rid = srv.add_reminder("встать", 10, every=3, path=path, now=100, context_id="host/chat")
+        assert srv.claim_reminder(rid, "one", "host/chat", path=path, now=110)
+        assert srv.finish_reminder(rid, "one", path=path, now=119.25)
+        item = srv.list_reminders(path=path, now=119.25)["items"][0]
+        assert item["fired"] == 1 and item["due_at"] == 122 and item["status"] == "pending", item
+        assert not srv.claim_reminder(rid, "two", "host/chat", path=path, now=121.999)
+        assert srv.claim_reminder(rid, "two", "host/chat", path=path, now=122)
+        assert srv.finish_reminder(rid, "two", path=path, now=122.5)
+        item = srv.list_reminders(path=path, now=200)["items"][0]
+        assert item["fired"] == 2 and item["due_at"] == 125, item
+    return "две реальные итерации; просроченные слоты пропущены, чтение не увеличивает fired"
 
 
 @check("cancel: существующее снимается, чужой номер — честный отказ текстом")
@@ -4786,7 +4779,7 @@ def check_remind_cancel():
     assert "снято" in gone, gone
     assert [i["text"] for i in snap["items"]] == ["два"], snap
     assert "№999 нет" in missing, missing
-    assert third.startswith("напоминание №3"), third
+    assert json.loads(third)["id"] == 3, third
     return "снял одну из двух, чужой номер — «нет», следующий номер — 3"
 
 
@@ -4806,13 +4799,13 @@ def check_remind_aggregate():
             srv.remind("период", 0, every=3600)
             snap = json.loads(srv.reminders())
     states = [i["state"] for i in snap["items"]]
-    assert states == ["ждёт", "сработало", "сработало"], states
+    assert states == ["не привязано к чату"] * 3, states
     assert snap["total"] == 3, snap
-    assert snap["waiting"] == states.count("ждёт") == 1, snap
-    assert snap["fired"] == states.count("сработало") == 2, snap
+    assert snap["waiting"] == 0 and snap["unbound"] == 3, snap
+    assert snap["fired"] == 0, snap
     recurring = snap["items"][2]
-    assert recurring["fired"] == 1 and recurring["every"] == 3600, recurring
-    return "ждёт 1 · сработало 2 из 3 — счётчики и список сходятся"
+    assert recurring["fired"] == 0 and recurring["every"] == 3600, recurring
+    return "три старых непривязанных записи сохранены; время не выдаётся за исполнение"
 
 
 @check("напоминания переживают перезапуск процесса: хранение — SQLite самого сервера")
@@ -4835,7 +4828,7 @@ def check_remind_survives_restart():
                 await first.start()
                 try:
                     made = await first.call("remind", {"text": marker, "in_seconds": 3600})
-                    assert made.content[0].text.startswith("напоминание №"), made.content
+                    assert json.loads(made.content[0].text)["scheduled"], made.content
                 finally:
                     await first.stop()
                 database = Path(tmp) / "reminders.db"
@@ -4859,7 +4852,7 @@ def check_remind_survives_restart():
         listing = asyncio.run(scenario())
     ours = [i for i in listing["items"] if i["text"] == marker]
     assert len(ours) == 1, listing
-    assert ours[0]["state"] == "ждёт" and ours[0]["fired"] == 0, ours
+    assert ours[0]["state"] == "не привязано к чату" and ours[0]["fired"] == 0, ours
     return "второй процесс сервера видит строку, заведённую первым"
 
 
@@ -4878,7 +4871,7 @@ def check_mcp_reminders_field():
                 answer = client.get("/api/mcp")
                 assert answer.status_code == 200, answer.text
                 servers = {s["name"]: s for s in answer.json()["servers"]}
-                with patch.object(main.mcp.MANAGER, "call", side_effect=RuntimeError("aggregate fixture failed")) as calls:
+                with patch.object(main.mcp.MANAGER, "reminder_protocol", side_effect=RuntimeError("aggregate fixture failed")) as calls:
                     failed = client.get("/api/mcp")
                 assert failed.status_code == 200, failed.text
                 assert calls.call_count == 1, calls.call_count
@@ -4896,17 +4889,14 @@ def check_mcp_reminders_field():
 
 @check("сквозной: заглушка зовёт remind — вызов доезжает до настоящего сервера")
 def check_remind_end_to_end():
-    """Первый вызов модели — `tool_calls` с просьбой о `remind`; агент
-    исполняет его на настоящем сервере напоминаний, и второй запрос несёт
-    tool-сообщение с подтверждением. Заведённое видно и через ручку
-    /api/mcp — полем `reminders` у сервера. В историю чата при этом не
-    пишется ничего, кроме пары вопрос-ответ."""
+    """Настоящий stdio-сервис сохраняет задачу, агент отвечает подтверждением
+    без второго вызова модели; срок далеко, отложенного результата ещё нет."""
     import sqlite3
     import tempfile
     import time
 
     marker = f"сквозное-{time.time_ns()}"
-    args = json.dumps({"text": marker, "in_seconds": 0})
+    args = json.dumps({"text": marker, "in_seconds": 3600})
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
         cfg = _remind_fixture_config(tmp)
         _stub.install(reply=_tool_reply, tool_calls=_first_call_only("remind", args))
@@ -4936,23 +4926,20 @@ def check_remind_end_to_end():
 
         asyncio.run(cleanup())
 
-    # Два обращения к модели, во втором — tool-сообщение с подтверждением.
-    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
-    tool = _stub.CALLS[1]["payload"]["messages"][-1]
-    assert tool["role"] == "tool" and tool["tool_call_id"] == "call_1", tool
-    assert tool["content"].startswith("напоминание №"), tool["content"]
-    assert marker in tool["content"], tool["content"]
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    tool = json.loads(_frame(frames, "tool_call")["result"])
+    assert tool["scheduled"] and marker in tool["message"], tool
     badge = _frame(frames, "tool_call")
     assert badge["name"] == "remind" and badge["server"] == "remind", badge
     assert badge["ok"] is True, badge
     assert body["transcript"][-1]["metrics"]["tool_calls"][0]["name"] == "remind", body
     assert [f["event"] for f in frames].index("tool_call") < [f["event"] for f in frames].index("done"), frames
-    assert body["transcript"][-1]["content"] == "вижу результат: " + tool["content"], (
+    assert body["transcript"][-1]["content"] == tool["message"], (
         body["transcript"][-1]["content"]
     )
     # Заведённое видно через ручку, а история осталась попарной.
     ours = [i for i in listing["items"] if i["text"] == marker]
-    assert len(ours) == 1 and ours[0]["state"] == "сработало" and ours[0]["fired"] == 1, ours
+    assert len(ours) == 1 and ours[0]["state"] == "ждёт" and ours[0]["fired"] == 0, ours
     conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
     roles = conn.execute(
         "SELECT role FROM messages WHERE session_id = ? ORDER BY seq", (chat,)
@@ -4960,6 +4947,36 @@ def check_remind_end_to_end():
     conn.close()
     assert roles == [("user",), ("assistant",)], roles
     return "вызов исполнен процессом, напоминание заведено и видно в ручке, история попарная"
+
+
+@check("scheduler: standalone HTTP, сроки, повтор, отмена, рестарт и изоляция чата")
+def check_reminder_scheduler():
+    result = subprocess.run([sys.executable, os.path.join(ROOT, "checks", "reminder_scheduler.py")],
+                            capture_output=True, text=True, cwd=ROOT, timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+@check("MCP URL: independent service, persisted config and explicit reconnect")
+def check_url_api():
+    from checks.mcp_url import check_url_api
+    return check_url_api()
+
+
+@check("MCP URL: foreground call/config and multi-round session races")
+def check_url_race():
+    from checks.mcp_url import check_url_race
+    return check_url_race()
+
+
+@check("request JSON: final outbound overrides survive config edits and restart")
+def check_request_capture():
+    from checks.mcp_url import check_request_capture
+    return check_request_capture()
+
+
+@check("Git HTTP: real tool rounds, exact request logs and whole-exchange lease")
+def check_git_exchange():
+    from checks.tool_url import check_git_exchange
+    return check_git_exchange()
 
 
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
