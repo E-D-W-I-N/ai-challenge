@@ -238,14 +238,27 @@ class McpManager:
         self.servers = []
         self.tools = {}
 
-    def view(self) -> dict:
-        """Список серверов для ручки и вкладки: имя, статус, инструменты."""
-        return {
-            "servers": [
-                {"name": s.name, "status": s.status, "tools": s.view}
-                for s in self.servers
-            ]
-        }
+    async def view(self) -> dict:
+        """Список серверов для ручки и вкладки: имя, статус, инструменты.
+
+        У живого сервера с инструментом `reminders` — и его свежий результат
+        полем `reminders`: напоминания показывают рядом с инструментами, и
+        второй ручки для этого не заводится. У лежачего сервера поля нет —
+        дёргать его нечем, а честнее молчащего поля — его отсутствие.
+        """
+        servers = []
+        for s in self.servers:
+            row = {"name": s.name, "status": s.status, "tools": s.view}
+            name = next(
+                (n for n, ref in self.tools.items() if ref.server is s and ref.tool == "reminders"),
+                None,
+            )
+            if s.status == "ok" and name is not None:
+                with contextlib.suppress(Exception):
+                    result = await self.call(name, {})
+                    row["reminders"] = json.loads(result.content[0].text)
+            servers.append(row)
+        return {"servers": servers}
 
 
 MANAGER = McpManager()

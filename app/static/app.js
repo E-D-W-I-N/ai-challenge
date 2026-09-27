@@ -27,6 +27,7 @@ const state = {
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
   invariants: null,    // инварианты — ответ ручки, прочитанный на открытие вкладки
   mcp: null,           // серверы MCP — ответ ручки, прочитанный на открытие вкладки
+  mcpTimer: null,      // перезапрос вкладки «Инструменты», пока она открыта
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -2468,6 +2469,49 @@ async function loadMcp() {
   renderMcp();
 }
 
+// Пока вкладка открыта, список перезапрашивается: напоминание срабатывает
+// без единого действия человека, и переворот «ждёт → сработало» обязан
+// быть виден живьём. Закрыли вкладку — запросы прекратились: сервер
+// напоминаний считает состояние при чтении, и молчащая вкладка его не
+// держит. Перезапрос невидимой вкладки был бы потоком ни о чём.
+const MCP_POLL_MS = 2000;
+
+function startMcpPoll() {
+  stopMcpPoll();
+  state.mcpTimer = setInterval(loadMcp, MCP_POLL_MS);
+}
+
+function stopMcpPoll() {
+  if (state.mcpTimer) { clearInterval(state.mcpTimer); state.mcpTimer = null; }
+}
+
+const clock = (epoch) => {
+  const d = new Date(epoch * 1000);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, "0")).join(":");
+};
+
+// Блок напоминаний у сервера, который их отдал: счётчики по состояниям
+// и каждая запись с текстом и временем. Состояние придумал сервер —
+// клиент его только показывает, сам по часам ничего не досчитывает.
+function remindersBlock(data) {
+  const box = el("div", "mem-reminders");
+  box.appendChild(el("div", "mem-kind",
+    "напоминания — ждёт: " + (data.waiting ?? 0) + " · сработало: " + (data.fired ?? 0)));
+  const items = data.items || [];
+  if (!items.length) box.appendChild(memNote("напоминаний нет"));
+  items.forEach((item) => {
+    box.appendChild(el("div", "mem-text", "№" + item.id + " — " + item.text));
+    let line;
+    if (item.state === "ждёт") line = "ждёт · сработает в " + clock(item.due_at);
+    else if (item.every) line = "сработало · раз: " + item.fired
+      + " · следующее в " + clock(item.due_at);
+    else line = "сработало · в " + clock(item.due_at);
+    box.appendChild(el("div", "mem-note", line));
+  });
+  return box;
+}
+
 function renderMcp() {
   const box = $("#mcp-list");
   box.innerHTML = "";
@@ -2490,6 +2534,9 @@ function renderMcp() {
       schema.appendChild(el("pre", "", JSON.stringify(tool.schema || {}, null, 2)));
       row.appendChild(schema);
     });
+    // Напоминания — поле того же ответа ручки: у сервера, который их
+    // ведёт, блок идёт под его инструментами.
+    if (server.reminders) row.appendChild(remindersBlock(server.reminders));
     box.appendChild(row);
   });
 }
@@ -2752,8 +2799,11 @@ function init() {
       // вкладки. Слой глобальный, и перечитывать его на смену чата незачем.
       if (which === "invariants") loadInvariants();
       // Инструменты MCP — тем же порядком и по тому же доводу: лениво,
-      // на открытие вкладки. Вкладка только показывает, править тут нечего.
-      if (which === "mcp") loadMcp();
+      // на открытие вкладки. Плюс живой перезапрос, пока она открыта:
+      // напоминание срабатывает само, и это обязано быть видно. Уход
+      // с вкладки перезапрос гасит — любой, а не только уход на соседнюю.
+      if (which === "mcp") { loadMcp(); startMcpPoll(); }
+      else stopMcpPoll();
     };
   });
 
