@@ -245,6 +245,141 @@ function tileOf($, name) {
 }
 
 async function routeChecks() {
+  {
+    const { client, server, $, settle, Evt } = freshClient({ records: [{ kind: "knowledge", content: "общая запись" }] }); client.init(); await settle(30);
+    const click = (id) => $("#" + id).dispatchEvent(new Evt("click"));
+    click("tab-btn-memory"); await settle(20);
+    $("#mem-work-content").value = "запись первого чата"; $("#mem-work-kind").value = "question"; click("mem-work-add"); await settle(20);
+    $("#mem-working").querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    const oldEditor = $("#mem-working").querySelector(".mem-edit");
+    oldEditor.value = "черновик старого чата";
+    $("#agent-list").querySelectorAll(".item-open")[1].dispatchEvent(new Evt("click")); await settle(30);
+    check("смена чата не переносит рабочий редактор и записи", !$("#mem-working").querySelector(".mem-edit") && !$("#mem-working").textContent.includes("запись первого чата") && client.state.memory.working.records.length === 0);
+    oldEditor.dispatchEvent(new Evt("keydown", { key: "Enter" })); await settle(20);
+    check("старый рабочий callback не правит выбранный чат", !server.state.requests.some((r) => r.method === "PATCH" && /\/working\//.test(r.path)));
+    const row = $("#mem-long").querySelector(".mem-item"); row.querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    const editor = $("#mem-long").querySelector(".mem-edit"); editor.value = "общая правка после ошибки";
+    const base = globalThis.fetch;
+    globalThis.fetch = (path, init) => /^\/api\/memory\/\d+$/.test(path) && init?.method === "PATCH" ? Promise.resolve({ ok: false, status: 503, json: async () => ({ detail: "память занята" }) }) : base(path, init);
+    editor.dispatchEvent(new Evt("keydown", { key: "Enter" })); await settle(20); click("workspace-chat"); click("workspace-settings"); await settle(20);
+    check("ошибка правки памяти сохраняет редактор и текст", $("#mem-long").querySelector(".mem-edit") === editor && editor.value === "общая правка после ошибки" && $("#mem-status").textContent.includes("память занята"));
+    globalThis.fetch = base; editor.dispatchEvent(new Evt("keydown", { key: "Enter" })); await settle(20);
+    check("сохранение после ошибки обновляет тот же глобальный номер", !$("#mem-long").querySelector(".mem-edit") && server.state.records[0].seq === 1 && server.state.records[0].content === "общая правка после ошибки");
+  }
+
+  {
+    const { client, $, settle, Evt } = freshClient(); client.init(); await settle(30);
+    const base = globalThis.fetch; let release;
+    globalThis.fetch = async (path, init) => {
+      const response = await base(path, init);
+      if (init?.method === "PATCH" && /^\/api\/agents\//.test(path)) await new Promise((resolve) => { release = resolve; });
+      return response;
+    };
+    $("#f-temperature").value = "0.2"; $("#f-temperature").dispatchEvent(new Evt("change")); await settle(20);
+    $("#f-response_format_kind").value = "custom"; $("#f-response_format").value = "{invalid"; $("#f-response_format").dispatchEvent(new Evt("change"));
+    release(); await settle(20);
+    check("поздний PATCH не снимает новую ошибку и грязное поле", client.state.panelDirty && $("#save-status").classList.contains("error") && $("#f-response_format").value === "{invalid");
+    globalThis.fetch = base;
+  }
+  {
+    const { client, $, settle, Evt } = freshClient({ narrow: true }); client.init(); await settle(30);
+    $("#restore-sidebar").dispatchEvent(new Evt("click"));
+    const trash = $("#agent-list").querySelector(".item").querySelectorAll(".mini").find((button) => button.title === "Удалить чат");
+    trash.focus(); trash.dispatchEvent(new Evt("click"));
+    const dialog = $(".confirm-box");
+    check("подтверждение имеет ARIA и принимает фокус", dialog.attributes.role === "dialog" && dialog.attributes["aria-modal"] === "true" && dialog.contains(document.activeElement));
+    document.fire(new Evt("keydown", { key: "Tab" }));
+    check("мобильный список не крадёт Tab у подтверждения", dialog.contains(document.activeElement));
+    document.fire(new Evt("keydown", { key: "Escape" }));
+    check("закрытие подтверждения возвращает фокус кнопке", !$(".confirm") && document.activeElement === trash);
+  }
+
+  // Рабочая область меняет видимость, сохраняя реальные узлы и поток.
+  {
+    const transcript = Array.from({ length: 20 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: "реплика " + i, metrics: null }));
+    const { client, server, $, settle, Evt } = freshClient({ delay: 30, chats: [{ label: "длинный", transcript }], tasks: { "первый чат": { stage: "planning", description: "План UI", step: "Проверить формы" } } });
+    client.init(); await settle(30);
+    const click = (id) => $("#" + id).dispatchEvent(new Evt("click"));
+    const id = client.state.current.id;
+    const feed = $("#feed");
+    $("#input").value = "черновик\nещё строка";
+    click("workspace-settings"); click("workspace-chat");
+    check("переключение области сохраняет чат, узлы и черновик", client.state.current.id === id && $("#feed") === feed && $("#input").value === "черновик\nещё строка");
+    click("workspace-settings");
+    check("шапка задачи остаётся видна в настройках", !$("#task-head").classList.contains("hidden") && $("#task-head").textContent.includes("Проверить формы"));
+    click("tab-btn-model");
+    $("#f-response_format_kind").value = "custom"; $("#f-response_format_kind").dispatchEvent(new Evt("change"));
+    $("#f-response_format").value = "{ошибка"; $("#f-response_format").dispatchEvent(new Evt("change"));
+    click("workspace-chat"); click("workspace-settings");
+    check("невалидный JSON и ошибка сохраняются при возврате", $("#f-response_format").value === "{ошибка" && $("#save-status").classList.contains("error") && client.state.panelDirty);
+    $("#f-response_format_kind").value = ""; $("#f-response_format_kind").dispatchEvent(new Evt("change")); await settle(20);
+    click("workspace-chat"); $("#input").value = "поток при смене области"; $("#composer").requestSubmit(); await settle(50);
+    const abort = client.state.abort;
+    click("workspace-settings"); click("tab-btn-agent");
+    check("настройки не отменяют активный поток", client.state.busy && client.state.abort === abort && !abort.signal.aborted);
+    await settle(250); click("workspace-chat");
+    check("поток завершился в том же чате ровно одним обменом", !client.state.busy && client.state.current.id === id && server.state.sent.length === 1 && $("#feed").textContent.includes("ответ модели"));
+    $("#chat-search").value = "второй"; $("#chat-search").dispatchEvent(new Evt("input"));
+    check("поиск фильтрует реальные чаты, не меняя выбор", $("#agent-list").querySelectorAll(".item-open").length === 1 && client.state.current.id === id);
+    $("#chat-search").value = "такого нет"; $("#chat-search").dispatchEvent(new Evt("input"));
+    check("пустой поиск назван словами", $("#agent-list").textContent.includes("Чаты не найдены"));
+  }
+  // Аватар использует тот же глобальный профиль и не правит конфиг чата.
+  {
+    const { client, server, $, settle, Evt } = freshClient({ profile: { style: "кратко", format: "списком" }, secret: "секрет-стенда" });
+    client.init(); await settle(30);
+    const click = (id) => $("#" + id).dispatchEvent(new Evt("click"));
+    const requests = (method, path) => server.state.requests.filter((r) => r.method === method && r.path === path);
+    check("профиль читается лениво", requests("GET", "/api/profile").length === 0);
+    click("profile-toggle"); await settle(20);
+    check("аватар показывает реальный сохранённый профиль", $("#profile-summary").textContent.includes("кратко") && $("#profile-summary").textContent.includes("списком") && $("#profile-toggle").attributes["aria-expanded"] === "true");
+    click("profile-edit");
+    check("аватар открывает общий редактор без повторного GET", client.state.workspace === "settings" && client.state.section === "profile" && $("#profile-style").value === "кратко" && requests("GET", "/api/profile").length === 1);
+    $("#profile-style").value = "ясно секрет-стенда"; $("#profile-style").dispatchEvent(new Evt("input")); $("#profile-style").dispatchEvent(new Evt("change")); await settle(20);
+    check("правка профиля отправляет одно поле и показывает записанное", JSON.stringify(requests("PATCH", "/api/profile")[0].body) === JSON.stringify({ style: "ясно секрет-стенда" }) && $("#profile-style").value === "ясно ***" && $("#profile-format").value === "списком" && !server.state.requests.some((r) => r.method === "PATCH" && /^\/api\/agents\//.test(r.path)));
+    const base = globalThis.fetch;
+    globalThis.fetch = (path, init) => path === "/api/profile" && init?.method === "PATCH" ? Promise.resolve({ ok: false, status: 503, json: async () => ({ detail: "профиль временно занят" }) }) : base(path, init);
+    $("#profile-context").value = "не терять этот текст"; $("#profile-context").dispatchEvent(new Evt("input")); $("#profile-context").dispatchEvent(new Evt("change")); await settle(20);
+    click("workspace-chat"); click("workspace-settings"); await settle(20);
+    check("ошибка профиля и несохранённый текст переживают повторный GET", $("#profile-context").value === "не терять этот текст" && $("#profile-status").textContent.includes("временно занят") && $("#profile-status").classList.contains("error"));
+    globalThis.fetch = base;
+    $("#profile-context").dispatchEvent(new Evt("change")); await settle(20);
+    $("#profile-style").value = ""; $("#profile-style").dispatchEvent(new Evt("input")); $("#profile-style").dispatchEvent(new Evt("change")); await settle(20);
+    document.querySelectorAll(".item-open")[1].dispatchEvent(new Evt("click")); await settle(20);
+    click("profile-toggle"); await settle(20);
+    check("очистка одного поля и смена чата сохраняют общий профиль", !server.state.profile.style && server.state.profile.format === "списком" && $("#profile-summary").textContent.includes("не терять этот текст"));
+    document.fire(new Evt("keydown", { key: "Escape" }));
+    check("Escape закрывает профиль и возвращает фокус аватару", $("#profile-menu").classList.contains("hidden") && document.activeElement === $("#profile-toggle"));
+  }
+  // Эффективная видимость учитывает и раздел, и внешнюю рабочую область.
+  {
+    const { client, server, $, settle, Evt } = freshClient({ records: [{ kind: "knowledge", content: "факт" }] });
+    client.init(); await settle(30);
+    const click = (id) => $("#" + id).dispatchEvent(new Evt("click"));
+    const memoryGets = () => server.state.requests.filter((r) => r.method === "GET" && /\/memory$/.test(r.path));
+    click("tab-btn-memory"); await settle(20); const reads = memoryGets().length;
+    click("workspace-chat"); $("#input").value = "вопрос"; $("#composer").requestSubmit(); await settle(120);
+    check("обмен не читает память скрытой рабочей области", memoryGets().length === reads);
+    click("workspace-settings"); await settle(20);
+    check("возврат в память перечитывает её один раз", memoryGets().length === reads + 1);
+    const row = $("#mem-long").querySelector(".mem-item"); row.querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
+    const editor = $("#mem-long").querySelector(".mem-edit"); editor.value = "незаконченная правка";
+    click("workspace-chat"); click("workspace-settings"); await settle(20);
+    check("возврат сохраняет смонтированный редактор памяти", $("#mem-long").querySelector(".mem-edit") === editor && editor.value === "незаконченная правка");
+    editor.dispatchEvent(new Evt("keydown", { key: "Escape" }));
+    const base = globalThis.fetch; let release;
+    globalThis.fetch = (path, init) => path === "/api/mcp" ? new Promise((resolve) => { release = () => resolve({ ok: true, json: async () => ({ servers: [{ name: "поздний ответ", status: "ok", tools: [] }] }) }); }) : base(path, init);
+    click("tab-btn-mcp"); const controller = client.state.mcpRequest; click("workspace-chat"); release(); await settle(20);
+    check("уход из инструментов отменяет GET и отбрасывает поздний ответ", controller.signal.aborted && !$("#mcp-list").textContent.includes("поздний ответ"));
+    globalThis.fetch = base;
+    const mcpGets = () => server.state.requests.filter((r) => r.path === "/api/mcp");
+    click("workspace-settings"); await settle(20); const count = mcpGets().length;
+    click("workspace-chat"); await settle(40);
+    check("MCP читается при возврате и молчит в чате", count === 1 && mcpGets().length === count && client.state.mcpRequest === null);
+    click("workspace-settings"); click("tab-btn-model"); $("#tab-btn-model").dispatchEvent(new Evt("keydown", { key: "End" })); await settle(20);
+    check("клавиши вкладок меняют выбор, ARIA и фокус", client.state.section === "mcp" && $("#tab-btn-mcp").attributes["aria-selected"] === "true" && document.activeElement === $("#tab-btn-mcp"));
+  }
+
   // ── каждое поле панели доезжает до запроса, даже без события change ──
   for (const [field, typed, key, expected] of PANEL_ROUTE) {
     const { client, server, $, settle } = freshClient();
@@ -1680,14 +1815,16 @@ async function routeChecks() {
     check("за списком сходили ровно один раз — на открытие вкладки",
       calls().length === 1, JSON.stringify(calls().map((r) => r.path)));
 
-    const rows = $("#mcp-list").querySelectorAll(".mem-item");
-    const kinds = $("#mcp-list").querySelectorAll(".mem-kind").map((n) => n.textContent);
-    const shown = $("#mcp-list").querySelectorAll(".mem-text").map((n) => n.textContent);
+    const rows = $("#mcp-list").querySelectorAll(".mcp-server");
+    const kinds = $("#mcp-list").querySelectorAll(".mcp-server-status").map((n) => n.textContent);
+    const names = $("#mcp-list").querySelectorAll(".mcp-server-name").map((n) => n.textContent);
+    const toolNames = $("#mcp-list").querySelectorAll(".mcp-tool-name").map((n) => n.textContent);
+    const shown = $("#mcp-list").querySelectorAll(".mcp-tool-description").map((n) => n.textContent);
     check("серверы показаны со статусом",
-      rows.length === 2 && kinds.join(" | ") === "echo · подключён | grok · не отвечает",
+      rows.length === 2 && names.join("|") === "echo|grok" && kinds.join(" | ") === "Подключён | Не отвечает",
       JSON.stringify(kinds));
-    check("инструмент показан с описанием",
-      shown.join(" | ") === "ping — проверка связи", JSON.stringify(shown));
+    check("имя инструмента отделено от описания",
+      toolNames.join("|") === "ping" && shown.join(" | ") === "проверка связи", JSON.stringify([toolNames, shown]));
     // Схема свёрнута, но доезжает: «что умеет инструмент» читают из неё.
     const folded = $("#mcp-list").querySelector("details");
     const schema = folded && folded.querySelector("pre");

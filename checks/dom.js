@@ -215,6 +215,10 @@ class El {
     this.attributes[name] = String(value);
   }
 
+  removeAttribute(name) {
+    delete this.attributes[name];
+  }
+
   matches(sel) {
     return parseSelector(sel).every((part) => {
       if (part.startsWith("#")) return this.id === part.slice(1);
@@ -508,6 +512,7 @@ function buildServer(options) {
     // Серверы MCP: список, как его отдаёт ручка. Слой глобальный, чату
     // не принадлежит, поэтому у стенда он один на всех, как инварианты.
     mcpServers: (options && options.mcp) || [],
+    profile: { ...((options && options.profile) || {}) },
     // Секрет, который сервер вырезает из всего, что уезжает в базу
     // (`redact`, `app/store.py`). Стенд чистит тем же способом — подменой
     // на «***» — и только когда секрет задан, ровно как сервер без ключа
@@ -850,6 +855,8 @@ function buildServer(options) {
     const task = taskView(agent);
     const head = [
       agent.system,
+      Object.keys(state.profile).length ? "[как отвечать]\n" + Object.entries(state.profile)
+        .map(([name, text]) => ({ style: "стиль", format: "формат", context: "контекст" }[name]) + ": " + text).join("\n") : "",
       task ? "[этап задачи: " + task.label + "]\n" + STAGE_RULES[task.stage] : "",
       task ? lifecycleBlock(task.stage) : "",
       invariantBlock(),
@@ -1077,6 +1084,20 @@ function buildServer(options) {
     // Границы те же, что на сервере: вид обязателен и без умолчания, текст
     // непустой, лишние поля 400, пустое тело правки 400, чужой номер 404,
     // номера от AUTOINCREMENT и заново не выдаются.
+    if (path === "/api/profile" && method === "GET") return json({ profile: { ...state.profile } });
+    if (path === "/api/profile" && method === "PATCH") {
+      const fields = ["style", "format", "context"];
+      if (!body || !Object.keys(body).length || Object.keys(body).some((key) => !fields.includes(key) || typeof body[key] !== "string")) {
+        return fail(400, "Профиль: нужны только текстовые style, format, context");
+      }
+      Object.entries(body).forEach(([name, value]) => {
+        const text = clean(value).trim();
+        if (text) state.profile[name] = text;
+        else delete state.profile[name];
+      });
+      return json({ profile: { ...state.profile } });
+    }
+
     if (path === "/api/invariants" && method === "GET") {
       return json({ total: state.invariants.length, records: state.invariants });
     }
@@ -1316,7 +1337,7 @@ function boot(html, options) {
   const store = {};
 
   globalThis.document = document;
-  globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
+  globalThis.window = { matchMedia: () => ({ matches: Boolean(options && options.narrow), addEventListener() {} }) };
   globalThis.localStorage = {
     getItem: (k) => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },

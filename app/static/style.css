@@ -1,16 +1,16 @@
-/* Чат-клиент: список чатов слева, лента по центру, настройки и метрики справа.
+/* Чат-клиент: список слева, общий заголовок, чат и рабочая область настроек.
 
    Ничего из сети: шрифт системный, иконки — inline SVG из app.js.
    Репозиторий публичный и обязан работать без интернета. */
 
 :root {
   --bg: #ffffff;
-  --bg-soft: #f7f7f8;
-  --line: #e6e6e9;
+  --bg-soft: #f7f9fc;
+  --line: #dfe5ef;
   --line-soft: #efeff1;
-  --text: #17171a;
-  --muted: #77777f;
-  --faint: #a1a1aa;
+  --text: #172033;
+  --muted: #66738a;
+  --faint: #718099;
   --accent: #2563eb;
   --error-bg: #eff4ff;
   --bubble: #f1f2f4;
@@ -21,19 +21,22 @@
   --warn-line: #efdcb4;
   --code-bg: #f5f5f6;
   --radius: 12px;
-  --sidebar-w: 264px;
-  --panel-w: 340px;
+  --sidebar-w: 268px;
+  --accent-soft: #eaf2ff;
+  --button-bg: #2870f0;
   color-scheme: light;
 }
 
 [data-theme="dark"] {
-  --bg: #131417;
+  --accent-soft: #203451;
+  --button-bg: #2870f0;
+  --bg: #13171f;
   --bg-soft: #17181c;
   --line: #2a2c33;
   --line-soft: #232529;
   --text: #e9e9ee;
-  --muted: #9a9aa4;
-  --faint: #71717a;
+  --muted: #a2adc0;
+  --faint: #98a5ba;
   --accent: #6ea8fe;
   --error-bg: #2a1d1f;
   --bubble: #23252b;
@@ -65,11 +68,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   height: 100vh;
   height: 100dvh;
   display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w);
-  transition: grid-template-columns .18s ease;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
 }
-.app.no-sidebar { --sidebar-w: 0px; }
-.app.no-panel { --panel-w: 0px; }
+.app.no-sidebar { grid-template-columns: 0 minmax(0, 1fr); }
 
 .hidden { display: none !important; }
 
@@ -119,17 +120,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .icon-btn:hover { background: var(--bg-soft); color: var(--text); }
 .icon-btn svg { width: 17px; height: 17px; }
-
-/* Кнопка разворота: живёт в шапке ленты, когда панель или сайдбар свёрнуты. */
-.floating-toggle {
-  position: absolute;
-  top: 10px;
-  z-index: 5;
-  background: var(--bg);
-  border: 1px solid var(--line);
-}
-.floating-toggle.left { left: 10px; }
-.floating-toggle.right { right: 10px; }
 
 .new-chat {
   flex: 0 0 auto;
@@ -614,53 +604,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ──────────────────────── панель настроек ────────────────────── */
 
-.panel {
-  min-width: 0;
-  border-left: 1px solid var(--line);
-  background: var(--bg);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.app.no-panel .panel { border-left: 0; }
-
-.panel-head {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 12px 10px;
-}
-/* Пять подписей в 300 пикселях: строчные буквы вместо прописных, отступы
-   впритык. Перенос — страховка: обрезанная подпись хуже второй строки. */
-.tabs {
-  flex: 1 1 auto;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 10px;
-  background: var(--bg-soft);
-}
-.tab {
-  position: relative;
-  flex: 1 1 0;
-  padding: 6px 2px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background .12s ease, color .12s ease;
-}
-.tab.active { background: var(--bg); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
-
-.panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 14px 14px; }
-.tab-page { display: flex; flex-direction: column; gap: 12px; }
-
 .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .field-label {
   font-size: 10px;
@@ -867,59 +810,8 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   background: var(--warn-text);
 }
 
-.panel-save {
-  flex: 0 0 auto;
-  min-height: 34px;
-  padding: 8px 14px;
-  border-top: 1px solid var(--line-soft);
-  display: flex;
-  align-items: center;
-}
-.save-status { flex: 1 1 auto; font-size: 11.5px; color: var(--ok); min-width: 0; line-height: 1.4; }
+.save-status { color: var(--ok); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .save-status.error { color: var(--danger); }
-
-/* ── плитки метрик ── */
-.tiles {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--line);
-  padding: 14px 14px 16px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  background: var(--bg-soft);
-}
-.tile {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--bg);
-  padding: 10px 12px 11px;
-  min-width: 0;
-}
-.tile-k {
-  font-size: 9px;
-  font-weight: 650;
-  letter-spacing: .07em;
-  text-transform: uppercase;
-  color: var(--faint);
-  /* Подпись переносится, а не обрезается многоточием. На узком окне панель
-     уходит с 340 px на 300, плитка — со 125 на 105, а «ВЫХОДНЫЕ ТОКЕНЫ»
-     требует 112: с прежним nowrap там оставалось «ВЫХОДНЫЕ ТОК…», то есть
-     подпись переставала говорить, что стоит в плитке. */
-  overflow-wrap: anywhere;
-}
-.tile-v {
-  margin-top: 3px;
-  font-size: 18px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -.02em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tile-v.small { font-size: 13px; font-weight: 550; }
-/* Число осталось от прошлого обмена: последний упал и своих чисел не принёс.
-   Размер тот же — плитка не растёт и не прыгает, меняется только цвет. */
 .tile-v.past { color: var(--muted); }
 
 /* ── подтверждение ── */
@@ -963,33 +855,173 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 
-/* ── адаптив ── */
-
-@media (max-width: 1180px) {
-  :root { --sidebar-w: 232px; --panel-w: 300px; }
+/* Общая рабочая область: одинаковая ширина для всех шести разделов. */
+.workspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.workspace-head {
+  display: flex; align-items: center; gap: 16px; min-height: 72px;
+  padding: 12px 24px; border-bottom: 1px solid var(--line); position: relative; z-index: 10;
 }
+.workspace-head h1 { font-size: 20px; font-weight: 650; margin: 0; min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.workspace-switch { display: flex; flex-shrink: 0; padding: 3px; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 9px; }
+.workspace-tab { border: 0; border-radius: 6px; padding: 10px 27px; background: transparent; cursor: pointer; color: var(--muted); }
+.workspace-tab.active { background: var(--button-bg); color: #fff; box-shadow: 0 2px 5px #2563eb20; }
+.profile-control { position: relative; margin-left: auto; }
+.profile-toggle { display: flex; align-items: center; gap: 8px; min-height: 44px; border: 0; border-radius: 24px; background: transparent; cursor: pointer; padding: 2px 6px; }
+.avatar { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--bubble); color: var(--muted); position: relative; }
+.avatar svg { width: 22px; height: 22px; }
+.profile-toggle.configured .avatar::after { content: ""; position: absolute; right: 0; bottom: 0; width: 9px; height: 9px; border: 2px solid var(--bg); border-radius: 50%; background: var(--ok); }
+.profile-chevron { font-size: 19px; color: var(--muted); }
+.profile-menu { position: absolute; top: calc(100% + 12px); right: 0; width: 340px; max-width: calc(100vw - 32px); max-height: min(600px, calc(100dvh - 150px)); overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg); box-shadow: 0 16px 45px #0002; display: flex; flex-direction: column; gap: 12px; }
+.profile-menu h2 { font-size: 18px; margin: 0; }
+#profile-summary { display: flex; flex-direction: column; gap: 12px; }
+.profile-summary-field { min-width: 0; }
+.profile-summary-field strong { font-size: 12px; color: var(--muted); }
+.profile-summary-field p { margin: 4px 0 0; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 110px; overflow-y: auto; }
+.primary-btn { border: 0; border-radius: 8px; padding: 12px 16px; background: var(--button-bg); color: #fff; cursor: pointer; }
+.panel { display: grid; grid-template-columns: 220px minmax(0, 1fr); flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.settings-nav { padding: 20px 10px; border-right: 1px solid var(--line); background: var(--bg-soft); overflow-y: auto; min-width: 0; }
+.tabs { display: flex; flex-direction: column; gap: 8px; }
+.tab { display: flex; align-items: center; gap: 14px; padding: 14px 16px; min-height: 50px; text-align: left; border: 0; border-radius: 9px; background: transparent; color: var(--text); cursor: pointer; position: relative; font-size: 15px; }
+.tab:hover { background: var(--bubble); }
+.tab.active { color: var(--accent); background: var(--accent-soft); }
+.tab-icon { display: grid; place-items: center; flex: 0 0 auto; }
+.tab-icon svg { width: 22px; height: 22px; }
+.panel-body { min-width: 0; min-height: 0; overflow-y: auto; padding: 30px; scroll-padding: 24px; }
+.settings-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 26px; }
+.settings-head h2 { font-size: 30px; letter-spacing: -.03em; margin: 0 0 6px; }
+.settings-head p { margin: 0 0 18px; color: var(--muted); font-size: 16px; line-height: 1.5; }
+.settings-head .save-status { margin-top: 10px; max-width: 280px; }
+.scope-badge { display: inline-block; border-radius: 20px; padding: 6px 12px; background: var(--bg-soft); color: var(--muted); font-size: 12px; line-height: 1.45; }
+.layer-scope { margin: -7px 0 0; color: var(--muted); font-size: 12px; }
+.tab-page { display: flex; flex-direction: column; gap: 24px; min-width: 0; padding-bottom: 12px; }
+.settings-card, .mem-layer { border: 1px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.settings-card h3, .mem-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--text); text-transform: none; letter-spacing: 0; }
+.prompt-card .field-label { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+#f-system { height: 290px; min-height: 290px; font-size: 15px; line-height: 1.6; }
+.field { gap: 7px; }
+.field-label { text-transform: none; letter-spacing: 0; font-size: 14px; color: var(--text); font-weight: 500; }
+.control { min-height: 44px; border-radius: 7px; padding: 10px 12px; font-size: 14px; }
+.control.area { font-size: 14px; min-height: 100px; }
+.control:disabled { opacity: .6; cursor: not-allowed; }
+.grid2, .grid3 { gap: 20px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid3:not(.context-grid) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.context-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.hint, .mem-note, .branch-note { font-size: 13px; color: var(--muted); }
+.mem-title { line-height: 1.5; }
+.mem-body { gap: 12px; }
+.mem-item { padding: 14px; gap: 10px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--bg-soft); }
+.mem-kind { font-size: 12px; letter-spacing: 0; }
+.mem-text { font-size: 14px; white-space: pre-wrap; }
+.mem-edit-box { flex: 1 1 100%; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.mem-edit-kind { max-width: 100%; width: 100%; font-size: 14px; padding: 10px 12px; }
+.mem-form { gap: 16px; }
+.mem-add-row { align-items: end; gap: 16px; }
+.mem-add { min-height: 44px; padding: 10px 18px; color: #fff; background: var(--button-bg); border-color: var(--button-bg); border-radius: 7px; }
+.mem-add:hover { background: var(--button-bg); filter: brightness(.95); border-color: var(--button-bg); }
+.mcp-server { border: 1px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.mcp-server-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.mcp-server-name { margin: 0; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
+.mcp-server-status { font-size: 12px; flex: 0 0 auto; padding: 4px 8px; border: 1px solid var(--line); border-radius: 20px; }
+.mcp-server-status.ok { color: var(--ok); }
+.mcp-server-status.down { color: var(--danger); }
+.mcp-tool { min-width: 0; padding: 16px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--bg-soft); }
+.mcp-tool-name { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; line-height: 1.5; }
+.mcp-tool-description { font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; margin: 8px 0 14px; }
+.mcp-tool pre, .mem-summary { max-width: 100%; max-height: 360px; overflow: auto; padding: 14px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 7px; font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+summary { cursor: pointer; padding: 8px 0; }
+.metrics-strip { display: flex; align-items: center; min-height: 56px; gap: 20px; border-top: 1px solid var(--line); padding: 10px 24px; overflow-x: auto; flex: 0 0 auto; background: var(--bg); }
+.tiles { display: flex; align-items: center; gap: 22px; flex: 0 0 auto; }
+.tile { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.tile-k { font-size: 12px; color: var(--muted); }
+.tile-v, .tile-v.small { font-size: 13px; font-weight: 550; font-variant-numeric: tabular-nums; }
+#chat-status { font-size: 12px; white-space: nowrap; color: var(--accent); }
+.sidebar { background: var(--bg-soft); }
+.sidebar-head { padding: 26px 18px 22px; gap: 4px; }
+.brand-mark { background: none; color: var(--button-bg); width: 35px; height: 35px; border-radius: 0; }
+.brand-mark svg { width: 35px; height: 35px; }
+.brand-name { font-size: 21px; letter-spacing: -.04em; }
+.brand-sub { color: var(--muted); margin-top: 3px; }
+.new-chat { justify-content: center; margin: 8px 18px 16px; background: var(--button-bg); border-color: var(--button-bg); color: #fff; min-height: 48px; font-weight: 600; }
+.new-chat:hover { background: var(--button-bg); border-color: var(--button-bg); filter: brightness(.95); }
+.new-chat .plus { color: #fff; }
+.chat-search { margin: 0 18px 20px; }
+.chat-search .control { background: var(--bg); }
+.list { padding: 0 10px 10px; }
+.list-empty { padding: 16px; color: var(--muted); }
+.item { margin-bottom: 6px; padding: 5px 4px 5px 0; min-height: 56px; }
+.item.active { background: var(--accent-soft); color: var(--accent); }
+.item-title { font-size: 14px; white-space: normal; overflow-wrap: anywhere; line-height: 1.4; }
+.item-icon svg { width: 20px; height: 20px; }
+.item-open { gap: 12px; padding: 8px 4px 8px 12px; }
+.sidebar-foot { margin: 12px 18px; border-top: 1px solid var(--line); padding: 14px 0 0; }
+.foot-btn { min-height: 44px; font-size: 14px; }
+.foot-icon { width: 28px; }
+.foot-icon svg { width: 22px; height: 22px; }
+.icon-btn { width: 36px; height: 36px; color: var(--muted); }
+#restore-sidebar { flex: 0 0 auto; }
+.app.no-sidebar .sidebar { visibility: hidden; }
+.chat { flex: 1; height: auto; }
+.feed, .composer { padding-left: clamp(20px, 5vw, 80px); padding-right: clamp(20px, 5vw, 80px); }
+.task-head { max-height: 180px; overflow-y: auto; overflow-wrap: anywhere; }
+button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.save-status:empty::after { content: "Сохранено"; color: var(--muted); }
+.save-status:empty::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--ok); }
+.control:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
-/* Узкое окно: лента занимает всё, борта становятся ящиками поверх неё.
-   Оба свёрнуты по умолчанию — иначе от чата остаётся полоска посередине. */
+@media (max-width: 1180px) and (min-width: 941px) {
+  :root { --sidebar-w: 232px; }
+  .brand-name { font-size: 18px; }
+  .panel { grid-template-columns: 180px minmax(0, 1fr); }
+  .settings-nav { padding: 16px 8px; }
+  .tab { padding: 12px 10px; gap: 10px; }
+  .panel-body { padding: 24px; }
+  .workspace-tab { padding: 10px 18px; }
+  .grid3:not(.context-grid) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 940px) {
-  .app { grid-template-columns: minmax(0, 1fr); }
+  .app, .app.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 20; width: min(310px, 88vw); box-shadow: 2px 0 24px #0003; }
+  .app.no-sidebar .sidebar { display: none; }
   .item-actions { opacity: 1; }
-  .sidebar, .panel {
-    position: fixed;
-    top: 0;
-    bottom: 0;
-    z-index: 20;
-    width: min(300px, 86vw);
-  }
-  .sidebar { left: 0; box-shadow: 2px 0 24px rgba(0, 0, 0, .16); }
-  .panel { right: 0; box-shadow: -2px 0 24px rgba(0, 0, 0, .16); }
-  .app.no-sidebar .sidebar, .app.no-panel .panel { display: none; }
-  .feed, .composer { padding-left: 16px; padding-right: 16px; }
+  .panel { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .settings-nav { padding: 10px 14px; border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
+  .tabs { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px; }
+  .tab { flex-direction: column; gap: 5px; justify-content: center; text-align: center; padding: 10px 4px; font-size: 12px; }
+  .tab-icon svg { width: 20px; height: 20px; }
+  .panel-body { padding: 22px; }
+  .workspace-head { gap: 10px; padding: 10px 16px; }
+  .workspace-head h1 { font-size: 18px; }
+  .workspace-tab { padding: 10px 20px; }
+  .settings-head h2 { font-size: 27px; }
+  .settings-head p { font-size: 14px; }
+  .metrics-strip { padding: 12px 16px; }
+  .tile { flex-direction: column; gap: 4px; }
+  .tile-k { font-size: 11px; }
+  .feed, .composer { padding-left: 18px; padding-right: 18px; }
 }
-
-/* Затемнение нужно только там, где панели стали ящиками. */
+@media (max-width: 600px) {
+  .workspace-head { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; }
+  .workspace-switch { grid-column: 1 / -1; grid-row: 2; width: 100%; }
+  .workspace-tab { flex: 1; }
+  .profile-control { grid-column: 3; grid-row: 1; }
+  .tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .tab { flex-direction: row; font-size: 12px; min-height: 44px; gap: 7px; padding: 8px 3px; }
+  .tab-icon svg { width: 17px; height: 17px; }
+  .settings-nav { padding: 8px 12px; }
+  .panel-body { padding: 20px 16px; }
+  .settings-head { flex-direction: column; gap: 8px; margin-bottom: 20px; }
+  .settings-head p { margin-bottom: 12px; }
+  .settings-head .save-status { margin: 0; max-width: none; }
+  .settings-card, .mem-layer, .mcp-server { padding: 16px; gap: 16px; }
+  .grid2, .grid3:not(.context-grid), .context-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  #f-system { min-height: 260px; }
+  .mcp-server-head { flex-direction: column; }
+  .mcp-tool { padding: 12px; }
+  .mem-item { padding: 12px; }
+  .mem-add-row { flex-wrap: wrap; }
+  .mem-add-row .field { flex: 1; min-width: 150px; }
+  .task-head { padding: 10px 16px; max-height: 112px; }
+}
 @media (min-width: 941px) { .backdrop { display: none; } }
-
-@media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; animation: none !important; }
-}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
