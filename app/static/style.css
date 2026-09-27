@@ -775,3 +775,13 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
   .settings-card, .mem-layer, .mcp-server { padding: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* Wide tools configuration; no separate viewport mode. */
+.mcp-config-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(200px, 3fr) auto; gap: 12px; align-items: end; margin: 14px 0; }
+.mcp-config-row .field { min-width: 0; }
+.mcp-config-row input { width: 100%; min-width: 0; }
+.mcp-config-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+.request-json { margin: 0; font-size: 12px; line-height: 1.6; max-height: 320px; overflow: auto; white-space: pre; }
+
+.mcp-button { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-height: 44px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
+.mcp-button:disabled, .mcp-config-actions .mem-add:disabled { opacity: .6; cursor: not-allowed; }

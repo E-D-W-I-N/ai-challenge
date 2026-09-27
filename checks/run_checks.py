@@ -325,13 +325,13 @@ ALL_TABLES = (
 чтобы ключ искался и в колонках, которых ещё не придумали."""
 
 
-def _columns_holding(conn, needle: str, tables=ALL_TABLES) -> list[str]:
+def _columns_holding(conn, needle: str, tables=ALL_TABLES, exclude=()) -> list[str]:
     """Колонки, в которых лежит `needle`, — списком `таблица.колонка`."""
     found = set()
     for table in tables:
         for row in conn.execute(f"SELECT * FROM {table}"):
             for name in row.keys():
-                if isinstance(row[name], str) and needle in row[name]:
+                if f"{table}.{name}" not in exclude and isinstance(row[name], str) and needle in row[name]:
                     found.add(f"{table}.{name}")
     return sorted(found)
 
@@ -921,7 +921,7 @@ def check_working_memory():
         assert "успеем к маю?" in revived.build_prompt("ещё")[0]["content"]
         _ask(revived, 1)
         assert fresh.list_working(revived.id) == before
-        assert not _columns_holding(fresh.conn, "успеем к маю?", ("messages", "summaries"))
+        assert not _columns_holding(fresh.conn, "успеем к маю?", ("messages", "summaries"), exclude=("messages.request_bodies",))
         revived.forget()
         assert fresh.list_working(revived.id) == [] and revived.working == []
         assert revived.build_prompt("после очистки") == [{"role": "user", "content": "после очистки"}]
@@ -1454,7 +1454,7 @@ def check_long_term_memory():
         }
         assert working_columns == {"seq", "session_id", "kind", "content", "at"}, working_columns
         spilled = _columns_holding(
-            store.conn, "пишу на Kotlin", ("messages", "summaries", "working_memory")
+            store.conn, "пишу на Kotlin", ("messages", "summaries", "working_memory"), exclude=("messages.request_bodies",)
         )
         assert not spilled, f"долговременная память утекла в чужие таблицы: {spilled}"
 
@@ -4004,8 +4004,26 @@ def check_mcp_empty_without_config():
             with TestClient(main.app) as client:
                 answer = client.get("/api/mcp")
                 assert answer.status_code == 200, answer.text
-                assert answer.json() == {"servers": []}, answer.json()
+                assert answer.json()["servers"] == [], answer.json()
         return "ни процессов, ни инструментов, ручка отдаёт пустой список"
+
+
+@check("MCP URL: independent service, persisted config and explicit reconnect")
+def check_url_api():
+    from checks.mcp_url import check_url_api
+    return check_url_api()
+
+
+@check("MCP URL: foreground call/config and multi-round session races")
+def check_url_race():
+    from checks.mcp_url import check_url_race
+    return check_url_race()
+
+
+@check("request JSON: actual outbound rounds survive config edits and restart")
+def check_request_capture():
+    from checks.mcp_url import check_request_capture
+    return check_request_capture()
 
 
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")

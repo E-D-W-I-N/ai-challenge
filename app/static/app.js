@@ -38,16 +38,15 @@ const state = {
   profileDirty: new Set(),
   mcpRequest: null,
   mcpEpoch: 0,
+  mcpConfig: null,
+  mcpDirty: false,
+  mcpDraftVersion: 0,
+  mcpMutation: false,
+  mcpDisabled: false,
 };
 
-// Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
-//
-// Карта живёт только до перезагрузки страницы, и это не недоделка: промпт —
-// производная истории, которая и так лежит в базе. Записывать его туда значило
-// бы хранить копию разговора в каждой строке — и хранить её устаревшей, потому
-// что сводка со следующим сворачиванием меняется. Обновил страницу — кнопки
-// у старых ответов нет, и это честнее, чем показать промпт, собранный заново
-// и не тот, что уехал.
+// Legacy SSE prompt fallback only. Exact outbound request bodies are carried
+// by assistant transcript rows from the server and survive page/app restart.
 const promptKey = (agentId, index) => agentId + ":" + index;
 
 const $ = (sel) => document.querySelector(sel);
@@ -569,18 +568,8 @@ function answerCard(agent, turn, index) {
     // в переключателе оно не зависит.
     iconButton("branch", "Ветка отсюда", () => forkFrom(agent, index))
   );
-  // Кнопка появляется у всякого ответа, чей промпт клиент видел, — при любой
-  // стратегии. У окна это единственный способ прочитать отброшенное начало,
-  // а решать за читателя, что у «Всей истории» смотреть незачем, значит
-  // прятать от него ровно то, что уехало в модель. Промпт берётся из этой же
-  // вкладки — не сохранился (страницу перезагрузили), значит и показывать
-  // нечего.
   const prompt = state.prompts.get(promptKey(agent.id, index));
-  if (prompt) {
-    actions.appendChild(
-      iconButton("lines", "Показать промпт запроса", () => showPrompt(card, prompt))
-    );
-  }
+  actions.appendChild(iconButton("lines", "Информация о запросе", () => showRequestInfo(card, turn, prompt)));
   head.appendChild(actions);
   card.appendChild(head);
 
@@ -804,6 +793,29 @@ function promptRole(msg, index, prompt) {
   return "сообщение пользователя";
 }
 
+function showRequestInfo(card, turn, legacyPrompt) {
+  const shown = card.querySelector(".prompt-view");
+  if (shown) { shown.remove(); return; }
+  if (!turn.request_bodies || !turn.request_bodies.length) {
+    if (legacyPrompt) return showPrompt(card, legacyPrompt);
+    const missing = el("div", "prompt-view");
+    missing.appendChild(el("div", "prompt-title", "JSON запроса недоступен: у этого сообщения нет сохранённого тела запроса."));
+    card.insertBefore(missing, card.querySelector(".card-body"));
+    return;
+  }
+  const box = el("div", "prompt-view");
+  box.appendChild(el("div", "prompt-title", "Фактические JSON-запросы к модели · " + turn.request_bodies.length));
+  turn.request_bodies.forEach((body, index) => {
+    const row = el("div", "prompt-msg");
+    row.appendChild(el("div", "prompt-role", "Запрос " + (index + 1)));
+    const code = el("pre", "request-json", JSON.stringify(body, null, 2));
+    code.tabIndex = 0;
+    code.setAttribute("aria-label", "JSON запроса " + (index + 1));
+    row.appendChild(code); box.appendChild(row);
+  });
+  card.insertBefore(box, card.querySelector(".card-body"));
+}
+
 function showPrompt(card, prompt) {
   const shown = card.querySelector(".prompt-view");
   if (shown) {
@@ -811,7 +823,7 @@ function showPrompt(card, prompt) {
     return;
   }
   const box = el("div", "prompt-view");
-  box.appendChild(el("div", "prompt-title", "Промпт запроса — что уехало в модель"));
+  box.appendChild(el("div", "prompt-title", "JSON запроса недоступен. Промпт из события старого обмена (legacy)"));
   prompt.messages.forEach((msg, index) => {
     const row = el("div", "prompt-msg");
     row.append(
@@ -1050,6 +1062,7 @@ async function exchange(path, body, questionText) {
   let status = null;
   let prompt = null;
   let committed = false;
+  let answerIndex = null;
 
   try {
     await streamPost(
@@ -1135,6 +1148,7 @@ async function exchange(path, body, questionText) {
           case "done":
             // Записался ли обмен в историю — знает агент, и говорит прямо.
             committed = e.committed === true;
+            answerIndex = Number.isInteger(e.answer_index) ? e.answer_index : null;
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
             if (e.metrics) keepMetrics(e.metrics);
@@ -1176,20 +1190,22 @@ async function exchange(path, body, questionText) {
   // своим промптом и своей сводкой. Привяжи его по длине истории, и он лёг бы
   // под ключ **прошлого** ответа: кнопка под давней карточкой показала бы
   // чужой запрос, внутри которого лежит сам этот ответ.
-  await refreshCurrent(committed ? prompt : null);
+  await refreshCurrent(committed ? prompt : null, agent.id, answerIndex);
 }
 
-async function refreshCurrent(prompt) {
+async function refreshCurrent(prompt, ownerId, answerIndex = null) {
   if (!state.current) return;
+  const id = ownerId || state.current.id;
   try {
-    const fresh = await api("/api/agents/" + state.current.id);
+    const fresh = await api("/api/agents/" + id);
+    if (!state.current || state.current.id !== id) return;
     state.current = fresh;
     // Промпт привязываем к реплике до перерисовки: номер ответа в истории
     // известен только теперь, а рисовать карточку с кнопкой уже пора. Сюда он
     // доезжает, только если обмен записался, — значит последняя реплика
     // истории и есть его ответ.
     if (prompt) {
-      state.prompts.set(promptKey(fresh.id, fresh.transcript.length - 1), prompt);
+      state.prompts.set(promptKey(fresh.id, answerIndex === null ? fresh.transcript.length - 1 : answerIndex), prompt);
     }
     const listed = state.agents.find((a) => a.id === fresh.id);
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }

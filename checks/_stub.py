@@ -52,7 +52,7 @@ def make(
         числа, и сумма по чату сошлась бы на любом коде. `None` в поле —
         законное значение: так провайдер молчит о цифре.
     """
-    from app.llm import Metrics, build_payload
+    from app.llm import Metrics, build_payload, record_request
 
     known = {f.name for f in dataclass_fields(Metrics)}
 
@@ -67,6 +67,8 @@ def make(
                 "payload": build_payload(session, prompt_override),
             }
         )
+
+        record_request(CALLS[-1]["payload"])
 
         if callable(reply):
             text = reply(messages, index)

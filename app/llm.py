@@ -19,6 +19,9 @@ HTTP-клиент на процесс один, и одновременных в
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextvars import ContextVar
+from copy import deepcopy
 import json
 import os
 import time
@@ -233,7 +236,28 @@ def build_payload(session: AgentSpec, messages: list[dict] | None = None) -> dic
             payload["plugins"] = merge_plugins(payload["plugins"], value)
         else:
             payload[key] = value
-    return payload
+    from .store import redact
+    return redact(payload)
+
+
+_request_capture = ContextVar("request_capture", default=None)
+
+
+@contextlib.contextmanager
+def capture_requests():
+    """Collect exact outbound JSON bodies in order, without headers or URLs."""
+    bodies = []
+    token = _request_capture.set(bodies)
+    try:
+        yield bodies
+    finally:
+        _request_capture.reset(token)
+
+
+def record_request(payload: dict) -> None:
+    bodies = _request_capture.get()
+    if bodies is not None:
+        bodies.append(deepcopy(payload))
 
 
 class MissingKeyError(RuntimeError):
@@ -272,6 +296,7 @@ async def stream_completion(
         # ограничивать надо одновременные вызовы, а не их старты.
         async with call_slots():
             client = shared_client()
+            record_request(payload)
             async with client.stream(
                 "POST",
                 f"{OPENROUTER_BASE_URL}/chat/completions",

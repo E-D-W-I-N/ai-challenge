@@ -25,12 +25,12 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 |---|---|---|---|
 | Markdown, формат, JSON/stop | text.js | Чистый разбор и один путь текста в карточку под Node | Клиент; Промпт, контекст и метрики |
 | Панель → запрос | app.js: readPanel, applySettings, ensurePanelApplied, exchange | Реальные поля → payload под Node; контракт вызова в Python | Клиент; Промпт, контекст и метрики |
-| Поток, метрики, промпт | app.js: exchange, refreshCurrent, renderFeed, usageLine, showPrompt | Success/error, committed prompt, отмена/смена области; серверные суммы | Промпт, контекст и метрики; Клиент |
+| Поток, метрики, информация JSON | app.js: exchange, refreshCurrent, renderFeed, usageLine, showPrompt | Success/error, persisted JSON rounds/legacy, отмена/смена области; actual outbound payload/restart и серверные суммы | Промпт, контекст и метрики; Клиент |
 | CRUD и ошибки editor | records.js: startRecordEdit, loadMemory, editWorking/editMemory, editInvariant | Scope/id/различающий тип, один PATCH Enter/focusout, текст после отказа | Память и профиль; Инварианты и сторож; Клиент |
 | Профиль и аватар | records.js: loadProfile, saveProfile, toggleProfileMenu | Partial PATCH/dirty/error под Node; глобальность и prompt в Python | Память и профиль; Клиент |
 | Машина задачи | app.js: parseCommand, runCommand, taskApi | Двойной Enter и смена чата при PATCH под Node; stage/gate/atomic в Python | Состояние задачи |
 | Ветка и очистка | app.js: forkFrom, openAgent; app/agent.py, store.py | Владение, persist/restart/seq и заполненные слои до очистки | Ветвление; Хранение и очистка |
-| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | Список/поздний GET под Node; локальные initialize/list/call/env/stop в Python | MCP |
+| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | URL/save/connect/draft/поздний GET под Node; независимые HTTP initialize/list/call/reopen/races/stop и stdio env в Python | MCP |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
@@ -60,6 +60,11 @@ batch-100 и длинные серии 25/500 обменов больше не �
 3. Откройте аватар, просмотрите глобальный профиль, перейдите к editor;
    Escape возвращает фокус. Проверьте черновик/ошибку после смены областей,
    подписи full/window/summary, guard без метрик и пустой/down MCP.
+   В «Инструментах» сохраните произвольный name/URL независимого HTTP-сервиса,
+   подключите, переподключите и отключите; процесс сервиса остаётся жив.
+   Ошибка URL сохраняет draft/причину. Откройте информацию ответа: полный JSON
+   с messages/tools/параметрами и отдельными раундами остаётся после refresh;
+   старое сообщение честно говорит, что JSON недоступен.
 4. Один editor: смените текст/тип, Enter, focusout, Escape, пустую/неизменную
    правку. Одно подтверждение: Tab, Escape и возврат фокуса; стрелки/Home/End
    на вкладках, видимый outline и prefers-reduced-motion.
