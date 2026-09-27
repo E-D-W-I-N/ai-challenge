@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content     TEXT NOT NULL,
     error       TEXT,
     metrics     TEXT,
+    request_bodies TEXT,
     at          REAL NOT NULL,
     PRIMARY KEY (session_id, seq)
 );
@@ -521,6 +522,10 @@ class Store:
         """
         done: list[str] = []
         with self.tx() as conn:
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+            if "request_bodies" not in columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN request_bodies TEXT")
+                done.append("messages.request_bodies")
             # Колонка авторства прожила один день — ровно тот, в который
             # в оба слоя памяти писал ещё и служебный вызов. Вызова не стало,
             # писать осталось некому, кроме человека, и поле перестало
@@ -720,7 +725,7 @@ class Store:
             return bool(cursor.rowcount)
 
     def clear(self) -> None:
-        """Стирает базу целиком, включая `meta`, сводки, рабочую память, родство,
+        """Стирает данные чатов и счётчики, сохраняя app-wide MCP config; сводки, рабочую память, родство,
         долговременную память и профиль. Нужно только проверкам: оставленный счётчик
         имён отдал бы следующей номер посередине, оставленная сводка — чужое
         начало разговора, а оставленная строка родства сделала бы свежий чат
@@ -744,7 +749,7 @@ class Store:
             conn.execute("DELETE FROM profile")
             conn.execute("DELETE FROM invariants")
             conn.execute("DELETE FROM sessions")
-            conn.execute("DELETE FROM meta")
+            conn.execute("DELETE FROM meta WHERE key != 'mcp_config'")
 
     # --- сообщения -----------------------------------------------------------
 
@@ -765,6 +770,7 @@ class Store:
                 turn.error,
                 _dumps(turn.metrics) if turn.metrics else None,
                 turn.at,
+                _dumps(turn.request_bodies) if turn.request_bodies is not None else None,
             )
             for seq, turn in enumerate(turns)
         ]
@@ -772,8 +778,8 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             if rows:
                 conn.executemany(
-                    "INSERT INTO messages (session_id, seq, role, content, error, metrics, at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages (session_id, seq, role, content, error, metrics, at, request_bodies) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
             conn.execute(
@@ -783,7 +789,7 @@ class Store:
     def load_messages(self, session_id: str) -> list[dict]:
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT role, content, error, metrics, at FROM messages "
+                "SELECT role, content, error, metrics, at, request_bodies FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
@@ -794,6 +800,7 @@ class Store:
                 "error": r["error"],
                 "metrics": _loads(r["metrics"], None) if r["metrics"] else None,
                 "at": r["at"],
+                "request_bodies": _loads(r["request_bodies"], None),
             }
             for r in rows
         ]
@@ -1216,6 +1223,22 @@ class Store:
         return {row["field"]: row["content"] for row in rows}
 
     # --- meta: счётчики, общие на всю базу -----------------------------------
+
+    def load_mcp_config(self) -> dict:
+        with self.reading() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'mcp_config'").fetchone()
+        return _loads(row["value"], None) if row else {"revision": 0, "servers": []}
+
+    def save_mcp_config(self, servers, revision) -> dict:
+        from .mcp import McpConfigConflict
+        with self.tx() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'mcp_config'").fetchone()
+            current = _loads(row["value"], None) if row else {"revision": 0}
+            if current["revision"] != revision:
+                raise McpConfigConflict("Настройки MCP уже изменились")
+            config = {"revision": revision + 1, "servers": servers}
+            conn.execute("INSERT INTO meta(key,value) VALUES ('mcp_config',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_dumps(config),))
+        return redact(config)
 
     def next_counter(self, key: str) -> int:
         """Следующее число счётчика из базы, никогда не повторяющееся.
