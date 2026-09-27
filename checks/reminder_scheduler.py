@@ -138,6 +138,52 @@ async def execution(config, git_root, restart_service):
                 print(f"Actual JSON capture: 1 acknowledgement + 3 delayed rounds; due={due:.6f}, "
                       f"first_delayed={sent_at[1]:.6f}, lag_ms={(sent_at[1] - due) * 1000:.1f}; "
                       "all delayed bodies equal the committed assistant snapshot")
+
+        # A received request may time out before Agent.ask yields done. Preserve
+        # every actual delayed round on the resulting error card and after reload.
+        captured = []
+        stalled = asyncio.Event()
+        async def timeout_provider(request):
+            captured.append(json.loads(request.content))
+            index = len(captured) - 1
+            if index == 2:
+                await stalled.wait()
+            name, args = [
+                ("remind", {"text": "timeout capture", "in_seconds": .1, "every": .2}),
+                ("git_log", {"n": 5}),
+            ][index]
+            frame = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": f"timeout_{index}",
+                "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+            ending = {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+            return httpx.Response(200, text="data: " + json.dumps(frame) + "\n\n"
+                + "data: " + json.dumps(ending) + "\n\n" + "data: [DONE]\n\n")
+
+        timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(timeout_provider)) as offline_client:
+            with patch("app.reminders.RUN_SECONDS", 1), \
+                    patch.object(agent_module, "stream_completion", llm.stream_completion), \
+                    patch.object(llm, "shared_client", return_value=offline_client), \
+                    patch.object(llm, "api_key", return_value="offline-fixture"), \
+                    patch.object(store_module, "api_key", return_value="offline-fixture"), \
+                    patch.object(llm, "attribution_headers", return_value={}):
+                [event async for event in timeout_agent.ask("schedule a timeout")]
+                await until(lambda: len(timeout_agent.history) == 4)
+                await until(lambda: not scheduler.running)
+                assert len(captured) == 3 and captured[-1]["messages"][-1]["role"] == "tool"
+                error = timeout_agent.history[-1]
+                assert "TimeoutError" in error.content and "TimeoutError" in error.error
+                expected = json.loads(json.dumps(captured[1:]))
+                assert error.request_bodies == expected, "timeout lost actually sent model JSON"
+                restored = AgentRegistry(store=store).require(timeout_agent.id)
+                assert restored.history[-1].request_bodies == expected
+                captured[-1]["model"] = "mutated after receipt"
+                assert error.request_bodies == expected and restored.history[-1].request_bodies == expected
+                listing = await manager.reminder_protocol(remote, "reminders", {})
+                failed = next(i for i in listing["items"] if i["context_id"] == manager.context_for(timeout_agent.id))
+                assert failed["status"] == "failed" and failed["fired"] == 0, failed
+                await asyncio.sleep(.3)
+                assert len(captured) == 3 and not timeout_agent.busy
+                print("Timeout JSON capture: 2 received delayed rounds equal committed/reloaded error snapshot; no repeat")
         timestamps = []
 
         def actions(messages, index):
@@ -355,12 +401,53 @@ def lifespan_acceptance(config, directory):
             current = client.get(f"/api/agents/{original}").json()
             busy_poll = client.get(f"/api/agents/{original}", params={"known_history_revision": current["history_revision"]}).json()
             assert busy_poll["unchanged"] and busy_poll["busy"] and "transcript" not in busy_poll
-            cancelled = client.post(f"/api/agents/{original}/reminders/remind/{job['id']}/cancel", json={})
-            assert cancelled.status_code == 200 and cancelled.json()["cancelled"], cancelled.text
-            assert time.monotonic() - started < 1.0, "cancel waited for the model exchange lease"
+            scheduler = app.state.reminder_scheduler
+            async def gates():
+                return asyncio.Event(), asyncio.Event()
+            finish_started, finish_release = client.portal.call(gates)
+            protocol = manager.reminder_protocol
+            finished = []
+            async def gated_finish(server, tool, args, **kwargs):
+                ours = tool == "_reminder_finish" and args["id"] == job["id"]
+                if ours:
+                    finish_started.set()
+                    await finish_release.wait()
+                result = await protocol(server, tool, args, **kwargs)
+                if ours:
+                    finished.append(True)
+                return result
+
+            with patch.object(manager, "reminder_protocol", gated_finish):
+                executors = []
+                client.portal.call(lambda: executors.append(scheduler.running[("remind", job["id"])]))
+                try:
+                    cancelled = client.post(f"/api/agents/{original}/reminders/remind/{job['id']}/cancel", json={})
+                    assert cancelled.status_code == 200 and cancelled.json()["cancelled"], cancelled.text
+                    assert time.monotonic() - started < 1.0, "cancel waited for the model exchange lease"
+                    async def wait_for_finish():
+                        await asyncio.wait_for(finish_started.wait(), 2)
+                    client.portal.call(wait_for_finish)
+                    # Deterministic second cancellation while remote cleanup is
+                    # suspended, followed by the real poll that sees the deleted job.
+                    client.portal.call(executors[0].cancel)
+                    async def poll_once():
+                        await asyncio.wait_for(scheduler.tick(), 2)
+                    client.portal.call(poll_once)
+                finally:
+                    client.portal.call(finish_release.set)
+                async def drained():
+                    await until(lambda: not scheduler.running)
+                client.portal.call(drained)
+                fresh = client.get(f"/api/agents/{original}").json()
+                assert not fresh["busy"], "cancelled job leaked the originating chat reservation"
+                assert finished, "second cancellation interrupted remote outcome cleanup"
             time.sleep(.6)
             assert client.get(f"/api/agents/{original}").json()["history_len"] == 6
             assert len(_stub.CALLS) == 2
+            _stub.install(reply="Чат снова доступен", tool_calls=None)
+            continued = client.post(f"/api/agents/{original}/messages", json={"text": "continue after cancel"})
+            assert continued.status_code == 200, continued.text
+            assert client.get(f"/api/agents/{original}").json()["transcript"][-1]["content"] == "Чат снова доступен"
     store.close()
 
 

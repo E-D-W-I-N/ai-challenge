@@ -22,12 +22,17 @@ class ReminderScheduler:
         self.claims = {}
         self.invalidating = {}
 
+    @staticmethod
+    def _cancel(task):
+        if not task.done() and not task.cancelling():
+            task.cancel()
+
     async def invalidate(self, names):
         for name in names:
             self.invalidating[name] = self.invalidating.get(name, 0) + 1
         tasks = [task for (name, _), task in self.running.items() if name in names]
         for task in tasks:
-            task.cancel()
+            self._cancel(task)
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def resume(self, names):
@@ -53,7 +58,7 @@ class ReminderScheduler:
         tasks = [self.loop, *self.running.values()]
         for task in tasks:
             if task is not None:
-                task.cancel()
+                self._cancel(task)
         await asyncio.gather(*(t for t in tasks if t is not None), return_exceptions=True)
         # A task cancelled before its first instruction never enters its finally.
         for claim in claims:
@@ -82,7 +87,7 @@ class ReminderScheduler:
                 and s.name not in self.invalidating}
         for (owner, _), task in list(self.running.items()):
             if owner not in live:
-                task.cancel()
+                self._cancel(task)
         for server in list(self.manager.servers):
             if server.status != "ok" or not self.manager.schedules(server) or server.name in self.invalidating:
                 continue
@@ -92,13 +97,13 @@ class ReminderScheduler:
                 # Connection loss prevents further tool/model work for this service.
                 for (owner, _), task in list(self.running.items()):
                     if owner == server.name:
-                        task.cancel()
+                        self._cancel(task)
                 LOG.exception("Reminder service unavailable: %s", server.name)
                 continue
             items = {i["id"]: i for i in data["items"]}
             for (owner, rid), task in list(self.running.items()):
                 if owner == server.name and (rid not in items or items[rid]["status"] != "running"):
-                    task.cancel()
+                    self._cancel(task)
             prefix = self.manager.context_namespace + "/"
             for item in items.values():
                 if (item["status"] != "pending" or item["due_at"] > time.time()
@@ -149,12 +154,19 @@ class ReminderScheduler:
             return False
         running = self.running.get((server_name, rid))
         if running is not None:
-            running.cancel()
+            self._cancel(running)
         return True
+
+    async def _finish(self, server, item, token, error):
+        # Bound both the exchange lease wait and the remote call.
+        async with asyncio.timeout(server.timeout_s):
+            await self.manager.reminder_protocol(server, "_reminder_finish",
+                {"id": item["id"], "token": token, "error": error})
 
     async def _execute(self, server, item, token, agent):
         self.claims[(server.name, item["id"])]["started"] = True
         error = ""
+        requests = []
         question = f"[Напоминание №{item['id']}] Срок наступил. Выполни сейчас, без нового планирования: {item['text']}"
 
         async def valid():
@@ -172,7 +184,7 @@ class ReminderScheduler:
             async with asyncio.timeout(RUN_SECONDS):
                 done = None
                 events = agent.ask(question, scheduled={"id": item["id"], "server": server.name},
-                                   can_run=valid)
+                                   can_run=valid, request_bodies=requests)
                 async with contextlib.aclosing(events):
                     async for event in events:
                         if event["type"] == "done":
@@ -187,7 +199,7 @@ class ReminderScheduler:
                 if error and await valid() and not (done or {}).get("committed"):
                     agent._commit(question, "Ошибка напоминания: " + error, error,
                                   metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
-                                  request_bodies=(done or {}).get("request_bodies"))
+                                  request_bodies=requests)
         except asyncio.CancelledError:
             error = "исполнение остановлено; автоматического повтора нет"
             raise
@@ -197,12 +209,22 @@ class ReminderScheduler:
             with contextlib.suppress(Exception):
                 if await valid():
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}})
+                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
+                                  request_bodies=requests)
         finally:
+            finish = asyncio.create_task(self._finish(server, item, token, error))
             try:
-                await self.manager.reminder_protocol(server, "_reminder_finish",
-                    {"id": item["id"], "token": token, "error": error})
+                # Poll, cancel and shutdown may all cancel this executor. Keep
+                # its bounded outcome write alive until the reservation is safe
+                # to release; the original execution cancellation still unwinds.
+                while not finish.done():
+                    try:
+                        await asyncio.shield(finish)
+                    except asyncio.CancelledError:
+                        continue
+                finish.result()
             except Exception:
                 LOG.exception("Reminder outcome could not be persisted; claim will expire")
-            if agent is not None:
-                agent.release()
+            finally:
+                if agent is not None:
+                    agent.release()

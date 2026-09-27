@@ -1563,7 +1563,7 @@ class Agent:
     # --- обмен ---------------------------------------------------------------
 
     async def ask(self, user_text: str, *, scheduled: dict | None = None,
-                  can_run=None) -> AsyncIterator[dict]:
+                  can_run=None, request_bodies: list[dict] | None = None) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
         События: `compressing`, `start`, `reasoning`, `delta`, `tool_call`,
@@ -1813,6 +1813,11 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                 failure = f"{type(exc).__name__}: {exc}"
                 yield {"type": "error", "message": failure, "metrics": None}
+            finally:
+                # Scheduled timeout handling needs the actual bodies even when
+                # cancellation prevents this generator from yielding done.
+                if request_bodies is not None:
+                    request_bodies[:] = copy.deepcopy(requests)
 
             if cancelled and failure is None:
                 failure = "генерация отменена"
