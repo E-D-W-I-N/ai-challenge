@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru" data-theme="light">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -25,12 +25,7 @@
         <span class="plus" aria-hidden="true">+</span> Новый чат
       </button>
 
-      <label class="chat-search"><span class="sr-only">Поиск чатов</span><input id="chat-search" type="search" class="control" placeholder="Поиск чатов…"></label>
       <nav class="list" id="agent-list" aria-label="Чаты"></nav>
-
-      <footer class="sidebar-foot">
-        <button class="foot-btn" id="theme-toggle" type="button"></button>
-      </footer>
     </aside>
 
     <main class="workspace" id="workspace">
@@ -292,6 +287,8 @@
       <footer class="metrics-strip" aria-label="Метрики текущего чата" tabindex="0"><div class="tiles" id="tiles"></div><span id="chat-status" role="status"></span></footer>
     </main>
   </div>
+  <script src="/static/text.js"></script>
+  <script src="/static/records.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
