@@ -27,6 +27,17 @@ const state = {
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
   invariants: null,    // инварианты — ответ ручки, прочитанный на открытие вкладки
   mcp: null,           // серверы MCP — ответ ручки, прочитанный на открытие вкладки
+  workspace: "chat",
+  section: "model",
+  feedScroll: 0,
+  sectionScroll: new Map(),
+  settingsRevision: 0,
+  profile: null,
+  profileError: "",
+  profileLoading: null,
+  profileDirty: new Set(),
+  mcpRequest: null,
+  mcpEpoch: 0,
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -68,6 +79,10 @@ const ICONS = {
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
   lines: "M4 6h16M4 10h16M4 14h12M4 18h7",
   branch: "M7 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM7 9v10M17 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM17 9v2a4 4 0 0 1-4 4H7",
+  user: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2",
+  memory: "M4 6c0-5 16-5 16 0s-16 5-16 0zM4 6v12c0 5 16 5 16 0V6M4 12c0 5 16 5 16 0",
+  shield: "M12 3 3 7v6c0 5 9 9 9 9s9-4 9-9V7zM8 12l3 3 5-6",
+  tools: "m14 7 3 3 4-4a6 6 0 0 1-8 8L5 22l-3-3 8-8a6 6 0 0 1 8-8z",
 };
 
 // Узел одной строкой: тег, класс, текст. Текст ставится через textContent,
@@ -138,7 +153,7 @@ function totalField(name) {
   return total ? total[name] : null;
 }
 
-// Заполнение контекста — единственное в правой панели, что не про весь диалог:
+// Заполнение контекста в строке метрик относится к последнему обмену:
 // доля окна, занятая последним обменом. Усреднять её по диалогу нечего, а при
 // смене модели она сбрасывается: окно у новой модели другое, и прежний процент
 // к ней не относится. Плитка молчит прочерком, пока не придёт первый ответ
@@ -409,7 +424,11 @@ async function loadAgents(selectId) {
 function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
-  state.agents.forEach((agent) => box.appendChild(listItem(agent)));
+  const query = $("#chat-search").value.trim().toLocaleLowerCase();
+  const agents = state.agents.filter((agent) => agent.label.toLocaleLowerCase().includes(query));
+  agents.forEach((agent) => box.appendChild(listItem(agent)));
+  if (!agents.length) box.appendChild(el("p", "list-empty", query ? "Чаты не найдены" : "Пока нет чатов"));
+  renderWorkspaceHead();
 }
 
 // Пометка ветки: от кого чат отделился и сколько сообщений унёс. Одна
@@ -438,6 +457,7 @@ function listItem(agent) {
 
   const open = el("button", "item-open");
   open.type = "button";
+  if (active) open.setAttribute("aria-current", "page");
   const ico = el("span", "item-icon");
   ico.appendChild(icon("chat"));
   // Имя и пометка — в столбик: пометка обязана быть видна, а не только
@@ -449,7 +469,10 @@ function listItem(agent) {
   if (note) text.appendChild(el("span", "item-branch", note));
   open.append(ico, text);
   open.title = agent.label + "\n" + agent.model + (note ? "\n" + note : "");
-  open.onclick = () => openAgent(agent.id);
+  open.onclick = async () => {
+    await openAgent(agent.id);
+    if (NARROW.matches) setCollapsed("sidebar", true);
+  };
 
   const actions = el("div", "item-actions");
   actions.append(
@@ -488,7 +511,7 @@ function startRename(row, agent) {
       }
     }
     renderList();
-    if (state.current) renderFeed(state.current);
+    if (state.current && !state.busy) renderFeed(state.current);
   };
 
   input.onkeydown = (ev) => {
@@ -534,6 +557,14 @@ async function openAgent(agentId) {
     return loadAgents();
   }
   state.current = agent;
+  state.settingsRevision += 1;
+  // Рабочий редактор принадлежит прежнему чату; глобальные редакторы
+  // сохраняются. Переключение рабочей области сюда не попадает.
+  $("#mem-working").querySelectorAll(".mem-edit-box").forEach((box) => box.remove());
+  $("#mem-work-content").value = "";
+  $("#mem-work-kind").value = "";
+  workingStatus("");
+  state.feedScroll = 0;
   state.panelDirty = false;
   // Чат открывают, чтобы увидеть последнее сообщение: отмотанная лента
   // прошлого чата к новому отношения не имеет.
@@ -545,16 +576,18 @@ async function openAgent(agentId) {
   renderTaskHead();
   renderFeed(agent);
   fillPanel(agent);
+  syncChatControls();
   renderTiles();
 
   // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
   // заново, но только если вкладка открыта: закрытой они не нужны.
   state.memory = null;
+  state.memoryNote = "";
   // Значок новых записей — про **этот** чат, и число ему даёт сам чат, а не
   // слои: закрытая вкладка его не гасит, а показывает, сколько агент завёл
   // в открытом чате с тех пор, как ему показывали память. Своего вызова ему
   // здесь не нужно: обе ветки ниже кончаются отрисовкой, а она его считает.
-  if (memoryTabOpen()) loadMemory();
+  if (memoryTabOpen()) loadMemory(true);
   else renderMemory();
 
   const input = $("#input");
@@ -579,7 +612,7 @@ function renderFeed(agent) {
   // Подмена содержимого обнуляет прокрутку, поэтому положение после
   // перерисовки задаётся здесь явно и всегда: либо низ, либо то место,
   // где читатель остановился. Иначе браузер выбросит его в начало разговора.
-  const keep = state.stick ? null : feed.scrollTop;
+  const keep = state.stick ? null : state.workspace === "chat" ? feed.scrollTop : state.feedScroll;
   feed.innerHTML = "";
 
   const turns = agent.transcript;
@@ -602,6 +635,7 @@ function renderFeed(agent) {
     );
   });
   feed.scrollTop = keep === null ? feed.scrollHeight : keep;
+  if (keep !== null) state.feedScroll = keep;
 }
 
 function userBubble(text) {
@@ -923,7 +957,7 @@ function atBottom(feed) {
 }
 
 function scrollFeed() {
-  if (!state.stick) return;
+  if (!state.stick || state.workspace !== "chat") return;
   const feed = $("#feed");
   feed.scrollTop = feed.scrollHeight;
 }
@@ -948,8 +982,10 @@ function setBusy(busy) {
   send.appendChild(icon(busy ? "stop" : "send"));
   send.classList.toggle("stop", busy);
   send.title = busy ? "Остановить" : "Отправить";
+  send.setAttribute("aria-label", send.title);
   send.disabled = !busy && !state.hasKey;
   $("#input").disabled = busy;
+  $("#chat-status").textContent = busy ? "Идёт ответ…" : "";
   // Про ключ в интерфейсе не говорим и менять его отсюда нельзя: репозиторий
   // публичный, ключ живёт в .env и остаётся делом того, кто поднял сервер.
   if (!state.hasKey) hint("Стенд не настроен: нет .env — вызова к модели не будет.", true);
@@ -1294,7 +1330,7 @@ async function refreshCurrent(prompt) {
   // Обмен меняет краткосрочный слой: история выросла, а со сворачиванием
   // могла добавиться и сводка. Это событие, а не отрисовка, и при закрытой
   // вкладке оно молчит.
-  if (memoryTabOpen()) loadMemory();
+  if (memoryTabOpen()) loadMemory(true);
 }
 
 // ─────────────────────── панель настроек ──────────────────────
@@ -1303,6 +1339,94 @@ async function refreshCurrent(prompt) {
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
 const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp"];
+
+const SETTINGS_PAGES = {
+  model: ["Модель", "Параметры ответа и генерации", "Для текущего чата", "bot"],
+  agent: ["Агент", "Поведение и контекст помощника", "Для текущего чата", "user"],
+  memory: ["Память", "Реплики, записи о задаче и сведения надолго", "Рабочая — этот чат · долговременная — все чаты", "memory"],
+  profile: ["Профиль", "Как ассистент отвечает вам", "Для всех чатов", "user"],
+  invariants: ["Инварианты", "Правила, которые задаёт человек", "Для всех чатов", "shield"],
+  mcp: ["Инструменты", "Серверы MCP и доступные инструменты", "Для всего приложения", "tools"],
+};
+
+function renderWorkspaceHead() {
+  const title = state.current ? state.current.label : "AI Challenge";
+  $("#chat-title").textContent = title;
+  $("#chat-title").title = title;
+  document.title = title + " — AI Challenge";
+}
+
+function syncChatControls() {
+  const noChat = !state.current;
+  $("#settings-no-chat").classList.toggle("hidden", !noChat || !["model", "agent"].includes(state.section));
+  $("#save-status").classList.toggle("hidden", noChat || !["model", "agent"].includes(state.section));
+  ["model", "agent"].forEach((name) => {
+    $("#tab-" + name).querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
+  });
+}
+
+function loadVisibleSettings() {
+  if (state.workspace !== "settings") return;
+  if (state.section === "memory") loadMemory();
+  if (state.section === "profile") loadProfile();
+  if (state.section === "invariants") loadInvariants();
+  if (state.section === "mcp") loadMcp();
+}
+
+// Эти переключения меняют видимость уже смонтированных областей. Они не
+// открывают чат повторно: черновик, поток, промпты и задача остаются на месте.
+function showWorkspace(which, load = true) {
+  if (which === state.workspace) return;
+  if (state.workspace === "chat") state.feedScroll = $("#feed").scrollTop;
+  stopMcpPolling();
+  state.workspace = which;
+  $("#chat-workspace").classList.toggle("hidden", which !== "chat");
+  $("#panel").classList.toggle("hidden", which !== "settings");
+  ["chat", "settings"].forEach((name) => {
+    const tab = $("#workspace-" + name);
+    tab.classList.toggle("active", name === which);
+    tab.setAttribute("aria-selected", String(name === which));
+    tab.tabIndex = name === which ? 0 : -1;
+  });
+  if (which === "chat") {
+    $("#feed").scrollTop = state.stick ? $("#feed").scrollHeight : state.feedScroll;
+    autoGrow($("#input"));
+  } else if (load) loadVisibleSettings();
+}
+
+function showSettings(which, load = true) {
+  if (!PANEL_TABS.includes(which)) return;
+  if (state.workspace === "settings") state.sectionScroll.set(state.section, $("#panel-body").scrollTop);
+  showWorkspace("settings", false);
+  stopMcpPolling();
+  state.section = which;
+  document.querySelectorAll(".tab").forEach((tab) => {
+    const selected = tab.dataset.tab === which;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  PANEL_TABS.forEach((name) => $("#tab-" + name).classList.toggle("hidden", name !== which));
+  const [title, description, scope] = SETTINGS_PAGES[which];
+  $("#settings-title").textContent = title;
+  $("#settings-description").textContent = description;
+  $("#settings-scope").textContent = scope;
+  $("#save-status").classList.toggle("hidden", !["model", "agent"].includes(which));
+  $("#panel-body").scrollTop = state.sectionScroll.get(which) || 0;
+  syncChatControls();
+  if (load) loadVisibleSettings();
+}
+
+function tabKeys(ev, tabs, active, select) {
+  const keys = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+  if (!keys.includes(ev.key)) return;
+  ev.preventDefault();
+  const index = tabs.indexOf(active);
+  const next = ev.key === "Home" ? 0 : ev.key === "End" ? tabs.length - 1
+    : (index + (["ArrowLeft", "ArrowUp"].includes(ev.key) ? -1 : 1) + tabs.length) % tabs.length;
+  select(tabs[next]);
+  tabs[next].focus();
+}
 
 const NUMBER_FIELDS = [
   "temperature", "max_tokens", "top_p", "top_k", "min_p",
@@ -1558,7 +1682,8 @@ function paramWarnings(model, settings, extraBody, baseModel) {
 // постоянная подпись. Ошибка не гаснет: её надо прочитать и исправить.
 function saveStatus(text, isError) {
   const el = $("#save-status");
-  el.className = "save-status" + (isError ? " error" : "");
+  el.className = "save-status" + (isError ? " error" : "")
+    + (!["model", "agent"].includes(state.section) ? " hidden" : "");
   el.textContent = text || "";
   if (state.statusTimer) clearTimeout(state.statusTimer);
   state.statusTimer = null;
@@ -1647,6 +1772,7 @@ async function ensurePanelApplied() {
 
 function applySettings() {
   if (!state.current) return Promise.resolve();
+  const revision = ++state.settingsRevision;
   let patch;
   try {
     patch = readPanel();
@@ -1664,6 +1790,7 @@ function applySettings() {
   // «Применено» появлялось бы на каждое сообщение.
   const before = { ...state.current };
   const fields = Object.keys(patch);
+  saveStatus("Сохраняю…");
   state.applying = (async () => {
     try {
       const updated = await api("/api/agents/" + id, json("PATCH", patch));
@@ -1672,6 +1799,7 @@ function applySettings() {
       }
       const listed = state.agents.find((a) => a.id === id);
       if (listed) Object.assign(listed, updated);
+      if (revision !== state.settingsRevision || !state.current || state.current.id !== id) return;
       state.panelDirty = false;
       // Модель сменили — плитка контекста гаснет сразу, а не после следующего
       // ответа: окно у новой модели другое. Правка температуры её не трогает.
@@ -1685,8 +1813,9 @@ function applySettings() {
       // правдой всегда.
       if (fields.some((name) => !sameValue(before[name], updated[name]))) {
         saveStatus("Применено — со следующего сообщения.");
-      }
+      } else saveStatus("");
     } catch (err) {
+      if (revision !== state.settingsRevision || !state.current || state.current.id !== id) return;
       // Правка не доехала. Забыть про неё нельзя: в панели у пользователя
       // одно, у агента другое, а `change` уже отработал и сам не повторится.
       state.panelDirty = true;
@@ -1798,9 +1927,12 @@ function startRecordEdit(row, record, kinds, commit, opts) {
   // Поле и список — в одном блоке: уход фокуса с поля на список это не конец
   // правки, а её продолжение, и различить их можно только на общем родителе.
   const box = el("div", "mem-edit-box");
-  const input = el("input", "mem-edit");
+  const input = el("textarea", "mem-edit control area");
+  input.rows = 4;
+  input.setAttribute("aria-label", "Текст записи");
   input.value = record.content;
   const kind = el("select", "mem-edit-kind control");
+  kind.setAttribute("aria-label", "Тип записи");
   fillKinds(kind, kinds, "— оставить тип —");
   box.append(input, kind);
   // Третье поле — только у инвариантов, у которых оно и есть: слова
@@ -1812,6 +1944,7 @@ function startRecordEdit(row, record, kinds, commit, opts) {
     banned = el("input", "mem-edit-banned control");
     banned.value = bannedText(record.banned);
     banned.title = "Запрещённые слова через запятую";
+    banned.setAttribute("aria-label", banned.title);
     box.appendChild(banned);
   }
   row.replaceChild(box, shown);
@@ -1836,12 +1969,16 @@ function startRecordEdit(row, record, kinds, commit, opts) {
       const words = parseBanned(banned.value);
       if (words.join("\u0000") !== (record.banned || []).join("\u0000")) patch.banned = words;
     }
-    if (save && Object.keys(patch).length) await commit(patch);
+    if (save && Object.keys(patch).length && await commit(patch) === false) {
+      settled = false;
+      return;
+    }
+    box.remove();
     redraw();
   };
 
   const keys = (ev) => {
-    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); finish(true); }
     if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(false); }
   };
   input.onkeydown = keys;
@@ -1857,22 +1994,26 @@ function startRecordEdit(row, record, kinds, commit, opts) {
 }
 
 function memoryTabOpen() {
-  return !$("#tab-memory").classList.contains("hidden");
+  return state.workspace === "settings" && state.section === "memory";
 }
 
 // Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
-async function loadMemory() {
+async function loadMemory(force = false) {
+  if (!force && $("#tab-memory").querySelector(".mem-edit-box")) return;
   const id = state.current && state.current.id;
   state.memoryNote = "Читаю память…";
   renderMemory();
   try {
     // Чата ещё нет — общий слой всё равно можно показать: он не про чат.
     // Первые два раздела в этом случае честно говорят, что показывать нечего.
-    state.memory = id
+    const layers = id
       ? await api("/api/agents/" + id + "/memory")
       : { short_term: null, working: null, long_term: await api("/api/memory") };
+    if (id !== (state.current && state.current.id)) return;
+    state.memory = layers;
     state.memoryNote = "";
   } catch (err) {
+    if (id !== (state.current && state.current.id)) return;
     state.memory = null;
     state.memoryNote = String(err.message || err);
   }
@@ -1930,8 +2071,8 @@ const memBlank = () => memNote(state.memoryNote || "Чат ещё не откр�
 
 function renderMemory() {
   renderShortTerm($("#mem-short"));
-  renderWorking($("#mem-working"));
-  renderLongTerm($("#mem-long"));
+  if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
+  if (!$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
 }
 
 function renderShortTerm(box) {
@@ -1975,6 +2116,7 @@ function renderWorking(box) {
   if (!working) { box.appendChild(memBlank()); return; }
 
   const records = working.records || [];
+  const ownerId = state.current && state.current.id;
   if (!records.length) box.appendChild(memNote("Записей нет."));
   records.forEach((record) => {
     const line = workingLine(record);
@@ -1991,8 +2133,8 @@ function renderWorking(box) {
       btn,
       iconButton("pencil", "Поправить запись",
         () => startRecordEdit(row, record, WORKING_KINDS,
-          (patch) => editWorking(record, patch)), "mini"),
-      iconButton("trash", "Удалить запись", () => dropWorking(record), "mini danger")
+          (patch) => editWorking(record, patch, ownerId)), "mini"),
+      iconButton("trash", "Удалить запись", () => dropWorking(record, ownerId), "mini danger")
     );
     box.appendChild(row);
   });
@@ -2038,8 +2180,7 @@ function workingStatus(text, isError) {
 // выдаёт база, текст по дороге чистит `redact()`), перечитывать слой для
 // этого незачем. Второй способ на той же странице читался бы как другое
 // действие, и слои разъехались бы на первой правке.
-const workingUrl = (seq) => {
-  const id = state.current && state.current.id;
+const workingUrl = (seq, id = state.current && state.current.id) => {
   return "/api/agents/" + id + "/working" + (seq === undefined ? "" : "/" + seq);
 };
 
@@ -2069,27 +2210,35 @@ async function addWorking(kind, content) {
 // Правка метит запись человеком — это делает сервер, и ответ приходит уже
 // с новым автором. Подставь клиент своё «human» — экран говорил бы о записи
 // то, чего в базе нет.
-async function editWorking(record, patch) {
+async function editWorking(record, patch, ownerId) {
+  if (ownerId !== (state.current && state.current.id)) return false;
   try {
-    const updated = await api(workingUrl(record.seq), json("PATCH", patch));
+    const updated = await api(workingUrl(record.seq, ownerId), json("PATCH", patch));
+    if (ownerId !== (state.current && state.current.id)) return true;
     const working = state.memory && state.memory.working;
     if (working) {
       working.records = (working.records || [])
         .map((item) => (item.seq === updated.seq ? updated : item));
     }
     workingStatus("Запись поправлена: с этой минуты она ваша.");
+    return true;
   } catch (err) {
+    if (ownerId !== (state.current && state.current.id)) return false;
     workingStatus(String(err.message || err), true);
+    return false;
   }
 }
 
-async function dropWorking(record) {
+async function dropWorking(record, ownerId) {
+  if (ownerId !== (state.current && state.current.id)) return;
   try {
-    await api(workingUrl(record.seq), { method: "DELETE" });
+    await api(workingUrl(record.seq, ownerId), { method: "DELETE" });
   } catch (err) {
+    if (ownerId !== (state.current && state.current.id)) return;
     workingStatus(String(err.message || err), true);
     return;
   }
+  if (ownerId !== (state.current && state.current.id)) return;
   const working = state.memory && state.memory.working;
   if (working) {
     working.records = (working.records || []).filter((item) => item.seq !== record.seq);
@@ -2109,8 +2258,10 @@ async function editMemory(record, patch) {
         .map((item) => (item.seq === updated.seq ? updated : item));
     }
     memoryStatus("Запись поправлена: с этой минуты она ваша.");
+    return true;
   } catch (err) {
     memoryStatus(String(err.message || err), true);
+    return false;
   }
 }
 
@@ -2248,20 +2399,26 @@ function profileStatus(text, isError) {
   box.textContent = text || "";
 }
 
-function showProfile(values) {
-  PROFILE_FIELDS.forEach((name) => {
-    profileInput(name).value = values[name] || "";
-  });
-}
-
 async function loadProfile() {
-  try {
-    const answer = await api("/api/profile");
-    showProfile(answer.profile || {});
-    profileStatus("");
-  } catch (err) {
-    profileStatus(String(err.message || err), true);
-  }
+  if (state.profileLoading) return state.profileLoading;
+  const held = Object.fromEntries(PROFILE_FIELDS.map((name) => [name, profileInput(name).value]));
+  state.profileLoading = (async () => {
+    try {
+      const answer = await api("/api/profile");
+      state.profile = answer.profile || {};
+      if (!state.profileDirty.size) state.profileError = "";
+      PROFILE_FIELDS.forEach((name) => {
+        if (!state.profileDirty.has(name) && profileInput(name).value === held[name]) profileInput(name).value = state.profile[name] || "";
+      });
+      if (!state.profileDirty.size) profileStatus("");
+    } catch (err) {
+      state.profileError = String(err.message || err);
+      profileStatus(state.profileError, true);
+    }
+    renderProfileSummary();
+  })();
+  await state.profileLoading;
+  state.profileLoading = null;
 }
 
 // Правка одного поля: уезжает **только тронутое**, остальные не называются
@@ -2269,18 +2426,62 @@ async function loadProfile() {
 // в первой. Пустая строка поле снимает: отдельной кнопки «очистить» нет,
 // ровно как у системного промпта чата.
 async function saveProfile(name) {
+  if (!PROFILE_FIELDS.includes(name)) return;
   const field = profileInput(name);
+  const sent = field.value;
+  profileStatus("Сохраняю…");
   try {
-    const answer = await api("/api/profile", json("PATCH", { [name]: field.value }));
+    const answer = await api("/api/profile", json("PATCH", { [name]: sent }));
     const values = answer.profile || {};
     // Показываем **записанное**, а не набранное: текст по дороге чистит
     // `redact()`, и поле обязано показывать то, что уедет в промпт.
-    showProfile(values);
+    state.profile = values;
+    state.profileError = "";
+    if (field.value === sent) {
+      field.value = values[name] || "";
+      state.profileDirty.delete(name);
+    }
+    renderProfileSummary();
     profileStatus(PROFILE_FIELDS.some((key) => values[key])
       ? "Профиль сохранён: он уезжает системным сообщением в каждый запрос."
       : "Профиль пуст: к запросам не добавляется ничего.");
   } catch (err) {
-    profileStatus(String(err.message || err), true);
+    state.profileError = String(err.message || err);
+    profileStatus(state.profileError, true);
+    renderProfileSummary();
+  }
+}
+
+function renderProfileSummary() {
+  const box = $("#profile-summary");
+  box.innerHTML = "";
+  const filled = state.profile && PROFILE_FIELDS.filter((name) => state.profile[name]);
+  $("#profile-toggle").classList.toggle("configured", Boolean(filled && filled.length));
+  if (state.profileError) box.appendChild(el("p", "hint error", state.profileError));
+  else if (!state.profile) box.appendChild(el("p", "hint", "Читаю профиль…"));
+  else if (!filled.length) box.appendChild(el("p", "hint", "Профиль пока пуст. Задайте стиль, формат или контекст ответа."));
+  if (filled) filled.forEach((name) => {
+    const row = el("div", "profile-summary-field");
+    row.append(el("strong", "", { style: "Стиль", format: "Формат", context: "Контекст" }[name]),
+      el("p", "", state.profile[name]));
+    box.appendChild(row);
+  });
+}
+
+function closeProfileMenu(returnFocus = false) {
+  $("#profile-menu").classList.add("hidden");
+  $("#profile-toggle").setAttribute("aria-expanded", "false");
+  if (returnFocus) $("#profile-toggle").focus();
+}
+
+function toggleProfileMenu() {
+  const open = $("#profile-menu").classList.contains("hidden");
+  $("#profile-menu").classList.toggle("hidden", !open);
+  $("#profile-toggle").setAttribute("aria-expanded", String(open));
+  if (open) {
+    renderProfileSummary();
+    loadProfile();
+    $("#profile-edit").focus();
   }
 }
 
@@ -2311,10 +2512,10 @@ function invariantStatus(text, isError) {
 }
 
 async function loadInvariants() {
+  if ($("#inv-list").querySelector(".mem-edit-box")) return;
   try {
     const answer = await api("/api/invariants");
     state.invariants = answer.records || [];
-    invariantStatus("");
   } catch (err) {
     state.invariants = null;
     invariantStatus(String(err.message || err), true);
@@ -2324,6 +2525,7 @@ async function loadInvariants() {
 
 function renderInvariants() {
   const box = $("#inv-list");
+  if (box.querySelector(".mem-edit-box")) return;
   box.innerHTML = "";
   const records = state.invariants;
   if (!records) { box.appendChild(memNote($("#inv-status").textContent || "Читаю…")); return; }
@@ -2378,8 +2580,10 @@ async function editInvariant(record, patch) {
     state.invariants = (state.invariants || [])
       .map((item) => (item.seq === updated.seq ? updated : item));
     invariantStatus("Инвариант поправлен.");
+    return true;
   } catch (err) {
     invariantStatus(String(err.message || err), true);
+    return false;
   }
 }
 
@@ -2419,17 +2623,39 @@ async function addInvariantFromForm() {
 // и запрос внутри отрисовки превратил бы один поход на сервер в поток.
 
 async function loadMcp() {
+  if (!toolsVisible() || state.mcpRequest) return;
+  const epoch = state.mcpEpoch;
+  const controller = new AbortController();
+  state.mcpRequest = controller;
   try {
-    const answer = await api("/api/mcp");
+    const answer = await api("/api/mcp", { signal: controller.signal });
+    if (epoch !== state.mcpEpoch) return;
     state.mcp = answer.servers || [];
   } catch (err) {
+    if (epoch !== state.mcpEpoch) return;
     state.mcp = null;
+  } finally {
+    if (state.mcpRequest === controller) state.mcpRequest = null;
   }
+  if (epoch !== state.mcpEpoch || !toolsVisible()) return;
   renderMcp();
+}
+
+function toolsVisible() {
+  return state.workspace === "settings" && state.section === "mcp" && document.visibilityState !== "hidden";
+}
+
+function stopMcpPolling() {
+  state.mcpEpoch += 1;
+  if (state.mcpRequest) {
+    state.mcpRequest.abort();
+    state.mcpRequest = null;
+  }
 }
 
 function renderMcp() {
   const box = $("#mcp-list");
+  const expanded = new Set(Array.from(box.querySelectorAll("details")).filter((node) => node.open).map((node) => node.dataset.tool));
   box.innerHTML = "";
   const servers = state.mcp;
   // Пустой менеджер назван словами, а не показан пустым экраном: «не
@@ -2437,18 +2663,29 @@ function renderMcp() {
   if (!servers) { box.appendChild(memNote("Не читается: ручка ответила ошибкой.")); return; }
   if (!servers.length) { box.appendChild(memNote("MCP не подключён.")); return; }
   servers.forEach((server) => {
-    const row = el("div", "mem-item");
-    row.appendChild(el("div", "mem-kind",
-      server.name + " · " + (server.status === "ok" ? "подключён" : "не отвечает")));
+    const row = el("article", "mcp-server");
+    const head = el("header", "mcp-server-head");
+    head.append(el("h3", "mcp-server-name", server.name),
+      el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : "Не отвечает"));
+    row.appendChild(head);
+    if (server.error) row.appendChild(el("p", "hint error", server.error));
     const tools = server.tools || [];
     if (!tools.length) row.appendChild(memNote("инструментов нет"));
     tools.forEach((tool) => {
-      row.appendChild(el("div", "mem-text", tool.name + " — " + (tool.description || "")));
+      const card = el("div", "mcp-tool");
+      card.append(el("h4", "mcp-tool-name", tool.name),
+        el("p", "mcp-tool-description", tool.description || "Описания нет."));
       // Схема свёрнута: она нужна, когда спрашивают «что умеет», а не всегда.
       const schema = el("details", "mem-note");
-      schema.appendChild(el("summary", "", "схема параметров"));
-      schema.appendChild(el("pre", "", JSON.stringify(tool.schema || {}, null, 2)));
-      row.appendChild(schema);
+      schema.dataset.tool = server.name + ":" + tool.name;
+      schema.open = expanded.has(schema.dataset.tool);
+      schema.appendChild(el("summary", "", "Схема параметров"));
+      const code = el("pre", "", JSON.stringify(tool.schema || {}, null, 2));
+      code.tabIndex = 0;
+      code.setAttribute("aria-label", "Схема параметров " + tool.name);
+      schema.appendChild(code);
+      card.appendChild(schema);
+      row.appendChild(card);
     });
     box.appendChild(row);
   });
@@ -2456,12 +2693,12 @@ function renderMcp() {
 
 // ─────────────────────────── плитки ───────────────────────────
 
-// Плитки справа — про весь диалог, а не про последний ответ: сколько всего
+// Метрики снизу — про весь диалог, кроме доли окна: сколько всего
 // ушло в модель, сколько она вернула, во что это обошлось и сколько было
 // сообщений. Числа одного обмена написаны под ним самим в ленте, и подписей
 // «накопленное» здесь больше нет — в панели теперь всё и так про разговор.
 //
-// Плиток шесть, сетка 2×3: пустых клеток в последнем ряду не остаётся.
+// Метрик шесть; на телефоне общая строка прокручивается горизонтально.
 const TILES = [
   ["Входные токены", () => fmt.tokens(totalField("prompt_tokens"))],
   ["Выходные токены", () => fmt.tokens(totalField("completion_tokens"))],
@@ -2495,10 +2732,10 @@ function renderTiles() {
 
 // ─────────────────── сворачивание и тема ──────────────────────
 
-const KEYS = { sidebar: "ui.sidebar", panel: "ui.panel", theme: "ui.theme" };
+const KEYS = { sidebar: "ui.sidebar", theme: "ui.theme" };
 
 function store(key, value) {
-  try { localStorage.setItem(key, value); } catch (e) { /* приватный режим — не беда */ }
+  try { localStorage.setItem(key, value); } catch (e) { /* приватный режим */ }
 }
 function read(key, fallback) {
   try {
@@ -2513,88 +2750,77 @@ function applyTheme(theme) {
   btn.innerHTML = "";
   const ico = el("span", "foot-icon");
   ico.appendChild(icon(theme === "dark" ? "sun" : "moon"));
-  btn.append(ico, el("span", "foot-label", theme === "dark" ? "Светлая тема" : "Тёмная тема"));
+  btn.append(ico, el("span", "foot-label", theme === "dark" ? "Тёмная тема" : "Светлая тема"));
+  btn.setAttribute("aria-label", theme === "dark" ? "Включить светлую тему" : "Включить тёмную тему");
+  btn.setAttribute("aria-pressed", String(theme === "dark"));
 }
 
 const NARROW = window.matchMedia("(max-width: 940px)");
 
-// Свёрнутый борт оставляет на экране кнопку разворота: иначе вернуть его
-// было бы нечем.
 function applyCollapsed(which, collapsed) {
-  $("#app").classList.toggle(which === "sidebar" ? "no-sidebar" : "no-panel", collapsed);
-  const id = which === "sidebar" ? "restore-sidebar" : "restore-panel";
-  const existing = document.getElementById(id);
-  if (existing) existing.remove();
-  if (collapsed) {
-    const btn = iconButton(
-      which === "sidebar" ? "panelLeft" : "panelRight",
-      which === "sidebar" ? "Показать список" : "Показать настройки",
-      () => setCollapsed(which, false)
-    );
-    btn.id = id;
-    btn.classList.add("floating-toggle", which === "sidebar" ? "left" : "right");
-    document.querySelector(".chat").appendChild(btn);
+  if (which !== "sidebar") return;
+  $("#app").classList.toggle("no-sidebar", collapsed);
+  const sidebar = $("#sidebar");
+  sidebar.inert = collapsed;
+  sidebar.setAttribute("aria-hidden", String(collapsed));
+  $("#restore-sidebar").setAttribute("aria-expanded", String(!collapsed));
+  $("#workspace").inert = NARROW.matches && !collapsed;
+  if (NARROW.matches && !collapsed) {
+    sidebar.setAttribute("role", "dialog");
+    sidebar.setAttribute("aria-label", "Список чатов");
+    sidebar.setAttribute("aria-modal", "true");
+  } else {
+    sidebar.removeAttribute("role");
+    sidebar.removeAttribute("aria-modal");
   }
   syncBackdrop();
 }
 
 function isCollapsed(which) {
-  return $("#app").classList.contains(which === "sidebar" ? "no-sidebar" : "no-panel");
+  return which === "sidebar" && $("#app").classList.contains("no-sidebar");
 }
 
 function setCollapsed(which, collapsed) {
-  // На узком окне свёрнутость — это состояние ящика, а не выбор пользователя:
-  // запоминать её нельзя, иначе она переедет на широкое окно и там оба борта
-  // окажутся закрыты без причины.
-  if (!NARROW.matches) store(KEYS[which], collapsed ? "1" : "0");
+  if (!NARROW.matches) store(KEYS.sidebar, collapsed ? "1" : "0");
   applyCollapsed(which, collapsed);
-  // Ящики не соседствуют: открыли один — второй закрывается.
-  if (NARROW.matches && !collapsed) {
-    const other = which === "sidebar" ? "panel" : "sidebar";
-    if (!isCollapsed(other)) applyCollapsed(other, true);
-  }
+  if (collapsed) $("#restore-sidebar").focus();
+  else if (NARROW.matches) { closeProfileMenu(); $("#sidebar-toggle").focus(); }
 }
 
 function openDrawers() {
-  return ["sidebar", "panel"].filter((which) => !isCollapsed(which));
+  return isCollapsed("sidebar") ? [] : ["sidebar"];
 }
 
 function closeDrawers() {
-  openDrawers().forEach((which) => applyCollapsed(which, true));
+  setCollapsed("sidebar", true);
 }
 
-// Затемнение под открытым ящиком: по клику в него ящик закрывается.
 function syncBackdrop() {
   const existing = document.querySelector(".backdrop");
-  const needed = NARROW.matches && openDrawers().length > 0;
-  if (!needed) {
-    if (existing) existing.remove();
-    return;
-  }
+  const needed = NARROW.matches && !isCollapsed("sidebar");
+  if (!needed) { if (existing) existing.remove(); return; }
   if (existing) return;
   const backdrop = el("div", "backdrop");
   backdrop.onclick = closeDrawers;
   document.body.appendChild(backdrop);
 }
 
-// Какие борта свёрнуты при данной ширине. Отдельной функцией без DOM —
-// решение проверяется без браузера.
 function layoutFor(narrow, stored) {
-  // На узком окне борта — ящики поверх ленты, и оба закрыты: иначе от чата
-  // остаётся полоска посередине.
-  if (narrow) return { sidebar: true, panel: true };
-  return { sidebar: stored.sidebar === "1", panel: stored.panel === "1" };
+  return { sidebar: narrow || stored.sidebar === "1" };
 }
 
-// Ширина окна изменилась: на узком закрываем оба борта, на широком
-// возвращаем то, что пользователь выбрал сам.
 function applyWidth() {
-  const want = layoutFor(NARROW.matches, {
-    sidebar: read(KEYS.sidebar, "0"),
-    panel: read(KEYS.panel, "0"),
-  });
+  const want = layoutFor(NARROW.matches, { sidebar: read(KEYS.sidebar, "0") });
+  const wasInside = $("#sidebar").contains(document.activeElement);
   applyCollapsed("sidebar", want.sidebar);
-  applyCollapsed("panel", want.panel);
+  if (want.sidebar && wasInside) $("#restore-sidebar").focus();
+  $(".tabs").setAttribute("aria-orientation", NARROW.matches ? "horizontal" : "vertical");
+}
+
+function escapeAction(hasDialog, narrow, openDrawerCount) {
+  if (hasDialog) return "dialog";
+  if (narrow && openDrawerCount > 0) return "drawers";
+  return null;
 }
 
 // ─────────────────── новый чат и подтверждения ────────────────
@@ -2611,15 +2837,24 @@ function confirmBox(title, text, confirmLabel, onYes) {
   const wrap = el("div", "confirm");
   const box = el("div", "confirm-box");
   const row = el("div", "confirm-row");
+  const previousFocus = document.activeElement;
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-modal", "true");
+  box.setAttribute("aria-labelledby", "confirm-title");
 
   const close = () => {
     document.removeEventListener("keydown", onKey);
     wrap.remove();
+    if (previousFocus && document.body.contains(previousFocus)) previousFocus.focus();
   };
   // Escape закрывает диалог всегда, а не только на узком окне: выйти
   // из подтверждения необратимого действия надо уметь не глядя.
   const onKey = (ev) => {
     if (ev.key === "Escape") close();
+    if (ev.key === "Tab") {
+      ev.preventDefault();
+      (document.activeElement === no ? yes : no).focus();
+    }
   };
   document.addEventListener("keydown", onKey);
 
@@ -2630,10 +2865,13 @@ function confirmBox(title, text, confirmLabel, onYes) {
   yes.type = "button";
   yes.onclick = () => { close(); onYes(); };
   row.append(no, yes);
-  box.append(el("h3", "", title), el("p", "", text), row);
+  const heading = el("h3", "", title);
+  heading.id = "confirm-title";
+  box.append(heading, el("p", "", text), row);
   wrap.appendChild(box);
   wrap.onclick = (ev) => { if (ev.target === wrap) close(); };
   document.body.appendChild(wrap);
+  no.focus();
 }
 
 async function newChat() {
@@ -2641,6 +2879,8 @@ async function newChat() {
   const created = await api("/api/agents", json("POST", {}));
   state.current = null;
   await loadAgents(created.agents[0].id);
+  showWorkspace("chat");
+  if (NARROW.matches) setCollapsed("sidebar", true);
   $("#input").focus();
 }
 
@@ -2648,9 +2888,29 @@ async function newChat() {
 
 function init() {
   $("#sidebar-toggle").appendChild(icon("panelLeft"));
-  $("#panel-toggle").appendChild(icon("panelRight"));
+  $("#restore-sidebar").appendChild(icon("panelLeft"));
   $("#sidebar-toggle").onclick = () => setCollapsed("sidebar", true);
-  $("#panel-toggle").onclick = () => setCollapsed("panel", true);
+  $("#restore-sidebar").onclick = () => setCollapsed("sidebar", isCollapsed("sidebar") ? false : true);
+  $("#chat-search").oninput = renderList;
+  $(".avatar").appendChild(icon("user"));
+  $("#profile-toggle").onclick = toggleProfileMenu;
+  $("#profile-edit").onclick = () => {
+    closeProfileMenu();
+    showSettings("profile", false);
+    $("#profile-style").focus();
+  };
+  document.addEventListener("click", (ev) => {
+    if (!$(".profile-control").contains(ev.target)) closeProfileMenu();
+  });
+  document.addEventListener("focusin", (ev) => {
+    if (!$(".profile-control").contains(ev.target)) closeProfileMenu();
+  });
+  ["chat", "settings"].forEach((name) => {
+    const tab = $("#workspace-" + name);
+    tab.onclick = () => showWorkspace(name);
+    tab.onkeydown = (ev) => tabKeys(ev, [$("#workspace-chat"), $("#workspace-settings")], tab,
+      (next) => showWorkspace(next.id === "workspace-chat" ? "chat" : "settings"));
+  });
 
   applyTheme(read(KEYS.theme, "light"));
   $("#theme-toggle").onclick = () => {
@@ -2662,15 +2922,26 @@ function init() {
   applyWidth();
   NARROW.addEventListener("change", applyWidth);
   document.addEventListener("keydown", (ev) => {
+    if (document.querySelector(".confirm")) return;
+    if (ev.key === "Tab" && NARROW.matches && !isCollapsed("sidebar")) {
+      const sidebar = $("#sidebar");
+      const buttons = Array.from(sidebar.querySelectorAll("button"));
+      const inputs = Array.from(sidebar.querySelectorAll("input"));
+      const nodes = [...buttons, ...inputs].filter((node) => !node.disabled &&
+        (!node.getClientRects || node.getClientRects().length));
+      const index = nodes.indexOf(document.activeElement);
+      const next = ev.shiftKey ? (index - 1 + nodes.length) % nodes.length : (index + 1) % nodes.length;
+      if (nodes.length) { ev.preventDefault(); nodes[next].focus(); }
+    }
     if (ev.key !== "Escape") return;
-    const what = escapeAction(
-      Boolean(document.querySelector(".confirm")),
-      NARROW.matches,
-      openDrawers().length
-    );
-    // Диалог закрывает себя сам — свой обработчик он вешает поверх этого.
-    if (what === "drawers") closeDrawers();
+    if (!$("#profile-menu").classList.contains("hidden")) { closeProfileMenu(true); return; }
+    if (NARROW.matches && openDrawers().length) closeDrawers();
   });
+  document.addEventListener("visibilitychange", () => {
+    stopMcpPolling();
+    if (toolsVisible()) loadMcp();
+  });
+  window.addEventListener?.("pagehide", stopMcpPolling);
 
   $("#new-chat").onclick = () => newChat();
 
@@ -2693,32 +2964,25 @@ function init() {
     if (id === "f-strategy") syncStrategyFields();
     applySettings();
   });
+  $("#panel-body").addEventListener("input", (ev) => {
+    if (String(ev.target.id || "").startsWith("f-")) {
+      state.settingsRevision += 1;
+      state.panelDirty = true;
+      saveStatus("Изменения не сохранены");
+    }
+    const name = String(ev.target.id || "").slice("profile-".length);
+    if (PROFILE_FIELDS.includes(name)) state.profileDirty.add(name);
+  });
 
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.onclick = () => {
-      const which = tab.dataset.tab;
-      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      PANEL_TABS.forEach((name) => $("#tab-" + name).classList.toggle("hidden", name !== which));
-      // Память запрашивается здесь и только здесь: лениво, на открытие
-      // вкладки. Отрисовка своего запроса не делает — см. `loadMemory`.
-      // Открытие вкладки — ещё и отметка «показано»: счётчик новых записей
-      // с этой минуты считает заново. Обмен и смена чата читают слои без
-      // отметки, иначе считать было бы нечего.
-      if (which === "memory") loadMemory();
-      // Профиль — тем же порядком и по тому же доводу: лениво, на открытие
-      // вкладки. Он глобальный, и перечитывать его на смену чата незачем.
-      if (which === "profile") loadProfile();
-      // Инварианты — тем же порядком и по тому же доводу: лениво, на открытие
-      // вкладки. Слой глобальный, и перечитывать его на смену чата незачем.
-      if (which === "invariants") loadInvariants();
-      // Инструменты MCP — тем же порядком и по тому же доводу: лениво,
-      // на открытие вкладки. Вкладка только показывает, править тут нечего.
-      if (which === "mcp") loadMcp();
-    };
+  const tabs = Array.from(document.querySelectorAll(".tab"));
+  tabs.forEach((tab) => {
+    tab.querySelector(".tab-icon").appendChild(icon(SETTINGS_PAGES[tab.dataset.tab][3]));
+    tab.onclick = () => showSettings(tab.dataset.tab);
+    tab.onkeydown = (ev) => tabKeys(ev, tabs, tab, (next) => showSettings(next.dataset.tab));
   });
 
   $("#feed").addEventListener("scroll", () => {
-    state.stick = atBottom($("#feed"));
+    if (state.workspace === "chat") state.stick = atBottom($("#feed"));
   });
 
   const input = $("#input");
@@ -2742,6 +3006,7 @@ function init() {
   renderTiles();
   renderTaskHead();
   renderMemory();
+  syncChatControls();
   loadAgents().catch((err) => hint(String(err.message || err), true));
 }
 

@@ -8,12 +8,10 @@
 </head>
 <body>
   <div class="app" id="app">
-
-    <!-- ── слева: список агентов ─────────────────────────────────────── -->
     <aside class="sidebar" id="sidebar">
       <header class="sidebar-head">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true">◆</span>
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M7 33 20 7l13 26M13 25h14" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
             <span class="brand-sub">чат · день 16</span>
@@ -27,55 +25,68 @@
         <span class="plus" aria-hidden="true">+</span> Новый чат
       </button>
 
-      <nav class="list" id="agent-list" aria-label="Агенты"></nav>
+      <label class="chat-search"><span class="sr-only">Поиск чатов</span><input id="chat-search" type="search" class="control" placeholder="Поиск чатов…"></label>
+      <nav class="list" id="agent-list" aria-label="Чаты"></nav>
 
       <footer class="sidebar-foot">
         <button class="foot-btn" id="theme-toggle" type="button"></button>
       </footer>
     </aside>
 
-    <!-- ── по центру: лента ──────────────────────────────────────────── -->
-    <main class="chat">
-      <!-- Шапка задачи: этап, текущий шаг и ожидаемое действие. Пуста
-           в разметке — наполняет её `renderTaskHead` по полю `task` агента,
-           и при выключенном режиме её нет вовсе. Кнопок здесь нет: состояние
-           двигают командами в поле ввода. -->
+    <main class="workspace" id="workspace">
+      <header class="workspace-head">
+        <button class="icon-btn" id="restore-sidebar" type="button" aria-label="Показать список чатов" aria-controls="sidebar" aria-expanded="true"></button>
+        <h1 id="chat-title">AI Challenge</h1>
+        <div class="workspace-switch" role="tablist" aria-label="Рабочая область">
+          <button id="workspace-chat" class="workspace-tab active" type="button" role="tab" aria-selected="true" aria-controls="chat-workspace">Чат</button>
+          <button id="workspace-settings" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="panel" tabindex="-1">Настройки</button>
+        </div>
+        <div class="profile-control">
+          <button id="profile-toggle" class="profile-toggle" type="button" aria-label="Профиль пользователя" aria-expanded="false" aria-controls="profile-menu">
+            <span class="avatar" aria-hidden="true"></span><span class="profile-chevron" aria-hidden="true">⌄</span>
+          </button>
+          <section class="profile-menu hidden" id="profile-menu" aria-label="Профиль пользователя">
+            <h2>Профиль пользователя</h2>
+            <p class="hint">Как ассистент отвечает вам во всех чатах</p>
+            <div id="profile-summary" role="status"></div>
+            <button id="profile-edit" class="primary-btn" type="button">Редактировать профиль</button>
+          </section>
+        </div>
+      </header>
       <div class="task-head hidden" id="task-head" role="status"></div>
+    <section class="chat" id="chat-workspace" role="tabpanel" aria-labelledby="workspace-chat">
 
-      <div class="feed" id="feed"></div>
+      <div class="feed" id="feed"><div class="empty"><h2>Начните разговор</h2><p>Создайте или выберите чат в списке слева.</p></div></div>
 
       <form class="composer" id="composer">
         <div class="composer-box">
-          <textarea id="input" class="composer-input" rows="1"
+          <textarea id="input" aria-label="Сообщение" class="composer-input" rows="1"
                     placeholder="Напишите сообщение… (/task — работа по этапам, Shift+Enter — новая строка)"></textarea>
           <button class="send-btn" id="send" type="submit" title="Отправить"
                   aria-label="Отправить"></button>
         </div>
         <div class="composer-hint" id="composer-hint"></div>
       </form>
-    </main>
+    </section>
 
-    <!-- ── справа: настройки агента ──────────────────────────────────── -->
-    <aside class="panel" id="panel">
-      <header class="panel-head">
-        <div class="tabs" role="tablist">
-          <button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab">Модель</button>
-          <button class="tab" data-tab="agent" type="button" role="tab">Агент</button>
-          <button class="tab" id="tab-btn-memory" data-tab="memory" type="button"
-                  role="tab">Память</button>
-          <button class="tab" id="tab-btn-profile" data-tab="profile" type="button"
-                  role="tab">Профиль</button>
-          <button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button"
-                  role="tab">Инварианты</button>
-          <button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button"
-                  role="tab">Инструменты</button>
-        </div>
-        <button class="icon-btn" id="panel-toggle" type="button"
-                title="Свернуть настройки" aria-label="Свернуть настройки"></button>
-      </header>
-
-      <div class="panel-body" id="panel-body">
-        <section class="tab-page" id="tab-model">
+      <section class="panel hidden" id="panel" role="tabpanel" aria-labelledby="workspace-settings">
+        <nav class="settings-nav" aria-label="Разделы настроек">
+          <div class="tabs" role="tablist" aria-label="Настройки" aria-orientation="vertical">
+<button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab" aria-controls="tab-model" aria-selected="true" tabindex="0"><span class="tab-icon" aria-hidden="true"></span>Модель</button>
+<button class="tab" id="tab-btn-agent" data-tab="agent" type="button" role="tab" aria-controls="tab-agent" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Агент</button>
+<button class="tab" id="tab-btn-memory" data-tab="memory" type="button" role="tab" aria-controls="tab-memory" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Память</button>
+<button class="tab" id="tab-btn-profile" data-tab="profile" type="button" role="tab" aria-controls="tab-profile" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Профиль</button>
+<button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button" role="tab" aria-controls="tab-invariants" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Инварианты</button>
+<button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button" role="tab" aria-controls="tab-mcp" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Инструменты</button>
+          </div>
+        </nav>
+        <div class="panel-body" id="panel-body">
+          <header class="settings-head">
+            <div><h2 id="settings-title">Модель</h2><p id="settings-description">Параметры ответа и генерации</p><span class="scope-badge" id="settings-scope">Для текущего чата</span></div>
+            <div class="save-status" id="save-status" role="status"></div>
+          </header>
+          <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель и агента.</p>
+        <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
           <label class="field">
             <span class="field-label">Модель</span>
             <select id="f-model" class="control"></select>
@@ -145,32 +156,18 @@
           <p class="hint">Пустое поле — параметр не отправляется вовсе.</p>
         </section>
 
-        <section class="tab-page hidden" id="tab-agent">
-          <!-- Пометка ветки: от кого чат отделился, сколько унёс и то, что он
-               сам по себе. Не поле — менять происхождение нельзя: это не
-               настройка. Спрятана разметкой, потому что у обычного чата её
-               нет вовсе; кому её показать, решает `fillBranch` в app.js. -->
+        <section class="tab-page hidden" id="tab-agent" role="tabpanel" aria-labelledby="tab-btn-agent" tabindex="0">
+
           <p class="branch-note hidden" id="branch-note" role="note"></p>
 
-          <label class="field">
+          <div class="settings-card prompt-card"><label class="field">
             <span class="field-label">Системный промпт</span>
             <textarea id="f-system" class="control area" rows="14" placeholder="без системного промпта"></textarea>
           </label>
 
-          <!-- Поля контекста на всю ширину, а не в два столбца: подписи здесь длиннее
-               соседских, и в узкой колонке они переносились на разное число строк,
-               разводя поля ввода по высоте. Сетку это больше не задевает, а страховка
-               от того же на любой длине подписи стоит в .grid2/.grid3 (style.css).
-
-               Числа спрятаны в разметке, а не показаны: умолчание стратегии — `full`,
-               а при ней не работает ни одно из них. Кто виден и как подписан, решает
-               `syncStrategyFields` в app.js — одним местом на все три варианта.
-
-               Вариантов три, и все три про одно: сколько реплик уедет в модель
-               дословно. «Факты» отсюда ушли — выписку состояния задачи агент ведёт
-               при любом варианте, и пунктом переключателя она быть перестала. -->
-          <label class="field">
-            <span class="field-label">Управление контекстом</span>
+          </div>
+          <div class="settings-card"><h3>Управление контекстом</h3><div class="grid3 context-grid"><label class="field">
+            <span class="field-label">Стратегия</span>
             <select id="f-strategy" class="control">
               <option value="full">Вся история</option>
               <option value="window">Скользящее окно</option>
@@ -186,50 +183,23 @@
             <input id="f-compress_every" class="control" type="number" step="1" placeholder="—">
           </label>
 
-        </section>
+        </div><p class="hint">Выбранная стратегия определяет, какие сообщения попадут в следующий запрос.</p></div></section>
 
-        <!-- Память агента: три слоя, по разделу на каждый, в порядке от
-             короткого к долгому. Разделы пусты в разметке намеренно — их
-             наполняет `renderMemory` по ответу `GET /api/agents/{id}/memory`,
-             и запрашивается он лениво, на открытие вкладки: панель
-             перерисовывается на каждый обмен, а слои меняются заметно реже.
+        <section class="tab-page hidden" id="tab-memory" role="tabpanel" aria-labelledby="tab-btn-memory" tabindex="0">
 
-             Заголовки называют слои **по существу**, а не по области: «этот
-             диалог» и «эта задача» у нас одно и то же, и читались они
-             одинаково. Реплики / записи о задаче / записи навсегда —
-             и объяснять после этого нечего.
-
-             Поля этого раздела нарочно **без** приставки `f-`: её носят поля
-             конфига чата, которые пролив панели шлёт PATCH'ем. Память — не
-             настройка чата, у неё свои ручки, и общий слушатель `change`
-             на #panel-body отличает одно от другого ровно по этой приставке. -->
-        <section class="tab-page hidden" id="tab-memory">
-          <!-- Сводки — здесь, рядом с историей, а не в рабочей памяти:
-               память это то, что пропадёт, если её выключить, а сводка
-               не пропадает — выключи сворачивание, и она соберётся заново.
-               Она не запомненное, а чем заменено то, что не уехало дословно,
-               и место ей ровно там, где сказано, сколько не уехало. -->
           <div class="mem-layer">
-            <h3 class="mem-title">Краткосрочная — реплики</h3>
+            <h3 class="mem-title">Краткосрочная — реплики</h3><p class="layer-scope">Для текущего чата</p>
             <div class="mem-body" id="mem-short"></div>
           </div>
 
-          <!-- Рабочий слой правится руками ровно так же, как долговременный:
-               у каждой записи правка и корзина, внизу форма с выбором типа.
-               Второго способа здесь нет намеренно — слои устроены одинаково,
-               и разной формой они разъехались бы на первой же правке. -->
           <div class="mem-layer">
-            <h3 class="mem-title">Рабочая — записи о задаче</h3>
+            <h3 class="mem-title">Рабочая — записи о задаче</h3><p class="layer-scope">Для текущего чата</p>
             <div class="mem-body" id="mem-working"></div>
 
-            <!-- Форма прячется вместе со слоем: область рабочей памяти —
-                 разговор, и пока слоя нет на экране (чат не открыт, слои
-                 не доехали), записывать некуда. Тип выбирается явно
-                 и умолчания не имеет — как и в долговременной форме. -->
             <div class="mem-form hidden" id="mem-work-form">
               <label class="field">
                 <span class="field-label">Запись о задаче</span>
-                <textarea id="mem-work-content" class="control area" rows="2"
+                <textarea id="mem-work-content" class="control area" rows="4"
                           placeholder="например: срок — конец мая"></textarea>
               </label>
               <div class="mem-add-row">
@@ -244,26 +214,18 @@
           </div>
 
           <div class="mem-layer">
-            <h3 class="mem-title">Долговременная — записи навсегда</h3>
+            <h3 class="mem-title">Долговременная — записи навсегда</h3><p class="layer-scope">Для всех чатов</p>
             <div class="mem-body" id="mem-long"></div>
 
-            <!-- Форма добавления. Тип записи выбирается явно и умолчания
-                 не имеет ни здесь, ни на сервере: первым пунктом списка стоит
-                 пустой «— выберите тип —», а ручка отказывает и отсутствующему
-                 ключу. Сюда кладёт **только** человек: агент в этот слой
-                 не пишет вовсе, и «явно выбирать, что и куда сохраняется» —
-                 не половина работы, а вся. -->
             <label class="field">
               <span class="field-label">Запись навсегда</span>
-              <textarea id="mem-content" class="control area" rows="2"
+              <textarea id="mem-content" class="control area" rows="4"
                         placeholder="например: пишу на Kotlin"></textarea>
             </label>
             <div class="mem-add-row">
               <label class="field">
                 <span class="field-label">Тип записи</span>
-                <!-- Опции пусты в разметке: их строит `fillKinds` из той же
-                     карты типов, по которой подписаны записи в списке. Двумя
-                     таблицами подписи разъехались бы молча. -->
+
                 <select id="mem-kind" class="control"></select>
               </label>
               <button class="mem-add" id="mem-add" type="button">Запомнить</button>
@@ -272,51 +234,33 @@
           </div>
         </section>
 
-        <!-- Профиль: как отвечать именно этому человеку. Три поля свободного
-             текста — стиль, формат и контекст, — и ничего кроме: примеры
-             стоят подсказками в самих полях.
-
-             Поля тоже **без** приставки `f-`: профиль не настройка чата —
-             он один на всю базу, у него своя ручка, и PATCH чата при правке
-             стиля был бы запросом ни о чём. Общий слушатель `change`
-             на #panel-body различает их по приставке. -->
-        <section class="tab-page hidden" id="tab-profile">
+        <section class="tab-page settings-card hidden" id="tab-profile" role="tabpanel" aria-labelledby="tab-btn-profile" tabindex="0">
           <label class="field">
             <span class="field-label">Стиль</span>
-            <textarea id="profile-style" class="control area" rows="2"
+            <textarea id="profile-style" class="control area" rows="4"
                       placeholder="например: кратко, без вступлений, на ты"></textarea>
           </label>
           <label class="field">
             <span class="field-label">Формат</span>
-            <textarea id="profile-format" class="control area" rows="2"
+            <textarea id="profile-format" class="control area" rows="4"
                       placeholder="например: с примерами кода, списком"></textarea>
           </label>
           <label class="field">
             <span class="field-label">Контекст</span>
-            <textarea id="profile-context" class="control area" rows="2"
+            <textarea id="profile-context" class="control area" rows="4"
                       placeholder="например: собираю ТЗ на мобильное приложение"></textarea>
           </label>
-          <p class="hint" id="profile-status"></p>
+          <p class="hint" id="profile-status" role="status"></p>
         </section>
 
-        <!-- Инварианты: чего ассистент не вправе предлагать. Слой глобальный,
-             как память и профиль, и наполняет его только человек.
-
-             Поля тоже **без** приставки `f-`: инвариант не настройка чата —
-             он один на всю базу, у него своя ручка, и PATCH чата при правке
-             запрещённых слов был бы запросом ни о чём.
-
-             Запрещённые слова видны здесь и правятся здесь, но в промпт
-             не уезжают ни одним символом: это знание сторожа, который
-             смотрит на ответ, а не подсказка модели. -->
-        <section class="tab-page hidden" id="tab-invariants">
+        <section class="tab-page hidden" id="tab-invariants" role="tabpanel" aria-labelledby="tab-btn-invariants" tabindex="0">
           <div class="mem-layer">
             <h3 class="mem-title">Инварианты — чего нельзя предлагать</h3>
             <div class="mem-body" id="inv-list"></div>
 
             <label class="field">
               <span class="field-label">Инвариант</span>
-              <textarea id="inv-content" class="control area" rows="2"
+              <textarea id="inv-content" class="control area" rows="4"
                         placeholder="например: бэкенд только на Python"></textarea>
             </label>
             <label class="field">
@@ -327,8 +271,7 @@
             <div class="mem-add-row">
               <label class="field">
                 <span class="field-label">Вид инварианта</span>
-                <!-- Опции пусты в разметке: их строит `fillKinds` из той же
-                     карты видов, которой подписаны записи в списке. -->
+
                 <select id="inv-kind" class="control"></select>
               </label>
               <button class="mem-add" id="inv-add" type="button">Записать</button>
@@ -337,27 +280,18 @@
           </div>
         </section>
 
-        <!-- Инструменты MCP: серверы, их статус и инструменты с описанием
-             и схемой. Вкладка только показывает — полей здесь нет вовсе.
-             Запрашивается лениво, на открытие вкладки (`loadMcp`), ровно
-             как слои памяти, профиль и инварианты. Пустой менеджер назван
-             словами, а не показан пустым экраном. -->
-        <section class="tab-page hidden" id="tab-mcp">
+        <section class="tab-page hidden" id="tab-mcp" role="tabpanel" aria-labelledby="tab-btn-mcp" tabindex="0">
           <div class="mem-layer">
             <h3 class="mem-title">Инструменты MCP</h3>
             <div class="mem-body" id="mcp-list"></div>
           </div>
         </section>
-      </div>
 
-      <div class="panel-save">
-        <div class="save-status" id="save-status"></div>
-      </div>
-
-      <div class="tiles" id="tiles"></div>
-    </aside>
+        </div>
+      </section>
+      <footer class="metrics-strip" aria-label="Метрики текущего чата" tabindex="0"><div class="tiles" id="tiles"></div><span id="chat-status" role="status"></span></footer>
+    </main>
   </div>
-
   <script src="/static/app.js"></script>
 </body>
 </html>
