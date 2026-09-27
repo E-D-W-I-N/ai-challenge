@@ -959,6 +959,7 @@ summary { cursor: pointer; padding: 8px 0; }
 .foot-icon svg { width: 22px; height: 22px; }
 .icon-btn { width: 36px; height: 36px; color: var(--muted); }
 #restore-sidebar { flex: 0 0 auto; }
+.app:not(.no-sidebar) #restore-sidebar { display: none; }
 .app.no-sidebar .sidebar { visibility: hidden; }
 .chat { flex: 1; height: auto; }
 .feed, .composer { padding-left: clamp(20px, 5vw, 80px); padding-right: clamp(20px, 5vw, 80px); }
