@@ -52,6 +52,33 @@ const promptKey = (agentId, index) => agentId + ":" + index;
 
 const $ = (sel) => document.querySelector(sel);
 
+const { fmt, has, renderMarkdown, NUMBER_FIELDS, readStopLines, parseResponseFormat, paramWarnings, sameValue } =
+  typeof module !== "undefined" ? require("./text.js") : globalThis.ChatText;
+const createRecords = typeof module !== "undefined"
+  ? require("./records.js") : globalThis.createChatRecords;
+const {
+  MEMORY_KINDS,
+  WORKING_KINDS,
+  INVARIANT_KINDS,
+  PROFILE_FIELDS,
+  memoryTabOpen,
+  loadMemory,
+  renderMemory,
+  workingStatus,
+  loadProfile,
+  saveProfile,
+  closeProfileMenu,
+  toggleProfileMenu,
+  loadInvariants,
+  loadMcp,
+  toolsVisible,
+  stopMcpPolling,
+  fillKinds,
+  addFromForm,
+  addWorkingFromForm,
+  addInvariantFromForm
+} = createRecords({ state, $, el, iconButton, api, json, fmt });
+
 // Сколько пикселей от низа ленты ещё считается «читатель внизу».
 const STICK_SLACK = 80;
 
@@ -64,16 +91,12 @@ const STATUS_FADE_MS = 5000;
 // кнопка.
 const ICONS = {
   panelLeft: "M3 3h18v18H3zM9 3v18",
-  panelRight: "M3 3h18v18H3zM15 3v18",
   chat: "M21 12a8 8 0 0 1-8 8H7l-4 3v-5a8 8 0 0 1 8-11h2a8 8 0 0 1 8 8z",
   bot: "M12 3v3M6 8h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM9 13h.01M15 13h.01",
-  copy: "M9 9h10v10H9zM5 15H4V4h11v1",
   refresh: "M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5",
   dots: "M12 5h.01M12 12h.01M12 19h.01",
   send: "M4 12l16-8-6 16-2.5-6.5z",
   stop: "M7 7h10v10H7z",
-  sun: "M12 5V3M12 21v-2M5 12H3M21 12h-2M6.5 6.5L5 5M19 19l-1.5-1.5M6.5 17.5L5 19M19 5l-1.5 1.5M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z",
-  moon: "M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z",
   clock: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
   pencil: "M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z",
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
@@ -120,28 +143,6 @@ function iconButton(name, title, onClick, className = "icon-btn") {
   return btn;
 }
 
-// ─────────────────────────── формат ───────────────────────────
-
-const fmt = {
-  sec: (ms) => (ms === null || ms === undefined ? "—" : (ms / 1000).toFixed(2)),
-  rate: (v) => (v ? v.toFixed(1) : "—"),
-  cost: (v) => (v === null || v === undefined ? "—" : "$" + Number(v).toFixed(6)),
-  pct: (v) => (v === null || v === undefined ? "—" : v.toFixed(1) + " %"),
-  // Токены: тысячи разделяются, от десяти тысяч — «12.4k». Прочерк остаётся
-  // прочерком: ноль — это ответ, а «неизвестно» — его отсутствие, и на экране
-  // они обязаны выглядеть по-разному.
-  tokens: (v) => {
-    if (v === null || v === undefined) return "—";
-    const n = Number(v);
-    if (!isFinite(n)) return "—";
-    // Порог для «M» стоит там, где округление в «k» уже дало бы «1000k»:
-    // такое число читается как миллион, миллионом его и пишем.
-    if (Math.abs(n) >= 999500) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
-    if (Math.abs(n) >= 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
-    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
-  },
-};
-
 // Поле итога по чату. Итог приходит с сервера полем `usage_total` — считает
 // его агент, клиент только показывает: здесь не складывается ни одного
 // слагаемого, и досчитать «всего» вместо смолчавшего провайдера клиент тоже
@@ -164,10 +165,6 @@ function totalField(name) {
 // расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
 // на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
 // плитку после каждого ответа, навсегда.
-function has(value) {
-  return value !== null && value !== undefined;
-}
-
 // Метрики упавшего обмена приходят с пустыми числами: заполнены `error`,
 // `model` и время, а `prompt_tokens`, `total_tokens`, `cost_usd`
 // и `context_fill_pct` — `null`. Класть такой набор поверх прежнего значило бы
@@ -240,116 +237,6 @@ function contextFill() {
 // на месте, приглушается цветом и объясняется подсказкой.
 function contextIsPast() {
   return state.contextPast && contextFill() !== null;
-}
-
-// ─────────────────────────── markdown ─────────────────────────
-
-// Свой разбор: заголовки, списки, цитаты, код, жирный, курсив, ссылки.
-// Текст модели сначала экранируется целиком, поэтому разметка из ответа
-// не может стать разметкой страницы.
-function escapeHtml(text) {
-  return String(text)
-    // Меткой inline-кода служит \u0000: пришли модель его в тексте, разбор
-    // подставил бы на его место чужой кусок. Выбрасываем до всего остального.
-    .replace(/\u0000/g, "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-// Метка, которой на время разбора подменяется inline-код: внутри кода
-// разметка не разбирается.
-const CODE_MARK = "\u0000";
-
-function inlineMarkdown(text) {
-  let out = escapeHtml(text);
-  const codes = [];
-  out = out.replace(/`([^`]+)`/g, (_, code) => {
-    codes.push(code);
-    return CODE_MARK + (codes.length - 1) + CODE_MARK;
-  });
-  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  out = out.replace(/(^|[^_\w])_([^_\n]+)_/g, "$1<em>$2</em>");
-  // Ссылка только на http(s): javascript: в href из ответа модели недопустим.
-  out = out.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    '<a href="$2" rel="noreferrer noopener" target="_blank">$1</a>'
-  );
-  out = out.replace(
-    new RegExp(CODE_MARK + "(\\d+)" + CODE_MARK, "g"),
-    (_, i) => "<code>" + (codes[Number(i)] || "") + "</code>"
-  );
-  return out;
-}
-
-function renderMarkdown(text) {
-  const lines = String(text || "").split("\n");
-  const html = [];
-  let list = null;        // "ul" | "ol" | null
-  let paragraph = [];
-  let code = null;        // накопитель строк внутри ```
-
-  const closeParagraph = () => {
-    if (paragraph.length) {
-      html.push("<p>" + inlineMarkdown(paragraph.join("\n")) + "</p>");
-      paragraph = [];
-    }
-  };
-  const closeList = () => {
-    if (list) { html.push("</" + list + ">"); list = null; }
-  };
-  const openList = (kind) => {
-    if (list !== kind) { closeList(); html.push("<" + kind + ">"); list = kind; }
-  };
-  const pushCode = () => html.push("<pre><code>" + escapeHtml(code.join("\n")) + "</code></pre>");
-
-  for (const raw of lines) {
-    if (code !== null) {
-      if (/^\s*```/.test(raw)) { pushCode(); code = null; } else { code.push(raw); }
-      continue;
-    }
-    if (/^\s*```/.test(raw)) { closeParagraph(); closeList(); code = []; continue; }
-
-    const line = raw.replace(/\s+$/, "");
-    if (!line.trim()) { closeParagraph(); closeList(); continue; }
-
-    const heading = line.match(/^(#{1,3})\s+(.*)$/);
-    if (heading) {
-      closeParagraph(); closeList();
-      const level = heading[1].length;
-      html.push("<h" + level + ">" + inlineMarkdown(heading[2]) + "</h" + level + ">");
-      continue;
-    }
-    if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
-      closeParagraph(); closeList(); html.push("<hr>"); continue;
-    }
-    const quote = line.match(/^>\s?(.*)$/);
-    if (quote) {
-      closeParagraph(); closeList();
-      html.push("<blockquote>" + inlineMarkdown(quote[1]) + "</blockquote>");
-      continue;
-    }
-    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (bullet) {
-      closeParagraph(); openList("ul");
-      html.push("<li>" + inlineMarkdown(bullet[1]) + "</li>");
-      continue;
-    }
-    const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (ordered) {
-      closeParagraph(); openList("ol");
-      html.push("<li>" + inlineMarkdown(ordered[1]) + "</li>");
-      continue;
-    }
-    closeList();
-    paragraph.push(line);
-  }
-  if (code !== null) pushCode();
-  closeParagraph();
-  closeList();
-  return html.join("");
 }
 
 // ─────────────────────────── сеть ─────────────────────────────
@@ -425,10 +312,8 @@ async function loadAgents(selectId) {
 function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
-  const query = $("#chat-search").value.trim().toLocaleLowerCase();
-  const agents = state.agents.filter((agent) => agent.label.toLocaleLowerCase().includes(query));
-  agents.forEach((agent) => box.appendChild(listItem(agent)));
-  if (!agents.length) box.appendChild(el("p", "list-empty", query ? "Чаты не найдены" : "Пока нет чатов"));
+  state.agents.forEach((agent) => box.appendChild(listItem(agent)));
+  if (!state.agents.length) box.appendChild(el("p", "list-empty", "Пока нет чатов"));
   renderWorkspaceHead();
 }
 
@@ -472,7 +357,6 @@ function listItem(agent) {
   open.title = agent.label + "\n" + agent.model + (note ? "\n" + note : "");
   open.onclick = async () => {
     await openAgent(agent.id);
-    if (NARROW.matches) setCollapsed("sidebar", true);
   };
 
   const actions = el("div", "item-actions");
@@ -678,7 +562,6 @@ function answerCard(agent, turn, index) {
 
   const actions = el("div", "card-actions");
   actions.append(
-    iconButton("copy", "Копировать ответ", () => copyText(turn.content)),
     iconButton("refresh", "Перегенерировать", () => regenerate()),
     iconButton("dots", "Показать сырой текст", () => showRaw(card, turn)),
     // Ветка отсюда — у каждого ответа и при любой стратегии: ветвление про
@@ -940,15 +823,6 @@ function showPrompt(card, prompt) {
   // Над телом ответа, но под «Рассуждением»: показанный промпт — про то, что
   // уехало в модель, и стоять ему выше ответа, к которому он привёл.
   card.insertBefore(box, card.querySelector(".card-body"));
-}
-
-async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    hint("Скопировано.");
-  } catch (e) {
-    hint("Скопировать не вышло — браузер не дал доступ к буферу.", true);
-  }
 }
 
 // Лента доматывается вниз, только если читатель и так внизу. Отмотал
@@ -1429,11 +1303,6 @@ function tabKeys(ev, tabs, active, select) {
   tabs[next].focus();
 }
 
-const NUMBER_FIELDS = [
-  "temperature", "max_tokens", "top_p", "top_k", "min_p",
-  "repetition_penalty", "presence_penalty", "frequency_penalty",
-];
-
 // Управление контекстом — не параметры сэмплирования: в тело запроса они не
 // уезжают ни одним ключом и по `supported_parameters` модели не проверяются.
 // Сжатие наше, а не провайдерское. Отдельным списком именно поэтому: попади
@@ -1590,95 +1459,6 @@ function readNumber(name) {
   return value;
 }
 
-// Стоп-строки: по одной в строке, пустые не в счёт. Отдельной функцией
-// без DOM — разбор проверяется без браузера.
-function readStopLines(text) {
-  const lines = String(text || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return lines.length ? lines : null;
-}
-
-// Формат ответа: частый случай выбирается из списка, редкий пишется JSON.
-// Кривой JSON — понятная ошибка, а не молчаливая отправка мусора провайдеру.
-function parseResponseFormat(kind, raw) {
-  if (!kind) return null;
-  if (kind === "json_object") return { type: "json_object" };
-  const text = String(raw || "").trim();
-  if (!text) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (e) {
-    throw new Error("формат ответа: это не JSON — " + e.message);
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("формат ответа: нужен объект JSON");
-  }
-  return parsed;
-}
-
-// Параметры панели в терминах OpenRouter. Наши поля — `system` и `model` —
-// параметрами не уходят и по `supported_parameters` не проверяются.
-const PROVIDER_PARAMS = [...NUMBER_FIELDS, "stop", "response_format"];
-
-// Чем заданные параметры не сойдутся с выбранной моделью. Предупреждать надо
-// **до** отправки: на каждом вызове стоит provider.require_parameters=true,
-// и параметр, которого модель не заявляет, выкашивает провайдеров — вместо
-// ответа придёт ошибка, по которой не понять, что виноват один переключатель.
-// Отдельной функцией без DOM — решение проверяется без браузера.
-function paramWarnings(model, settings, extraBody, baseModel) {
-  const warnings = [];
-
-  // Чат, привязанный к одному поставщику, на чужой модели ответа не получит.
-  // Говорим об этом ровно в тот момент, когда модель меняют: постоянная
-  // надпись про настройку, которой не видно, только сбивает с толку.
-  const pinned = ((extraBody || {}).provider || {}).order;
-  if (Array.isArray(pinned) && pinned.length && baseModel && settings.model !== baseModel) {
-    warnings.push(
-      `Этот чат привязан к одному поставщику моделей — ${pinned.join(", ")}. ` +
-        `Если у него нет «${settings.model}», ответа не будет: вернётся ошибка. ` +
-        `Раньше здесь стояла «${baseModel}».`
-    );
-  }
-
-  // Каталог не загрузился или модель в нём не нашлась — про параметры молчим:
-  // пугать предупреждением, которого не на чем основать, хуже.
-  if (!model) return warnings;
-
-  const declared = model.supported_parameters || [];
-  if (declared.length) {
-    const missing = PROVIDER_PARAMS.filter(
-      (name) => settings[name] !== null && settings[name] !== undefined && !declared.includes(name)
-    );
-    if (missing.length) {
-      warnings.push(
-        `«${model.id}» не заявляет ${missing.join(", ")}. ` +
-          "Запрос уходит с provider.require_parameters, поэтому подходящего " +
-          "провайдера может не найтись — вместо ответа придёт ошибка."
-      );
-    }
-  }
-
-  const cap = model.temperature_cap;
-  if (
-    model.temperature_capped &&
-    settings.temperature !== null &&
-    settings.temperature !== undefined &&
-    cap !== null &&
-    cap !== undefined &&
-    settings.temperature > cap
-  ) {
-    warnings.push(
-      `«${model.id}» обрезает temperature на ${cap.toFixed(1)}: ` +
-        `на ${settings.temperature} ` +
-        "запрос вернётся с ошибкой, хотя temperature эта модель и заявляет."
-    );
-  }
-  return warnings;
-}
-
 // Строка состояния гаснет сама: «Применено» — сообщение о событии, а не
 // постоянная подпись. Ошибка не гаснет: её надо прочитать и исправить.
 function saveStatus(text, isError) {
@@ -1695,25 +1475,6 @@ function saveStatus(text, isError) {
   }, STATUS_FADE_MS);
 }
 
-// Одинаковы ли два значения конфига. Не `==`: `null` — это «параметр
-// не отправлять», и он не равен ни нулю, ни пустой строке, а `==` их уравнял бы.
-// Не `JSON.stringify`: порядок ключей в объекте от провайдера не гарантирован.
-function sameValue(a, b) {
-  const empty = (v) => v === null || v === undefined;
-  if (empty(a) || empty(b)) return empty(a) && empty(b);
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    return a.every((item, i) => sameValue(item, b[i]));
-  }
-  if (typeof a === "object" || typeof b === "object") {
-    if (typeof a !== "object" || typeof b !== "object") return false;
-    const keys = Object.keys(a);
-    if (keys.length !== Object.keys(b).length) return false;
-    return keys.every((k) => Object.prototype.hasOwnProperty.call(b, k) && sameValue(a[k], b[k]));
-  }
-  return a === b;
-}
-
 // Что сейчас набрано в панели. Бросает, если поле не разобрать.
 function readPanel() {
   const patch = {
@@ -1725,8 +1486,6 @@ function readPanel() {
       $("#f-response_format").value
     ),
     strategy: $("#f-strategy").value,
-    // Выключатель памяти уезжает при любой стратегии: он не про историю,
-    // а про слой поверх неё, и прятать его не за чем.
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
   return patch;
@@ -1827,871 +1586,6 @@ function applySettings() {
 }
 
 
-// ────────────────────── вкладка «Память» ──────────────────────
-
-// Три слоя памяти агента — по разделу на каждый, в порядке от короткого
-// к долгому. Данные приходят одним ответом `GET /api/agents/{id}/memory`:
-// `short_term` — счётчик сообщений этого чата, `working` — записи о состоянии
-// задачи и сводки этого чата, `long_term` — выключатель чата и общий на всю
-// базу список.
-//
-// Ответ лежит в `state.memory`, и отрисовка берёт всё оттуда: **запрос идёт
-// на открытие вкладки, а не на отрисовку**. Панель перерисовывается на каждый
-// обмен и на каждую правку конфига, а слои столько раз не меняются — запрос
-// внутри отрисовки превратил бы один поход на сервер в поток.
-//
-// Перечитывается память там, где она правда изменилась: при открытии другого
-// чата (первые два слоя — его собственные) и после обмена (история выросла,
-// память обновилась). И то и другое — события, а не отрисовки, и оба молчат,
-// пока вкладка закрыта.
-
-// Типы записей: токен для сервера и русская подпись. Одна карта на список
-// записей и на дропдаун формы — его опции строятся отсюда же (`fillKinds`).
-// Второй таблицей подписи разъехались бы молча: в списке стояло бы одно
-// слово, а в форме другое. Слова те же, что в `MEMORY_LABELS` на сервере, —
-// ими же память подписана и в промпте.
-const MEMORY_KINDS = [
-  ["profile", "о собеседнике"],
-  ["decision", "решение"],
-  ["knowledge", "факт"],
-];
-
-const memoryKindLabel = (kind) =>
-  (MEMORY_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
-
-// Типы записей рабочей памяти — состояние задачи. Список свой, а не общий
-// с долговременной: слои разные, и «цель» в одном не значит того же, что
-// «о собеседнике» в другом. Слова те же, что в `WORKING_LABELS` на сервере, — ими
-// же запись подписана и в промпте.
-const WORKING_KINDS = [
-  ["goal", "цель"],
-  ["limit", "ограничение"],
-  ["decision", "решение"],
-  ["question", "открытый вопрос"],
-];
-
-const workingKindLabel = (kind) =>
-  (WORKING_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
-
-// Запись рабочей памяти так, как она уезжает в промпт: «подпись типа:
-// содержимое» (`working_lines`, app/agent.py). В той же форме она и
-// продвигается в долговременную память — иначе запись говорила бы не то,
-// что показано.
-const workingLine = (record) => workingKindLabel(record.kind) + ": " + record.content;
-
-// Виды инвариантов: токен для сервера и русская подпись. Карта та же, что
-// `INVARIANT_LABELS` на сервере, — ею же инвариант подписан и в промпте.
-//
-// Ни одно слово не совпадает со словом соседних слоёв: «решение» уже занято
-// и долговременной памятью, и рабочей, и назови мы вид инварианта тем же
-// словом, утверждение «это запись из слоя инвариантов» стало бы зелёным
-// и на чужой записи. Поэтому «техническое решение», а не «решение».
-const INVARIANT_KINDS = [
-  ["architecture", "архитектура"],
-  ["technical", "техническое решение"],
-  ["stack", "ограничение стека"],
-  ["business", "бизнес-правило"],
-];
-
-const invariantKindLabel = (kind) =>
-  (INVARIANT_KINDS.find(([token]) => token === kind) || [kind, kind])[1];
-
-// Запрещённые слова: список — на экране, строка через запятую — в поле.
-// Разбор и сборка одной парой на форму и на правку: две копии разошлись бы
-// на первом же слове с пробелом внутри.
-const bannedText = (words) => (words || []).join(", ");
-const parseBanned = (text) =>
-  String(text || "").split(",").map((w) => w.trim()).filter(Boolean);
-
-// Правка записи прямо в списке: Enter сохраняет, Escape отменяет, потеря
-// фокуса — тоже сохраняет. Идиом тот же, что у переименования чата слева:
-// второй способ правки на той же странице читался бы как другое действие.
-//
-// Правится и текст, и **тип**: агент кладёт запись не в тот слой и не того
-// типа примерно с той же частотой, и до сих пор второе чинилось только
-// удалением с заведением заново — дырой ровно посреди «явного выбора»,
-// ради которого день и делался. Ручка оба поля принимала с самого начала,
-// не спрашивал их только экран.
-//
-// Список типов открывается **пустым**, как и в форме добавления: умолчания
-// у типа нет нигде, и «оставить прежний» — это не выбор, а его отсутствие.
-// Предвыбери мы здесь нынешний тип, правка текста молча пересылала бы его
-// обратно — и запись, которой тип поправили в соседней вкладке, вернулась бы
-// к старому.
-function startRecordEdit(row, record, kinds, commit, opts) {
-  // `opts` — чем этот слой отличается от соседних: есть ли у записи третье
-  // поле (`banned`) и чем перерисовывать список после правки. Два слоя
-  // памяти отличий не имеют вовсе и зовут функцию без него.
-  const withBanned = Boolean(opts && opts.banned);
-  const redraw = (opts && opts.redraw) || renderMemory;
-  const shown = row.querySelector(".mem-text");
-  // Поле и список — в одном блоке: уход фокуса с поля на список это не конец
-  // правки, а её продолжение, и различить их можно только на общем родителе.
-  const box = el("div", "mem-edit-box");
-  const input = el("textarea", "mem-edit control area");
-  input.rows = 4;
-  input.setAttribute("aria-label", "Текст записи");
-  input.value = record.content;
-  const kind = el("select", "mem-edit-kind control");
-  kind.setAttribute("aria-label", "Тип записи");
-  fillKinds(kind, kinds, "— оставить тип —");
-  box.append(input, kind);
-  // Третье поле — только у инвариантов, у которых оно и есть: слова
-  // правятся тем же нажатием, что текст и вид. Второй функции правки
-  // на третий слой не заводим — правила у них одни, и вторая копия
-  // разошлась бы с первой на первом же исправлении.
-  let banned = null;
-  if (withBanned) {
-    banned = el("input", "mem-edit-banned control");
-    banned.value = bannedText(record.banned);
-    banned.title = "Запрещённые слова через запятую";
-    banned.setAttribute("aria-label", banned.title);
-    box.appendChild(banned);
-  }
-  row.replaceChild(box, shown);
-  input.focus();
-  input.select();
-
-  let settled = false;
-  const finish = async (save) => {
-    if (settled) return;
-    settled = true;
-    const text = (input.value || "").trim();
-    const patch = {};
-    // Пустой текст — не правка, а потеря записи: удаление здесь рядом,
-    // и делать его вслепую очисткой поля нельзя. Текст слово в слово прежний
-    // и невыбранный тип тоже не едут: ручке нечего было бы делать.
-    if (text && text !== record.content) patch.content = text;
-    if (kind.value && kind.value !== record.kind) patch.kind = kind.value;
-    // Слова — тем же правилом: уезжают только тронутые. Пустое поле здесь
-    // законно и значит «ничего не запрещено», в отличие от пустого текста:
-    // сторожить нечего — не то же самое, что записывать нечего.
-    if (banned) {
-      const words = parseBanned(banned.value);
-      if (words.join("\u0000") !== (record.banned || []).join("\u0000")) patch.banned = words;
-    }
-    if (save && Object.keys(patch).length && await commit(patch) === false) {
-      settled = false;
-      return;
-    }
-    box.remove();
-    redraw();
-  };
-
-  const keys = (ev) => {
-    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); finish(true); }
-    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(false); }
-  };
-  input.onkeydown = keys;
-  kind.onkeydown = keys;
-  if (banned) banned.onkeydown = keys;
-  // `focusout` всплывает, `blur` — нет: слушаем блок и смотрим, куда фокус
-  // ушёл. Остался внутри — правка продолжается; ушёл наружу — сохраняем,
-  // ровно как раньше сохранял уход фокуса с поля. Вешай мы это на само поле,
-  // щелчок по списку типов убрал бы список прямо из-под курсора.
-  box.onfocusout = (ev) => {
-    if (!box.contains(ev.relatedTarget)) finish(true);
-  };
-}
-
-function memoryTabOpen() {
-  return state.workspace === "settings" && state.section === "memory";
-}
-
-// Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
-async function loadMemory(force = false) {
-  if (!force && $("#tab-memory").querySelector(".mem-edit-box")) return;
-  const id = state.current && state.current.id;
-  state.memoryNote = "Читаю память…";
-  renderMemory();
-  try {
-    // Чата ещё нет — общий слой всё равно можно показать: он не про чат.
-    // Первые два раздела в этом случае честно говорят, что показывать нечего.
-    const layers = id
-      ? await api("/api/agents/" + id + "/memory")
-      : { short_term: null, working: null, long_term: await api("/api/memory") };
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = layers;
-    state.memoryNote = "";
-  } catch (err) {
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = null;
-    state.memoryNote = String(err.message || err);
-  }
-  renderMemory();
-}
-
-// Сколько первых реплик не уедет в модель дословно при нынешней стратегии —
-// и каким словом это называется.
-//
-// Расчёт повторяет серверный (`Agent.context_cut` и `summary_cover`): ручка
-// отдаёт его **входы** — длину истории и докуда покрывает последняя сводка,
-// — а не готовое число. Сводки при этом лежат в краткосрочном разделе:
-// сводка не запомненное, а чем заменено то, что не уехало дословно.
-//
-// Считается по конфигу агента, а не по полям панели: в панели может стоять
-// непролитая правка, а раздел говорит о том, что уедет сейчас. Незнакомая
-// стратегия читается как «вся история» — ровно как на сервере.
-function shortTermCut(agent, layers) {
-  const total = layers.short_term.messages;
-  const keep = agent && agent.keep_last !== undefined ? agent.keep_last : null;
-  const strategy = agent ? agent.strategy : "full";
-  // Пустое поле — резать нечем: идиом тот же, что у сервера, `null` это
-  // «не делать», а не «делать с нулём».
-  const nothing = keep === null || keep === undefined;
-  if (strategy === "window") {
-    // Окно режет ровно столько, сколько просили: зажима по «докуда дочитала
-    // память» больше нет ни здесь, ни на сервере — читать её стало некому,
-    // а записи в ней от длины разговора не зависят вовсе.
-    return {
-      cut: nothing ? 0 : Math.max(0, total - keep),
-      word: "отброшено окном",
-    };
-  }
-  if (strategy === "summary") {
-    const summaries = layers.short_term.summaries || [];
-    const last = summaries.length ? summaries[summaries.length - 1] : null;
-    const upto = last && typeof last.upto === "number" ? last.upto : 0;
-    return { cut: nothing || upto <= 0 ? 0 : Math.min(upto, total), word: "заменено сводкой" };
-  }
-  return { cut: 0, word: "" };
-}
-
-function memRow(label, value) {
-  const row = el("div", "mem-row");
-  row.append(el("span", "mem-k", label), el("span", "mem-v", value));
-  return row;
-}
-
-const memNote = (text) => el("p", "mem-note", text);
-
-// Раздела нет данных — говорим почему: читаем, не открыт чат или ручка
-// ответила ошибкой. Пустой раздел молчал бы о разнице между «пусто»
-// и «не доехало».
-const memBlank = () => memNote(state.memoryNote || "Чат ещё не открыт.");
-
-function renderMemory() {
-  renderShortTerm($("#mem-short"));
-  if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
-  if (!$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
-}
-
-function renderShortTerm(box) {
-  box.innerHTML = "";
-  const layers = state.memory;
-  if (!layers || !layers.short_term) { box.appendChild(memBlank()); return; }
-  const total = layers.short_term.messages;
-  const cut = shortTermCut(state.current, layers);
-  box.append(
-    memRow("Сообщений в истории", fmt.tokens(total)),
-    memRow("Уезжает дословно", fmt.tokens(total - cut.cut)),
-    memNote(cut.cut
-      ? "Остальные " + fmt.tokens(cut.cut) + " — " + cut.word + "."
-      : "Вся история уезжает в модель дословно.")
-  );
-
-  // Сводки — здесь, под историей: сводка не память, а замена той её части,
-  // что не уехала дословно. Выключи сворачивание — не пропадёт ничего,
-  // история цела и сводка соберётся заново; памятью её делал только сосед
-  // по разделу.
-  const summaries = layers.short_term.summaries || [];
-  if (!summaries.length) return;
-  box.appendChild(el("div", "mem-sub", "Сводки"));
-  summaries.forEach((item) => {
-    const row = el("div", "mem-item column");
-    row.append(
-      el("div", "mem-text", item.content),
-      memNote("вместо первых " + fmt.tokens(item.upto) + " сообщений")
-    );
-    box.appendChild(row);
-  });
-}
-
-function renderWorking(box) {
-  box.innerHTML = "";
-  const working = state.memory && state.memory.working;
-  // Форма прячется вместе со слоем: область рабочей памяти — разговор,
-  // и пока слоя нет на экране — чат не открыт или ручка ответила отказом, —
-  // записывать некуда.
-  $("#mem-work-form").classList.toggle("hidden", !working);
-  if (!working) { box.appendChild(memBlank()); return; }
-
-  const records = working.records || [];
-  const ownerId = state.current && state.current.id;
-  if (!records.length) box.appendChild(memNote("Записей нет."));
-  records.forEach((record) => {
-    const line = workingLine(record);
-    const row = el("div", "mem-item");
-    // Продвижение записи через границу слоёв: то, что записали как состояние
-    // задачи, оказалось верным и после неё. Это нажатие, а не автоматика:
-    // границу слоёв проводит человек — он один и пишет в оба.
-    const btn = el("button", "mem-btn", "Запомнить надолго");
-    btn.type = "button";
-    btn.title = "Запомнить надолго";
-    btn.onclick = () => promote(line);
-    row.append(
-      el("div", "mem-text", line),
-      btn,
-      iconButton("pencil", "Поправить запись",
-        () => startRecordEdit(row, record, WORKING_KINDS,
-          (patch) => editWorking(record, patch, ownerId)), "mini"),
-      iconButton("trash", "Удалить запись", () => dropWorking(record, ownerId), "mini danger")
-    );
-    box.appendChild(row);
-  });
-
-}
-
-function renderLongTerm(box) {
-  box.innerHTML = "";
-  const long = state.memory && state.memory.long_term;
-  if (!long) { box.appendChild(memBlank()); return; }
-  const records = long.records || [];
-  if (!records.length) { box.appendChild(memNote("Записей нет.")); return; }
-  records.forEach((record) => {
-    const row = el("div", "mem-item");
-    row.append(
-      el("div", "mem-kind", memoryKindLabel(record.kind)),
-      el("div", "mem-text", record.content),
-      iconButton("pencil", "Поправить запись",
-        () => startRecordEdit(row, record, MEMORY_KINDS,
-          (patch) => editMemory(record, patch)), "mini"),
-      iconButton("trash", "Забыть запись", () => forget(record), "mini danger")
-    );
-    box.appendChild(row);
-  });
-}
-
-function memoryStatus(text, isError) {
-  const box = $("#mem-status");
-  box.className = "hint" + (isError ? " error" : "");
-  box.textContent = text || "";
-}
-
-function workingStatus(text, isError) {
-  const box = $("#mem-work-status");
-  box.className = "hint" + (isError ? " error" : "");
-  box.textContent = text || "";
-}
-
-// ── рабочая память правится руками ──
-//
-// Тем же набором, каким правится долговременная, и по тем же правилам: тип
-// обязателен и без умолчания, список пополняется **ответом ручки** (номер
-// выдаёт база, текст по дороге чистит `redact()`), перечитывать слой для
-// этого незачем. Второй способ на той же странице читался бы как другое
-// действие, и слои разъехались бы на первой правке.
-const workingUrl = (seq, id = state.current && state.current.id) => {
-  return "/api/agents/" + id + "/working" + (seq === undefined ? "" : "/" + seq);
-};
-
-async function addWorking(kind, content) {
-  const text = (content || "").trim();
-  if (!text) {
-    workingStatus("Текст записи пуст: записывать нечего.", true);
-    return false;
-  }
-  if (!(state.current && state.current.id)) {
-    workingStatus("Чат ещё не открыт: рабочая память живёт в разговоре.", true);
-    return false;
-  }
-  try {
-    const record = await api(workingUrl(), json("POST", { kind, content: text }));
-    const working = state.memory && state.memory.working;
-    if (working) working.records = [...(working.records || []), record];
-    renderMemory();
-    workingStatus("Записано: " + workingKindLabel(record.kind) + ".");
-    return true;
-  } catch (err) {
-    workingStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-// Правка метит запись человеком — это делает сервер, и ответ приходит уже
-// с новым автором. Подставь клиент своё «human» — экран говорил бы о записи
-// то, чего в базе нет.
-async function editWorking(record, patch, ownerId) {
-  if (ownerId !== (state.current && state.current.id)) return false;
-  try {
-    const updated = await api(workingUrl(record.seq, ownerId), json("PATCH", patch));
-    if (ownerId !== (state.current && state.current.id)) return true;
-    const working = state.memory && state.memory.working;
-    if (working) {
-      working.records = (working.records || [])
-        .map((item) => (item.seq === updated.seq ? updated : item));
-    }
-    workingStatus("Запись поправлена: с этой минуты она ваша.");
-    return true;
-  } catch (err) {
-    if (ownerId !== (state.current && state.current.id)) return false;
-    workingStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-async function dropWorking(record, ownerId) {
-  if (ownerId !== (state.current && state.current.id)) return;
-  try {
-    await api(workingUrl(record.seq, ownerId), { method: "DELETE" });
-  } catch (err) {
-    if (ownerId !== (state.current && state.current.id)) return;
-    workingStatus(String(err.message || err), true);
-    return;
-  }
-  if (ownerId !== (state.current && state.current.id)) return;
-  const working = state.memory && state.memory.working;
-  if (working) {
-    working.records = (working.records || []).filter((item) => item.seq !== record.seq);
-  }
-  renderMemory();
-  workingStatus("Запись убрана.");
-}
-
-// Правка долговременной записи — тот же путь и тот же ответ: с этой минуты
-// запись человека, и служебный вызов её не перепишет.
-async function editMemory(record, patch) {
-  try {
-    const updated = await api("/api/memory/" + record.seq, json("PATCH", patch));
-    const long = state.memory && state.memory.long_term;
-    if (long) {
-      long.records = (long.records || [])
-        .map((item) => (item.seq === updated.seq ? updated : item));
-    }
-    memoryStatus("Запись поправлена: с этой минуты она ваша.");
-    return true;
-  } catch (err) {
-    memoryStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-// Новая запись долговременной памяти. Список пополняется **записанным
-// ответом**, а не присланным телом: номер выдаёт база, а текст по дороге
-// чистит `redact()`. Перечитывать слой целиком для этого незачем.
-//
-// Дедупликации нет намеренно: второй клик по тому же факту заводит вторую
-// запись. Отличить «то же самое» от «похожего» может только человек, и
-// удаляется лишняя одной кнопкой.
-async function remember(kind, content) {
-  const text = (content || "").trim();
-  if (!text) {
-    memoryStatus("Текст записи пуст: записывать нечего.", true);
-    return false;
-  }
-  try {
-    const record = await api("/api/memory", json("POST", { kind, content: text }));
-    const long = state.memory && state.memory.long_term;
-    if (long) long.records = [...(long.records || []), record];
-    renderMemory();
-    memoryStatus("Запомнено: " + memoryKindLabel(record.kind) + ".");
-    return true;
-  } catch (err) {
-    memoryStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-async function forget(record) {
-  try {
-    await api("/api/memory/" + record.seq, { method: "DELETE" });
-  } catch (err) {
-    memoryStatus(String(err.message || err), true);
-    return;
-  }
-  const long = state.memory && state.memory.long_term;
-  if (long) long.records = (long.records || []).filter((item) => item.seq !== record.seq);
-  renderMemory();
-  memoryStatus("Запись забыта.");
-}
-
-// «Запомнить надолго»: перенос записи через границу слоёв — единственное
-// место, где запись меняет слой, и до сих пор единственное, где тип выбирал
-// не человек. В коде стояло `knowledge`, и это прямо против нашего же
-// правила: умолчания у типа нет ни в форме, ни на сервере. Мало того, что
-// выбрано за человека, — выбрано ещё и наугад: «о собеседнике» подходит
-// переносимой записи ничуть не реже.
-//
-// Поэтому кнопка не записывает, а **спрашивает**: кладёт строку в ту же
-// форму, которой долговременный слой пополняют руками, и снимает выбор типа.
-// Форма одна и та же — второго способа записать в этот слой не заводим, —
-// а значит и правила у переноса те же: без выбранного типа не уходит ничего.
-function promote(line) {
-  $("#mem-content").value = line;
-  const kind = $("#mem-kind");
-  kind.value = "";
-  kind.focus();
-  memoryStatus("Выберите тип записи и нажмите «Запомнить»: при переносе тип выбирает человек.");
-}
-
-// Тип записи уезжает тот, что выбран в списке: умолчания у него нет ни здесь,
-// ни на сервере — `_kind_field` отказывает и отсутствию ключа тоже.
-async function addFromForm() {
-  const kind = $("#mem-kind").value;
-  // Тип не выбран — не шлём вовсе: ручка ответит 400, и незачем спрашивать
-  // сервер о том, что видно здесь. Отказ при этом тот же по смыслу —
-  // «тип записи выбирает человек».
-  if (!kind) {
-    memoryStatus("Тип записи не выбран: о собеседнике, решение или факт.", true);
-    return;
-  }
-  const field = $("#mem-content");
-  const saved = await remember(kind, field.value);
-  if (saved) field.value = "";
-}
-
-// Та же форма для рабочего слоя: тип обязателен и здесь, и умолчания
-// у него нет — слои устроены одинаково, и второе правило на втором слое
-// разошлось бы с первым молча.
-async function addWorkingFromForm() {
-  const kind = $("#mem-work-kind").value;
-  if (!kind) {
-    workingStatus("Тип записи не выбран: цель, ограничение, решение или открытый вопрос.", true);
-    return;
-  }
-  const field = $("#mem-work-content");
-  const saved = await addWorking(kind, field.value);
-  if (saved) field.value = "";
-}
-
-// Опции дропдауна — из той же карты, что и подписи в списке.
-//
-// Первым пунктом — пустой: **умолчания у типа нет и в форме**, ровно как
-// на сервере, где `_kind_field` отказывает и отсутствующему ключу. Уберём
-// пустой пункт — список возьмёт первый настоящий, и пользователь, не тронувший
-// его, запишет «о собеседнике», ничего не выбрав: сервер за него не выбирает, а
-// форма выбрала бы. День про явный выбор, и выбор обязан быть нажатием
-// человека в обоих местах.
-// Список типов — параметром: формы две, а правило одно, и вторая копия
-// правила разошлась бы с первой на первой же правке.
-function fillKinds(select, kinds, blankLabel) {
-  select.innerHTML = "";
-  const blank = el("option", "", blankLabel || "— выберите тип —");
-  blank.value = "";
-  select.appendChild(blank);
-  kinds.forEach(([token, label]) => {
-    const option = el("option", "", label);
-    option.value = token;
-    select.appendChild(option);
-  });
-}
-
-// ─────────────────────────── профиль ──────────────────────────
-//
-// Профиль — про то, **как** с человеком разговаривать: стиль, формат
-// и контекст его работы. Он один на всю базу, как долговременная память,
-// и пишет в него только человек: профиль это распоряжение («отвечай кратко»),
-// а не наблюдение о собеседнике («пишет на Kotlin») — выводить распоряжения
-// из разговора агент не вправе.
-//
-// Запрашивается лениво, на открытие вкладки, ровно как слои памяти: панель
-// перерисовывается на каждый обмен, и запрос внутри отрисовки превратил бы
-// один поход на сервер в поток.
-
-// Поля — тем же списком, что `PROFILE_FIELDS` на сервере, и в том же порядке:
-// им же собран блок `[как отвечать]` в промпте.
-const PROFILE_FIELDS = ["style", "format", "context"];
-
-const profileInput = (name) => $("#profile-" + name);
-
-function profileStatus(text, isError) {
-  const box = $("#profile-status");
-  box.className = "hint" + (isError ? " error" : "");
-  box.textContent = text || "";
-}
-
-async function loadProfile() {
-  if (state.profileLoading) return state.profileLoading;
-  const held = Object.fromEntries(PROFILE_FIELDS.map((name) => [name, profileInput(name).value]));
-  state.profileLoading = (async () => {
-    try {
-      const answer = await api("/api/profile");
-      state.profile = answer.profile || {};
-      if (!state.profileDirty.size) state.profileError = "";
-      PROFILE_FIELDS.forEach((name) => {
-        if (!state.profileDirty.has(name) && profileInput(name).value === held[name]) profileInput(name).value = state.profile[name] || "";
-      });
-      if (!state.profileDirty.size) profileStatus("");
-    } catch (err) {
-      state.profileError = String(err.message || err);
-      profileStatus(state.profileError, true);
-    }
-    renderProfileSummary();
-  })();
-  await state.profileLoading;
-  state.profileLoading = null;
-}
-
-// Правка одного поля: уезжает **только тронутое**, остальные не называются
-// вовсе — иначе вторая вкладка, правящая формат, затирала бы стиль, набранный
-// в первой. Пустая строка поле снимает: отдельной кнопки «очистить» нет,
-// ровно как у системного промпта чата.
-async function saveProfile(name) {
-  if (!PROFILE_FIELDS.includes(name)) return;
-  const field = profileInput(name);
-  const sent = field.value;
-  profileStatus("Сохраняю…");
-  try {
-    const answer = await api("/api/profile", json("PATCH", { [name]: sent }));
-    const values = answer.profile || {};
-    // Показываем **записанное**, а не набранное: текст по дороге чистит
-    // `redact()`, и поле обязано показывать то, что уедет в промпт.
-    state.profile = values;
-    state.profileError = "";
-    if (field.value === sent) {
-      field.value = values[name] || "";
-      state.profileDirty.delete(name);
-    }
-    renderProfileSummary();
-    profileStatus(PROFILE_FIELDS.some((key) => values[key])
-      ? "Профиль сохранён: он уезжает системным сообщением в каждый запрос."
-      : "Профиль пуст: к запросам не добавляется ничего.");
-  } catch (err) {
-    state.profileError = String(err.message || err);
-    profileStatus(state.profileError, true);
-    renderProfileSummary();
-  }
-}
-
-function renderProfileSummary() {
-  const box = $("#profile-summary");
-  box.innerHTML = "";
-  const filled = state.profile && PROFILE_FIELDS.filter((name) => state.profile[name]);
-  $("#profile-toggle").classList.toggle("configured", Boolean(filled && filled.length));
-  if (state.profileError) box.appendChild(el("p", "hint error", state.profileError));
-  else if (!state.profile) box.appendChild(el("p", "hint", "Читаю профиль…"));
-  else if (!filled.length) box.appendChild(el("p", "hint", "Профиль пока пуст. Задайте стиль, формат или контекст ответа."));
-  if (filled) filled.forEach((name) => {
-    const row = el("div", "profile-summary-field");
-    row.append(el("strong", "", { style: "Стиль", format: "Формат", context: "Контекст" }[name]),
-      el("p", "", state.profile[name]));
-    box.appendChild(row);
-  });
-}
-
-function closeProfileMenu(returnFocus = false) {
-  $("#profile-menu").classList.add("hidden");
-  $("#profile-toggle").setAttribute("aria-expanded", "false");
-  if (returnFocus) $("#profile-toggle").focus();
-}
-
-function toggleProfileMenu() {
-  const open = $("#profile-menu").classList.contains("hidden");
-  $("#profile-menu").classList.toggle("hidden", !open);
-  $("#profile-toggle").setAttribute("aria-expanded", String(open));
-  if (open) {
-    renderProfileSummary();
-    loadProfile();
-    $("#profile-edit").focus();
-  }
-}
-
-// ───────────────────────── инварианты ─────────────────────────
-//
-// Чего ассистент не вправе предлагать: архитектура, технические решения,
-// ограничения стека, бизнес-правила. Слой глобальный, как долговременная
-// память и профиль, и пишет в него только человек: инвариант это
-// распоряжение, а распоряжений из разговора агент не выводит.
-//
-// От профиля он отличается наклонением наоборот: профиль про **форму**
-// ответа («отвечай кратко»), инвариант про его **суть** («Java не
-// предлагать»). Оба едут системным сообщением, и оба задал человек.
-//
-// Запрещённые слова видны и правятся здесь — и только здесь: в промпт они
-// не уезжают ни одним символом. Перечисленный запрет сам по себе подсказка
-// его употребить, а законный отказ («почему не Java?») без запрещённого
-// слова не написать. Смотрит на них сторож ответа, а не модель.
-//
-// Запрашивается лениво, на открытие вкладки, ровно как слои памяти
-// и профиль: панель перерисовывается на каждый обмен, и запрос внутри
-// отрисовки превратил бы один поход на сервер в поток.
-
-function invariantStatus(text, isError) {
-  const box = $("#inv-status");
-  box.className = "hint" + (isError ? " error" : "");
-  box.textContent = text || "";
-}
-
-async function loadInvariants() {
-  if ($("#inv-list").querySelector(".mem-edit-box")) return;
-  try {
-    const answer = await api("/api/invariants");
-    state.invariants = answer.records || [];
-  } catch (err) {
-    state.invariants = null;
-    invariantStatus(String(err.message || err), true);
-  }
-  renderInvariants();
-}
-
-function renderInvariants() {
-  const box = $("#inv-list");
-  if (box.querySelector(".mem-edit-box")) return;
-  box.innerHTML = "";
-  const records = state.invariants;
-  if (!records) { box.appendChild(memNote($("#inv-status").textContent || "Читаю…")); return; }
-  if (!records.length) { box.appendChild(memNote("Инвариантов нет.")); return; }
-  records.forEach((record) => {
-    const row = el("div", "mem-item");
-    row.append(
-      el("div", "mem-kind", invariantKindLabel(record.kind)),
-      el("div", "mem-text", record.content),
-      iconButton("pencil", "Поправить инвариант",
-        () => startRecordEdit(row, record, INVARIANT_KINDS,
-          (patch) => editInvariant(record, patch),
-          { banned: true, redraw: renderInvariants }), "mini"),
-      iconButton("trash", "Убрать инвариант", () => dropInvariant(record), "mini danger")
-    );
-    // Слова видны только тут: строка под инвариантом говорит, чем сторож
-    // будет проверять ответ. В промпт она не уезжает.
-    const words = record.banned || [];
-    const note = memNote(
-      words.length ? "запрещённые слова: " + bannedText(words) : "запрещённых слов нет"
-    );
-    note.className = "mem-note banned";
-    row.appendChild(note);
-    box.appendChild(row);
-  });
-}
-
-// Новый инвариант: список пополняется **ответом ручки**, а не присланным
-// телом — номер выдаёт база, а текст по дороге чистит `redact()`. Довод
-// и форма те же, что у долговременной памяти.
-async function addInvariant(kind, content, banned) {
-  const text = (content || "").trim();
-  if (!text) {
-    invariantStatus("Текст инварианта пуст: записывать нечего.", true);
-    return false;
-  }
-  try {
-    const record = await api("/api/invariants", json("POST", { kind, content: text, banned }));
-    state.invariants = [...(state.invariants || []), record];
-    renderInvariants();
-    invariantStatus("Записано: " + invariantKindLabel(record.kind) + ".");
-    return true;
-  } catch (err) {
-    invariantStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-async function editInvariant(record, patch) {
-  try {
-    const updated = await api("/api/invariants/" + record.seq, json("PATCH", patch));
-    state.invariants = (state.invariants || [])
-      .map((item) => (item.seq === updated.seq ? updated : item));
-    invariantStatus("Инвариант поправлен.");
-    return true;
-  } catch (err) {
-    invariantStatus(String(err.message || err), true);
-    return false;
-  }
-}
-
-async function dropInvariant(record) {
-  try {
-    await api("/api/invariants/" + record.seq, { method: "DELETE" });
-  } catch (err) {
-    invariantStatus(String(err.message || err), true);
-    return;
-  }
-  state.invariants = (state.invariants || []).filter((item) => item.seq !== record.seq);
-  renderInvariants();
-  invariantStatus("Инвариант убран.");
-}
-
-// Вид обязателен и здесь: умолчания у него нет ни в форме, ни на сервере —
-// правило то же, что у обоих слоёв памяти. А вот пустой список слов законен:
-// у большинства инвариантов сторожить нечего, их держит сам текст.
-async function addInvariantFromForm() {
-  const kind = $("#inv-kind").value;
-  if (!kind) {
-    invariantStatus("Вид инварианта не выбран: архитектура, техническое решение, "
-      + "ограничение стека или бизнес-правило.", true);
-    return;
-  }
-  const field = $("#inv-content");
-  const words = $("#inv-banned");
-  const saved = await addInvariant(kind, field.value, parseBanned(words.value));
-  if (saved) { field.value = ""; words.value = ""; }
-}
-
-// ───────────────────────── инструменты MCP ─────────────────────────
-//
-// Вкладка только показывает: серверы, их статус и инструменты с описанием
-// и схемой. Запрашивается лениво, на открытие вкладки — ровно как слои
-// памяти, профиль и инварианты: панель перерисовывается на каждый обмен,
-// и запрос внутри отрисовки превратил бы один поход на сервер в поток.
-
-async function loadMcp() {
-  if (!toolsVisible() || state.mcpRequest) return;
-  const epoch = state.mcpEpoch;
-  const controller = new AbortController();
-  state.mcpRequest = controller;
-  try {
-    const answer = await api("/api/mcp", { signal: controller.signal });
-    if (epoch !== state.mcpEpoch) return;
-    state.mcp = answer.servers || [];
-  } catch (err) {
-    if (epoch !== state.mcpEpoch) return;
-    state.mcp = null;
-  } finally {
-    if (state.mcpRequest === controller) state.mcpRequest = null;
-  }
-  if (epoch !== state.mcpEpoch || !toolsVisible()) return;
-  renderMcp();
-}
-
-function toolsVisible() {
-  return state.workspace === "settings" && state.section === "mcp" && document.visibilityState !== "hidden";
-}
-
-function stopMcpPolling() {
-  state.mcpEpoch += 1;
-  if (state.mcpRequest) {
-    state.mcpRequest.abort();
-    state.mcpRequest = null;
-  }
-}
-
-function renderMcp() {
-  const box = $("#mcp-list");
-  const expanded = new Set(Array.from(box.querySelectorAll("details")).filter((node) => node.open).map((node) => node.dataset.tool));
-  box.innerHTML = "";
-  const servers = state.mcp;
-  // Пустой менеджер назван словами, а не показан пустым экраном: «не
-  // подключён» и «не доехало» — разные новости, ровно как у слоёв памяти.
-  if (!servers) { box.appendChild(memNote("Не читается: ручка ответила ошибкой.")); return; }
-  if (!servers.length) { box.appendChild(memNote("MCP не подключён.")); return; }
-  servers.forEach((server) => {
-    const row = el("article", "mcp-server");
-    const head = el("header", "mcp-server-head");
-    head.append(el("h3", "mcp-server-name", server.name),
-      el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : "Не отвечает"));
-    row.appendChild(head);
-    if (server.error) row.appendChild(el("p", "hint error", server.error));
-    const tools = server.tools || [];
-    if (!tools.length) row.appendChild(memNote("инструментов нет"));
-    tools.forEach((tool) => {
-      const card = el("div", "mcp-tool");
-      card.append(el("h4", "mcp-tool-name", tool.name),
-        el("p", "mcp-tool-description", tool.description || "Описания нет."));
-      // Схема свёрнута: она нужна, когда спрашивают «что умеет», а не всегда.
-      const schema = el("details", "mem-note");
-      schema.dataset.tool = server.name + ":" + tool.name;
-      schema.open = expanded.has(schema.dataset.tool);
-      schema.appendChild(el("summary", "", "Схема параметров"));
-      const code = el("pre", "", JSON.stringify(tool.schema || {}, null, 2));
-      code.tabIndex = 0;
-      code.setAttribute("aria-label", "Схема параметров " + tool.name);
-      schema.appendChild(code);
-      card.appendChild(schema);
-      row.appendChild(card);
-    });
-    box.appendChild(row);
-  });
-}
-
 // ─────────────────────────── плитки ───────────────────────────
 
 // Метрики снизу — про весь диалог, кроме доли окна: сколько всего
@@ -2699,7 +1593,7 @@ function renderMcp() {
 // сообщений. Числа одного обмена написаны под ним самим в ленте, и подписей
 // «накопленное» здесь больше нет — в панели теперь всё и так про разговор.
 //
-// Метрик шесть; на телефоне общая строка прокручивается горизонтально.
+// Метрик шесть; в компактном окне общая строка прокручивается горизонтально.
 const TILES = [
   ["Входные токены", () => fmt.tokens(totalField("prompt_tokens"))],
   ["Выходные токены", () => fmt.tokens(totalField("completion_tokens"))],
@@ -2731,113 +1625,28 @@ function renderTiles() {
   });
 }
 
-// ─────────────────── сворачивание и тема ──────────────────────
+// Desktop-список скрывается целиком; скрытые кнопки не получают фокус.
+const SIDEBAR_KEY = "ui.sidebar";
 
-const KEYS = { sidebar: "ui.sidebar", theme: "ui.theme" };
-
-function store(key, value) {
-  try { localStorage.setItem(key, value); } catch (e) { /* приватный режим */ }
-}
-function read(key, fallback) {
-  try {
-    const value = localStorage.getItem(key);
-    return value === null ? fallback : value;
-  } catch (e) { return fallback; }
-}
-
-function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme;
-  const btn = $("#theme-toggle");
-  btn.innerHTML = "";
-  const ico = el("span", "foot-icon");
-  ico.appendChild(icon(theme === "dark" ? "sun" : "moon"));
-  btn.append(ico, el("span", "foot-label", theme === "dark" ? "Тёмная тема" : "Светлая тема"));
-  btn.setAttribute("aria-label", theme === "dark" ? "Включить светлую тему" : "Включить тёмную тему");
-  btn.setAttribute("aria-pressed", String(theme === "dark"));
-}
-
-const NARROW = window.matchMedia("(max-width: 940px)");
-
-function applyCollapsed(which, collapsed) {
-  if (which !== "sidebar") return;
+function applyCollapsed(collapsed) {
   $("#app").classList.toggle("no-sidebar", collapsed);
-  const sidebar = $("#sidebar");
-  sidebar.inert = collapsed;
-  sidebar.setAttribute("aria-hidden", String(collapsed));
+  $("#sidebar").classList.toggle("hidden", collapsed);
   $("#restore-sidebar").setAttribute("aria-expanded", String(!collapsed));
-  $("#workspace").inert = NARROW.matches && !collapsed;
-  if (NARROW.matches && !collapsed) {
-    sidebar.setAttribute("role", "dialog");
-    sidebar.setAttribute("aria-label", "Список чатов");
-    sidebar.setAttribute("aria-modal", "true");
-  } else {
-    sidebar.removeAttribute("role");
-    sidebar.removeAttribute("aria-modal");
-  }
-  syncBackdrop();
 }
 
-function isCollapsed(which) {
-  return which === "sidebar" && $("#app").classList.contains("no-sidebar");
+function setCollapsed(collapsed) {
+  try { localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) { /* приватный режим */ }
+  applyCollapsed(collapsed);
+  $(collapsed ? "#restore-sidebar" : "#sidebar-toggle").focus();
 }
 
-function setCollapsed(which, collapsed) {
-  if (!NARROW.matches) store(KEYS.sidebar, collapsed ? "1" : "0");
-  applyCollapsed(which, collapsed);
-  if (collapsed) $("#restore-sidebar").focus();
-  else {
-    if (NARROW.matches) closeProfileMenu();
-    $("#sidebar-toggle").focus();
-  }
-}
-
-function openDrawers() {
-  return isCollapsed("sidebar") ? [] : ["sidebar"];
-}
-
-function closeDrawers() {
-  setCollapsed("sidebar", true);
-}
-
-function syncBackdrop() {
-  const existing = document.querySelector(".backdrop");
-  const needed = NARROW.matches && !isCollapsed("sidebar");
-  if (!needed) { if (existing) existing.remove(); return; }
-  if (existing) return;
-  const backdrop = el("div", "backdrop");
-  backdrop.onclick = closeDrawers;
-  document.body.appendChild(backdrop);
-}
-
-function layoutFor(narrow, stored) {
-  return { sidebar: narrow || stored.sidebar === "1" };
-}
-
-function applyWidth() {
-  const want = layoutFor(NARROW.matches, { sidebar: read(KEYS.sidebar, "0") });
-  const wasInside = $("#sidebar").contains(document.activeElement);
-  const wasRestore = document.activeElement === $("#restore-sidebar");
-  applyCollapsed("sidebar", want.sidebar);
-  if (want.sidebar && wasInside) $("#restore-sidebar").focus();
-  else if (!want.sidebar && wasRestore) $("#sidebar-toggle").focus();
-  $(".tabs").setAttribute("aria-orientation", NARROW.matches ? "horizontal" : "vertical");
-}
-
-function escapeAction(hasDialog, narrow, openDrawerCount) {
-  if (hasDialog) return "dialog";
-  if (narrow && openDrawerCount > 0) return "drawers";
-  return null;
+function restoreSidebar() {
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(SIDEBAR_KEY) === "1"; } catch (e) { /* приватный режим */ }
+  applyCollapsed(collapsed);
 }
 
 // ─────────────────── новый чат и подтверждения ────────────────
-
-// Что должен закрыть Escape: диалог подтверждения всегда важнее ящиков.
-// Отдельной функцией без DOM — решение проверяется без браузера.
-function escapeAction(hasDialog, narrow, openDrawerCount) {
-  if (hasDialog) return "dialog";
-  if (narrow && openDrawerCount > 0) return "drawers";
-  return null;
-}
 
 function confirmBox(title, text, confirmLabel, onYes) {
   const wrap = el("div", "confirm");
@@ -2886,7 +1695,6 @@ async function newChat() {
   state.current = null;
   await loadAgents(created.agents[0].id);
   showWorkspace("chat");
-  if (NARROW.matches) setCollapsed("sidebar", true);
   $("#input").focus();
 }
 
@@ -2895,9 +1703,8 @@ async function newChat() {
 function init() {
   $("#sidebar-toggle").appendChild(icon("panelLeft"));
   $("#restore-sidebar").appendChild(icon("panelLeft"));
-  $("#sidebar-toggle").onclick = () => setCollapsed("sidebar", true);
-  $("#restore-sidebar").onclick = () => setCollapsed("sidebar", isCollapsed("sidebar") ? false : true);
-  $("#chat-search").oninput = renderList;
+  $("#sidebar-toggle").onclick = () => setCollapsed(true);
+  $("#restore-sidebar").onclick = () => setCollapsed(false);
   $(".avatar").appendChild(icon("user"));
   $(".profile-chevron").appendChild(icon("chevronDown"));
   $("#profile-toggle").onclick = toggleProfileMenu;
@@ -2919,30 +1726,10 @@ function init() {
       (next) => showWorkspace(next.id === "workspace-chat" ? "chat" : "settings"));
   });
 
-  applyTheme(read(KEYS.theme, "light"));
-  $("#theme-toggle").onclick = () => {
-    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-    store(KEYS.theme, next);
-    applyTheme(next);
-  };
-
-  applyWidth();
-  NARROW.addEventListener("change", applyWidth);
+  restoreSidebar();
   document.addEventListener("keydown", (ev) => {
-    if (document.querySelector(".confirm")) return;
-    if (ev.key === "Tab" && NARROW.matches && !isCollapsed("sidebar")) {
-      const sidebar = $("#sidebar");
-      const buttons = Array.from(sidebar.querySelectorAll("button"));
-      const inputs = Array.from(sidebar.querySelectorAll("input"));
-      const nodes = [...buttons, ...inputs].filter((node) => !node.disabled &&
-        (!node.getClientRects || node.getClientRects().length));
-      const index = nodes.indexOf(document.activeElement);
-      const next = ev.shiftKey ? (index - 1 + nodes.length) % nodes.length : (index + 1) % nodes.length;
-      if (nodes.length) { ev.preventDefault(); nodes[next].focus(); }
-    }
-    if (ev.key !== "Escape") return;
-    if (!$("#profile-menu").classList.contains("hidden")) { closeProfileMenu(true); return; }
-    if (NARROW.matches && openDrawers().length) closeDrawers();
+    if (document.querySelector(".confirm") || ev.key !== "Escape") return;
+    if (!$("#profile-menu").classList.contains("hidden")) closeProfileMenu(true);
   });
   document.addEventListener("visibilitychange", () => {
     stopMcpPolling();
@@ -3025,8 +1812,6 @@ if (typeof module === "undefined") {
     init,
     state,
     renderMarkdown,
-    layoutFor,
-    escapeAction,
     readStopLines,
     parseCommand,
     parseResponseFormat,
