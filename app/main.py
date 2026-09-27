@@ -76,13 +76,12 @@ def _next_branch_label() -> str:
 async def _lifespan(_app: FastAPI):
     # MCP — до yield: к первому запросу список инструментов уже на руках.
     # Пустой менеджер (нет конфига, MCP_DISABLED=1) неотличим от дня 15.
-    await mcp.MANAGER.start()
-    yield
-    # Остановка MCP — до закрытия httpx: terminate, через две секунды kill.
-    await mcp.MANAGER.stop()
-    # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
-    # руками: без этого uvicorn на остановке ругается на незакрытый пул.
-    await llm.aclose()
+    await mcp.MANAGER.start(REGISTRY.store)
+    try:
+        yield
+    finally:
+        await mcp.MANAGER.stop()
+        await llm.aclose()
 
 
 app = FastAPI(title="AI Challenge Agents", version="2.0.0", lifespan=_lifespan)
@@ -1218,10 +1217,8 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
 
 @app.get("/api/mcp")
 async def list_mcp() -> dict:
-    """Подключённые MCP-серверы: имя, статус и инструменты с описанием
-    и схемой. Пустой список — MCP не подключён (нет конфига или
-    MCP_DISABLED=1), и это неотличимо от приложения без MCP."""
-    return mcp.MANAGER.view()
+    """App-wide URL config and live MCP sessions; no model tool calls in day16."""
+    return await mcp.MANAGER.status()
 
 
 # --- служебное ----------------------------------------------------------------
@@ -1238,3 +1235,36 @@ async def health() -> dict:
         "sessions_stored": REGISTRY.store.count_sessions(),
         "llm_max_concurrency": llm.max_concurrency(),
     }
+
+
+@app.put("/api/mcp/config")
+async def configure_mcp(payload: dict = Body(...)) -> dict:
+    if set(payload) != {"revision", "servers"}:
+        raise HTTPException(400, "тело: revision и servers")
+    try:
+        return await mcp.MANAGER.configure(payload["servers"], payload["revision"])
+    except mcp.McpConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+async def _mcp_connection(payload, enabled):
+    if set(payload) != {"revision", "name"} or not isinstance(payload.get("name"), str):
+        raise HTTPException(400, "тело: revision и name")
+    try:
+        return await mcp.MANAGER.connection(payload["name"], payload["revision"], enabled)
+    except mcp.McpConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/mcp/connect")
+async def connect_mcp(payload: dict = Body(...)) -> dict:
+    return await _mcp_connection(payload, True)
+
+
+@app.post("/api/mcp/disconnect")
+async def disconnect_mcp(payload: dict = Body(...)) -> dict:
+    return await _mcp_connection(payload, False)

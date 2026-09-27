@@ -1,1 +1,1 @@
-{"servers": {"echo": {"module": "app.mcp_servers.echo", "timeout_s": 10}, "git": {"module": "app.mcp_servers.git", "timeout_s": 15}}}
+{"servers": {}}
