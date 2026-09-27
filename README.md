@@ -38,11 +38,11 @@ MCP-инструмент с отложенным или периодически
 процессами через тот же McpManager.
 
 ```bash
-.venv/bin/python checks/run_checks.py    # 62 проверки, включая семь новых и клиентскую
+make check                             # весь набор, включая процессы и клиент
 .venv/bin/python checks/restart.py       # два процесса подряд на одном файле
 .venv/bin/python checks/two_processes.py # сервер и консоль на одной базе
 .venv/bin/python checks/spawn_100.py     # сто агентов в одном процессе
-node checks/browser_check.js             # клиент под node, 377 утверждений
+make check-browser                     # только клиент под Node.js
 ```
 
 Новые: одноразовое срабатывает к сроку (статус вычисляется, а не пишется);
@@ -58,16 +58,56 @@ node checks/browser_check.js             # клиент под node, 377 утв�
 ## Как запустить
 
 ```bash
-cp .env.example .env    # впишите OPENROUTER_API_KEY; он в .gitignore
-python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/uvicorn app.main:app --reload --port 8000
+make help
+make setup
+# Только если .env ещё нет; впишите OPENROUTER_API_KEY вручную.
+test -e .env || cp .env.example .env
+make run
 ```
+
+Нужны Python >= 3.11 и Node.js для клиентских проверок. `make setup`
+по умолчанию создаёт `.venv` через `python3.11`. Другой интерпретатор:
+
+```bash
+make setup PYTHON=/path/to/python
+```
+
+`PYTHON` выбирает только интерпретатор создания окружения. Повторный
+`setup` использует существующую `.venv`, проверяет её Python >= 3.11 и
+устанавливает `requirements.txt`; окружение не пересоздаёт, `.env` не
+трогает. `run` и `check` всегда используют `.venv/bin/python`.
+`make run` запускает uvicorn с reload на порту 8000:
+http://127.0.0.1:8000. `make check` требует `node` в PATH и один раз
+вызывает `checks/run_checks.py`, который уже включает проверки отдельных
+процессов и браузерную. Любая ошибка завершает цель ненулевым кодом.
 
 В `mcp.json` три сервера: `echo` (стенд связи), `git` и `remind`.
 Спросите «напомни через минуту про чай» — под ответом будет бейдж
 `remind · remind · N мс`, а во вкладке «Инструменты» запись перевернётся
 в «сработало» на глазах. Репозиторий публичный: не коммитьте
 `git add -A`.
+
+## Работа с OpenCode и Pi
+
+Запускайте установленный инструмент из корня этого worktree:
+
+```bash
+cd /path/to/ai-challenge-9-week-01
+opencode
+# Или:
+pi
+```
+
+Корневой [AGENTS.md](AGENTS.md) автоматически попадает в контекст
+[OpenCode](https://opencode.ai/docs/rules/) и
+[Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md).
+Он требует перед изменениями прочитать нужные разделы
+[архитектуры](docs/architecture.md): ссылка сама по себе не загружает их
+содержимое. Модель и авторизацию настраивайте лично в выбранном инструменте
+(OpenCode — пользовательские настройки/подключение провайдера;
+Pi — `/login`, `/model`, настройки в `~/.pi/agent`). Эти настройки и
+учётные данные не переносите в репозиторий или `.env` приложения.
+`mcp.json` настраивает MCP-серверы самого чат-приложения, а не OpenCode/Pi.
 
 ## Что осталось честно назвать
 
