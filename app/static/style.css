@@ -689,7 +689,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
    текст переносится, а действие остаётся на месте и видно его всегда. */
 .mem-item {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   flex-wrap: wrap;
   gap: 8px;
   padding: 7px 9px;
@@ -698,14 +698,14 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
   background: var(--bg-soft);
   font-size: 12.5px;
 }
-.mem-item.column { flex-direction: column; gap: 4px; }
+.mem-item.column { flex-direction: column; align-items: flex-start; gap: 4px; }
+.mem-item > .mini, .mem-item > .mem-btn { align-self: flex-start; }
 /* Основа в процентах, а не `auto`: в узком ящике (панель там 300px и уже)
    кнопка рядом с длинной строкой факта сжимала бы текст в столбик по слову.
    С этой основой она уезжает на свою строку и встаёт справа. */
 .mem-text { flex: 1 1 55%; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
 .mem-kind {
   flex: 0 0 auto;
-  padding-top: 1px;
   font-size: 10px;
   font-weight: 650;
   letter-spacing: .05em;
@@ -870,7 +870,8 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .avatar { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--bubble); color: var(--muted); position: relative; }
 .avatar svg { width: 22px; height: 22px; }
 .profile-toggle.configured .avatar::after { content: ""; position: absolute; right: 0; bottom: 0; width: 9px; height: 9px; border: 2px solid var(--bg); border-radius: 50%; background: var(--ok); }
-.profile-chevron { font-size: 19px; color: var(--muted); }
+.profile-chevron { display: grid; place-items: center; color: var(--muted); }
+.profile-chevron svg { width: 19px; height: 19px; }
 .profile-menu { position: absolute; top: calc(100% + 12px); right: 0; width: 340px; max-width: calc(100vw - 32px); max-height: min(600px, calc(100dvh - 150px)); overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg); box-shadow: 0 16px 45px #0002; display: flex; flex-direction: column; gap: 12px; }
 .profile-menu h2 { font-size: 18px; margin: 0; }
 #profile-summary { display: flex; flex-direction: column; gap: 12px; }
@@ -919,7 +920,7 @@ select.control { appearance: none; cursor: pointer; padding-right: 26px;
 .mem-add { min-height: 44px; padding: 10px 18px; color: #fff; background: var(--button-bg); border-color: var(--button-bg); border-radius: 7px; }
 .mem-add:hover { background: var(--button-bg); filter: brightness(.95); border-color: var(--button-bg); }
 .mcp-server { border: 1px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.mcp-server-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.mcp-server-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .mcp-server-name { margin: 0; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
 .mcp-server-status { font-size: 12px; flex: 0 0 auto; padding: 4px 8px; border: 1px solid var(--line); border-radius: 20px; }
 .mcp-server-status.ok { color: var(--ok); }
@@ -1017,7 +1018,7 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
   .settings-card, .mem-layer, .mcp-server { padding: 16px; gap: 16px; }
   .grid2, .grid3:not(.context-grid), .context-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   #f-system { min-height: 260px; }
-  .mcp-server-head { flex-direction: column; }
+  .mcp-server-head { flex-direction: column; align-items: flex-start; }
   .mcp-tool { padding: 12px; }
   .mem-item { padding: 12px; }
   .mem-add-row { flex-wrap: wrap; }
