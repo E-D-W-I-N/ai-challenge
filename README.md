@@ -28,14 +28,11 @@
 ## Проверки
 
 ```bash
-.venv/bin/python checks/run_checks.py    # 69 проверок, включая семь новых и клиентскую
-.venv/bin/python checks/restart.py       # два процесса подряд на одном файле
-.venv/bin/python checks/two_processes.py # сервер и консоль на одной базе
-.venv/bin/python checks/spawn_100.py     # сто агентов в одном процессе
-node checks/browser_check.js             # клиент под node, 377 утверждений
+make check          # весь офлайн-набор: Python, subprocess и клиент под Node.js
+make check-browser  # только клиентский набор
 ```
 
-Новые семь: search детерминирован (повтор совпадает, top-N, перемешанный
+Проверки пайплайна: search детерминирован (повтор совпадает, top-N, перемешанный
 вход отсортирован); пустая выдача — честный отказ; summarize на
 фиксированном входе даёт эталонный выход побайтово (дедуп, группы, лимит);
 save_file пишет в каталог из `PIPELINE_FILES_DIR` побайтово; пять форм
@@ -51,17 +48,70 @@ search, аргумент save_file — вывод summarize (читается и
 
 ## Как запустить
 
+Из корня репозитория, с Python >= 3.11, Node.js, git и make:
+
 ```bash
-cp .env.example .env    # впишите OPENROUTER_API_KEY; он в .gitignore
-python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/uvicorn app.main:app --reload --port 8000
+make help
+make setup
+make run             # http://127.0.0.1:8000
 ```
+
+`setup` создаёт `.venv` либо повторно использует существующее окружение,
+проверяет Python >= 3.11 и устанавливает `requirements.txt`; `.env` не трогает.
+По умолчанию для создания выбран `python3.11`; другой путь задаётся так:
+
+```bash
+make setup PYTHON=/path/to/python
+```
+
+`PYTHON` используется только при создании окружения. Остальные цели всегда
+используют `.venv/bin/python`. Существующее окружение не пересоздаётся;
+несовместимое нужно исправить явно. `run` выполняет
+`.venv/bin/python -m uvicorn app.main:app --reload --port 8000`.
+`check` требует Node.js и единожды запускает `checks/run_checks.py`, который
+сам включает subprocess и браузерные проверки; ошибка любой цели даёт
+ненулевой код завершения.
+
+Для ручного общения с моделью человек создаёт `.env`, только если файла ещё
+нет, и вписывает `OPENROUTER_API_KEY` локально (файл в `.gitignore`):
+
+```bash
+if [ ! -e .env ] && [ ! -L .env ]; then cp .env.example .env; fi
+```
+
+Проверкам ключ не нужен: они используют заглушку без живых вызовов LLM.
+Smoke запускайте с временным `AGENT_DB_PATH` и `MCP_DISABLED=1`.
+Не читайте и не выводите секреты; для коммита перечисляйте файлы явно,
+не используйте `git add -A` или `git add .`.
 
 В `mcp.json` четыре сервера: `echo` (стенд связи), `git`, `remind` и
 `pipeline`. Спросите «найди упоминания require_parameters, сожми выдачу и
 сохрани в файл» — под ответом будут три бейджа подряд, а файл ляжет в
 `files/` (каталог в `.gitignore`: репозиторий публичный, не коммитьте
 `git add -A`).
+
+## Работа через OpenCode и Pi
+
+Запускайте установленный инструмент **из корня этого checkout/worktree**:
+
+```bash
+opencode
+# или
+pi
+```
+
+Оба инструмента автоматически включают корневой `AGENTS.md` в контекст
+([правила OpenCode](https://opencode.ai/docs/rules/),
+[контекст Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md)).
+Ссылка на `docs/architecture.md` не загружает файл сама: агент обязан прочитать
+нужные разделы перед изменениями, как требует `AGENTS.md`.
+
+Модель и авторизация — личные настройки каждого инструмента; задавайте их
+в его интерфейсе/пользовательском конфиге, не в отслеживаемых файлах проекта
+и не в `.env` приложения. Ключ OpenRouter приложения не настраивает
+OpenCode/Pi. Корневой `mcp.json` управляет серверами **приложения**, а не
+MCP coding-агентов; переносить его в настройки инструментов не нужно.
+Общие команды проекта одинаковы: `make setup`, `make run`, `make check`.
 
 ## Что осталось честно назвать
 
