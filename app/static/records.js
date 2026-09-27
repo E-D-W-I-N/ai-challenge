@@ -806,16 +806,19 @@ function remindersBlock(data) {
   const box = el("section", "mem-reminders");
   box.setAttribute("aria-label", "Напоминания");
   box.appendChild(el("h4", "mem-kind", "напоминания — ждёт: " + (data.waiting ?? 0)
-    + " · сработало: " + (data.fired ?? 0)));
+    + " · сработало: " + (data.fired ?? 0)
+    + (data.running ? " · выполняется: " + data.running : "")
+    + (data.failed ? " · ошибка: " + data.failed : "")
+    + (data.unbound ? " · не привязано: " + data.unbound : "")));
   const items = data.items || [];
   if (!items.length) box.appendChild(memNote("напоминаний нет"));
   for (const item of items) {
     const row = el("div", "reminder-item");
     row.appendChild(el("div", "mem-text", "№" + item.id + " — " + item.text));
     const deadline = fmt.clock(item.due_at);
-    const line = item.state === "ждёт" ? "ждёт · сработает в " + deadline
-      : item.every ? "сработало · раз: " + item.fired + " · следующее в " + deadline
-      : "сработало · в " + deadline;
+    const line = item.state + " · раз: " + item.fired
+      + (item.state === "ждёт" || item.every ? " · следующее в " + deadline : " · срок " + deadline)
+      + (item.error ? " · " + item.error : "");
     row.appendChild(el("div", "mem-note", line));
     box.appendChild(row);
   }

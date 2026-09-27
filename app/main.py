@@ -27,6 +27,7 @@ from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
+from .reminders import ReminderScheduler
 from .schema import (
     CONTEXT_FIELDS,
     CONTEXT_NUMBERS,
@@ -77,12 +78,15 @@ async def _lifespan(_app: FastAPI):
     # MCP — до yield: к первому запросу список инструментов уже на руках.
     # Пустой менеджер (нет конфига, MCP_DISABLED=1) неотличим от дня 15.
     await mcp.MANAGER.start()
-    yield
-    # Остановка MCP — до закрытия httpx: terminate, через две секунды kill.
-    await mcp.MANAGER.stop()
-    # Общий httpx-клиент переживает все запросы, поэтому закрывать его надо
-    # руками: без этого uvicorn на остановке ругается на незакрытый пул.
-    await llm.aclose()
+    scheduler = ReminderScheduler(mcp.MANAGER, REGISTRY)
+    scheduler.start()
+    try:
+        yield
+    finally:
+        await scheduler.stop()
+        # Close connections after executor outcomes; external services stay alive.
+        await mcp.MANAGER.stop()
+        await llm.aclose()
 
 
 app = FastAPI(title="AI Challenge Agents", version="2.0.0", lifespan=_lifespan)
@@ -1199,6 +1203,8 @@ async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
                 out = {key: value for key, value in event.items() if key != "type"}
                 out["event"] = event["type"]
                 out["agent"] = agent.id
+                if event["type"] == "done" and event.get("committed"):
+                    out["answer_index"] = len(agent.history) - 1
                 yield out
     except (AgentBusyError, MissingKeyError) as exc:
         yield {"event": "error", "agent": agent.id, "message": str(exc), "metrics": None}

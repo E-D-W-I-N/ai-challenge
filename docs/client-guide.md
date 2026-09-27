@@ -31,7 +31,7 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 | Машина задачи | app.js: parseCommand, runCommand, taskApi | Двойной Enter и смена чата при PATCH под Node; stage/gate/atomic в Python | Состояние задачи |
 | Ветка и очистка | app.js: forkFrom, openAgent; app/agent.py, store.py | Владение, persist/restart/seq и заполненные слои до очистки | Ветвление; Хранение и очистка |
 | Бейджи вызовов | app.js: toolBadge, toolLine, answerCard, exchange | Событие до done, ошибка, metrics.tool_calls при перерисовке/открытии | MCP; Клиент |
-| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | Список/агрегат/poll/stop/late GET под Node; локальные remind/restart/initialize/list/call/env/stop в Python | MCP |
+| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | Список/агрегат/poll/stop/late GET под Node; локальные HTTP remind/due/repeat/cancel/restart и initialize/list/call/env/stop в Python | MCP |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
@@ -72,3 +72,8 @@ batch-100 и длинные серии 25/500 обменов больше не �
 
 Это проверка представления; она не заменяет автоматические границы хранения,
 payload, идентификаторов, отмены позднего GET и асинхронных гонок.
+
+Для scheduler оставьте исходный чат открытым, не открывая «Инструменты»: после
+срока должен появиться новый подписанный результат и реальные tool-бейджи.
+Проверьте два повтора, сохранение черновика/незаписанных настроек и переключение
+чата во время GET; скрытие окна прекращает poll, возвращение сразу обновляет.

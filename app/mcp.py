@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import os
 import subprocess
@@ -28,6 +29,7 @@ import anyio
 import anyio.abc
 import anyio.streams.text
 from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.message import SessionMessage
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,7 +90,8 @@ class McpServer:
 
     name: str
     timeout_s: float
-    params: StdioServerParameters
+    params: StdioServerParameters | None = None
+    url: str = ""
     status: str = "down"
     error: str = ""
     tools: list = field(default_factory=list)  # types.Tool, как ответил сервер
@@ -116,6 +119,18 @@ class McpManager:
     def __init__(self) -> None:
         self.servers: list[McpServer] = []
         self.tools: dict[str, ToolRef] = {}
+        self.context_namespace = ""
+
+    @staticmethod
+    def schedules(server: McpServer) -> bool:
+        return {"_reminder_claim", "_reminder_finish"} <= {t.name for t in server.tools}
+
+    def scheduling_tool(self, name: str) -> bool:
+        ref = self.tools.get(name)
+        return ref is not None and ref.tool == "remind" and self.schedules(ref.server)
+
+    def context_for(self, chat_id: str) -> str:
+        return self.context_namespace + "/" + chat_id
 
     async def start(self) -> None:
         if os.environ.get("MCP_DISABLED") == "1":
@@ -129,7 +144,8 @@ class McpManager:
             server = McpServer(
                 name=name,
                 timeout_s=float(spec.get("timeout_s", 10)),
-                params=StdioServerParameters(
+                url=spec.get("url", ""),
+                params=None if spec.get("url") else StdioServerParameters(
                     # Команда — всегда тот интерпретатор, что крутит приложение:
                     # системный python3.9 сервер не поднял бы.
                     command=sys.executable,
@@ -148,6 +164,23 @@ class McpManager:
         Упал — status down и управление возвращается: старт приложения
         не держится на чужом процессе.
         """
+        if server.url:
+            stack = contextlib.AsyncExitStack()
+            try:
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(server.url, timeout=server.timeout_s)
+                )
+                server.session = await stack.enter_async_context(ClientSession(read, write))
+                await asyncio.wait_for(server.session.initialize(), CONNECT_TIMEOUT_S)
+                result = await asyncio.wait_for(server.session.list_tools(), CONNECT_TIMEOUT_S)
+                server.tools = list(result.tools)
+                server.status, server.stack = "ok", stack
+            except Exception as exc:
+                server.error = f"{type(exc).__name__}: {exc}"
+                with contextlib.suppress(Exception):
+                    await stack.aclose()
+            return
+        assert server.params is not None
         process = await anyio.open_process(
             [server.params.command, *server.params.args],
             stdin=subprocess.PIPE,
@@ -186,28 +219,43 @@ class McpManager:
         owners: dict[str, int] = {}
         for server in self.servers:
             for tool in server.tools:
+                if self.schedules(server) and tool.name.startswith("_reminder_"):
+                    continue
                 owners[tool.name] = owners.get(tool.name, 0) + 1
         for server in self.servers:
             for tool in server.tools:
+                if self.schedules(server) and tool.name.startswith("_reminder_"):
+                    continue
                 name = f"{server.name}__{tool.name}" if owners[tool.name] > 1 else tool.name
                 self.tools[name] = ToolRef(server=server, tool=tool.name)
+                schema = copy.deepcopy(tool.inputSchema)
+                if self.schedules(server) and tool.name in {"remind", "cancel"}:
+                    schema.get("properties", {}).pop("context_id", None)
                 server.view.append(
                     {
                         "name": name,
                         "description": tool.description or "",
-                        "schema": tool.inputSchema,
+                        "schema": schema,
                     }
                 )
 
-    async def call(self, name: str, args: dict):
+    async def call(self, name: str, args: dict, *, chat_id: str | None = None):
         """Вызов инструмента по имени из реестра, с таймаутом его сервера."""
         ref = self.tools.get(name)
         if ref is None:
             raise KeyError(f"инструмента {name!r} нет ни на одном живом сервере")
         assert ref.server.session is not None  # в реестре только живые серверы
+        if chat_id is not None and self.schedules(ref.server) and ref.tool in {"remind", "cancel"}:
+            args = {**args, "context_id": self.context_for(chat_id)}
         return await asyncio.wait_for(
             ref.server.session.call_tool(ref.tool, args), ref.server.timeout_s
         )
+
+    async def reminder_protocol(self, server: McpServer, tool: str, args: dict):
+        result = await asyncio.wait_for(server.session.call_tool(tool, args), server.timeout_s)
+        if result.isError:
+            raise RuntimeError(result.content)
+        return json.loads(result.content[0].text)
 
     async def stop(self) -> None:
         """Гасит все процессы: terminate всем, через две секунды kill тем,

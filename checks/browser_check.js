@@ -52,6 +52,43 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  for (const classic of [false, true]) await scenario("Automatic due result and late chat refresh " + classic, async () => {
+    const { client, server, $, requests, open } = freshClient({}, classic);
+    client.init(); await settle(30);
+    $("#input").value = "unsent draft";
+    $("#f-system").value = "unsaved setting";
+    const delayed = [{ ...turns[0], content: "[Напоминание №7] Выполни сейчас" },
+      { ...turns[1], content: "Автоматический свежий итог", metrics: { tool_calls: [{ name: "git_log", server: "git", ms: 3, ok: true }] } }];
+    Object.assign(server.state.agents[0], { transcript: delayed, history_len: 2 });
+    await settle(1100);
+    check("Idle chat receives real server result without Tools or send " + classic,
+      $("#feed").textContent.includes("Автоматический свежий итог") && $("#feed").textContent.includes("git_log")
+      && requests("GET", "/api/mcp").length === 0 && requests("POST", /\/messages$/).length === 0);
+    check("Background refresh preserves composer and settings drafts " + classic,
+      $("#input").value === "unsent draft" && $("#f-system").value === "unsaved setting");
+    const late = deferred(); server.respond("GET", "/api/agents/ag_1", () => late.promise);
+    document.fire(new Evt("visibilitychange")); await settle(10);
+    const controller = client.state.chatRequest;
+    open(1); await settle(20);
+    late.resolve(json({ ...server.state.agents[0], transcript: [{ ...turns[1], content: "LATE BACKGROUND" }] })); await settle(10);
+    check("Chat switch aborts and ignores late background GET " + classic,
+      controller.signal.aborted && client.state.current.id === "ag_2" && !$("#feed").textContent.includes("LATE BACKGROUND"));
+    window.dispatchEvent(new Evt("pagehide"));
+    check("Pagehide cancels selected-chat timer " + classic, client.state.chatTimer === null);
+  });
+
+  await scenario("Foreground prompt stays on its committed answer before due append", async () => {
+    const { client, server, $, send } = freshClient();
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream(success.map((event) =>
+      event.event === "done" ? { ...event, answer_index: 1 } : event), {
+        finish: () => Object.assign(server.state.agents[0], { transcript: [...turns,
+          { ...turns[0], content: "scheduled task" }, { ...turns[1], content: "scheduled answer" }], history_len: 4 }),
+      }));
+    client.init(); await settle(30); send("question"); await settle(30);
+    check("Foreground info is bound to SSE answer_index, never newest background row",
+      client.state.prompts.has("ag_1:1") && !client.state.prompts.has("ag_1:3"));
+  });
+
   await scenario("Markdown and parameters", async () => {
     const { client } = freshClient();
     for (const input of ["<script>x</script>", "**<img src=x onerror=x>**", "`<script>x</script>`", "```\n<img src=x>\n```", "# <iframe>", "> <img>", "- <img>"]) {

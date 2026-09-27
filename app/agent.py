@@ -475,7 +475,7 @@ def tool_result_text(result) -> str:
     return "\n".join(part for part in parts if part)
 
 
-async def run_tool(manager, call: dict) -> tuple[dict, object, str]:
+async def run_tool(manager, call: dict, *, chat_id: str | None = None) -> tuple[dict, object, str]:
     """Один вызов инструмента: разбор аргументов, сам вызов, замер.
 
     Отдаёт `(запись метрики, разобранные аргументы, текст результата)`.
@@ -492,7 +492,10 @@ async def run_tool(manager, call: dict) -> tuple[dict, object, str]:
         return run, call["arguments"], f"аргументы вызова не разобрать как JSON: {exc}"
     started = time.monotonic()
     try:
-        result = await manager.call(name, arguments)
+        if chat_id is not None and getattr(manager, "context_namespace", ""):
+            result = await manager.call(name, arguments, chat_id=chat_id)
+        else:
+            result = await manager.call(name, arguments)
         content, ok = tool_result_text(result), not getattr(result, "isError", False)
     except Exception as exc:  # noqa: BLE001 — ошибка вызова едет модели, а не вверх
         content, ok = f"{type(exc).__name__}: {exc}", False
@@ -1550,7 +1553,8 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
-    async def ask(self, user_text: str) -> AsyncIterator[dict]:
+    async def ask(self, user_text: str, *, scheduled: dict | None = None,
+                  can_run=None) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
         События: `compressing`, `start`, `reasoning`, `delta`, `tool_call`,
@@ -1575,6 +1579,8 @@ class Agent:
             self._cancel = asyncio.Event()
             cancel = self._cancel
             self.last_used_at = time.time()
+            if can_run is not None and not await can_run():
+                return
 
             # Слепок конфига на весь обмен. Промпт и тело запроса собираются
             # в двух разных точках, и между ними стоит `yield` события `start`:
@@ -1666,6 +1672,8 @@ class Agent:
             # неотличимо. Сжатию (`compress`) они не достаются никогда:
             # пересказу разговора вызовы ни к чему.
             tools = declared_tools(MANAGER)
+            if scheduled:
+                tools = [t for t in tools if not MANAGER.scheduling_tool(t["function"]["name"])]
             tool_runs: list[dict] = []
             iteration_metrics: list[dict] = []
             # Рабочий список сообщений: промпт плюс ход цикла вызовов.
@@ -1673,6 +1681,7 @@ class Agent:
             # и следующий обмен видит только финальный ответ.
             work = list(prompt)
             rounds = 0
+            scheduled_receipt = None
 
             try:
                 # Цикл вызовов: стрим → модель попросила инструменты →
@@ -1681,6 +1690,9 @@ class Agent:
                 # зовущая инструменты бесконечно, получает честный отказ,
                 # а не зависание.
                 while True:
+                    if can_run is not None and not await can_run():
+                        cancelled = True
+                        break
                     piece = ""
                     calls: list[dict] | None = None
                     stream = stream_completion(
@@ -1727,6 +1739,10 @@ class Agent:
                         # честный отказ, и он назван в метриках.
                         break
                     rounds += 1
+                    # Preflight the whole frame: even actions BEFORE remind must wait.
+                    scheduling = [] if scheduled else [c for c in calls if getattr(MANAGER, "scheduling_tool", lambda n: False)(c["name"])]
+                    if scheduling:
+                        calls = scheduling[:1]
                     work.append(
                         {
                             "role": "assistant",
@@ -1742,7 +1758,14 @@ class Agent:
                         }
                     )
                     for call in calls:
-                        run, arguments, content = await run_tool(MANAGER, call)
+                        if cancel.is_set() or (can_run is not None and not await can_run()):
+                            cancelled = True
+                            break
+                        if scheduled and MANAGER.scheduling_tool(call["name"]):
+                            run = {"name": call["name"], "server": tool_server(MANAGER, call["name"]), "ms": 0, "ok": False}
+                            arguments, content = {}, "срок наступил: новое планирование запрещено, выполните задачу сейчас"
+                        else:
+                            run, arguments, content = await run_tool(MANAGER, call, chat_id=self.id)
                         tool_runs.append(run)
                         # Событие о каждом вызове — сразу: пауза на сервере
                         # иначе выглядела бы зависанием.
@@ -1755,13 +1778,27 @@ class Agent:
                         work.append(
                             {"role": "tool", "tool_call_id": call["id"], "content": content}
                         )
+                        if scheduling:
+                            try:
+                                result = json.loads(content)
+                            except (ValueError, TypeError):
+                                result = {}
+                            if run["ok"] and result.get("scheduled") is True:
+                                text = result["message"]
+                                scheduled_receipt = {"id": result["id"], "server": run["server"]}
+                            else:
+                                text = "Не удалось запланировать задачу: " + content
+                                failure = text
+                    if scheduling or cancelled:
+                        break  # No further model round can execute delayed content now.
             except MissingKeyError as exc:
                 failure = str(exc)
                 yield {"type": "error", "message": failure, "metrics": None}
             except asyncio.CancelledError:
                 # Клиент ушёл: частичный ответ всё равно записываем — он уже
                 # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                self._commit(user_text, text, "вызов прерван", reasoning, final_metrics)
+                if scheduled is None:
+                    self._commit(user_text, text, "вызов прерван", reasoning, final_metrics)
                 raise
             except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                 failure = f"{type(exc).__name__}: {exc}"
@@ -1777,6 +1814,10 @@ class Agent:
 
             if tool_runs:
                 final_metrics = {**(final_metrics or {}), TOOL_METRIC: tool_runs}
+            if scheduled_receipt:
+                final_metrics = {**(final_metrics or {}), "reminder_scheduled": scheduled_receipt}
+            if scheduled:
+                final_metrics = {**(final_metrics or {}), "reminder_execution": scheduled}
             if rounds >= MAX_TOOL_ITER:
                 final_metrics = {**(final_metrics or {}), TOOL_ITER_METRIC: rounds}
 
@@ -1809,7 +1850,8 @@ class Agent:
             if hits:
                 final_metrics = {**(final_metrics or {}), BANNED_METRIC: hits}
 
-            committed = self._commit(user_text, text, failure, reasoning, final_metrics)
+            allowed = can_run is None or await can_run()
+            committed = self._commit(user_text, text, failure, reasoning, final_metrics) if allowed else False
 
             done: dict = {
                 "type": "done",

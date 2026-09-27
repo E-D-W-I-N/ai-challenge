@@ -39,6 +39,9 @@ const state = {
   mcpRequest: null,
   mcpEpoch: 0,
   mcpTimer: null,
+  chatTimer: null,
+  chatRequest: null,
+  chatEpoch: 0,
 };
 
 // Ключ промпта в `state.prompts`: чат и номер реплики-ответа в его истории.
@@ -434,6 +437,8 @@ function askDelete(agent) {
 
 async function openAgent(agentId) {
   if (!agentId) return;
+  stopChatPolling();
+  const epoch = state.chatEpoch;
   stopStream();
   let agent;
   try {
@@ -442,6 +447,7 @@ async function openAgent(agentId) {
     // Агента вытеснили или стёрли перезапуском — обновляем список.
     return loadAgents();
   }
+  if (epoch !== state.chatEpoch) return;
   state.current = agent;
   state.settingsRevision += 1;
   // Рабочий редактор принадлежит прежнему чату; глобальные редакторы
@@ -464,6 +470,7 @@ async function openAgent(agentId) {
   fillPanel(agent);
   syncChatControls();
   renderTiles();
+  scheduleChatPoll();
 
   // Открыт другой чат — первые два слоя теперь его, а не прежние. Читаем их
   // заново, но только если вкладка открыта: закрытой они не нужны.
@@ -1068,6 +1075,8 @@ async function exchange(path, body, questionText) {
   scrollFeed();
 
   setBusy(true);
+  stopChatPolling();
+  const epoch = state.chatEpoch;
   hint("");
 
   const controller = new AbortController();
@@ -1080,6 +1089,7 @@ async function exchange(path, body, questionText) {
   let prompt = null;
   let toolBox = null;
   let committed = false;
+  let answerIndex = null;
 
   try {
     await streamPost(
@@ -1176,6 +1186,7 @@ async function exchange(path, body, questionText) {
           case "done":
             // Записался ли обмен в историю — знает агент, и говорит прямо.
             committed = e.committed === true;
+            answerIndex = e.answer_index ?? null;
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
             if (e.metrics) keepMetrics(e.metrics);
@@ -1217,20 +1228,22 @@ async function exchange(path, body, questionText) {
   // своим промптом и своей сводкой. Привяжи его по длине истории, и он лёг бы
   // под ключ **прошлого** ответа: кнопка под давней карточкой показала бы
   // чужой запрос, внутри которого лежит сам этот ответ.
-  await refreshCurrent(committed ? prompt : null);
+  await refreshCurrent(committed ? prompt : null, answerIndex, agent.id, epoch);
+  scheduleChatPoll();
 }
 
-async function refreshCurrent(prompt) {
+async function refreshCurrent(prompt, answerIndex = null, id = state.current?.id, epoch = state.chatEpoch) {
   if (!state.current) return;
   try {
-    const fresh = await api("/api/agents/" + state.current.id);
+    const fresh = await api("/api/agents/" + id);
+    if (epoch !== state.chatEpoch || state.current?.id !== id) return;
     state.current = fresh;
     // Промпт привязываем к реплике до перерисовки: номер ответа в истории
     // известен только теперь, а рисовать карточку с кнопкой уже пора. Сюда он
     // доезжает, только если обмен записался, — значит последняя реплика
     // истории и есть его ответ.
     if (prompt) {
-      state.prompts.set(promptKey(fresh.id, fresh.transcript.length - 1), prompt);
+      state.prompts.set(promptKey(fresh.id, answerIndex ?? fresh.transcript.length - 1), prompt);
     }
     const listed = state.agents.find((a) => a.id === fresh.id);
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
@@ -1247,6 +1260,48 @@ async function refreshCurrent(prompt) {
   // могла добавиться и сводка. Это событие, а не отрисовка, и при закрытой
   // вкладке оно молчит.
   if (memoryTabOpen()) loadMemory(true);
+}
+
+// Due results arrive without a send or a Tools visit. One visible-page request
+// at a time; epochs keep late GETs away from another chat or foreground stream.
+function stopChatPolling() {
+  state.chatEpoch += 1;
+  clearTimeout(state.chatTimer);
+  state.chatTimer = null;
+  state.chatRequest?.abort();
+  state.chatRequest = null;
+}
+
+function scheduleChatPoll() {
+  clearTimeout(state.chatTimer);
+  state.chatTimer = null;
+  if (!state.current || document.visibilityState === "hidden") return;
+  state.chatTimer = setTimeout(pollCurrentChat, 1000);
+}
+
+async function pollCurrentChat() {
+  state.chatTimer = null;
+  if (!state.current || document.visibilityState === "hidden") return;
+  if (state.busy) { scheduleChatPoll(); return; }
+  const id = state.current.id, epoch = state.chatEpoch;
+  const controller = new AbortController();
+  state.chatRequest = controller;
+  try {
+    const fresh = await api("/api/agents/" + id, { signal: controller.signal });
+    if (state.chatEpoch !== epoch || state.current?.id !== id || state.busy || document.visibilityState === "hidden") return;
+    const changed = JSON.stringify(fresh.transcript) !== JSON.stringify(state.current.transcript);
+    state.current = fresh;
+    $("#chat-status").textContent = fresh.busy ? "Выполняется задача…" : "";
+    if (changed) {
+      resetMetrics(fresh);
+      const listed = state.agents.find((a) => a.id === id);
+      if (listed) Object.assign(listed, { history_len: fresh.history_len, label: fresh.label });
+      renderList(); renderTaskHead(); renderFeed(fresh); renderTiles();
+    }
+  } catch (error) { /* offline/transient GET retries on the next visible tick */ }
+  finally {
+    if (epoch === state.chatEpoch) { state.chatRequest = null; scheduleChatPoll(); }
+  }
 }
 
 // ─────────────────────── панель настроек ──────────────────────
@@ -1775,8 +1830,11 @@ function init() {
   document.addEventListener("visibilitychange", () => {
     stopMcpPolling();
     if (toolsVisible()) loadMcp();
+    stopChatPolling();
+    if (document.visibilityState !== "hidden") pollCurrentChat();
   });
   window.addEventListener?.("pagehide", stopMcpPolling);
+  window.addEventListener?.("pagehide", stopChatPolling);
 
   $("#new-chat").onclick = () => newChat();
 
