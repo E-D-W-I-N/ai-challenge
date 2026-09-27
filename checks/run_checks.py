@@ -4703,10 +4703,16 @@ def check_url_race():
     return check_url_race()
 
 
-@check("request JSON: actual outbound rounds survive config edits and restart")
+@check("request JSON: final outbound overrides survive config edits and restart")
 def check_request_capture():
     from checks.mcp_url import check_request_capture
     return check_request_capture()
+
+
+@check("Git HTTP: real tool rounds, exact request logs and whole-exchange lease")
+def check_git_exchange():
+    from checks.tool_url import check_git_exchange
+    return check_git_exchange()
 
 
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")

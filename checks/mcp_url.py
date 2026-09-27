@@ -24,13 +24,13 @@ from app import store as store_module
 
 
 @contextlib.contextmanager
-def service(module, folder):
+def service(module, folder, *extra_args):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     with open(Path(folder) / (module + ".log"), "w") as log:
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ}
-        proc = subprocess.Popen([sys.executable, "-m", module, "--port", str(port)], cwd=mcp.ROOT, env=env, stdout=log, stderr=log)
+        proc = subprocess.Popen([sys.executable, "-m", module, "--port", str(port), *extra_args], cwd=mcp.ROOT, env=env, stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 10
             while True:
@@ -164,29 +164,19 @@ def check_request_capture():
         def provider(request):
             received.append(json.loads(request.content))
             assert request.headers["authorization"] == "Bearer " + fake_key
-            reply = "first" if len(received) == 1 else "final <script>text</script>"
+            reply = "final <script>text</script>"
             frames = [{"choices": [{"delta": {"content": reply}}]}, {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13, "cost": .001}}]
             return httpx.Response(200, text="".join("data: " + json.dumps(frame) + "\n\n" for frame in frames) + "data: [DONE]\n\n")
 
         async def scenario():
             async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-                # Day16 has no model tool loop. This offline adapter exercises
-                # capture across two actual outbound HTTP rounds inside ask;
-                # future tool-loop code uses the same enclosing capture context.
-                async def two_rounds(spec, *, prompt_override, context_length):
-                    async for event in llm.stream_completion(spec, prompt_override=prompt_override, context_length=context_length):
-                        pass
-                    followup = agent.copy_spec(spec)
-                    followup.extra_body["messages"] = [*deepcopy(prompt_override), {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ping", "arguments": '{"text":"hello"}'}}]}, {"role": "tool", "tool_call_id": "call_1", "content": "pong hello"}]
-                    async for event in llm.stream_completion(followup, prompt_override=prompt_override, context_length=context_length):
-                        yield event
-                with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value=fake_key), patch.object(store_module, "api_key", return_value=fake_key), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", two_rounds):
+                with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value=fake_key), patch.object(store_module, "api_key", return_value=fake_key), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", llm.stream_completion):
                     events = [event async for event in chat.ask("question " + fake_key)]
                 assert events[-1]["committed"] and events[-1]["answer_index"] == 1
-                assert len(received) == 2
+                assert len(received) == 1
                 assert chat.history[-1].request_bodies == received
                 assert received[0]["temperature"] == .37 and received[0]["max_tokens"] == 17
-                assert received[1]["messages"][-1]["role"] == "tool" and received[1]["tools"] == spec.extra_body["tools"]
+                assert received[0]["tools"] == spec.extra_body["tools"]
                 assert fake_key not in json.dumps(received) and "Authorization" not in json.dumps(chat.transcript())
                 snapshot = deepcopy(received)
                 spec.temperature = .99
@@ -210,4 +200,4 @@ def check_request_capture():
         assert migrated.load_messages(identity)[1]["request_bodies"] is None
         migrated.init()
         migrated.close()
-    return "actual outbound JSON equals committed/restored snapshot over two rounds, tools and tool response; config edits cannot change it; no auth/key capture; populated legacy migration"
+    return "actual outbound JSON equals committed/restored snapshot with final tools override; config edits cannot change it; no auth/key capture; populated legacy migration"

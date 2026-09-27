@@ -31,7 +31,7 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 | Машина задачи | app.js: parseCommand, runCommand, taskApi | Двойной Enter и смена чата при PATCH под Node; stage/gate/atomic в Python | Состояние задачи |
 | Ветка и очистка | app.js: forkFrom, openAgent; app/agent.py, store.py | Владение, persist/restart/seq и заполненные слои до очистки | Ветвление; Хранение и очистка |
 | Бейджи вызовов | app.js: toolBadge, toolLine, answerCard, exchange | Событие до done, ошибка, metrics.tool_calls при перерисовке/открытии | MCP; Клиент |
-| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | URL/save/connect/draft/поздний GET под Node; независимые HTTP initialize/list/call/reopen/races/stop и stdio env в Python | MCP |
+| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | URL/save/connect/draft/поздний GET под Node; независимые echo/Git HTTP initialize/list/call/reopen/races/stop, полный tool exchange lease и stdio env в Python | MCP |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
