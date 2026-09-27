@@ -25,13 +25,13 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 |---|---|---|---|
 | Markdown, формат, JSON/stop | text.js | Чистый разбор и один путь текста в карточку под Node | Клиент; Промпт, контекст и метрики |
 | Панель → запрос | app.js: readPanel, applySettings, ensurePanelApplied, exchange | Реальные поля → payload под Node; контракт вызова в Python | Клиент; Промпт, контекст и метрики |
-| Поток, метрики, промпт | app.js: exchange, refreshCurrent, renderFeed, usageLine, showPrompt | Success/error, committed prompt, отмена/смена области; серверные суммы | Промпт, контекст и метрики; Клиент |
+| Поток, метрики, информация JSON | app.js: exchange, refreshCurrent, renderFeed, usageLine, showPrompt | Success/error, persisted JSON rounds/legacy, отмена/смена области; actual outbound payload/restart и серверные суммы | Промпт, контекст и метрики; Клиент |
 | CRUD и ошибки editor | records.js: startRecordEdit, loadMemory, editWorking/editMemory, editInvariant | Scope/id/различающий тип, один PATCH Enter/focusout, текст после отказа | Память и профиль; Инварианты и сторож; Клиент |
 | Профиль и аватар | records.js: loadProfile, saveProfile, toggleProfileMenu | Partial PATCH/dirty/error под Node; глобальность и prompt в Python | Память и профиль; Клиент |
 | Машина задачи | app.js: parseCommand, runCommand, taskApi | Двойной Enter и смена чата при PATCH под Node; stage/gate/atomic в Python | Состояние задачи |
 | Ветка и очистка | app.js: forkFrom, openAgent; app/agent.py, store.py | Владение, persist/restart/seq и заполненные слои до очистки | Ветвление; Хранение и очистка |
 | Бейджи вызовов | app.js: toolBadge, toolLine, answerCard, exchange | Событие до done, ошибка, metrics.tool_calls при перерисовке/открытии | MCP; Клиент |
-| MCP | records.js: loadMcp, toolsVisible, stopMcpPolling; app/mcp.py | Список/агрегат/poll/stop/late GET под Node; локальные remind/restart/initialize/list/call/env/stop в Python | MCP |
+| MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | app/mcp_servers/pipeline.py; checks/run_checks.py, _stub.py | Временный Git/bytes; четыре payload-снимка, реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
@@ -62,7 +62,7 @@ batch-100 и длинные серии 25/500 обменов больше не �
 3. Откройте аватар, просмотрите глобальный профиль, перейдите к editor;
    Escape возвращает фокус. Проверьте черновик/ошибку после смены областей,
    подписи full/window/summary, guard без метрик, пустой/down MCP и
-   read-only напоминания. Оставьте вкладку открытой
+   напоминания и кнопку «Снять» для задачи текущего чата. Оставьте вкладку открытой
    для обновления через 2 секунды; скрытие/уход останавливает опрос,
    повторный вход сразу обновляет, раскрытая схема сохраняется. В чате
    проверьте удачный/ошибочный tool-бейдж до конца потока и после открытия
@@ -75,3 +75,8 @@ batch-100 и длинные серии 25/500 обменов больше не �
 
 Это проверка представления; она не заменяет автоматические границы хранения,
 payload, идентификаторов, отмены позднего GET и асинхронных гонок.
+
+Для scheduler оставьте исходный чат открытым, не открывая «Инструменты»: после
+срока должен появиться новый подписанный результат и реальные tool-бейджи.
+Проверьте два повтора, сохранение черновика/незаписанных настроек и переключение
+чата во время GET; скрытие окна прекращает poll, возвращение сразу обновляет.
