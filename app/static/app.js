@@ -80,6 +80,7 @@ const ICONS = {
   lines: "M4 6h16M4 10h16M4 14h12M4 18h7",
   branch: "M7 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM7 9v10M17 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM17 9v2a4 4 0 0 1-4 4H7",
   user: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2",
+  chevronDown: "m6 9 6 6 6-6",
   memory: "M4 6c0-5 16-5 16 0s-16 5-16 0zM4 6v12c0 5 16 5 16 0V6M4 12c0 5 16 5 16 0",
   shield: "M12 3 3 7v6c0 5 9 9 9 9s9-4 9-9V7zM8 12l3 3 5-6",
   tools: "m14 7 3 3 4-4a6 6 0 0 1-8 8L5 22l-3-3 8-8a6 6 0 0 1 8-8z",
@@ -2898,6 +2899,7 @@ function init() {
   $("#restore-sidebar").onclick = () => setCollapsed("sidebar", isCollapsed("sidebar") ? false : true);
   $("#chat-search").oninput = renderList;
   $(".avatar").appendChild(icon("user"));
+  $(".profile-chevron").appendChild(icon("chevronDown"));
   $("#profile-toggle").onclick = toggleProfileMenu;
   $("#profile-edit").onclick = () => {
     closeProfileMenu();
