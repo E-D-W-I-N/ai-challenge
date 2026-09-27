@@ -525,7 +525,7 @@ async function routeChecks() {
     // уже поднятом клиенте, а не отдельным сценарием: свой запуск стенда ради
     // одной строки текста дороже самой строки.
     check("в шапке стоит номер этого дня",
-      $(".brand-sub").textContent === "чат · день 17", $(".brand-sub").textContent);
+      $(".brand-sub").textContent === "чат · день 18", $(".brand-sub").textContent);
 
     const empty = tiles();
     check("до первого ответа входные токены — прочерк, а не ноль",
@@ -1765,6 +1765,97 @@ async function routeChecks() {
       schema ? schema.textContent : "(схемы нет)");
     check("у лежачего сервера сказано, что инструментов нет",
       $("#mcp-list").textContent.includes("инструментов нет"), $("#mcp-list").textContent);
+    // Уходим со вкладки: у открытой живёт перезапрос раз в 2 секунды
+    // (см. сценарий ниже), и брошенный таймер держал бы процесс.
+    openTab("model");
+    await settle(20);
+  }
+
+  // ── вкладка «Инструменты»: напоминания переворачиваются живьём ──
+  //
+  // Сервер отдал поле `reminders`: блок со счётчиками и записями под
+  // инструментами. Пока вкладка открыта, клиент перезапрашивает её сам —
+  // напоминание срабатывает без единого действия человека, и переворот
+  // «ждёт → сработало» обязан появиться на экране живьём. Закрыли
+  // вкладку — запросы прекратились.
+  {
+    const soon = Date.now() / 1000 + 60;
+    const { client, server, $, settle, Evt } = freshClient({
+      mcp: [
+        { name: "remind", status: "ok", tools: [
+          { name: "remind", description: "завести напоминание",
+            schema: { type: "object", properties: {} } },
+          { name: "reminders", description: "список напоминаний",
+            schema: { type: "object", properties: {} } },
+        ], reminders: {
+          items: [
+            { id: 1, text: "позвонить в банк", every: null, due_at: soon,
+              fired: 0, state: "ждёт" },
+            { id: 2, text: "размяться", every: 3600, due_at: soon + 3600,
+              fired: 3, state: "сработало" },
+          ],
+          total: 2, waiting: 1, fired: 1,
+        } },
+        { name: "echo", status: "ok", tools: [
+          { name: "ping", description: "проверка связи",
+            schema: { type: "object", properties: {} } },
+        ] },
+      ],
+    });
+    client.init();
+    await settle(30);
+    const openTab = (which) =>
+      document.querySelectorAll(".tab").find((t) => t.dataset.tab === which)
+        .dispatchEvent(new Evt("click"));
+    const calls = () =>
+      server.state.requests.filter((r) => r.method === "GET" && r.path === "/api/mcp");
+
+    openTab("mcp");
+    await settle(40);
+    check("у remind-сервера под инструментами — блок со счётчиками по состояниям",
+      $("#mcp-list").textContent.includes("напоминания — ждёт: 1 · сработало: 1"),
+      $("#mcp-list").textContent);
+    check("ждущее показано с текстом и временем срабатывания",
+      $("#mcp-list").textContent.includes("позвонить в банк")
+        && $("#mcp-list").textContent.includes("ждёт · сработает в "),
+      $("#mcp-list").textContent);
+    check("сработавшее повторяющееся — со счётом и следующим сроком",
+      $("#mcp-list").textContent.includes("размяться")
+        && $("#mcp-list").textContent.includes("сработало · раз: 3")
+        && $("#mcp-list").textContent.includes("следующее в "),
+      $("#mcp-list").textContent);
+    check("у сервера без поля reminders блока не заводится", (() => {
+      const rows = $("#mcp-list").querySelectorAll(".mem-item");
+      const echo = rows[rows.length - 1];
+      return echo.textContent.includes("echo") && !echo.querySelector(".mem-reminders");
+    })(), $("#mcp-list").textContent);
+
+    // Сервер переворачивает состояние: запрос тот же, ответ другой.
+    server.state.mcpServers[0].reminders = {
+      items: [
+        { id: 1, text: "позвонить в банк", every: null, due_at: soon,
+          fired: 1, state: "сработало" },
+        { id: 2, text: "размяться", every: 3600, due_at: soon + 3600,
+          fired: 3, state: "сработало" },
+      ],
+      total: 2, waiting: 0, fired: 2,
+    };
+    const seen = calls().length;
+    await settle(2300);
+    check("пока вкладка открыта, список перезапрашивается сам",
+      calls().length > seen, "запросов /api/mcp: " + calls().length);
+    check("переворот «ждёт → сработало» появился без единого действия",
+      $("#mcp-list").textContent.includes("напоминания — ждёт: 0 · сработало: 2")
+        && $("#mcp-list").textContent.includes("сработало · в "),
+      $("#mcp-list").textContent);
+
+    openTab("model");
+    await settle(30);
+    const closed = calls().length;
+    await settle(2300);
+    check("закрытая вкладка не опрашивается",
+      calls().length === closed,
+      "запросов после закрытия: " + (calls().length - closed));
   }
 
   // ── вкладка «Инструменты»: пустой менеджер назван словами ──
@@ -1780,6 +1871,10 @@ async function routeChecks() {
     await settle(40);
     check("без серверов вкладка говорит «MCP не подключён», а не пустой экран",
       $("#mcp-list").textContent.includes("MCP не подключён"), $("#mcp-list").textContent);
+    // И здесь уходим со вкладки — перезапрос открытой держал бы процесс.
+    document.querySelectorAll(".tab").find((t) => t.dataset.tab === "model")
+      .dispatchEvent(new Evt("click"));
+    await settle(20);
   }
 
   // ── вкладка «Память»: три слоя видны и управляются ──
