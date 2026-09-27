@@ -5746,6 +5746,299 @@ def check_remind_end_to_end():
     return "вызов исполнен процессом, напоминание заведено и видно в ручке, история попарная"
 
 
+# --- День 19: пайплайн из трёх инструментов ----------------------------------
+#
+# search → summarize → save_file. Цепочку ведёт модель циклом вызовов дня 17:
+# автоматики, передающей результат одного инструмента в другой мимо модели,
+# нет. Механика проверяется in-process (декоратор FastMCP возвращает функцию
+# как есть), связь и сквозная цепочка — настоящим процессом через тот же
+# McpManager.
+
+PIPELINE = {"module": "app.mcp_servers.pipeline", "timeout_s": 15}
+
+
+@check("search: выдача детерминирована — сортировка по (файл, строка), потом top-N")
+def check_pipeline_search_deterministic():
+    """Два одинаковых вызова дают одну выдачу, limit режет её до top-N,
+    каждая строка содержит запрос. Сортировку проверяем жёстче: на
+    подменённом `_grep` с намеренно перемешанными строками выдача обязана
+    выйти отсортированной и обрезанной — git свой порядок не обещает, и без
+    сортировки она зависела бы от его потоков."""
+    from app.mcp_servers import pipeline as srv
+
+    first = srv.search("the", 5)
+    second = srv.search("the", 5)
+    assert first == second, "повтор того же запроса дал другую выдачу"
+    lines = first.splitlines()
+    assert len(lines) == 5, lines
+    assert all("the" in line.lower() for line in lines), lines
+    assert lines == sorted(lines, key=lambda l: (l.split(":")[0], int(l.split(":")[1]))), lines
+
+    shuffled = ["b.py:5: x", "a.py:9: x", "a.py:2: x", "b.py:1: x"]
+    with patch.object(srv, "_grep", lambda query: shuffled):
+        arranged = srv.search("x", 3)
+    assert arranged.splitlines() == ["a.py:2: x", "a.py:9: x", "b.py:1: x"], arranged
+    return "повтор совпал, top-5 из 40+, перемешанное отсортировано и обрезано"
+
+
+@check("search: пустая выдача — честное «ничего не найдено», а не выдумка")
+def check_pipeline_search_empty():
+    """Запрос-маркер, которого в репозитории нет заведомо: ответ называет
+    запрос и говорит «ничего не найдено» — ни пустой строки, ни выдуманных
+    совпадений. Границы тоже названы, а не молчат."""
+    import time
+
+    from app.mcp_servers import pipeline as srv
+
+    marker = f"нет-такого-{time.time_ns()}"
+    answer = srv.search(marker)
+    assert answer == f"по запросу «{marker}» ничего не найдено", answer
+    assert srv.search("   ") == "пустой запрос: искать нечего"
+    assert "больше нуля" in srv.search("раз", 0)
+    return "отсутствующее названо отсутствующим, границы — текстом"
+
+
+@check("summarize: фиксированный вход → эталонный выход (дедуп, группы, лимит)")
+def check_pipeline_summarize_reference():
+    """Механический конденсат, без LLM: дубли схлопнуты, строки сгруппированы
+    по файлам в порядке первого появления, лишние группы отброшены — и это
+    названо числом. Вход фиксирован, выход обязан совпасть побайтово."""
+    from app.mcp_servers import pipeline as srv
+
+    raw = "\n".join(
+        [
+            "b.py:5: два",
+            "a.py:2: раз",
+            "a.py:9: полтора",
+            "b.py:5: два",  # дубль: схлопывается
+            "строка без номера",
+            "c.py:1: три",
+        ]
+    )
+    out = srv.summarize(raw, max_items=2)
+    assert out == (
+        "b.py — 1 строка:\n"
+        "  b.py:5: два\n"
+        "\n"
+        "a.py — 2 строки:\n"
+        "  a.py:2: раз\n"
+        "  a.py:9: полтора\n"
+        "\n"
+        "…ещё 2 файла не показано"
+    ), out
+    assert srv.summarize("") == "пустой вход: конденсировать нечего"
+    assert "больше нуля" in srv.summarize(raw, 0)
+    return "дубль схлопнут, 4 группы обрезаны до 2, обрезка названа числом"
+
+
+@check("save_file: пишет в каталог из PIPELINE_FILES_DIR, содержимое побайтово")
+def check_pipeline_save_file_writes():
+    """Каталог приходит из env (проверка уводит его во временный), ответ
+    называет путь записанного, а байты на диске — в точности те, что просили."""
+    import tempfile
+    from pathlib import Path
+
+    from app.mcp_servers import pipeline as srv
+
+    content = "раз\r\nдва ⚙\n"
+    with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
+        with patch.dict(os.environ, {"PIPELINE_FILES_DIR": tmp}):
+            answer = srv.save_file("итог.txt", content)
+        written = (Path(tmp) / "итог.txt").read_bytes()
+    assert written == content.encode("utf-8"), written
+    assert answer.startswith("записано: ") and "итог.txt" in answer, answer
+    return "файл лежит в заданном каталоге, байты совпали, путь назван"
+
+
+@check("save_file: имя с «../» или «/» — отказ текстом, и файла не появляется")
+def check_pipeline_save_file_name():
+    """Пять форм нечестного имени: обход каталога, подкаталог, чужой
+    разделитель, сама точка-точка, пустое. Все пять — отказ текстом, и
+    каталог остался пустым: files/ — единственное файловое место записи."""
+    import tempfile
+    from pathlib import Path
+
+    from app.mcp_servers import pipeline as srv
+
+    with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
+        with patch.dict(os.environ, {"PIPELINE_FILES_DIR": tmp}):
+            for bad in ("../escape.txt", "sub/dir.txt", "a\\b.txt", "..", "  "):
+                answer = srv.save_file(bad, "x")
+                assert answer.startswith("отказано:"), (bad, answer)
+        assert list(Path(tmp).iterdir()) == [], list(Path(tmp).iterdir())
+    return "пять форм нечестного имени — пять отказов, каталог пуст"
+
+
+@check("pipeline через MANAGER: настоящий процесс, search по репо находит известную строку")
+def check_pipeline_end_to_end():
+    """Сервер поднят процессом через тот же McpManager: все три инструмента
+    в списке, с описанием и схемой от самого сервера. search по строке,
+    заведомо лежащей в коде самого сервера, возвращает строки с именем
+    его файла."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
+        cfg = _mcp_config(tmp, {"pipeline": PIPELINE})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()
+                try:
+                    server = manager.servers[0]
+                    assert server.status == "ok", server.error
+                    tools = {t["name"]: t for t in server.view}
+                    assert sorted(tools) == ["save_file", "search", "summarize"], sorted(tools)
+                    for tool in tools.values():
+                        assert tool["description"], tool
+                        assert tool["schema"].get("properties"), tool
+                    result = await manager.call(
+                        "search", {"query": "PIPELINE_FILES_DIR", "limit": 5}
+                    )
+                    return result.content[0].text
+                finally:
+                    await manager.stop()
+
+        found = asyncio.run(scenario())
+    lines = found.splitlines()
+    assert lines and all("pipeline_files_dir" in line.lower() for line in lines), found
+    assert any(line.startswith("app/mcp_servers/pipeline.py:") for line in lines), found
+    return "процесс отдал три инструмента, search нашёл свою же строку в коде"
+
+
+@check("сквозная: цепочка search → summarize → save_file, данные текут по tool-сообщениям")
+def check_pipeline_chain():
+    """Сквозной сценарий дня. Заглушка играет модель, ведущую цепочку: зовёт
+    search, затем summarize с его результатом — прочитанным из tool-сообщения,
+    как прочитала бы его модель, — затем save_file с выводом summarize.
+    Передача данных проверяется там же, где её увидела бы модель: в
+    CALLS[n].payload["messages"] аргумент summarize содержит результат search,
+    аргумент save_file — вывод summarize. В продукте автоматики нет: каждый
+    инструмент видит только то, что положила модель."""
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from app.mcp_servers import pipeline as srv
+
+    query = "require_parameters"
+    name = f"цепочка-{time.time_ns()}.txt"
+    target = Path(ROOT) / "files" / name
+    # Ожидание — независимо от продукта: тот же git grep, сортировка и лимит
+    # посчитаны здесь руками.
+    raw = subprocess.run(
+        ["git", "grep", "-n", "-i", "-F", "--untracked", "-e", query, "--", "."],
+        cwd=ROOT, capture_output=True, text=True, timeout=15,
+    ).stdout.splitlines()
+    expected_search = "\n".join(
+        sorted(raw, key=lambda l: (l.split(":")[0], int(l.split(":")[1])))[:5]
+    )
+    assert expected_search, "в репозитории обязана быть строка require_parameters"
+    expected_summary = srv.summarize(expected_search, 3)
+
+    def last_tool(messages):
+        tool = next((m for m in reversed(messages) if m.get("role") == "tool"), None)
+        return tool["content"] if tool else ""
+
+    plan = ["search", "summarize", "save_file"]
+
+    def chain_calls(messages, index):
+        """Модель ведёт цепочку: аргумент следующего вызова — результат
+        предыдущего, взятый из последнего tool-сообщения."""
+        if index >= len(plan):
+            return None
+        if index == 0:
+            args = {"query": query, "limit": 5}
+        elif index == 1:
+            args = {"text": last_tool(messages), "max_items": 3}
+        else:
+            args = {"name": name, "content": last_tool(messages)}
+        return [
+            {
+                "id": f"call_{index + 1}",
+                "name": plan[index],
+                "arguments": json.dumps(args, ensure_ascii=False),
+            }
+        ]
+
+    def chain_reply(messages, index):
+        """Пока цепочка идёт — молчание; в конце — пересказ подтверждения
+        из последнего tool-сообщения."""
+        if index < len(plan):
+            return ""
+        return "сохранил: " + last_tool(messages)
+
+    with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
+        cfg = _mcp_config(tmp, {"pipeline": PIPELINE})
+        _stub.install(reply=chain_reply, tool_calls=chain_calls)
+        try:
+            with _mcp_env(cfg):
+                with TestClient(main.app) as client:
+                    chat = new_agent(client)
+                    answer = client.post(
+                        f"/api/agents/{chat}/messages",
+                        json={"text": "найди и сохрани"},
+                    )
+                    assert answer.status_code == 200, answer.text
+                    frames = sse(answer.text)
+                    body = client.get(f"/api/agents/{chat}").json()
+                    written = target.read_bytes() if target.exists() else None
+        finally:
+            # save_file писал в files/ репозитория (env дочерних — белый
+            # список): за собой чистим.
+            target.unlink(missing_ok=True)
+
+    # Четыре обращения к модели: три с просьбой о вызове и финальное словами.
+    assert len(_stub.CALLS) == 4, len(_stub.CALLS)
+    first, second, third, fourth = _stub.CALLS
+    declared = {t["function"]["name"] for t in first["payload"]["tools"]}
+    assert declared == {"search", "summarize", "save_file"}, declared
+
+    # search исполнен: его настоящий результат лежит в tool-сообщении.
+    got_search = second["payload"]["messages"][-1]
+    assert got_search["role"] == "tool" and got_search["tool_call_id"] == "call_1", got_search
+    assert got_search["content"] == expected_search, got_search["content"]
+
+    # summarize позван с результатом search — читаем аргумент из запроса.
+    asked2 = third["payload"]["messages"][-2]
+    arg2 = json.loads(asked2["tool_calls"][0]["function"]["arguments"])
+    assert arg2 == {"text": expected_search, "max_items": 3}, arg2
+    got_summary = third["payload"]["messages"][-1]
+    assert got_summary["role"] == "tool" and got_summary["tool_call_id"] == "call_2", got_summary
+    assert got_summary["content"] == expected_summary, got_summary["content"]
+
+    # save_file позван с выводом summarize, и файл лежал с ним побайтово.
+    asked3 = fourth["payload"]["messages"][-2]
+    arg3 = json.loads(asked3["tool_calls"][0]["function"]["arguments"])
+    assert arg3 == {"name": name, "content": expected_summary}, arg3
+    got_saved = fourth["payload"]["messages"][-1]
+    assert got_saved["role"] == "tool" and got_saved["content"].startswith("записано: "), got_saved
+    assert written == expected_summary.encode("utf-8"), written
+    assert not target.exists(), "файл проверки не убран"
+
+    # SSE: три бейджа подряд, до done, каждый со своим результатом.
+    kinds = [f["event"] for f in frames]
+    badges = [f for f in frames if f["event"] == "tool_call"]
+    assert [b["name"] for b in badges] == plan, badges
+    assert badges[0]["result"] == expected_search, badges[0]
+    assert badges[1]["result"] == expected_summary, badges[1]
+    assert all(b["ok"] and b["server"] == "pipeline" for b in badges), badges
+    assert kinds.index("tool_call") < kinds.index("done"), kinds
+
+    # Финальный ответ пересказывает подтверждение, история попарная, метрики
+    # несут три записи вызовов в порядке цепочки.
+    answer_turn = body["transcript"][-1]
+    assert answer_turn["content"] == "сохранил: " + got_saved["content"], answer_turn["content"]
+    assert [t["role"] for t in body["transcript"]] == ["user", "assistant"], body["transcript"]
+    runs = answer_turn["metrics"]["tool_calls"]
+    assert [r["name"] for r in runs] == plan, runs
+    assert all(r["ok"] and r["server"] == "pipeline" for r in runs), runs
+    return (
+        "три вызова доехали процессом, аргумент summarize — результат search, "
+        "аргумент save_file — вывод summarize, файл записан, история попарная"
+    )
+
+
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
 def check_browser():
     """Клиентский код исполняется под node: payload на входе, утверждения

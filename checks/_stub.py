@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import fields as dataclass_fields
 from typing import Callable
 
@@ -75,7 +76,10 @@ def make(
                 # Инструменты уезжают в настоящий `build_payload`: проверки
                 # смотрят в записанное тело и спрашивают его «объявлены ли
                 # `tools` и какие», а пересказ заглушки отвечал бы за себя.
-                "payload": build_payload(session, prompt_override, tools=tools),
+                # Снимок глубокий: build_payload ссылается на живой рабочий
+                # список, и цикл вызовов иначе дописывал бы tool-сообщения
+                # в тело уже записанного, давнего вызова.
+                "payload": copy.deepcopy(build_payload(session, prompt_override, tools=tools)),
             }
         )
 
