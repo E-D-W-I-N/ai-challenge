@@ -6039,6 +6039,149 @@ def check_pipeline_chain():
     )
 
 
+# --- День 20: оркестрация — несколько серверов, длинный флоу -----------------
+#
+# Четыре сервера живут в mcp.json, реестр разруливает имена и коллизии, цикл
+# вызовов дня 17 исполняет и показывает — механика оркестрации уже есть. День
+# добавляет проверки ей: маршрутизацию (каждый вызов уезжает в свой сервер,
+# порядок сохранён) и изоляцию упавшего.
+
+
+@check("оркестрация: один обмен — вызовы двух разных серверов, каждый в свой, порядок сохранён")
+def check_orch_two_servers_routing():
+    """Заглушка просит два вызова одним кадром — git_log (git) и ping (echo),
+    в порядке, обратном порядку серверов в конфиге. Каждый обязан уехать в свой
+    сервер: иначе tool-сообщение лежало бы с чужим результатом или с ошибкой.
+    Порядок обязан сохраниться: модель читает tool-сообщения позиционно, и
+    перестановка молча разменяла бы результаты. Метрики обмена называют сервер
+    каждого вызова."""
+    import tempfile
+    import time
+
+    marker = f"маршрут-{time.time_ns()}"
+
+    def route_calls(messages, index):
+        if index:
+            return None
+        return [
+            {"id": "call_1", "name": "git_log", "arguments": '{"n": 1}'},
+            {"id": "call_2", "name": "ping", "arguments": json.dumps({"text": marker})},
+        ]
+
+    def route_reply(messages, index):
+        if index == 0:
+            return ""
+        tools = [m["content"] for m in messages if m.get("role") == "tool"]
+        return "итог: " + " | ".join(tools)
+
+    with tempfile.TemporaryDirectory(prefix="check-orch-") as tmp:
+        cfg = _mcp_config(tmp, {"echo": ECHO, "git": GIT})
+        _stub.install(reply=route_reply, tool_calls=route_calls)
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(
+                    f"/api/agents/{chat}/messages", json={"text": "журнал и связь"}
+                )
+                assert answer.status_code == 200, answer.text
+                frames = sse(answer.text)
+                body = client.get(f"/api/agents/{chat}").json()
+
+    # Два обращения к модели: с просьбой о вызовах и с их результатами.
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    head = _git_head_line()
+    sent = _stub.CALLS[1]["payload"]["messages"]
+    roles = [m["role"] for m in sent]
+    assert roles[-3:] == ["assistant", "tool", "tool"], roles
+    asked = sent[-3]
+    assert [c["function"]["name"] for c in asked["tool_calls"]] == ["git_log", "ping"], asked
+
+    # Каждый вызов уехал в свой сервер: результаты не перепутать — одно
+    # сообщение несёт настоящий коммит, второе отвечает эхом.
+    first, second = sent[-2], sent[-1]
+    assert first["tool_call_id"] == "call_1" and first["content"] == head, first
+    assert second["tool_call_id"] == "call_2" and second["content"] == f"pong {marker}", second
+
+    # SSE: два бейджа до done, в порядке просьбы, каждый со своим сервером.
+    kinds = [f["event"] for f in frames]
+    badges = [f for f in frames if f["event"] == "tool_call"]
+    assert [b["name"] for b in badges] == ["git_log", "ping"], badges
+    assert [b["server"] for b in badges] == ["git", "echo"], badges
+    assert badges[0]["result"] == head and badges[1]["result"] == f"pong {marker}", badges
+    assert all(b["ok"] for b in badges), badges
+    assert kinds.index("tool_call") < kinds.index("done"), kinds
+
+    # Финальный ответ собран из обоих результатов, история попарная, метрики
+    # называют сервер каждого вызова в порядке исполнения.
+    answer_turn = body["transcript"][-1]
+    assert answer_turn["content"] == f"итог: {head} | pong {marker}", answer_turn["content"]
+    assert [t["role"] for t in body["transcript"]] == ["user", "assistant"], body["transcript"]
+    runs = answer_turn["metrics"]["tool_calls"]
+    assert [(r["name"], r["server"]) for r in runs] == [("git_log", "git"), ("ping", "echo")], runs
+    assert all(r["ok"] for r in runs), runs
+    return "два сервера, два вызова одним кадром: каждый в свой, порядок сохранён"
+
+
+@check("оркестрация: в payload объявлены инструменты всех живых серверов, полный список")
+def check_orch_full_tool_list():
+    """Три сервера (echo, git, pipeline) — модель выбирает из полного списка,
+    и обрезанный список сделал бы часть инструментов для неё невидимыми.
+    Эталон не записан здесь: список берётся из /api/mcp — того, что сами
+    серверы отдали, — и сверяется с телом запроса из CALLS, описание и схема
+    у каждого на месте."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-orch-") as tmp:
+        cfg = _mcp_config(tmp, {"echo": ECHO, "git": GIT, "pipeline": PIPELINE})
+        _stub.install(reply="ок")
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert answer.status_code == 200, answer.text
+                servers = client.get("/api/mcp").json()["servers"]
+
+    assert len(servers) == 3 and all(s["status"] == "ok" for s in servers), servers
+    listed = sorted(t["name"] for s in servers for t in s["tools"])
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    declared = {t["function"]["name"]: t["function"] for t in _stub.CALLS[0]["payload"]["tools"]}
+    assert sorted(declared) == listed, (sorted(declared), listed)
+    for name, tool in declared.items():
+        assert tool["description"], f"{name}: нет описания"
+        assert "properties" in tool["parameters"], f"{name}: нет схемы"
+    return f"все {len(listed)} инструментов трёх серверов в теле запроса, с описанием и схемой"
+
+
+@check("оркестрация: упавший на старте сервер изолирован — обмен идёт, его инструменты не объявлены")
+def check_orch_down_server_isolated():
+    """Зонд падает на initialize, echo и git живы. Обмен обязан пройти, в
+    объявленных tools — только инструменты живых серверов, а в ручке /api/mcp
+    зонд виден со статусом down: иначе человек не узнал бы, что часть
+    инструментов молча пропала. Уровень менеджера стережёт своя проверка
+    (день 16), здесь — сквозная: до тела запроса и до ручки."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-orch-") as tmp:
+        cfg = _mcp_config(tmp, {"probe": PROBE, "echo": ECHO, "git": GIT})
+        _stub.install(reply="ок")
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert answer.status_code == 200, answer.text
+                servers = {s["name"]: s for s in client.get("/api/mcp").json()["servers"]}
+
+    assert servers["probe"]["status"] == "down", servers["probe"]
+    assert servers["probe"]["tools"] == [], servers["probe"]
+    assert servers["echo"]["status"] == "ok", servers["echo"]
+    assert servers["git"]["status"] == "ok", servers["git"]
+    live = sorted(t["name"] for s in servers.values() if s["status"] == "ok" for t in s["tools"])
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    declared = sorted(t["function"]["name"] for t in _stub.CALLS[0]["payload"]["tools"])
+    assert declared == live, (declared, live)
+    return "зонд down и виден в ручке, обмен прошёл, объявлены только инструменты живых"
+
+
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
 def check_browser():
     """Клиентский код исполняется под node: payload на входе, утверждения
