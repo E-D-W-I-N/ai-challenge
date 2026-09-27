@@ -194,7 +194,7 @@ async function main() {
     await settle(90);
     const card = $("#feed").querySelector(".card");
     check("Real card escapes model HTML and unsafe links", !card.querySelector(".card-body").innerHTML.includes("<script") && !card.querySelector(".card-body").innerHTML.includes("<a "));
-    button(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    button(card, "Информация о запросе").dispatchEvent(new Evt("click"));
     const roles = card.querySelectorAll(".prompt-role").map((node) => node.textContent);
     check("Slots use numeric positions, including zero", same(roles, ["долговременная память", "факты о разговоре", "состояние задачи", "сводка начала разговора", "ответ модели", "сообщение пользователя"]), JSON.stringify(roles));
     const savedPrompt = [...client.state.prompts.values()][0];
@@ -315,6 +315,66 @@ async function main() {
     check("Hidden document does not poll MCP", requests("GET", "/api/mcp").length === before);
     document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(10);
     check("Visible MCP reopens with one GET", requests("GET", "/api/mcp").length === before + 1);
+  });
+
+  await scenario("Persisted outbound JSON info and legacy unavailable", async () => {
+    const bodies = [
+      { model: "sent/model", temperature: .37, max_tokens: 17, messages: [{ role: "user", content: "<script>question</script>" }], tools: [{ type: "function", function: { name: "remote__ping" } }] },
+      { model: "sent/model", temperature: .37, messages: [{ role: "tool", tool_call_id: "call_1", content: "pong" }], tools: [{ type: "function", function: { name: "remote__ping" } }] },
+    ];
+    const { client, $, click } = freshClient({ agents: [{ transcript: [turns[0], { ...turns[1], request_bodies: bodies }, turns[0], turns[1]], history_len: 4 }] });
+    client.init(); await settle(30); click("workspace-chat");
+    const cards = $("#feed").querySelectorAll(".card");
+    button(cards[0], "Информация о запросе").dispatchEvent(new Evt("click"));
+    const displayed = cards[0].querySelectorAll(".request-json").map((node) => JSON.parse(node.textContent));
+    check("Cold page renders exact persisted rounds including tools", same(displayed, bodies) && client.state.prompts.size === 0);
+    check("JSON is text and never executes model markup", !cards[0].querySelector("script") && cards[0].querySelector(".request-json").textContent.includes("<script>"));
+    $("#f-temperature").value = ".99"; $("#f-temperature").dispatchEvent(new Evt("change")); await settle(10);
+    check("Edited settings do not rewrite request info", same(cards[0].querySelectorAll(".request-json").map((node) => JSON.parse(node.textContent)), bodies));
+    button(cards[1], "Информация о запросе").dispatchEvent(new Evt("click"));
+    check("Legacy message explicitly says JSON is unavailable", cards[1].querySelector(".prompt-view").textContent.includes("JSON запроса недоступен") && !cards[1].querySelector(".request-json"));
+  });
+
+  await scenario("MCP URL save/connect, draft preservation and stale GET", async () => {
+    const { client, server, $, click, requests } = freshClient();
+    const empty = { servers: [], config: { revision: 0, servers: [] } };
+    const rows = [{ name: "custom", url: "http://127.0.0.1:8016/mcp", enabled: false }];
+    const saved = { servers: [{ ...rows[0], status: "disconnected", tools: [] }], config: { revision: 1, servers: rows } };
+    server.respond("GET", "/api/mcp", empty);
+    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    const name = $(".mcp-name"), url = $(".mcp-url");
+    name.value = "custom"; name.dispatchEvent(new Evt("input"));
+    url.value = rows[0].url; url.dispatchEvent(new Evt("input"));
+    const late = deferred(); server.respond("GET", "/api/mcp", () => late.promise);
+    click("workspace-chat"); click("workspace-settings");
+    const oldController = client.state.mcpRequest;
+    const saving = deferred(); server.respond("PUT", "/api/mcp/config", () => saving.promise);
+    $("#mcp-config-form").requestSubmit(); $("#mcp-config-form").requestSubmit();
+    check("URL form submits one revision-checked save", requests("PUT", "/api/mcp/config").length === 1 && same(requests("PUT", "/api/mcp/config")[0].body, { revision: 0, servers: rows }));
+    late.resolve(json(empty)); saving.resolve(json(saved)); await settle(15);
+    check("Config mutation aborts stale GET and renders saved URL", oldController.signal.aborted && client.state.mcpConfig.revision === 1 && $(".mcp-url").value === rows[0].url);
+    const connected = { servers: [{ ...rows[0], status: "ok", tools: [{ name: "ping", schema: {} }] }], config: { revision: 2, servers: [{ ...rows[0], enabled: true }] } };
+    server.respond("POST", "/api/mcp/connect", connected);
+    $("#mcp-list").querySelectorAll("button").find((b) => b.textContent === "Подключить").dispatchEvent(new Evt("click")); await settle(10);
+    check("Connect uses persisted row name and revision", same(requests("POST", "/api/mcp/connect")[0].body, { name: "custom", revision: 1 }) && $("#mcp-list").textContent.includes("Подключён"));
+    const edited = "http://127.0.0.1:8017/mcp";
+    $(".mcp-url").value = edited; $(".mcp-url").dispatchEvent(new Evt("input"));
+    const savingAgain = deferred(); server.respond("PUT", "/api/mcp/config", () => savingAgain.promise);
+    $("#mcp-config-form").requestSubmit();
+    check("Changed URL is saved disconnected", requests("PUT", "/api/mcp/config")[1].body.servers[0].enabled === false);
+    $(".mcp-url").value = "http://127.0.0.1:8018/mcp"; $(".mcp-url").dispatchEvent(new Evt("input"));
+    savingAgain.resolve(json({ ...saved, config: { revision: 3, servers: [{ ...rows[0], url: edited }] } })); await settle(10);
+    check("Edit typed while save is pending survives its response", $(".mcp-url").value.endsWith("8018/mcp") && client.state.mcpDirty);
+    server.respond("PUT", "/api/mcp/config", () => failure("fixture validation refusal", 400));
+    $("#mcp-config-form").requestSubmit(); await settle(10);
+    check("Save refusal preserves URL draft and visible reason", $(".mcp-url").value.endsWith("8018/mcp") && $("#mcp-config-status").textContent.includes("fixture validation refusal"));
+    const delayedConnect = deferred(); server.respond("POST", "/api/mcp/connect", () => delayedConnect.promise);
+    client.state.mcpDirty = false;
+    $("#mcp-list").querySelectorAll("button").find((b) => b.textContent === "Подключить").dispatchEvent(new Evt("click"));
+    const hiddenText = $("#mcp-list").textContent;
+    click("workspace-chat");
+    delayedConnect.resolve(json({ ...saved, config: { revision: 4, servers: rows } })); await settle(10);
+    check("Late connection result updates version without populating hidden page", client.state.mcpConfig.revision === 4 && client.state.workspace === "chat" && $("#mcp-list").textContent === hiddenText);
   });
 
   await scenario("Stop and chat switch abort the original stream", async () => {
