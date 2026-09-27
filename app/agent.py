@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import re
 import threading
 import time
@@ -22,6 +23,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, stream_completion
+from .mcp import MANAGER
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -418,6 +420,98 @@ BANNED_METRIC = "banned_hits"
 провайдера, и место ему в метриках обмена. В суммы по чату ключ не идёт.
 Второго экземпляра факта — счётчика срабатываний — нет намеренно: он лежит
 здесь, в метриках, и пересчитывается из них."""
+
+TOOL_METRIC = "tool_calls"
+"""Каким ключом обмен говорит, какие инструменты звали по дороге к ответу:
+список `{"name", "server", "ms", "ok"}` на вызов. Образец — `BANNED_METRIC`:
+это знание агента, и место ему в метриках обмена, из которых клиент рисует
+бейджи при перерисовке ленты. В суммы по чату ключ не идёт."""
+
+TOOL_ITER_METRIC = "tool_iterations"
+"""Сколько оборотов цикла вызовов прошёл обмен. Ставится только на лимите:
+исчерпанный лимит — честный отказ, и он обязан быть назван."""
+
+MAX_TOOL_ITER = 4
+"""Сколько оборотов «модель позвала инструмент — агент исполнил» у одного
+обмена. Модель, зовущая инструменты бесконечно, останавливается здесь:
+отдаём накопленный текст, а не зависаем в цикле."""
+
+
+def declared_tools(manager) -> list[dict]:
+    """Инструменты к объявлению модели — только когда реестр непуст.
+
+    Из `server.view`, одним списком на все серверы: описание и схему отдал
+    сам сервер, и пересказывать их здесь нечего. Пустой реестр — пустой
+    список, и тело запроса ключа `tools` не получит вовсе: чат без MCP
+    обязан быть неотличим от дня 15.
+    """
+    declared = []
+    for server in getattr(manager, "servers", []):
+        for item in server.view:
+            declared.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": item["name"],
+                        "description": item.get("description") or "",
+                        "parameters": item.get("schema") or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+    return declared
+
+
+def tool_server(manager, name: str) -> str:
+    """Чей это инструмент — по реестру. Незнакомое имя (модель выдумала
+    вызов) — пустая строка: сервера у него нет, и выдумывать его не надо."""
+    ref = getattr(manager, "tools", {}).get(name)
+    return ref.server.name if ref is not None else ""
+
+
+def tool_result_text(result) -> str:
+    """Результат вызова строкой для tool-сообщения. Пустой ответ сервера —
+    честная пустая строка, а не выдумка."""
+    parts = [getattr(item, "text", "") for item in getattr(result, "content", None) or []]
+    return "\n".join(part for part in parts if part)
+
+
+async def run_tool(manager, call: dict) -> tuple[dict, object, str]:
+    """Один вызов инструмента: разбор аргументов, сам вызов, замер.
+
+    Отдаёт `(запись метрики, разобранные аргументы, текст результата)`.
+    Битый JSON и упавший сервер — не падение обмена, а tool-сообщение
+    с ошибкой: модель обязана увидеть, чем кончился её вызов, иначе она
+    позовёт его снова с теми же аргументами.
+    """
+    name = call["name"]
+    server = tool_server(manager, name)
+    try:
+        arguments = json.loads(call["arguments"]) if call["arguments"].strip() else {}
+    except ValueError as exc:
+        run = {"name": name, "server": server, "ms": 0.0, "ok": False}
+        return run, call["arguments"], f"аргументы вызова не разобрать как JSON: {exc}"
+    started = time.monotonic()
+    try:
+        result = await manager.call(name, arguments)
+        content, ok = tool_result_text(result), not getattr(result, "isError", False)
+    except Exception as exc:  # noqa: BLE001 — ошибка вызова едет модели, а не вверх
+        content, ok = f"{type(exc).__name__}: {exc}", False
+    ms = round((time.monotonic() - started) * 1000, 1)
+    return {"name": name, "server": server, "ms": ms, "ok": ok}, arguments, content
+
+
+def _summed_usage(iterations: list[dict]) -> dict:
+    """Usage, сложенный по итерациям цикла: вызовы модели после первого
+    оплачены, и сумма, их не считающая, врёт. Прецедент — метрики сводок
+    вторым проходом в `usage_summary`."""
+    summed = {}
+    for name in USAGE_FIELDS:
+        values = [_usage_number(m.get(name)) for m in iterations]
+        values = [v for v in values if v is not None]
+        if values:
+            total = sum(values)
+            summed[name] = round(total, 8) if name == "cost_usd" else total
+    return summed
 
 
 _last_id = 0
@@ -1459,11 +1553,13 @@ class Agent:
     async def ask(self, user_text: str) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
-        События: `compressing`, `start`, `reasoning`, `delta`, `metrics`,
-        `error`, `done`. Первое приходит на **каждый** служебный вызов,
-        который этому обмену предстоит, — ведение памяти, сворачивание или
-        и то и другое, — и раньше всех остальных: оно про паузу **до** ответа,
-        и полем `strategy` называет, чем эта пауза занята.
+        События: `compressing`, `start`, `reasoning`, `delta`, `tool_call`,
+        `metrics`, `error`, `done`. Первое приходит на **каждый** служебный
+        вызов, который этому обмену предстоит, — сворачивание, — и раньше
+        всех остальных: оно про паузу **до** ответа, и полем `strategy`
+        называет, чем эта пауза занята. `tool_call` приходит на каждый
+        исполненный вызов инструмента: с именем, сервером, миллисекундами
+        и пометкой об ошибке.
 
         История не трогается до конца обмена — откат получается по построению:
 
@@ -1565,32 +1661,100 @@ class Agent:
             failure: str | None = None
             cancelled = False
 
+            # Инструменты объявляются, только когда реестр непуст: пустой
+            # реестр — это день 15, и тело запроса обязано быть ему
+            # неотличимо. Сжатию (`compress`) они не достаются никогда:
+            # пересказу разговора вызовы ни к чему.
+            tools = declared_tools(MANAGER)
+            tool_runs: list[dict] = []
+            iteration_metrics: list[dict] = []
+            # Рабочий список сообщений: промпт плюс ход цикла вызовов.
+            # В историю и в базу он не попадает никогда — история попарная,
+            # и следующий обмен видит только финальный ответ.
+            work = list(prompt)
+            rounds = 0
+
             try:
-                stream = stream_completion(
-                    spec, prompt_override=prompt, context_length=context_length
-                )
-                async with contextlib.aclosing(stream):
-                    async for chunk in stream:
-                        kind = chunk["type"]
-                        if kind == "delta":
-                            text += chunk["text"]
-                            yield chunk
-                        elif kind == "reasoning":
-                            reasoning += chunk["text"]
-                            yield chunk
-                        elif kind == "metrics":
-                            yield chunk
-                        elif kind == "error":
-                            failure = chunk["message"]
-                            final_metrics = chunk["metrics"]
-                            yield chunk
-                        elif kind == "done":
-                            text = chunk["text"]
-                            reasoning = chunk.get("reasoning") or reasoning
-                            final_metrics = chunk["metrics"]
-                        if cancel.is_set():
-                            cancelled = True
-                            break
+                # Цикл вызовов: стрим → модель попросила инструменты →
+                # агент исполнил их на настоящих серверах → повторный стрим
+                # с результатами. Лимит — MAX_TOOL_ITER оборотов: модель,
+                # зовущая инструменты бесконечно, получает честный отказ,
+                # а не зависание.
+                while True:
+                    piece = ""
+                    calls: list[dict] | None = None
+                    stream = stream_completion(
+                        spec,
+                        prompt_override=work,
+                        context_length=context_length,
+                        tools=tools or None,
+                    )
+                    async with contextlib.aclosing(stream):
+                        async for chunk in stream:
+                            kind = chunk["type"]
+                            if kind == "delta":
+                                piece += chunk["text"]
+                                text += chunk["text"]
+                                yield chunk
+                            elif kind == "reasoning":
+                                reasoning += chunk["text"]
+                                yield chunk
+                            elif kind == "metrics":
+                                yield chunk
+                            elif kind == "error":
+                                failure = chunk["message"]
+                                final_metrics = chunk["metrics"]
+                                yield chunk
+                            elif kind == "tool_calls":
+                                # Только объявленным инструментам: при пустом
+                                # реестре вызовов быть не может, и чужое
+                                # событие обмен переживает молча.
+                                if tools:
+                                    calls = chunk["calls"]
+                            elif kind == "done":
+                                piece = chunk["text"]
+                                reasoning = chunk.get("reasoning") or reasoning
+                                final_metrics = chunk["metrics"]
+                                if isinstance(chunk["metrics"], dict):
+                                    iteration_metrics.append(chunk["metrics"])
+                            if cancel.is_set():
+                                cancelled = True
+                                break
+                    if cancelled or failure is not None or not calls:
+                        break
+                    if rounds >= MAX_TOOL_ITER:
+                        # Лимит исчерпан: отдаём накопленный текст. Это
+                        # честный отказ, и он назван в метриках.
+                        break
+                    rounds += 1
+                    work.append(
+                        {
+                            "role": "assistant",
+                            "content": piece,
+                            "tool_calls": [
+                                {
+                                    "id": c["id"],
+                                    "type": "function",
+                                    "function": {"name": c["name"], "arguments": c["arguments"]},
+                                }
+                                for c in calls
+                            ],
+                        }
+                    )
+                    for call in calls:
+                        run, arguments, content = await run_tool(MANAGER, call)
+                        tool_runs.append(run)
+                        # Событие о каждом вызове — сразу: пауза на сервере
+                        # иначе выглядела бы зависанием.
+                        yield {
+                            "type": "tool_call",
+                            **run,
+                            "arguments": arguments,
+                            "result": content,
+                        }
+                        work.append(
+                            {"role": "tool", "tool_call_id": call["id"], "content": content}
+                        )
             except MissingKeyError as exc:
                 failure = str(exc)
                 yield {"type": "error", "message": failure, "metrics": None}
@@ -1605,6 +1769,16 @@ class Agent:
 
             if cancelled and failure is None:
                 failure = "генерация отменена"
+
+            # Usage складывается по итерациям: вызовы модели после первого
+            # оплачены, и сумма, их не считающая, врёт.
+            if len(iteration_metrics) > 1 and isinstance(final_metrics, dict):
+                final_metrics = {**final_metrics, **_summed_usage(iteration_metrics)}
+
+            if tool_runs:
+                final_metrics = {**(final_metrics or {}), TOOL_METRIC: tool_runs}
+            if rounds >= MAX_TOOL_ITER:
+                final_metrics = {**(final_metrics or {}), TOOL_ITER_METRIC: rounds}
 
             # Сколько реплик не уехало дословно — знание агента, а не
             # провайдера, и место ему рядом с числами обмена: строка под

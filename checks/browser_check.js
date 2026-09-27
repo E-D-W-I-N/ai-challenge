@@ -793,6 +793,75 @@ async function routeChecks() {
       $("#tiles").children.length === 6, "плиток " + $("#tiles").children.length);
   }
 
+  // ── бейдж вызова инструмента: из события и из метрик после перерисовки ──
+  //
+  // Бейдж — своя строка, как у сторожа: имя, сервер, миллисекунды, а при
+  // ошибке пометка. Живой бейдж встаёт из кадра `tool_call`, ещё до конца
+  // обмена; после перерисовки ленты он обязан остаться — читается из
+  // `metrics.tool_calls`, иначе перезагрузка страницы стёрла бы его вместе
+  // с потоком.
+  {
+    const { client, $, settle, Evt } = freshClient({
+      delay: 80,
+      toolCall: { name: "git_log", server: "git", arguments: { n: 1 },
+                  result: "2fbf4ee день 17", ms: 12.4, ok: true },
+      chats: [{
+        label: "с вызовами",
+        transcript: [
+          { role: "user", content: "вопрос", error: null, reasoning: "", metrics: null },
+          {
+            role: "assistant", content: "ответ", error: null, reasoning: "",
+            metrics: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
+                       tool_calls: [
+                         { name: "git_log", server: "git", ms: 12.4, ok: true },
+                         { name: "git_diff_stat", server: "git", ms: 3, ok: false },
+                       ] },
+          },
+          { role: "user", content: "чисто", error: null, reasoning: "", metrics: null },
+          { role: "assistant", content: "без вызовов", error: null, reasoning: "", metrics: null },
+        ],
+        history_len: 4,
+      }],
+    });
+    client.init();
+    await settle(30);
+    $("#agent-list").querySelectorAll(".item-open")[2].dispatchEvent(new Evt("click"));
+    await settle(40);
+
+    const badges = (card) =>
+      card.querySelectorAll(".tool-badge").map((b) => b.textContent).join(" | ");
+    const cards = $("#feed").querySelectorAll(".card");
+    check("бейджи из метрик: имя, сервер, миллисекунды — и пометка об ошибке",
+      badges(cards[0]) === "git_log · git · 12 мс | ошибка вызова: git_diff_stat · git · 3 мс",
+      badges(cards[0]));
+    check("упавший вызов помечен отдельно, удачный — нет",
+      cards[0].querySelectorAll(".tool-badge").length === 2 &&
+      cards[0].querySelectorAll(".tool-badge.failed").length === 1 &&
+      cards[0].querySelectorAll(".tool-badge.failed")[0].textContent.includes("git_diff_stat"),
+      badges(cards[0]));
+    check("бейджи — своя строка, к числам приписки не добавилось",
+      usageText(cards[0], ".usage-tokens") ===
+        "входные токены 10 · выходные токены 5 · всего токенов 15",
+      usageText(cards[0], ".usage-tokens"));
+    check("у ответа без вызовов бейджей нет вовсе",
+      cards[1].querySelector(".card-tools") === null, badges(cards[1]));
+
+    // Живой обмен: бейдж встаёт из кадра `tool_call`, пока ответ ещё идёт.
+    $("#input").value = "вопрос";
+    $("#composer").requestSubmit();
+    await settle(200);
+    const live = $("#feed").querySelectorAll(".card");
+    const streaming = live[live.length - 1];
+    check("бейдж из события — до конца обмена, той же формой",
+      streaming.classList.contains("busy") && badges(streaming) === "git_log · git · 12 мс",
+      (streaming.classList.contains("busy") ? "идёт" : "уже кончился") + ": " + badges(streaming));
+    await settle(500);
+    const done = $("#feed").querySelectorAll(".card");
+    check("после перерисовки бейдж остался — теперь из метрик",
+      badges(done[done.length - 1]) === "git_log · git · 12 мс",
+      badges(done[done.length - 1]));
+  }
+
   // ── итог берётся с сервера, а не складывается в браузере ──
   //
   // Инвариант дня: сумму считает агент, клиент её только показывает. Сервер

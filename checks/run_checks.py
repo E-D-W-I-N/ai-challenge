@@ -4380,11 +4380,10 @@ def check_tool_calls_transport():
 
     # --- незнакомый тип события обмен переживает ------------------------------
     #
-    # `tool_calls` в этом PR не ждёт никто: `tools` не передаёт ни один
-    # вызывающий, и событие в продукте не возникает вовсе. Но перебор событий
-    # в `ask` обязан пережить чужой тип молча — иначе следующий PR уронит
-    # обмен раньше, чем научится вызов исполнять. Заглушка отдаёт событие
-    # той же формы, что настоящий транспорт, и обмен обязан записаться.
+    # Реестр пуст (MCP_DISABLED=1) — значит инструменты не объявлены,
+    # и событие `tool_calls` агент исполнять не вправе: он переживает его
+    # молча, обмен идёт одним обращением и записывается. Заглушка отдаёт
+    # событие той же формы, что настоящий транспорт.
     _stub.install(
         reply="ок",
         tool_calls=[{"id": "call_a", "name": "git_log", "arguments": "{}"}],
@@ -4397,9 +4396,9 @@ def check_tool_calls_transport():
         history = client.get(f"/api/agents/{chat}").json()["transcript"]
     frame_kinds = [f["event"] for f in frames]
     # Наружу событие не уехало: `ask` перечисляет известные имена и чужое
-    # не пересылает. Появись оно в ленте — клиент этого дня не знал бы,
-    # что с ним делать.
-    assert "tool_calls" not in frame_kinds, frame_kinds
+    # не пересылает. И исполнения не было: реестр пуст, вызывать нечего.
+    assert "tool_calls" not in frame_kinds and "tool_call" not in frame_kinds, frame_kinds
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
     assert frame_kinds[-1] == "done" and frames[-1]["committed"] is True, frames[-1]
     assert [m["role"] for m in history] == ["user", "assistant"], history
     assert history[-1]["content"] == "ок", history[-1]
@@ -4411,6 +4410,352 @@ def check_tool_calls_transport():
         "а без них ключа в теле нет и extra_body их перебивает; обмен "
         "переживает незнакомый тип события и записывается"
     )
+
+
+# --- День 17: цикл вызовов инструментов --------------------------------------
+#
+# Модель просит вызов — агент исполняет его на настоящем сервере (git из
+# `app/mcp_servers/git.py`, процессом через тот же McpManager) и повторяет
+# запрос уже с результатом. Заглушка отвечает на первый вызов `tool_calls`,
+# а на второй читает tool-сообщение **из запроса** — там же, где прочла бы
+# его модель. Поэтому утверждение «ответ использует результат» не зависит
+# от заглушки: она отвечает тем, что лежит в промпте.
+
+GIT = {"module": "app.mcp_servers.git", "timeout_s": 15}
+
+
+def _git_head_line() -> str:
+    """Первая строка настоящего `git log -1` — тем же вызовом, что у сервера."""
+    run = subprocess.run(
+        ["git", "log", "-1", "--format=%h %ad %s", "--date=short"],
+        cwd=ROOT, capture_output=True, text=True, timeout=15,
+    )
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip()
+
+
+def _tool_reply(messages, index):
+    """Первый вызов — молчание (модель позвала инструмент без предисловий),
+    дальше — тем, что лежит в tool-сообщении, или честным «сам по себе»,
+    если его нет. Утверждение о втором запросе стоит на различении."""
+    if index == 0:
+        return ""
+    tool = next((m for m in messages if m.get("role") == "tool"), None)
+    return "вижу результат: " + tool["content"] if tool else "сам по себе"
+
+
+def _first_call_only(name, arguments):
+    """`tool_calls` на первый вызов и дальше словами — заглушка в функцию,
+    как `reply`."""
+    return lambda messages, index: (
+        None if index else [{"id": "call_1", "name": name, "arguments": arguments}]
+    )
+
+
+@check("вызов инструмента: исполнен на настоящем сервере, второй запрос несёт результат")
+def check_tool_call_loop():
+    """Сквозной сценарий дня. Заглушка на первый вызов отвечает `tool_calls`
+    с просьбой о `git_log`; агент обязан исполнить его на настоящем
+    git-сервере и повторить запрос с assistant-`tool_calls` и `role: "tool"`,
+    где лежит настоящий последний коммит репозитория. Финальный ответ —
+    заглушкин пересказ этого сообщения: «ответ использует результат»
+    проверяется там же, где его увидела бы модель."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(
+            reply=_tool_reply,
+            tool_calls=_first_call_only("git_log", '{"n": 1}'),
+        )
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(
+                    f"/api/agents/{chat}/messages", json={"text": "покажи журнал"}
+                )
+                assert answer.status_code == 200, answer.text
+                frames = sse(answer.text)
+                body = client.get(f"/api/agents/{chat}").json()
+
+    # Два обращения к модели: с просьбой о вызове и с его результатом.
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    head = _git_head_line()
+    first, second = _stub.CALLS
+    # Инструменты объявлены — все три, с описанием и схемой от самого сервера.
+    declared = {t["function"]["name"]: t["function"] for t in first["payload"]["tools"]}
+    assert sorted(declared) == ["git_diff_stat", "git_log", "git_status"], sorted(declared)
+    assert declared["git_log"]["description"], declared["git_log"]
+    assert "n" in declared["git_log"]["parameters"]["properties"], declared["git_log"]
+
+    # Второй запрос: за промптом — assistant с вызовами и tool с результатом.
+    sent = second["payload"]["messages"]
+    roles = [m["role"] for m in sent]
+    assert roles[-2:] == ["assistant", "tool"], roles
+    asked = sent[-2]
+    assert asked["tool_calls"][0]["id"] == "call_1", asked
+    assert asked["tool_calls"][0]["function"]["arguments"] == '{"n": 1}', asked
+    tool = sent[-1]
+    assert tool["tool_call_id"] == "call_1", tool
+    assert tool["content"] == head, (tool["content"], head)
+
+    # SSE: кадр на вызов — до done, с именем, сервером, миллисекундами и ok.
+    kinds = [f["event"] for f in frames]
+    assert "tool_calls" not in kinds, kinds  # внутреннее событие наружу не уехало
+    badge = _frame(frames, "tool_call")
+    assert kinds.index("tool_call") < kinds.index("done"), kinds
+    assert badge["name"] == "git_log" and badge["server"] == "git", badge
+    assert badge["arguments"] == {"n": 1} and badge["result"] == head, badge
+    assert badge["ok"] is True and badge["ms"] >= 0, badge
+
+    # Финальный ответ результат использует, история попарная, а в метриках —
+    # запись вызова с именем, сервером и миллисекундами.
+    answer_turn = body["transcript"][-1]
+    assert [t["role"] for t in body["transcript"]] == ["user", "assistant"], body["transcript"]
+    assert answer_turn["content"] == "вижу результат: " + head, answer_turn["content"]
+    runs = answer_turn["metrics"]["tool_calls"]
+    assert len(runs) == 1, runs
+    assert runs[0]["name"] == "git_log" and runs[0]["server"] == "git", runs
+    assert runs[0]["ok"] is True and runs[0]["ms"] >= 0, runs
+    return (
+        f"git_log исполнен процессом, второй запрос несёт «{head[:40]}…», "
+        "ответ его пересказывает, кадр и метрика на месте"
+    )
+
+
+@check("tools объявляются только при непустом реестре: пустой — неотличим от дня 15")
+def check_tools_only_with_registry():
+    """Реестр пуст (MCP_DISABLED=1): тело запроса ключа `tools` не имеет
+    вовсе — ни с пустым списком, ни с чужим. Слать всегда значило бы назвать
+    модели инструменты, которых у нас нет."""
+    _stub.install(reply="ок")
+    with TestClient(main.app) as client:
+        chat = new_agent(client)
+        answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+        assert answer.status_code == 200, answer.text
+    assert len(_stub.CALLS) == 1, len(_stub.CALLS)
+    assert "tools" not in _stub.CALLS[0]["payload"], _stub.CALLS[0]["payload"]
+    return "пустой реестр — тело без ключа tools; с реестром — см. сквозной сценарий"
+
+
+@check("битый JSON аргументов — tool-сообщение с ошибкой, а не падение обмена")
+def check_tool_call_broken_arguments():
+    """Модель прислала неразбираемые аргументы. Падать нельзя: её вызов
+    обязан кончиться tool-сообщением с понятной ошибкой — иначе она позовёт
+    его снова с теми же аргументами. Сервер при этом не дёргается вовсе:
+    вызывать нечем."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(
+            reply=_tool_reply,
+            tool_calls=_first_call_only("git_log", '{"n":'),
+        )
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert answer.status_code == 200, answer.text
+                frames = sse(answer.text)
+                body = client.get(f"/api/agents/{chat}").json()
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    tool = _stub.CALLS[1]["payload"]["messages"][-1]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "call_1", tool
+    assert "не разобрать как JSON" in tool["content"], tool["content"]
+    badge = _frame(frames, "tool_call")
+    assert badge["ok"] is False, badge
+    # Обмен завершён штатно: финальный ответ прочитал ошибку и записался.
+    assert frames[-1]["event"] == "done" and frames[-1]["committed"] is True, frames[-1]
+    assert body["transcript"][-1]["content"].startswith("вижу результат: аргументы"), (
+        body["transcript"][-1]["content"]
+    )
+    assert body["transcript"][-1]["metrics"]["tool_calls"][0]["ok"] is False, (
+        body["transcript"][-1]["metrics"]
+    )
+    return "tool-сообщение с ошибкой вместо падения, кадр с ok=false, обмен записан"
+
+
+@check("модель зовёт инструменты вечно — стоп на MAX_TOOL_ITER, накопленное отдано")
+def check_tool_call_limit():
+    """Заглушка отвечает `tool_calls` на каждый вызов. Цикл обязан
+    остановиться: исполнено ровно MAX_TOOL_ITER вызовов, обращений к модели
+    на одно больше (последнее — уже без исполнения), а накопленный текст
+    отдан. Без лимита это было бы зависание на оплаченных вызовах."""
+    import tempfile
+
+    from app.agent import MAX_TOOL_ITER
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(
+            reply="ответ",
+            tool_calls=[{"id": "call_x", "name": "git_status", "arguments": "{}"}],
+        )
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert answer.status_code == 200, answer.text
+                frames = sse(answer.text)
+                body = client.get(f"/api/agents/{chat}").json()
+
+    # Оборотов на один больше исполнений: последний запрос модели уже не
+    # исполняется — лимит стопит цикл ДО вызова, а не после.
+    assert len(_stub.CALLS) == MAX_TOOL_ITER + 1, len(_stub.CALLS)
+    last_roles = [m["role"] for m in _stub.CALLS[-1]["payload"]["messages"]]
+    assert last_roles.count("tool") == MAX_TOOL_ITER, last_roles
+    kinds = [f["event"] for f in frames]
+    assert kinds.count("tool_call") == MAX_TOOL_ITER, kinds
+    metrics = body["transcript"][-1]["metrics"]
+    assert metrics["tool_iterations"] == MAX_TOOL_ITER, metrics
+    assert len(metrics["tool_calls"]) == MAX_TOOL_ITER, metrics
+    # Накопленное отдано: текст всех итераций в ответе, обмен записан.
+    assert body["transcript"][-1]["content"] == "ответ" * (MAX_TOOL_ITER + 1), (
+        body["transcript"][-1]["content"]
+    )
+    assert frames[-1]["committed"] is True, frames[-1]
+    return f"{MAX_TOOL_ITER} исполнений из {MAX_TOOL_ITER + 1} обращений, лимит назван в метриках"
+
+
+@check("usage по итерациям складывается: вызовы модели после первого оплачены")
+def check_tool_usage_sums_iterations():
+    """Каждая итерация цикла — отдельный оплаченный вызов. Сумма, берущая
+    только последний, врала бы ровно на стоимость первого — прецедент тот же,
+    что у метрик сводок вторым проходом."""
+    import tempfile
+
+    plan = [_usage(100, 10, 110, 0.001), _usage(200, 20, 220, 0.002)]
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(
+            reply="итог",
+            usage=lambda i: plan[i],
+            tool_calls=_first_call_only("git_status", "{}"),
+        )
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                answer = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert answer.status_code == 200, answer.text
+                body = client.get(f"/api/agents/{chat}").json()
+
+    assert len(_stub.CALLS) == 2, len(_stub.CALLS)
+    metrics = body["transcript"][-1]["metrics"]
+    assert metrics["prompt_tokens"] == 300, metrics
+    assert metrics["completion_tokens"] == 30, metrics
+    assert metrics["total_tokens"] == 330, metrics
+    assert metrics["cost_usd"] == 0.003, metrics
+    # И итог по чату согласен с ней: он считается из тех же записей.
+    assert body["usage_total"]["total_tokens"] == 330, body["usage_total"]
+    return "110 + 220 = 330 токенов и $0.003 — сумма по обеим итерациям"
+
+
+@check("история в базе попарная: ни tool-сообщений, ни дыр в seq")
+def check_tool_history_stays_pairwise():
+    """Цикл вызовов живёт в рабочем списке сообщений и умирает с обменом:
+    в `messages` ложатся только вопрос и финальный ответ. Иначе перегенерация
+    (`take_last_exchange` ждёт хвост user/assistant), свёртка и нумерация
+    поехали бы разом. Смотрим в сам файл базы, а не в стенограмму."""
+    import sqlite3
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(
+            reply="готово",
+            tool_calls=_first_call_only("git_log", '{"n": 1}'),
+        )
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(client)
+                first = client.post(f"/api/agents/{chat}/messages", json={"text": "раз"})
+                assert first.status_code == 200, first.text
+                # Следующий обмен видит только финальный ответ: результат
+                # вызова он уже впитал, и второго экземпляра ему не надо.
+                second = client.post(f"/api/agents/{chat}/messages", json={"text": "два"})
+                assert second.status_code == 200, second.text
+
+    conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
+    rows = conn.execute(
+        "SELECT seq, role FROM messages WHERE session_id = ? ORDER BY seq", (chat,)
+    ).fetchall()
+    conn.close()
+    assert rows == [(0, "user"), (1, "assistant"), (2, "user"), (3, "assistant")], rows
+    followup = _stub.CALLS[-1]["payload"]["messages"]
+    assert "tool" not in [m["role"] for m in followup], [m["role"] for m in followup]
+    assert not any("tool_calls" in m for m in followup), followup
+    return "в базе две пары user/assistant, seq без дыр, следующий промпт без tool-ролей"
+
+
+@check("сжатию инструменты не объявляются: оно пересказывает разговор, а не работает")
+def check_compress_declares_no_tools():
+    """Вызов на сжатие — служебный: ему пересказывать, и вызовы инструментов
+    ему ни к чему. При непустом реестре обычные обращения несут `tools`,
+    а сжатие — нет: иначе модель на свёртке позвала бы инструмент, и цикл
+    вызовов начал бы работать внутри пересказа."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+        _stub.install(reply="слово")
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:
+                chat = new_agent(
+                    client, strategy="summary", keep_last=KEEP, compress_every=EVERY
+                )
+                _talk(client, chat, 9)
+
+    kinds = [_service_kind(c["messages"]) for c in _stub.CALLS]
+    assert "summary" in kinds, kinds  # сворачивание правда случилось
+    folding = _stub.CALLS[kinds.index("summary")]
+    assert "tools" not in folding["payload"], folding["payload"]
+    # А у обычных обращений того же чата инструменты объявлены.
+    talking = next(c for c, k in zip(_stub.CALLS, kinds) if k is None)
+    assert talking["payload"]["tools"], talking["payload"]
+    return "у сжатия ключа tools нет, у обменов того же чата — есть"
+
+
+@check("git-сервер: три инструмента, настоящий журнал и честная ругань git")
+def check_git_server():
+    """По живому процессу: список с описаниями и схемами, `git_log` отвечает
+    настоящим последним коммитом, а на несуществующий ref едет текст самого
+    git — сервер его не прячет и не переводит."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-tools-") as tmp:
+        cfg = _mcp_config(tmp, {"git": GIT})
+
+        async def scenario():
+            with _mcp_env(cfg):
+                manager = McpManager()
+                await manager.start()
+                try:
+                    assert len(manager.servers) == 1, manager.servers
+                    server = manager.servers[0]
+                    assert server.status == "ok", server.error
+                    tools = {t["name"]: t for t in server.view}
+                    assert sorted(tools) == ["git_diff_stat", "git_log", "git_status"], tools
+                    for name, tool in tools.items():
+                        assert tool["description"], f"{name}: нет описания"
+                        assert tool["schema"].get("properties") is not None, f"{name}: нет схемы"
+                    assert "n" in tools["git_log"]["schema"]["properties"], tools["git_log"]
+                    assert "ref" in tools["git_diff_stat"]["schema"]["properties"], (
+                        tools["git_diff_stat"]
+                    )
+                    log = await manager.call("git_log", {"n": 1})
+                    assert log.content[0].text == _git_head_line(), log.content[0].text
+                    bad = await manager.call("git_diff_stat", {"ref": "несуществующий-ref"})
+                    return bad.content[0].text
+                finally:
+                    await manager.stop()
+
+        error = asyncio.run(scenario())
+    # Ругань — собственными словами git: имя ref в ней названо.
+    assert "несуществующий-ref" in error, error
+    assert "fatal" in error, error
+    return "журнал настоящий, на плохой ref — текст самого git, не прятки"
 
 
 # --- День 7: память переживает перезапуск, чаты изолированы -------------------
@@ -5102,6 +5447,27 @@ def check_mcp_child_env_whitelist():
     assert "OPENROUTER_API_KEY" not in keys, f"ключ уехал в subprocess: {keys}"
     assert "PATH" in keys, f"даже PATH не доехал — процесс не поднялся бы: {keys}"
     return f"в окружении subprocess'а только белый список: {keys}"
+
+
+@check("MCP: два сервера — остановка приложения чистая: стеки закрываются LIFO")
+def check_mcp_stop_two_servers_lifo():
+    """У каждого сервера свой AsyncExitStack, а входили они в скоупы anyio
+    по очереди и в одну задачу. Закрытие в прямом порядке ломало стек
+    скоупов молча (под suppress в stop) — и падал уже портал TestClient на
+    своём выходе, далеко от причины. Проверка — сам выход из TestClient:
+    он и есть утверждение, и держится оно на двух живых серверах."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
+        cfg = _mcp_config(tmp, {"echo": ECHO, "git": GIT})
+        with _mcp_env(cfg):
+            with TestClient(main.app) as client:  # выход без исключения — проверяемое
+                answer = client.get("/api/mcp")
+                assert answer.status_code == 200, answer.text
+                servers = {s["name"]: s for s in answer.json()["servers"]}
+                assert servers["echo"]["status"] == "ok", servers
+                assert servers["git"]["status"] == "ok", servers
+    return "два живых сервера, выход из приложения без исключения"
 
 
 @check("MCP: без конфига менеджер пуст, и ручка отдаёт пустой список")

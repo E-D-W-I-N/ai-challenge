@@ -676,6 +676,11 @@ function answerCard(agent, turn, index) {
   const guard = guardLine(turn);
   if (guard) card.appendChild(guard);
 
+  // Бейджи вызовов инструментов — из метрик: перерисовка обязана показать
+  // то же, что показал живой поток.
+  const tools = toolLine(turn);
+  if (tools) card.appendChild(tools);
+
   const usage = usageLine(turn);
   if (usage) card.appendChild(usage);
 
@@ -762,6 +767,29 @@ function guardLine(turn) {
   for (const hit of hits) {
     box.appendChild(el("div", "guard-hit", "«" + hit.word + "» задело запрет — " + hit.rule));
   }
+  return box;
+}
+
+// Бейдж вызова инструмента: имя, сервер и сколько он занял. При ошибке —
+// пометка: упавший вызов обязан быть виден, иначе ответ на его результате
+// читался бы как удачный. Одна форма на живой бейдж из события и на бейдж
+// из метрик после перерисовки — двумя они разъехались бы молча.
+function toolBadge(run) {
+  const text = run.name + " · " + run.server + " · " + Math.round(run.ms || 0) + " мс";
+  return el(
+    "div",
+    "tool-badge" + (run.ok === false ? " failed" : ""),
+    (run.ok === false ? "ошибка вызова: " : "") + text
+  );
+}
+
+// Бейджи обмена при перерисовке ленты — из метрик, как отметка сторожа:
+// иначе после перезагрузки страницы они пропали бы вместе с потоком.
+function toolLine(turn) {
+  const calls = (turn.metrics && turn.metrics.tool_calls) || [];
+  if (!calls.length) return null;
+  const box = el("div", "card-tools");
+  for (const run of calls) box.appendChild(toolBadge(run));
   return box;
 }
 
@@ -1138,6 +1166,7 @@ async function exchange(path, body, questionText) {
   let failure = null;
   let status = null;
   let prompt = null;
+  let toolBox = null;
   let committed = false;
 
   try {
@@ -1213,6 +1242,17 @@ async function exchange(path, body, questionText) {
             // Ответ на новой модели пришёл — контексту снова есть что показать.
             keepMetrics(e.metrics);
             renderTiles();
+            break;
+          case "tool_call":
+            // Агент исполнил вызов инструмента: бейдж встаёт сразу, не
+            // дожидаясь конца обмена, — пауза на сервере иначе выглядела бы
+            // зависанием. После перерисовки те же бейджи встанут из метрик.
+            if (!toolBox) {
+              toolBox = el("div", "card-tools");
+              card.appendChild(toolBox);
+            }
+            toolBox.appendChild(toolBadge(e));
+            scrollFeed();
             break;
           case "error":
             failure = e.message;

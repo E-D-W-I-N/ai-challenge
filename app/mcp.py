@@ -224,7 +224,11 @@ class McpManager:
                 await asyncio.wait_for(server.process.wait(), KILL_AFTER_S)
             except asyncio.TimeoutError:
                 await _kill(server.process)
-        for server in self.servers:
+        # Стеки — строго в обратном порядке: скоупы anyio выходят только
+        # LIFO, а два сервера входили в них по очереди, в одну задачу.
+        # Прямой порядок ломал стек скоупов **молча**, под suppress — и
+        # падал уже портал на своём выходе, далеко от причины.
+        for server in reversed(self.servers):
             if server.stack is not None:
                 with contextlib.suppress(Exception):
                     await server.stack.aclose()
