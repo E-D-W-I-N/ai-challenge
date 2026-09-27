@@ -43,11 +43,8 @@
 Живых вызовов к LLM нет; MCP-серверы поднимаются настоящими процессами.
 
 ```bash
-.venv/bin/python checks/run_checks.py    # 55 проверок, включая девять новых и клиентскую
-.venv/bin/python checks/restart.py       # два процесса подряд на одном файле
-.venv/bin/python checks/two_processes.py # сервер и консоль на одной базе
-.venv/bin/python checks/spawn_100.py     # сто агентов в одном процессе
-node checks/browser_check.js             # клиент под node, 370 утверждений
+make check             # весь набор: сервер, subprocess-сценарии и клиент
+make check-browser     # только настоящий клиент под Node.js
 ```
 
 Новые: сквозной сценарий (заглушка просит `git_log`, агент исполняет на
@@ -64,14 +61,55 @@ node checks/browser_check.js             # клиент под node, 370 утв�
 ## Как запустить
 
 ```bash
-cp .env.example .env    # впишите OPENROUTER_API_KEY; он в .gitignore
-python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/uvicorn app.main:app --reload --port 8000
+make help
+make setup
+# Только если .env ещё нет: создайте из шаблона, затем впишите ключ вручную.
+test -e .env || cp .env.example .env
+make run               # http://127.0.0.1:8000
 ```
+
+Команды выполняются из корня checkout. Нужны Python >= 3.11 и Node.js для
+проверок. `PYTHON ?= python3.11` выбирает Python только при создании среды:
+`make setup PYTHON=/path/to/python`. Существующая `.venv` переиспользуется,
+requirements устанавливаются в неё; setup не создаёт и не перезаписывает
+`.env`. run/check используют `.venv/bin/python`. run запускает
+`-m uvicorn app.main:app --reload --port 8000`. Ошибки команд возвращают
+ненулевой код; `make check` вызывает `checks/run_checks.py` один раз, включая
+`spawn_100.py`, `restart.py`, `two_processes.py` и браузерный сценарий.
 
 В `mcp.json` два сервера: `echo` (стенд связи) и `git`. Спросите «покажи
 последние коммиты» — под ответом будет бейдж `git_log · git · N мс`.
-Репозиторий публичный: не коммитьте `git add -A`.
+Репозиторий публичный: не выводите секреты и базы с диалогами, добавляйте
+файлы в git только явным перечнем, без `git add .` и `git add -A`.
+
+## Работа через OpenCode или Pi
+
+Установленный инструмент запускайте из корня этого checkout:
+
+```bash
+cd /path/to/ai-challenge-9-week-01
+opencode
+# Или в отдельной сессии:
+pi
+```
+
+[OpenCode](https://opencode.ai/docs/rules/) и
+[Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent#context-files)
+автоматически загружают корневой `AGENTS.md` в контекст. Инструкции в нём
+обязуют прочитать нужные разделы `docs/architecture.md` перед изменениями:
+саму ссылку инструмент не обязан раскрывать автоматически. Для Pi список
+загруженных файлов виден в заголовке запуска.
+
+Модель и авторизацию выбирайте в личных настройках инструмента: OpenCode —
+`opencode auth login` и пользовательская конфигурация, Pi — `/login`, `/model`
+и настройки в `~/.pi/agent/`. Эти настройки и ключи не коммитятся в проект;
+они не меняют модели/OpenRouter приложения. `mcp.json` принадлежит приложению
+и не является конфигурацией MCP для OpenCode или Pi. Расширения и отдельные
+конфиги инструментов для чтения `AGENTS.md` не нужны.
+
+Проверки работают с заглушкой без ключа, живые вызовы LLM агентам запрещены.
+Для smoke используйте временную `AGENT_DB_PATH`, `MCP_DISABLED=1` и
+`GET /api/health`; не отправляйте сообщение модели.
 
 ## Что осталось честно назвать
 
@@ -83,4 +121,7 @@ python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
   ответ может повторяться.
 * **Переподключения нет**: сервер, упавший после рукопожатия, — down до
   перезапуска приложения; вызов на нём кончится tool-сообщением с ошибкой.
+* **Сторож запретов — отметка совпадения**: отказ, цитата вопроса и имя
+  пакета могут дать ложное срабатывание; словоформы не распознаются.
+  Ответ не скрывается и не переписывается.
 * _Живой прогон на ключе:_ **место под числа оставлено пустым — впишет человек.**
