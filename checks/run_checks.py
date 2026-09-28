@@ -4969,7 +4969,7 @@ def _pipeline_fixture(tmp: str) -> tuple[Path, str]:
     subprocess.run(["git", "add", ".gitignore", "a.txt", "b.txt"], cwd=repo, check=True)
     (repo / "z.txt").write_text("NEEDLE untracked\n", encoding="utf-8")
     (repo / "ignored.txt").write_text("needle ignored\n", encoding="utf-8")
-    for package in ("app", "checks"):
+    for package in ("app", "checks", "services"):
         (directory / package).symlink_to(Path(ROOT) / package, target_is_directory=True)
     (directory / "_isolated_pipeline.py").write_text(
         "import os\nfrom pathlib import Path\n"
@@ -5291,6 +5291,12 @@ def check_request_capture():
 def check_git_exchange():
     from checks.tool_url import check_git_exchange
     return check_git_exchange()
+
+
+@check("Pipeline HTTP: operator paths, exact four-round JSON and persistent client info")
+def check_pipeline_http():
+    from checks.pipeline_url import check_pipeline_http
+    return check_pipeline_http()
 
 
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")

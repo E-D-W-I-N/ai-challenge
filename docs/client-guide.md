@@ -32,7 +32,7 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 | Ветка и очистка | app.js: forkFrom, openAgent; app/agent.py, store.py | Владение, persist/restart/seq и заполненные слои до очистки | Ветвление; Хранение и очистка |
 | Бейджи вызовов | app.js: toolBadge, toolLine, answerCard, exchange | Событие до done, ошибка, metrics.tool_calls при перерисовке/открытии | MCP; Клиент |
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
-| Pipeline | app/mcp_servers/pipeline.py; checks/run_checks.py, _stub.py | Временный Git/bytes; четыре payload-снимка, реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
+| Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
@@ -68,7 +68,9 @@ batch-100 и длинные серии 25/500 обменов больше не �
    проверьте удачный/ошибочный tool-бейдж до конца потока и после открытия
    чата; нижние шесть метрик стабильны. Для pipeline проверьте три последовательных
    бейджа search/summarize/save_file с именем сервера до done и после открытия;
-   длинные описания и раскрытые схемы не расширяют страницу.
+   длинные описания и раскрытые схемы не расширяют страницу. Подключите отдельно
+   запущенный pipeline по URL и проверьте четыре сохранённых JSON-раунда ответа
+   после refresh; настройки и paths выбираются в приложении и сервисе соответственно.
 4. Один editor: смените текст/тип, Enter, focusout, Escape, пустую/неизменную
    правку. Одно подтверждение: Tab, Escape и возврат фокуса; стрелки/Home/End
    на вкладках, видимый outline и prefers-reduced-motion.

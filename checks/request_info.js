@@ -24,7 +24,7 @@ async function main() {
   $("#f-temperature").dispatchEvent(new Evt("change")); await settle(10);
   assert.deepEqual(displayed(), fixture.received, "edited settings changed the captured request");
   globalThis.window.dispatchEvent(new Evt("pagehide"));
-  console.log("Actual three-round provider bodies equal persisted/escaped client JSON after config change");
+  console.log(`Actual ${fixture.received.length}-round provider bodies equal persisted/escaped client JSON after config change`);
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
