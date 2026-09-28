@@ -20,6 +20,7 @@ import argparse
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -141,7 +142,14 @@ def save_file(name: str, content: str) -> str:
         return "отказано: имя обязано быть именем файла — непустое, без «/», «\\» и «..»"
     target = files_dir() / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    handle, staged_path = tempfile.mkstemp(dir=target.parent, prefix=".pipeline-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as staged:
+            staged.write(content)
+        # Replace the directory entry itself; never follow a target symlink.
+        os.replace(staged_path, target)
+    finally:
+        Path(staged_path).unlink(missing_ok=True)
     return f"записано: {target} ({len(content.encode('utf-8'))} байт)"
 
 

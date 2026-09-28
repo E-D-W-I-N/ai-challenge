@@ -24,6 +24,12 @@ def check_pipeline_http():
         repo = Path(tmp) / "selected repository"
         output = Path(tmp) / "selected output"
         repo.mkdir()
+        output.mkdir()
+        outside = Path(tmp) / "outside sentinel.txt"
+        sentinel = b"outside sentinel must remain unchanged\n"
+        outside.write_bytes(sentinel)
+        linked = output / "linked.txt"
+        linked.symlink_to(outside)
         subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
         (repo / ".gitignore").write_text("/ignored.txt\n")
         (repo / "a.txt").write_text("\nneedle alpha2\n" + "\n" * 7 + "Needle alpha10\n")
@@ -89,6 +95,14 @@ def check_pipeline_http():
                     chat = main.REGISTRY.load(identity)
 
                     async def exchange():
+                        # Actual HTTP calls must replace this output entry,
+                        # keeping its outside target intact, then overwrite normally.
+                        for content in ["replacement — only inside output\n", "ordinary overwrite\n"]:
+                            saved = await manager.call("save_file", {"name": linked.name, "content": content})
+                            assert not saved.isError, saved
+                            assert saved.content[0].text == f"записано: {output.resolve() / linked.name} ({len(content.encode('utf-8'))} байт)", saved
+                            assert outside.read_bytes() == sentinel
+                            assert not linked.is_symlink() and linked.read_bytes() == content.encode("utf-8")
                         session = server.session
                         events = []
                         async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
@@ -125,7 +139,7 @@ def check_pipeline_http():
                     assert json.loads(received[2]["messages"][-2]["tool_calls"][0]["function"]["arguments"]) == {"text": expected_search, "max_items": 3}
                     assert json.loads(received[3]["messages"][-2]["tool_calls"][0]["function"]["arguments"]) == {"name": name, "content": expected_summary}
                     assert (output / name).read_bytes() == expected_summary.encode("utf-8")
-                    assert [item.name for item in output.iterdir()] == [name]
+                    assert {item.name for item in output.iterdir()} == {name, linked.name}
                     assert fake_key not in json.dumps(bodies) and "authorization" not in json.dumps(bodies).lower()
                     metrics = chat.usage_summary()
                     assert (metrics["prompt_tokens"], metrics["completion_tokens"], metrics["total_tokens"], metrics["cost_usd"]) == (80, 26, 106, .01), metrics
@@ -143,4 +157,4 @@ def check_pipeline_http():
         rendered = subprocess.run(["node", str(mcp.ROOT / "checks" / "request_info.js")], input=json.dumps({"transcript": restored.transcript(), "received": received}), capture_output=True, text=True, cwd=mcp.ROOT, timeout=15)
         assert rendered.returncode == 0, rendered.stdout + rendered.stderr
         reopened.close()
-    return "manual pipeline HTTP URL save/connect/list; real 4-round provider bodies equal SQLite/restart/Node info; result bytes and usage; whole-exchange disconnect keeps external service alive"
+    return "manual pipeline HTTP URL save/connect/list; symlink replaced and ordinary overwrite keeps outside sentinel intact; real 4-round provider bodies equal SQLite/restart/Node info; result bytes and usage; whole-exchange disconnect keeps external service alive"
