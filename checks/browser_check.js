@@ -52,6 +52,85 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Conditional selected-chat refresh uses revision and catches replacement", async () => {
+    const old = { ...turns[1], content: "старый ответ" };
+    const { client, server, $, requests } = freshClient({ agents: [{
+      transcript: [turns[0], old], history_len: 2, history_revision: "rev-a",
+    }] });
+    const samePath = "/api/agents/ag_1?known_history_revision=rev-a";
+    server.respond("GET", samePath, { unchanged: true, history_revision: "rev-a", busy: true });
+    client.init(); await settle(1130);
+    check("Unchanged poll transfers no transcript and reports running state",
+      requests("GET", samePath).length === 1 && $("#feed").textContent.includes("старый ответ")
+      && $("#chat-status").textContent.includes("Выполняется"));
+    server.respond("GET", samePath, { ...server.state.agents[0],
+      transcript: [turns[0], { ...old, content: "исправленный ответ" }],
+      history_revision: "rev-b", busy: false });
+    await settle(1070);
+    check("Revision change updates same-length replacement",
+      $("#feed").textContent.includes("исправленный ответ") && !$("#feed").textContent.includes("старый ответ"));
+  });
+
+  await scenario("Owned running reminder is cancellable from Tools", async () => {
+    const { client, server, $, click, requests } = freshClient({ agents: [{ busy: true }] });
+    const base = { servers: [{ name: "remind", url: "http://127.0.0.1:8018/mcp", status: "ok", tools: [],
+      reminders: { waiting: 0, fired: 0, running: 1, items: [
+        { id: 7, text: "active", status: "running", state: "выполняется", fired: 0, due_at: 1700000000, can_cancel: true },
+        { id: 8, text: "other chat", status: "pending", state: "ждёт", fired: 0, due_at: 1700000000, can_cancel: false },
+      ] } }], config: { revision: 1, servers: [] } };
+    server.respond("GET", "/api/mcp", base);
+    const path = "/api/agents/ag_1/reminders/remind/7/cancel";
+    server.respond("POST", path, () => {
+      server.respond("GET", "/api/mcp", { ...base, servers: [{ ...base.servers[0],
+        reminders: { waiting: 1, fired: 0, items: [base.servers[0].reminders.items[1]] } }] });
+      return json({ cancelled: true });
+    });
+    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    const buttons = $("#mcp-list").querySelectorAll("button").filter((node) => node.textContent === "Снять");
+    check("Tools offers cancellation only for owned occurrence while chat is busy", buttons.length === 1);
+    buttons[0].dispatchEvent(new Evt("click")); await settle(15);
+    check("Cancellation uses scoped route and refreshes Tools without a message",
+      requests("POST", path).length === 1 && requests("POST", /\/messages$/).length === 0
+      && $("#mcp-list").querySelectorAll("button").filter((node) => node.textContent === "Снять").length === 0);
+  });
+
+  for (const classic of [false, true]) await scenario("Automatic due result and late chat refresh " + classic, async () => {
+    const { client, server, $, requests, open } = freshClient({}, classic);
+    client.init(); await settle(30);
+    $("#input").value = "unsent draft";
+    $("#f-system").value = "unsaved setting";
+    const delayed = [{ ...turns[0], content: "[Напоминание №7] Выполни сейчас" },
+      { ...turns[1], content: "Автоматический свежий итог", metrics: { tool_calls: [{ name: "git_log", server: "git", ms: 3, ok: true }] } }];
+    Object.assign(server.state.agents[0], { transcript: delayed, history_len: 2 });
+    await settle(1100);
+    check("Idle chat receives real server result without Tools or send " + classic,
+      $("#feed").textContent.includes("Автоматический свежий итог") && $("#feed").textContent.includes("git_log")
+      && requests("GET", "/api/mcp").length === 0 && requests("POST", /\/messages$/).length === 0);
+    check("Background refresh preserves composer and settings drafts " + classic,
+      $("#input").value === "unsent draft" && $("#f-system").value === "unsaved setting");
+    const late = deferred(); server.respond("GET", "/api/agents/ag_1", () => late.promise);
+    document.fire(new Evt("visibilitychange")); await settle(10);
+    const controller = client.state.chatRequest;
+    open(1); await settle(20);
+    late.resolve(json({ ...server.state.agents[0], transcript: [{ ...turns[1], content: "LATE BACKGROUND" }] })); await settle(10);
+    check("Chat switch aborts and ignores late background GET " + classic,
+      controller.signal.aborted && client.state.current.id === "ag_2" && !$("#feed").textContent.includes("LATE BACKGROUND"));
+    window.dispatchEvent(new Evt("pagehide"));
+    check("Pagehide cancels selected-chat timer " + classic, client.state.chatTimer === null);
+  });
+
+  await scenario("Foreground prompt stays on its committed answer before due append", async () => {
+    const { client, server, $, send } = freshClient();
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream(success.map((event) =>
+      event.event === "done" ? { ...event, answer_index: 1 } : event), {
+        finish: () => Object.assign(server.state.agents[0], { transcript: [...turns,
+          { ...turns[0], content: "scheduled task" }, { ...turns[1], content: "scheduled answer" }], history_len: 4 }),
+      }));
+    client.init(); await settle(30); send("question"); await settle(30);
+    check("Foreground info is bound to SSE answer_index, never newest background row",
+      client.state.prompts.has("ag_1:1") && !client.state.prompts.has("ag_1:3"));
+  });
+
   await scenario("Markdown and parameters", async () => {
     const { client } = freshClient();
     for (const input of ["<script>x</script>", "**<img src=x onerror=x>**", "`<script>x</script>`", "```\n<img src=x>\n```", "# <iframe>", "> <img>", "- <img>"]) {
@@ -234,7 +313,7 @@ async function main() {
     await completed.promise; await settle(10);
     const card = $("#feed").querySelector(".card");
     check("Real card escapes model HTML and unsafe links", !card.querySelector(".card-body").innerHTML.includes("<script") && !card.querySelector(".card-body").innerHTML.includes("<a "));
-    button(card, "Показать промпт запроса").dispatchEvent(new Evt("click"));
+    button(card, "Информация о запросе").dispatchEvent(new Evt("click"));
     const roles = card.querySelectorAll(".prompt-role").map((node) => node.textContent);
     check("Slots use numeric positions, including zero", same(roles, ["долговременная память", "факты о разговоре", "состояние задачи", "сводка начала разговора", "ответ модели", "сообщение пользователя"]), JSON.stringify(roles));
     const savedPrompt = [...client.state.prompts.values()][0];
@@ -405,6 +484,65 @@ async function main() {
     const closedCount = requests("GET", "/api/mcp").length;
     await settle(2100);
     check("Pagehide stops all scheduled requests " + classic, client.state.mcpTimer === null && requests("GET", "/api/mcp").length === closedCount);
+  });
+  await scenario("Persisted outbound JSON info and legacy unavailable", async () => {
+    const bodies = [
+      { model: "sent/model", temperature: .37, max_tokens: 17, messages: [{ role: "user", content: "<script>question</script>" }], tools: [{ type: "function", function: { name: "remote__ping" } }] },
+      { model: "sent/model", temperature: .37, messages: [{ role: "tool", tool_call_id: "call_1", content: "pong" }], tools: [{ type: "function", function: { name: "remote__ping" } }] },
+    ];
+    const { client, $, click } = freshClient({ agents: [{ transcript: [turns[0], { ...turns[1], request_bodies: bodies }, turns[0], turns[1]], history_len: 4 }] });
+    client.init(); await settle(30); click("workspace-chat");
+    const cards = $("#feed").querySelectorAll(".card");
+    button(cards[0], "Информация о запросе").dispatchEvent(new Evt("click"));
+    const displayed = cards[0].querySelectorAll(".request-json").map((node) => JSON.parse(node.textContent));
+    check("Cold page renders exact persisted rounds including tools", same(displayed, bodies) && client.state.prompts.size === 0);
+    check("JSON is text and never executes model markup", !cards[0].querySelector("script") && cards[0].querySelector(".request-json").textContent.includes("<script>"));
+    $("#f-temperature").value = ".99"; $("#f-temperature").dispatchEvent(new Evt("change")); await settle(10);
+    check("Edited settings do not rewrite request info", same(cards[0].querySelectorAll(".request-json").map((node) => JSON.parse(node.textContent)), bodies));
+    button(cards[1], "Информация о запросе").dispatchEvent(new Evt("click"));
+    check("Legacy message explicitly says JSON is unavailable", cards[1].querySelector(".prompt-view").textContent.includes("JSON запроса недоступен") && !cards[1].querySelector(".request-json"));
+  });
+
+  await scenario("MCP URL save/connect, draft preservation and stale GET", async () => {
+    const { client, server, $, click, requests } = freshClient();
+    const empty = { servers: [], config: { revision: 0, servers: [] } };
+    const rows = [{ name: "custom", url: "http://127.0.0.1:8016/mcp", enabled: false }];
+    const saved = { servers: [{ ...rows[0], status: "disconnected", tools: [] }], config: { revision: 1, servers: rows } };
+    server.respond("GET", "/api/mcp", empty);
+    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    const name = $(".mcp-name"), url = $(".mcp-url");
+    name.value = "custom"; name.dispatchEvent(new Evt("input"));
+    url.value = rows[0].url; url.dispatchEvent(new Evt("input"));
+    const late = deferred(); server.respond("GET", "/api/mcp", () => late.promise);
+    click("workspace-chat"); click("workspace-settings");
+    const oldController = client.state.mcpRequest;
+    const saving = deferred(); server.respond("PUT", "/api/mcp/config", () => saving.promise);
+    $("#mcp-config-form").requestSubmit(); $("#mcp-config-form").requestSubmit();
+    check("URL form submits one revision-checked save", requests("PUT", "/api/mcp/config").length === 1 && same(requests("PUT", "/api/mcp/config")[0].body, { revision: 0, servers: rows }));
+    late.resolve(json(empty)); saving.resolve(json(saved)); await settle(15);
+    check("Config mutation aborts stale GET and renders saved URL", oldController.signal.aborted && client.state.mcpConfig.revision === 1 && $(".mcp-url").value === rows[0].url);
+    const connected = { servers: [{ ...rows[0], status: "ok", tools: [{ name: "ping", schema: {} }] }], config: { revision: 2, servers: [{ ...rows[0], enabled: true }] } };
+    server.respond("POST", "/api/mcp/connect", connected);
+    $("#mcp-list").querySelectorAll("button").find((b) => b.textContent === "Подключить").dispatchEvent(new Evt("click")); await settle(10);
+    check("Connect uses persisted row name and revision", same(requests("POST", "/api/mcp/connect")[0].body, { name: "custom", revision: 1 }) && $("#mcp-list").textContent.includes("Подключён"));
+    const edited = "http://127.0.0.1:8017/mcp";
+    $(".mcp-url").value = edited; $(".mcp-url").dispatchEvent(new Evt("input"));
+    const savingAgain = deferred(); server.respond("PUT", "/api/mcp/config", () => savingAgain.promise);
+    $("#mcp-config-form").requestSubmit();
+    check("Changed URL is saved disconnected", requests("PUT", "/api/mcp/config")[1].body.servers[0].enabled === false);
+    $(".mcp-url").value = "http://127.0.0.1:8018/mcp"; $(".mcp-url").dispatchEvent(new Evt("input"));
+    savingAgain.resolve(json({ ...saved, config: { revision: 3, servers: [{ ...rows[0], url: edited }] } })); await settle(10);
+    check("Edit typed while save is pending survives its response", $(".mcp-url").value.endsWith("8018/mcp") && client.state.mcpDirty);
+    server.respond("PUT", "/api/mcp/config", () => failure("fixture validation refusal", 400));
+    $("#mcp-config-form").requestSubmit(); await settle(10);
+    check("Save refusal preserves URL draft and visible reason", $(".mcp-url").value.endsWith("8018/mcp") && $("#mcp-config-status").textContent.includes("fixture validation refusal"));
+    const delayedConnect = deferred(); server.respond("POST", "/api/mcp/connect", () => delayedConnect.promise);
+    client.state.mcpDirty = false;
+    $("#mcp-list").querySelectorAll("button").find((b) => b.textContent === "Подключить").dispatchEvent(new Evt("click"));
+    const hiddenText = $("#mcp-list").textContent;
+    click("workspace-chat");
+    delayedConnect.resolve(json({ ...saved, config: { revision: 4, servers: rows } })); await settle(10);
+    check("Late connection result updates version without populating hidden page", client.state.mcpConfig.revision === 4 && client.state.workspace === "chat" && $("#mcp-list").textContent === hiddenText);
   });
 
   await scenario("Stop and chat switch abort the original stream", async () => {
