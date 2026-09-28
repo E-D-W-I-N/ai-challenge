@@ -104,6 +104,20 @@ def cancel_reminder(reminder_id: int, *, path: Path | None = None,
         return cur.rowcount > 0
 
 
+def clear_reminders(*, context_id: str, path: Path | None = None) -> dict:
+    if not context_id.strip():
+        raise ValueError("очистка требует привязки к исходному чату")
+    with contextlib.closing(_connect(path or db_path())) as conn:
+        # Report exactly the rows deleted in this transaction. Deleting a
+        # running row also invalidates its token: finish cannot revive repeats.
+        conn.execute("BEGIN IMMEDIATE")
+        ids = [row[0] for row in conn.execute(
+            "SELECT id FROM reminders WHERE context_id=? ORDER BY id", (context_id,))]
+        conn.execute("DELETE FROM reminders WHERE context_id=?", (context_id,))
+        conn.commit()
+    return {"cleared": True, "scope": "current_chat", "ids": ids, "total": len(ids)}
+
+
 def claim_reminder(rid: int, token: str, context_id: str, *, check: bool = False,
                    path: Path | None = None, now: float | None = None) -> bool:
     now = time.time() if now is None else now
@@ -171,11 +185,18 @@ def reminders() -> str:
     return json.dumps(list_reminders(), ensure_ascii=False)
 
 
-@server.tool(description="Снять напоминание по номеру в этом чате, остановить будущие повторы")
+@server.tool(description="Снять только одно напоминание по его номеру в этом чате, остановить его будущие повторы")
 def cancel(id: int, context_id: str = "") -> str:
     if cancel_reminder(id, context_id=context_id):
         return f"напоминание №{id} снято"
     return f"напоминания №{id} нет"
+
+
+@server.tool(description="Очистить все напоминания текущего чата на этом сервере: "
+             "снять ожидающие и выполняющиеся, остановить все их будущие повторы; "
+             "удалить также завершённые записи. Напоминания других чатов остаются.")
+def clear(context_id: str) -> str:
+    return json.dumps(clear_reminders(context_id=context_id), ensure_ascii=False)
 
 
 # Application protocol, filtered out of the model/UI registry by McpManager.

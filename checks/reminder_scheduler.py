@@ -340,6 +340,112 @@ async def execution(config, git_root, restart_service):
             store.close()
 
 
+def clear_acceptance(config, directory):
+    from app import main
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    # Reuse the independently launched service under an arbitrary host name.
+    url = json.loads(config.read_text())["servers"]["remind"]["url"]
+    scoped_config = directory / "clear-mcp.json"
+    scoped_config.write_text(json.dumps({"servers": {"clock": {"url": url, "enabled": True}}}))
+    store = Store(directory / "clear-app.db").init()
+    registry = AgentRegistry(store=store)
+    manager = mcp.McpManager()
+
+    async def external_call(tool, args):
+        async with streamable_http_client(url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool(tool, args)
+
+    with patch.dict(os.environ, {"MCP_CONFIG_PATH": str(scoped_config), "MCP_DISABLED": "0"}), \
+            patch.object(mcp, "ROOT", directory), patch.object(mcp, "MANAGER", manager), \
+            patch.object(agent_module, "MANAGER", manager), patch.object(main, "REGISTRY", registry):
+        with TestClient(app) as client:
+            original = registry.create(AgentSpec(label="clear origin", model="stub/clear")).id
+            other = registry.create(AgentSpec(label="clear neighbour", model="stub/other")).id
+            tools = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()
+            declaration = next((t for t in tools["servers"][0]["tools"] if t["name"] == "clear"), None)
+            assert declaration is not None, "reminder service has no bulk clear operation"
+            assert "context_id" not in declaration["schema"]["properties"]
+            assert "context_id" not in declaration["schema"].get("required", [])
+            _stub.reset()
+            for chat, text, every in [(original, "clear pending", None),
+                                       (original, "clear repeat", .2), (other, "keep neighbour", None)]:
+                _stub.install(reply="", tool_calls=[call("remind", {
+                    "text": text, "in_seconds": 1.2, "every": every})])
+                sent = client.post(f"/api/agents/{chat}/messages", json={"text": text})
+                assert sent.status_code == 200, sent.text
+            before = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()["servers"][0]["reminders"]["items"]
+            ours = [i for i in before if i["context_id"] == manager.context_for(original)]
+            theirs = next(i for i in before if i["context_id"] == manager.context_for(other))
+            assert len(ours) == 2 and all(i["status"] == "pending" and i["fired"] == 0 for i in ours)
+            for args in ({}, {"context_id": ""}):
+                assert asyncio.run(external_call("clear", args)).isError, "unscoped clear must fail closed"
+            assert time.time() < min(i["due_at"] for i in ours)
+            _stub.reset()
+            _stub.install(reply=lambda ms, i: "" if ms[-1]["role"] == "user" else ms[-1]["content"],
+                tool_calls=lambda ms, i: [call("clear", {"context_id": manager.context_for(other)})]
+                if ms[-1]["role"] == "user" else None)
+            cleared = client.post(f"/api/agents/{original}/messages", json={"text": "Очисти напоминания"})
+            assert cleared.status_code == 200, cleared.text
+            history = client.get(f"/api/agents/{original}").json()
+            result = json.loads(history["transcript"][-1]["request_bodies"][1]["messages"][-1]["content"])
+            assert result == {"cleared": True, "scope": "current_chat", "ids": [i["id"] for i in ours], "total": 2}, result
+            assert history["transcript"][-1]["metrics"]["tool_calls"][0]["server"] == "clock"
+            after = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()["servers"][0]["reminders"]["items"]
+            assert not any(i["id"] in result["ids"] for i in after)
+            assert next(i for i in after if i["id"] == theirs["id"]) == theirs
+            _stub.install(reply="surviving neighbour result", tool_calls=None)
+            async def neighbour_finished():
+                await until(lambda: len(registry.require(other).history) == 4 and not registry.require(other).busy)
+            client.portal.call(neighbour_finished)
+            time.sleep(.4)
+            assert client.get(f"/api/agents/{original}").json()["history_len"] == 6
+            assert client.get(f"/api/agents/{other}").json()["transcript"][-1]["content"] == "surviving neighbour result"
+            assert len(_stub.CALLS) == 3, "cleared pending/recurring jobs made a model call"
+            empty = asyncio.run(external_call("clear", {"context_id": manager.context_for(original)}))
+            assert json.loads(empty.content[0].text) == {"cleared": True, "scope": "current_chat", "ids": [], "total": 0}
+
+            # A separate SDK session clears a running job while its provider is
+            # blocked. Poll must invalidate it without waiting for the model lease.
+            _stub.reset()
+            _stub.install(reply=lambda ms, i: "" if i == 0 else "stale cleared result", delay=30, chunks=1,
+                tool_calls=lambda ms, i: [call("remind", {"text": "clear running", "in_seconds": .1, "every": .2})]
+                if i == 0 else None)
+            assert client.post(f"/api/agents/{original}/messages", json={"text": "schedule running"}).status_code == 200
+            async def running_started():
+                await until(lambda: len(_stub.CALLS) == 2)
+            client.portal.call(running_started)
+            scheduler = app.state.reminder_scheduler
+            key = next(k for k in scheduler.running if k[0] == "clock")
+            token = scheduler.claims[key]["token"]
+            started = time.monotonic()
+            removed = asyncio.run(external_call("clear", {"context_id": manager.context_for(original)}))
+            assert json.loads(removed.content[0].text)["ids"] == [key[1]]
+            async def drained():
+                await until(lambda: not scheduler.running, seconds=2)
+            client.portal.call(drained)
+            assert time.monotonic() - started < 2 and not registry.require(original).busy
+            check = asyncio.run(external_call("_reminder_claim", {
+                "id": key[1], "token": token, "context_id": manager.context_for(original), "check": True}))
+            assert json.loads(check.content[0].text) is False
+            finish = asyncio.run(external_call("_reminder_finish", {"id": key[1], "token": token}))
+            assert json.loads(finish.content[0].text) is False
+            time.sleep(.4)
+            state = client.get(f"/api/agents/{original}").json()
+            assert state["history_len"] == 8 and len(_stub.CALLS) == 2
+            assert [t["role"] for t in state["transcript"]] == ["user", "assistant"] * 4
+            items = client.get("/api/mcp", headers={"X-Chat-ID": original}).json()["servers"][0]["reminders"]["items"]
+            assert not any(i["context_id"] == manager.context_for(original) for i in items)
+            assert next(i for i in items if i["id"] == theirs["id"])["fired"] == 1
+            _stub.install(reply="available after clear", tool_calls=None)
+            assert client.post(f"/api/agents/{original}/messages", json={"text": "continue"}).status_code == 200
+    store.close()
+    print("HTTP clear: pending + recurring removed, forged/empty scope safe, neighbour fires, blocked running claim invalidated and chat released")
+
+
 def lifespan_acceptance(config, directory):
     from app import main
     store = Store(directory / "lifespan.db").init()
@@ -502,6 +608,7 @@ def main():
             config = directory / "mcp.json"
             config.write_text(json.dumps({"servers": {"remind": {"url": f"http://127.0.0.1:{port}/mcp", "enabled": True},
                                                       "git": {"url": f"http://127.0.0.1:{git_port}/mcp", "enabled": True}}}))
+            clear_acceptance(config, directory)
             asyncio.run(execution(config, directory, restart_service))
             lifespan_acceptance(config, directory)
             assert process.poll() is None  # Application shutdown leaves service alive.
