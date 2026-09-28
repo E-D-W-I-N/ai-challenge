@@ -331,7 +331,7 @@ class McpManager:
                 name = f"{server.name}__{tool.name}" if tool.name in qualified else tool.name
                 self.tools[name] = ToolRef(server, tool.name)
                 schema = deepcopy(tool.inputSchema)
-                if self.schedules(server) and tool.name in {"remind", "cancel"}:
+                if self.schedules(server) and tool.name in {"remind", "cancel", "clear"}:
                     schema.get("properties", {}).pop("context_id", None)
                     if "context_id" in schema.get("required", []):
                         schema["required"].remove("context_id")
@@ -407,7 +407,7 @@ class McpManager:
             ref = self.tools.get(name)
             if ref is None or ref.server.status != "ok" or ref.server.session is None:
                 raise KeyError(f"инструмента {name!r} нет ни на одном живом сервере")
-            if chat_id is not None and self.schedules(ref.server) and ref.tool in {"remind", "cancel"}:
+            if chat_id is not None and self.schedules(ref.server) and ref.tool in {"remind", "cancel", "clear"}:
                 args = {**args, "context_id": self.context_for(chat_id)}
             try:
                 return await asyncio.wait_for(ref.server.session.call_tool(ref.tool, args), ref.server.timeout_s)

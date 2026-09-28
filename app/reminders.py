@@ -92,7 +92,9 @@ class ReminderScheduler:
             if server.status != "ok" or not self.manager.schedules(server) or server.name in self.invalidating:
                 continue
             try:
-                data = await self.manager.reminder_protocol(server, "reminders", {})
+                # Observe remote clear/cancel even while a model owns the
+                # exchange lease. Host protocol uses the pinned live session.
+                data = await self.manager.reminder_protocol(server, "reminders", {}, concurrent=True)
             except Exception:
                 # Connection loss prevents further tool/model work for this service.
                 for (owner, _), task in list(self.running.items()):
@@ -122,7 +124,7 @@ class ReminderScheduler:
                 token = uuid.uuid4().hex
                 try:
                     claimed = await self.manager.reminder_protocol(server, "_reminder_claim",
-                        {"id": item["id"], "token": token, "context_id": item["context_id"]})
+                        {"id": item["id"], "token": token, "context_id": item["context_id"]}, concurrent=True)
                 except BaseException:
                     if agent is not None:
                         agent.release()
