@@ -138,6 +138,25 @@ def normalize_html(data: bytes, source: str, content_type="") -> dict:
         if text:
             blocks.append({"text": text, "kind": kind, "section": section})
 
+    def contains_blocks(node):
+        return any(n.tag in block_tags | {"table", "div", "ul", "ol"} or re.fullmatch(r"h[1-6]", n.tag)
+                   for n in descendants(node))
+
+    def walk_children(node, kind="paragraph"):
+        # An unclosed legacy FONT/SPAN may wrap tables and later paragraphs.
+        # Flatten only truly inline descendants; block boundaries remain visible.
+        pending = []
+        for child in node.children:
+            if isinstance(child, str):
+                pending.append(child)
+            elif child.tag in {"b", "strong", "i", "em", "font", "span", "a", "br"} and not contains_blocks(child):
+                pending.append(visible_text(child))
+            else:
+                emit(" ".join(pending), kind)
+                pending = []
+                walk(child)
+        emit(" ".join(pending), kind)
+
     def walk(node):
         nonlocal title, section
         if node.tag == "title":
@@ -157,7 +176,8 @@ def normalize_html(data: bytes, source: str, content_type="") -> dict:
             # Layout tables contain paragraphs/tables; recurse rather than flatten.
             def has_blocks(x):
                 return any(isinstance(c, Node) and (c.tag in {"table", "div"} or re.fullmatch(r"h[1-6]", c.tag) or has_blocks(c)) for c in x.children)
-            if cells and not any(has_blocks(c) or len(clean(visible_text(c))) > 1200 or sum(n.tag == "p" for n in descendants(c)) > 2 for c in cells):
+            if cells and not any(has_blocks(c) or len(clean(visible_text(c))) > 1200 or sum(n.tag == "p" for n in descendants(c)) > 2
+                                 or (len(cells) == 1 and any(n.tag == "p" and n.attrs.get("align", "").lower() == "center" for n in descendants(c))) for c in cells):
                 values = [clean(visible_text(c)) for c in cells if not ignored(c)]
                 if any(values):
                     emit(" | ".join(values), "table_row")
@@ -169,24 +189,9 @@ def normalize_html(data: bytes, source: str, content_type="") -> dict:
             section = clean(visible_text(node))
             emit(section, "heading")
         elif node.tag in block_tags:
-            # Nested lists retain separate item records, with the same section.
-            emit(" ".join(x if isinstance(x, str) else visible_text(x) for x in node.children
-                          if not isinstance(x, Node) or x.tag not in {"ul", "ol"}), node.tag)
-            for child in node.children:
-                if isinstance(child, Node) and child.tag in {"ul", "ol"}:
-                    walk(child)
+            walk_children(node, node.tag)
         else:
-            pending = []
-            for child in node.children:
-                if isinstance(child, str):
-                    pending.append(child)
-                elif child.tag in {"b", "strong", "i", "em", "font", "span", "a", "br"}:
-                    pending.append(visible_text(child))
-                else:
-                    emit(" ".join(pending), "paragraph")
-                    pending = []
-                    walk(child)
-            emit(" ".join(pending), "paragraph")
+            walk_children(node)
 
     def descendants(node):
         for child in node.children:

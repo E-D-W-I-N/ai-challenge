@@ -113,7 +113,7 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
                 computed += 1
             cache.commit()
             operation.update(computed=computed, dimension=dimension, pending=len(items) - computed)
-        metadata = {"version": VERSION, "index_id": uuid.uuid4().hex, "built_at": now(), "strategy": strategy,
+        metadata = {"version": VERSION, "index_id": uuid.uuid4().hex, "operation_id": operation.value["operation_id"], "built_at": now(), "strategy": strategy,
                     "chunk_size": SIZE, "overlap": OVERLAP, "corpus_fingerprint": corpus["fingerprint"],
                     "embedding_fingerprint": fingerprint, "embedding_config": asdict(config), "dimension": dimension,
                     "documents": len(documents), "chunks": len(chunks), "words": sum(d["words"] for d in documents),
@@ -131,7 +131,13 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
         with open(temporary, "rb") as file:
             os.fsync(file.fileno())
         os.replace(temporary, root / "index.sqlite")
-        operation.update(state="ready", index_id=metadata["index_id"])
+        # replace is the success boundary. Telemetry cannot undo publication.
+        operation.value.update(state="ready", index_id=metadata["index_id"])
+        try:
+            operation.update(state="ready", index_id=metadata["index_id"])
+        except OSError:
+            # The committed operation_id lets readers reconcile stale progress.
+            metadata["warning"] = "Index published; final progress could not be saved"
         return metadata
     finally:
         cache.close()
@@ -184,6 +190,10 @@ class Index:
                     metadata["rows"] = {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("documents", "chunks")}
                 if any(metadata["rows"][table] != metadata[table] for table in ("documents", "chunks")):
                     raise ValueError("Index row counts differ from committed metadata")
+                if operation and operation.get("operation_id") == metadata.get("operation_id") and operation["state"] != "ready":
+                    operation = {**operation, "state": "ready", "stage": "save", "index_id": metadata["index_id"],
+                                 "warning": "Индекс опубликован; завершающее состояние операции не сохранено"}
+                    result["operation"] = operation
                 metadata["state"] = "ready"
                 result.update(state="ready", index=metadata)
                 corpus = read_json(self.root / "corpus.json")

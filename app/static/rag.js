@@ -76,7 +76,7 @@ function createRagInspector({ state, $, el, api }) {
     try {
       const data = await api("/api/rag/status", { signal: controller.signal });
       if (token !== epoch || !visible()) return;
-      $("#rag-error").textContent = data.error || data.operation?.error || "";
+      $("#rag-error").textContent = data.error || data.operation?.error || data.operation?.warning || "";
       $("#rag-status").textContent = labels[data.state] || data.state;
       const target = $("#rag-operation"); target.replaceChildren();
       const op = data.operation;

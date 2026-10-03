@@ -71,6 +71,10 @@ def check_rag():
                 else:
                     assert not any("Раздел А" in c["section"] and "Раздел Б" in c["section"] for c in chunks)
                     assert any("Первый пункт" in c["text"] and "Второй пункт" in c["text"] for c in chunks)
+            wrapped = normalize_html(b'<article><font><p align="center"><strong>Stage one</strong></p><span><table><tr><td>00:01</td><td><p>Operation alpha</p></td></tr></table></span><p align="center"><strong>Alloy section</strong></p><font><table><tr><td>M1</td><td>4.4</td><td>42</td></tr></table></font></font></article>', 'https://example.test/wrapped')
+            rows = [b for b in wrapped["blocks"] if b["kind"] == "table_row"]
+            assert [(b["text"], b["section"]) for b in rows] == [('00:01 | Operation alpha', 'Stage one'), ('M1 | 4.4 | 42', 'Alloy section')]
+            assert [b["text"] for b in wrapped["blocks"] if b["kind"] == "heading"] == ['Stage one', 'Alloy section']
             inputs = [{"path": str(source), "source": doc["source"]}]
             report = ingest(inputs, root)
             assert report["words"] == doc["words"] and report["documents"] == 1
@@ -96,6 +100,18 @@ def check_rag():
             initial_calls = len(calls)
             cached = build_index(root, config)
             assert len(calls) == initial_calls and cached["computed"] == 0 and cached["cached"] == cached["chunks"]
+            update = Operation.update
+            def fail_final_progress(operation, **values):
+                if values.get("state") == "ready":
+                    raise OSError("injected final progress fsync failure")
+                return update(operation, **values)
+            with patch.object(Operation, "update", fail_final_progress):
+                published = build_index(root, config)
+            assert published["index_id"] != cached["index_id"] and published["warning"]
+            status = index.status()
+            assert status["state"] == "ready" and status["operation"]["state"] == "ready"
+            assert status["operation"]["warning"] and status["index"]["index_id"] == published["index_id"]
+            cached = published
             first = index.chunks(doc["document_id"])[0]
             assert "vector" not in first
             saved = index.chunk(first["chunk_id"], True)
