@@ -12,6 +12,7 @@ from rag import workflow
 from rag.artifacts import clear
 from rag.documents import ingest
 from rag.embeddings import EmbeddingConfig
+from rag.semantic import SemanticConfig
 from rag.index import Index, Operation, stage_chunks, stage_embeddings, save_index
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
@@ -40,6 +41,8 @@ class StageRequest(BaseModel):
     model: str = EmbeddingConfig.model
     dimensions: int | None = Field(default=None, gt=0, strict=True)
     revision: str = "1"
+    semantic_base_url: str = SemanticConfig.base_url
+    semantic_model: str = SemanticConfig.model
     batch_size: int = Field(default=16, ge=1, le=256, strict=True)
 
     class Config:
@@ -50,10 +53,13 @@ class StageRequest(BaseModel):
 def start(kind: str, body: StageRequest):
     if kind not in {"ingest", "chunks", "embeddings", "save"}:
         raise HTTPException(404, "Unknown RAG stage")
-    if body.strategy not in {"fixed", "structural"} or body.overlap >= body.size:
+    if body.strategy not in {"fixed", "structural", "semantic"} or body.overlap >= body.size:
         raise HTTPException(422, "Invalid chunk strategy/overlap")
     index = Index()
     try:
+        semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model)
+        if body.strategy == "semantic" and body.size > 12000:
+            raise ValueError("Semantic chunk size must not exceed 12000 characters")
         config = EmbeddingConfig(body.base_url, body.model, body.dimensions, body.revision)
         inputs = [{"url": url} for url in body.urls]
         if kind == "ingest":
@@ -79,10 +85,10 @@ def start(kind: str, body: StageRequest):
     def run():
         try:
             if kind == "ingest":
-                report = ingest(inputs, index.root)
+                report = ingest(inputs, index.root, operation=operation)
                 operation.update(documents=report["documents"], words=report["words"], state="complete")
             elif kind == "chunks":
-                stage_chunks(index.root, body.strategy, body.size, body.overlap, operation=operation)
+                stage_chunks(index.root, body.strategy, body.size, body.overlap, operation=operation, semantic_config=semantic_config)
             elif kind == "embeddings":
                 stage_embeddings(index.root, config, body.batch_size, operation=operation)
             else:

@@ -14,6 +14,7 @@ from .chunks import STRATEGIES, chunk_documents
 from .artifacts import clear
 from .documents import ingest, load_corpus, write_json
 from .embeddings import EmbeddingConfig
+from .semantic import SemanticConfig
 from .index import Index, Operation, build_index, stage_chunks, stage_embeddings, save_index, storage_root
 
 
@@ -25,9 +26,11 @@ def main(argv=None):
     load.add_argument("--url", action="append", default=[])
     load.add_argument("--manifest", type=Path, help='JSON list: {"url":...} or {"path":...,"source":...}; relative paths resolve by manifest')
     split = commands.add_parser("chunks")
-    split.add_argument("--strategy", choices=STRATEGIES, default="fixed")
+    split.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="fixed")
     split.add_argument("--size", type=int, default=1200)
     split.add_argument("--overlap", type=int, default=180)
+    split.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
+    split.add_argument("--semantic-model", default=SemanticConfig.model)
     commands.add_parser("save")
     clear_command = commands.add_parser("clear")
     clear_command.add_argument("stage", choices=("chunks", "embeddings"))
@@ -39,9 +42,11 @@ def main(argv=None):
         command.add_argument("--revision", default="1", help="Change when replacing weights under same model ID")
         command.add_argument("--batch-size", type=int, default=16)
         if name == "index":
-            command.add_argument("--strategy", choices=STRATEGIES, default="structural")
+            command.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="structural")
             command.add_argument("--size", type=int, default=1200)
             command.add_argument("--overlap", type=int, default=180)
+            command.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
+            command.add_argument("--semantic-model", default=SemanticConfig.model)
     commands.add_parser("status")
     args = parser.parse_args(argv)
     root = args.root.resolve()
@@ -60,13 +65,13 @@ def main(argv=None):
             if not inputs:
                 raise ValueError("Provide --url or --manifest")
             with Operation(root, "ingest") as operation:
-                result = ingest(inputs, root)
+                result = ingest(inputs, root, operation=operation)
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
         elif args.command == "clear":
             with Operation(root, "delete_" + args.stage) as operation:
                 result = clear(root, args.stage, operation)
         elif args.command == "chunks":
-            result = stage_chunks(root, args.strategy, args.size, args.overlap)
+            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model))
         elif args.command == "save":
             result = save_index(root)
         elif args.command == "status":
@@ -74,7 +79,7 @@ def main(argv=None):
         else:
             config = EmbeddingConfig(args.base_url, args.model, args.dimensions, args.revision)
             if args.command == "index":
-                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap)
+                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model))
             elif args.command == "embed":
                 result = stage_embeddings(root, config, args.batch_size)
             else:

@@ -17,6 +17,9 @@ CLI загружает явные HTML-входы, замораживает ко
 Каталог `data/rag` (или операторский `RAG_DIR`) содержит приватные снимки и отчёты:
 не читайте пользовательский корпус, не коммитьте его или коллекции вопросов.
 Standalone CLI не импортирует `app.config`/`.env`; RAG пока не меняет чат.
+Semantic разбиение использует отдельный generative HTTP endpoint и runtime auth,
+выбирает IDs границ исходных units; fixed и structural остаются детерминированными.
+Кэш/trace private; проверяем только offline fixtures, без живых LLM вызовов.
 Offline HTTP-эмбеддинги проверяются на нейтральном временном HTML, без инференса.
 Прямые зависимости
 (`fastapi`, `uvicorn[standard]`, `httpx`, `mcp`) закреплены в `requirements.txt`.

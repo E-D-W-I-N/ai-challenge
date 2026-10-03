@@ -545,6 +545,22 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   абзацы, пункты и строки таблиц пакуются внутри раздела до 1200 символов;
   длинный блок режется теми же окнами с перекрытием. Offset срезает точный
   очищенный документ; chunk_id стабилен для source/strategy/границ/hash/параметров.
+- Semantic: отдельная generative LLM выбирает только boundary IDs нумерованных
+  исходных units, не переписывает текст. Units сохраняют все символы корпуса;
+  oversized блок предварительно делится, окно ограничено 12000 символами и
+  256 units. Ordered unique IDs должны покрыть последнее unit, каждая группа
+  ограничена size-overlap; последующим чанкам добавляется точный исходный
+  overlap. Чанки — source slices, ошибочный JSON/границы не заменяются fixed.
+  `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
+  64–12000. Runtime `RAG_CHUNKING_API_KEY` или fallback `OPENROUTER_API_KEY`
+  читается только HTTP-границей, standalone не загружает `.env`.
+  `semantic-cache` хранит приватные проверенные per-document segmentation и
+  request/response traces без auth headers; identity включает document/hash,
+  config, prompt version, size/overlap, не ключ. Текущий report содержит actual
+  calls/tokens/cache counts/time; cache hit не начисляет прошлые токены. Report
+  исключён из chunks fingerprint: повторное разбиение сохраняет downstream
+  vectors, если реальные chunks/параметры неизменны. UI показывает два варианта:
+  fixed и semantic LLM, structural сохранён для CLI index/compare.
 - `EmbeddingConfig` фиксирует endpoint/model/dimensions/revision; fingerprint
   включает их все. Оператор меняет revision при замене весов под прежним ID.
   oMLX обслуживается отдельно, приложение не устанавливает/скачивает модели.

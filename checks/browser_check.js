@@ -114,6 +114,11 @@ async function main() {
     $("#rag-strategy").value = "fixed"; $("#rag-size").value = "512"; $("#rag-overlap").value = "64";
     click("rag-split"); await settle();
     check("Chunk button sends configured character size and overlap", same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
+    $("#rag-strategy").value = "semantic"; $("#rag-strategy").dispatchEvent(new Evt("change"));
+    $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1"; $("#rag-semantic-model").value = "offline-boundaries";
+    click("rag-split"); await settle();
+    check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
+      {strategy: "semantic", size: 512, overlap: 64, semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
     $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();

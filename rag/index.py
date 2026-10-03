@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .chunks import SIZE, OVERLAP, chunk_documents
 from .artifacts import available, revive
+from .semantic import SemanticConfig, semantic_chunks
 from .documents import digest, load_corpus, now, write_json
 from .embeddings import EmbeddingConfig, Embeddings, normalize
 
@@ -74,20 +75,34 @@ class Operation:
             self.lock.close()
 
 
-def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operation=None):
+def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operation=None, semantic_config=None, client=None):
     if operation is None:
         with Operation(root, "chunks") as progress:
-            return stage_chunks(root, strategy, size, overlap, operation=progress)
+            return stage_chunks(root, strategy, size, overlap, operation=progress, semantic_config=semantic_config, client=client)
     root = Path(root)
     corpus = load_corpus(root)
-    operation.update(stage="chunks", documents=len(corpus["documents"]))
-    chunks = chunk_documents(corpus["documents"], strategy, size, overlap)
+    operation.update(stage="chunks", documents=len(corpus["documents"]), strategy=strategy, size=size, overlap=overlap)
+    semantic_config = semantic_config or SemanticConfig()
+    report = None
+    if strategy == "semantic":
+        # A tombstoned cache may survive interrupted physical cleanup.
+        if not available(root, "semantic-cache"):
+            import shutil
+            shutil.rmtree(root / "semantic-cache", ignore_errors=True)
+            revive(root, "semantic-cache")
+        chunks, report = semantic_chunks(corpus["documents"], semantic_config, size, overlap, root=root, client=client, operation=operation)
+    else:
+        chunks = chunk_documents(corpus["documents"], strategy, size, overlap)
     value = {"version": 1, "corpus_fingerprint": corpus["fingerprint"], "strategy": strategy,
              "size": size, "overlap": overlap, "chunks": chunks}
+    if strategy == "semantic":
+        value["semantic_config"] = asdict(semantic_config)
     value["fingerprint"] = digest(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    if report is not None:
+        value["report"] = report
     write_json(root / "chunks.json", value)
     revive(root, "chunks.json")
-    operation.update(chunks=len(chunks), state="complete")
+    operation.update(chunks=len(chunks), state="complete", **({"semantic_report": report} if report is not None else {}))
     return {key: item for key, item in value.items() if key != "chunks"} | {"chunks": len(chunks)}
 
 
@@ -96,7 +111,7 @@ def load_chunks(root):
     value = read_json(Path(root) / "chunks.json")
     if not value or value["corpus_fingerprint"] != corpus["fingerprint"]:
         raise ValueError("Create chunks for the current corpus first")
-    expected = digest(json.dumps({k: v for k, v in value.items() if k != "fingerprint"}, sort_keys=True, separators=(",", ":")))
+    expected = digest(json.dumps({k: v for k, v in value.items() if k not in {"fingerprint", "report"}}, sort_keys=True, separators=(",", ":")))
     if value["fingerprint"] != expected or not value["chunks"]:
         raise ValueError("Invalid staged chunks")
     return corpus, value
@@ -207,11 +222,11 @@ def save_index(root, *, operation=None):
         Path(temporary).unlink(missing_ok=True)
 
 
-def build_index(root: Path, config=None, strategy="structural", batch_size=16, *, client=None, operation=None, size=SIZE, overlap=OVERLAP):
+def build_index(root: Path, config=None, strategy="structural", batch_size=16, *, client=None, operation=None, size=SIZE, overlap=OVERLAP, semantic_config=None):
     if operation is None:
         with Operation(root, "index") as progress:
-            return build_index(root, config, strategy, batch_size, client=client, operation=progress, size=size, overlap=overlap)
-    stage_chunks(root, strategy, size, overlap, operation=operation)
+            return build_index(root, config, strategy, batch_size, client=client, operation=progress, size=size, overlap=overlap, semantic_config=semantic_config)
+    stage_chunks(root, strategy, size, overlap, operation=operation, semantic_config=semantic_config, client=client)
     operation.update(state="running")
     stage_embeddings(root, config, batch_size, client=client, operation=operation)
     operation.update(state="running")

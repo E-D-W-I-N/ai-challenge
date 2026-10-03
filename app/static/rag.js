@@ -94,7 +94,19 @@ function createRagInspector({ state, $, el, api }) {
       renderIndex(data.index, data.ingestion);
       lastStatus = data;
       const stages = data.stages;
+      if (!seeded && stages?.chunks?.semantic_config) {
+        for (const [id, key] of [["semantic-base-url", "base_url"], ["semantic-model", "model"]]) {
+          const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = stages.chunks.semantic_config[key];
+        }
+      }
       if (!seeded) {
+        if (stages?.chunks) {
+          const saved = stages.chunks;
+          for (const [id, value] of [["size", saved.size], ["overlap", saved.overlap], ["strategy", saved.strategy === "semantic" ? "semantic" : "fixed"]]) {
+            const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = value;
+          }
+          $("#rag-strategy")?.onchange?.();
+        }
         const defaults = data.embedding_defaults;
         if (defaults) {
           for (const [id, key] of [["base-url", "base_url"], ["model", "model"], ["dimensions", "dimensions"], ["revision", "revision"]]) {
@@ -167,14 +179,26 @@ function createRagInspector({ state, $, el, api }) {
       const node = $("#rag-" + id); if (node) node.disabled = busy || !available;
     }
     const summary = $("#rag-stage-status");
-    if (summary) summary.textContent = `Загружено документов: ${stages.corpus?.documents ?? 0} · чанков: ${stages.chunks?.chunks ?? 0} · эмбеддинги: ${stages.embeddings ? "готовы" : "не созданы"}`;
+    if (summary) {
+      summary.textContent = `Загружено документов: ${stages.corpus?.documents ?? 0} · чанков: ${stages.chunks?.chunks ?? 0} · эмбеддинги: ${stages.embeddings ? "готовы" : "не созданы"}`;
+      const report = data.operation?.kind === "chunks" && data.operation?.semantic_report || stages.chunks?.report;
+      if (report) summary.textContent += ` · LLM запросов: ${report.calls} · документов из кэша: ${report.cached} · токены вход/выход: ${report.usage?.prompt_tokens ?? (report.calls === 0 ? 0 : "не сообщены")}/${report.usage?.completion_tokens ?? (report.calls === 0 ? 0 : "не сообщены")}`;
+    }
+  }
+  function chunkOptions() {
+    const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
+    if (body.strategy === "semantic") {
+      body.semantic_base_url = $("#rag-semantic-base-url").value.trim();
+      body.semantic_model = $("#rag-semantic-model").value.trim();
+    }
+    return body;
   }
   async function start(kind) {
     if (submitting || lastStatus?.operation?.state === "running") return;
     submitting = true; updateControls();
     try {
       const body = kind === "ingest" ? {urls: $("#rag-urls").value.split(/\n/).map(x => x.trim()).filter(Boolean), use_manifest: $("#rag-manifest").checked}
-        : kind === "chunks" ? {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)}
+        : kind === "chunks" ? chunkOptions()
         : kind === "embeddings" ? {base_url: $("#rag-base-url").value.trim(), model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (lastStatus) lastStatus.operation = {...lastStatus.operation, state: "running"};
@@ -195,7 +219,14 @@ function createRagInspector({ state, $, el, api }) {
   for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
-  for (const id of ["urls", "base-url", "model", "dimensions", "revision"]) {
+  const strategy = $("#rag-strategy");
+  if (strategy) strategy.onchange = () => {
+    strategy.dataset.dirty = "true";
+    const semantic = strategy.value === "semantic";
+    $("#rag-semantic-fields").hidden = !semantic;
+    $("#rag-size").max = semantic ? "12000" : "100000";
+  };
+  for (const id of ["urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input) input.oninput = () => { input.dataset.dirty = "true"; };
   }
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {

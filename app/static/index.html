@@ -85,17 +85,22 @@
         <section class="tab-page settings-card hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
           <p>Выполните четыре этапа последовательно. Документы и чанки доступны для просмотра до сохранения индекса.</p>
           <div id="rag-controls" class="rag-controls">
-            <label>URL документов, по одному на строку<textarea id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
+            <label>URL документов, по одному на строку<textarea class="control" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
             <button id="rag-ingest" class="btn" type="button">Загрузить документы</button>
-            <label>Способ разбиения<select id="rag-strategy"><option value="fixed">По размеру</option><option value="structural">По заголовкам и абзацам</option></select></label>
-            <label>Размер чанка, символов<input id="rag-size" type="number" min="64" max="100000" value="1200"></label>
-            <details><summary>Параметры разбиения</summary><label>Перекрытие, символов<input id="rag-overlap" type="number" min="0" value="180"></label></details>
+            <label>Способ разбиения<select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
+            <div id="rag-semantic-fields" hidden>
+              <label>URL сервера LLM<input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
+              <label>Модель для границ чанков<input class="control" id="rag-semantic-model" type="text" value="openai/gpt-4.1-mini"></label>
+              <p class="muted">LLM выбирает границы исходного текста. Повторное разбиение использует кэш. Авторизация: RAG_CHUNKING_API_KEY или OPENROUTER_API_KEY в окружении сервера.</p>
+            </div>
+            <label>Размер чанка, символов<input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
+            <details><summary>Параметры разбиения</summary><label>Перекрытие, символов<input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>
             <button id="rag-split" class="btn" type="button">Разбить на чанки</button>
             <button id="rag-delete-chunks" class="btn" type="button">Удалить чанки</button>
-            <label>URL сервера эмбеддингов<input id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
-            <label>Модель эмбеддингов<input id="rag-model" type="text" value="mlx-community/Qwen3-Embedding-0.6B-8bit"></label>
-            <details><summary>Параметры эмбеддингов</summary><label>Размерность (пусто — от сервера)<input id="rag-dimensions" type="number" min="1"></label><label>Ревизия модели<input id="rag-revision" type="text" value="1"></label></details>
+            <label>URL сервера эмбеддингов<input class="control" id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
+            <label>Модель эмбеддингов<input class="control" id="rag-model" type="text" value="mlx-community/Qwen3-Embedding-0.6B-8bit"></label>
+            <details><summary>Параметры эмбеддингов</summary><label>Размерность (пусто — от сервера)<input class="control" id="rag-dimensions" type="number" min="1"></label><label>Ревизия модели<input class="control" id="rag-revision" type="text" value="1"></label></details>
             <p class="muted">Авторизация сервера задаётся оператором через RAG_EMBEDDING_API_KEY.</p>
             <button id="rag-embed" class="btn" type="button">Создать эмбеддинги</button>
             <button id="rag-delete-embeddings" class="btn" type="button">Удалить эмбеддинги</button>
