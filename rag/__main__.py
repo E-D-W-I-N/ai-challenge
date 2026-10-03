@@ -11,9 +11,10 @@ import sys
 from pathlib import Path
 
 from .chunks import STRATEGIES, chunk_documents
+from .artifacts import clear
 from .documents import ingest, load_corpus, write_json
 from .embeddings import EmbeddingConfig
-from .index import Index, Operation, build_index, storage_root
+from .index import Index, Operation, build_index, stage_chunks, stage_embeddings, save_index, storage_root
 
 
 def main(argv=None):
@@ -23,7 +24,14 @@ def main(argv=None):
     load = commands.add_parser("ingest", help="Explicit URLs/local HTML, never crawl")
     load.add_argument("--url", action="append", default=[])
     load.add_argument("--manifest", type=Path, help='JSON list: {"url":...} or {"path":...,"source":...}; relative paths resolve by manifest')
-    for name in ("index", "compare"):
+    split = commands.add_parser("chunks")
+    split.add_argument("--strategy", choices=STRATEGIES, default="fixed")
+    split.add_argument("--size", type=int, default=1200)
+    split.add_argument("--overlap", type=int, default=180)
+    commands.add_parser("save")
+    clear_command = commands.add_parser("clear")
+    clear_command.add_argument("stage", choices=("chunks", "embeddings"))
+    for name in ("index", "compare", "embed"):
         command = commands.add_parser(name)
         command.add_argument("--base-url", default=EmbeddingConfig.base_url)
         command.add_argument("--model", default=EmbeddingConfig.model)
@@ -32,6 +40,8 @@ def main(argv=None):
         command.add_argument("--batch-size", type=int, default=16)
         if name == "index":
             command.add_argument("--strategy", choices=STRATEGIES, default="structural")
+            command.add_argument("--size", type=int, default=1200)
+            command.add_argument("--overlap", type=int, default=180)
     commands.add_parser("status")
     args = parser.parse_args(argv)
     root = args.root.resolve()
@@ -52,12 +62,21 @@ def main(argv=None):
             with Operation(root, "ingest") as operation:
                 result = ingest(inputs, root)
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
+        elif args.command == "clear":
+            with Operation(root, "delete_" + args.stage) as operation:
+                result = clear(root, args.stage, operation)
+        elif args.command == "chunks":
+            result = stage_chunks(root, args.strategy, args.size, args.overlap)
+        elif args.command == "save":
+            result = save_index(root)
         elif args.command == "status":
             result = Index(root).status()
         else:
             config = EmbeddingConfig(args.base_url, args.model, args.dimensions, args.revision)
             if args.command == "index":
-                result = build_index(root, config, args.strategy, args.batch_size)
+                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap)
+            elif args.command == "embed":
+                result = stage_embeddings(root, config, args.batch_size)
             else:
                 # Separate artifacts: comparing never replaces the active index.
                 with Operation(root, "compare") as operation:

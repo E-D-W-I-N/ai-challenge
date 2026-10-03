@@ -5454,6 +5454,11 @@ def check_pipeline_http():
 
 
 @check("RAG: HTML/HTTP/CLI/SQLite/cache/atomic index and bounded inspector")
+def check_rag_workflow():
+    from checks.workflow_check import check_workflow
+    return check_workflow()
+
+
 def check_rag_index():
     from checks.rag_check import check_rag
     return check_rag()

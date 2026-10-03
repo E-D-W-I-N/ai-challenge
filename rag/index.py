@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .chunks import SIZE, OVERLAP, chunk_documents
+from .artifacts import available, revive
 from .documents import digest, load_corpus, now, write_json
 from .embeddings import EmbeddingConfig, Embeddings, normalize
 
@@ -24,6 +25,8 @@ def storage_root() -> Path:
 
 
 def read_json(path, default=None):
+    if not available(path.parent, path.name):
+        return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -47,9 +50,13 @@ class Operation:
             raise ValueError("Another RAG operation is running") from None
         self.started = time.monotonic()
         self.value = {"operation_id": uuid.uuid4().hex, "kind": self.kind, "pid": os.getpid(),
-                      "state": "running", "stage": "documents", "started_at": now(), "updated_at": now(),
+                      "state": "running", "stage": {"chunks": "chunks", "embeddings": "embeddings", "save": "save"}.get(self.kind, "documents"), "started_at": now(), "updated_at": now(),
                       "duration_seconds": 0, "documents": 0, "chunks": 0, "computed": 0, "cached": 0}
-        self.update()
+        try:
+            self.update()
+        except BaseException:
+            self.lock.close()
+            raise
         return self
 
     def update(self, **values):
@@ -67,27 +74,51 @@ class Operation:
             self.lock.close()
 
 
-def build_index(root: Path, config=None, strategy="structural", batch_size=16, *, client=None, operation=None):
+def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operation=None):
+    if operation is None:
+        with Operation(root, "chunks") as progress:
+            return stage_chunks(root, strategy, size, overlap, operation=progress)
+    root = Path(root)
+    corpus = load_corpus(root)
+    operation.update(stage="chunks", documents=len(corpus["documents"]))
+    chunks = chunk_documents(corpus["documents"], strategy, size, overlap)
+    value = {"version": 1, "corpus_fingerprint": corpus["fingerprint"], "strategy": strategy,
+             "size": size, "overlap": overlap, "chunks": chunks}
+    value["fingerprint"] = digest(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    write_json(root / "chunks.json", value)
+    revive(root, "chunks.json")
+    operation.update(chunks=len(chunks), state="complete")
+    return {key: item for key, item in value.items() if key != "chunks"} | {"chunks": len(chunks)}
+
+
+def load_chunks(root):
+    corpus = load_corpus(root)
+    value = read_json(Path(root) / "chunks.json")
+    if not value or value["corpus_fingerprint"] != corpus["fingerprint"]:
+        raise ValueError("Create chunks for the current corpus first")
+    expected = digest(json.dumps({k: v for k, v in value.items() if k != "fingerprint"}, sort_keys=True, separators=(",", ":")))
+    if value["fingerprint"] != expected or not value["chunks"]:
+        raise ValueError("Invalid staged chunks")
+    return corpus, value
+
+
+def stage_embeddings(root, config=None, batch_size=16, *, client=None, operation=None):
     if not 1 <= batch_size <= 256:
         raise ValueError("Batch size must be between 1 and 256")
     if operation is None:
-        with Operation(root, "index") as progress:
-            return build_index(root, config, strategy, batch_size, client=client, operation=progress)
-    root = Path(root)
-    config = config or EmbeddingConfig()
-    corpus = load_corpus(root)
-    documents = corpus["documents"]
-    operation.update(stage="documents", documents=len(documents), words=sum(d["words"] for d in documents),
-                     corpus_fingerprint=corpus["fingerprint"], config=asdict(config), strategy=strategy)
-    chunks = chunk_documents(documents, strategy)
-    operation.update(stage="chunks", chunks=len(chunks))
-    cache = sqlite3.connect(root / "embeddings-cache.sqlite")
-    cache.execute("CREATE TABLE IF NOT EXISTS embeddings (fingerprint TEXT, hash TEXT, vector TEXT, PRIMARY KEY(fingerprint,hash))")
-    fingerprint = config.fingerprint()
+        with Operation(root, "embeddings") as progress:
+            return stage_embeddings(root, config, batch_size, client=client, operation=progress)
+    root, config = Path(root), config or EmbeddingConfig()
+    corpus, staged = load_chunks(root)
+    chunks = staged["chunks"]
+    operation.update(stage="embeddings", documents=len(corpus["documents"]), chunks=len(chunks), config=asdict(config))
     vectors, missing, dimension = {}, {}, config.dimensions
-    fd, temporary = tempfile.mkstemp(prefix="index-", suffix=".sqlite", dir=root)
-    os.close(fd)
-    try:
+    fingerprint = config.fingerprint()
+    if not available(root, "embeddings-cache.sqlite"):
+        (root / "embeddings-cache.sqlite").unlink(missing_ok=True)
+        revive(root, "embeddings-cache.sqlite")
+    with closing(sqlite3.connect(root / "embeddings-cache.sqlite")) as cache:
+        cache.execute("CREATE TABLE IF NOT EXISTS embeddings (fingerprint TEXT, hash TEXT, vector TEXT, PRIMARY KEY(fingerprint,hash))")
         cached = computed = 0
         for chunk in chunks:
             key = chunk["content_hash"]
@@ -99,13 +130,12 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
                 cached += 1
             elif key not in missing:
                 missing[key] = chunk["text"]
-        operation.update(stage="embeddings", cached=cached, dimension=dimension, pending=len(missing))
+        operation.update(cached=cached, dimension=dimension, pending=len(missing))
         items = list(missing.items())
         embedder = Embeddings(config, client)
         for start in range(0, len(items), batch_size):
             batch = items[start:start + batch_size]
-            batch_vectors = embedder.embed([text for _, text in batch])
-            for (key, _), vector in zip(batch, batch_vectors):
+            for (key, _), vector in zip(batch, embedder.embed([text for _, text in batch])):
                 vector = normalize(vector, dimension)
                 dimension = len(vector)
                 vectors[key] = vector
@@ -113,11 +143,44 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
                 computed += 1
             cache.commit()
             operation.update(computed=computed, dimension=dimension, pending=len(items) - computed)
-        metadata = {"version": VERSION, "index_id": uuid.uuid4().hex, "operation_id": operation.value["operation_id"], "built_at": now(), "strategy": strategy,
-                    "chunk_size": SIZE, "overlap": OVERLAP, "corpus_fingerprint": corpus["fingerprint"],
-                    "embedding_fingerprint": fingerprint, "embedding_config": asdict(config), "dimension": dimension,
+    value = {"version": 1, "chunks_fingerprint": staged["fingerprint"], "embedding_config": asdict(config),
+             "embedding_fingerprint": fingerprint, "dimension": dimension, "vectors": vectors,
+             "computed": computed, "cached": cached}
+    write_json(root / "vectors.json", value)
+    revive(root, "vectors.json")
+    operation.update(state="complete")
+    return {key: item for key, item in value.items() if key != "vectors"}
+
+
+def load_vectors(root, staged):
+    value = read_json(Path(root) / "vectors.json")
+    if not value or value["chunks_fingerprint"] != staged["fingerprint"]:
+        raise ValueError("Create embeddings for the current chunks first")
+    config = EmbeddingConfig(**value["embedding_config"])
+    if config.fingerprint() != value["embedding_fingerprint"]:
+        raise ValueError("Invalid staged embedding configuration")
+    value["vectors"] = {c["content_hash"]: normalize(value["vectors"][c["content_hash"]], value["dimension"]) for c in staged["chunks"]}
+    return value
+
+
+def save_index(root, *, operation=None):
+    if operation is None:
+        with Operation(root, "save") as progress:
+            return save_index(root, operation=progress)
+    root = Path(root)
+    corpus, staged = load_chunks(root)
+    embedded = load_vectors(root, staged)
+    documents, chunks = corpus["documents"], staged["chunks"]
+    vectors, dimension = embedded["vectors"], embedded["dimension"]
+    config = EmbeddingConfig(**embedded["embedding_config"])
+    fd, temporary = tempfile.mkstemp(prefix="index-", suffix=".sqlite", dir=root)
+    os.close(fd)
+    try:
+        metadata = {"version": VERSION, "index_id": uuid.uuid4().hex, "operation_id": operation.value["operation_id"], "built_at": now(), "strategy": staged["strategy"],
+                    "chunk_size": staged["size"], "overlap": staged["overlap"], "corpus_fingerprint": corpus["fingerprint"],
+                    "embedding_fingerprint": embedded["embedding_fingerprint"], "embedding_config": asdict(config), "dimension": dimension,
                     "documents": len(documents), "chunks": len(chunks), "words": sum(d["words"] for d in documents),
-                    "computed": computed, "cached": cached}
+                    "computed": embedded["computed"], "cached": embedded["cached"]}
         operation.update(stage="save")
         with closing(sqlite3.connect(temporary)) as db:
             db.executescript("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
@@ -131,6 +194,7 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
         with open(temporary, "rb") as file:
             os.fsync(file.fileno())
         os.replace(temporary, root / "index.sqlite")
+        revive(root, "index.sqlite")
         # replace is the success boundary. Telemetry cannot undo publication.
         operation.value.update(state="ready", index_id=metadata["index_id"])
         try:
@@ -140,8 +204,18 @@ def build_index(root: Path, config=None, strategy="structural", batch_size=16, *
             metadata["warning"] = "Index published; final progress could not be saved"
         return metadata
     finally:
-        cache.close()
         Path(temporary).unlink(missing_ok=True)
+
+
+def build_index(root: Path, config=None, strategy="structural", batch_size=16, *, client=None, operation=None, size=SIZE, overlap=OVERLAP):
+    if operation is None:
+        with Operation(root, "index") as progress:
+            return build_index(root, config, strategy, batch_size, client=client, operation=progress, size=size, overlap=overlap)
+    stage_chunks(root, strategy, size, overlap, operation=operation)
+    operation.update(state="running")
+    stage_embeddings(root, config, batch_size, client=client, operation=operation)
+    operation.update(state="running")
+    return save_index(root, operation=operation)
 
 
 class Index:
@@ -149,6 +223,8 @@ class Index:
         self.root = Path(root) if root is not None else storage_root()
 
     def connect(self):
+        if not available(self.root, "index.sqlite"):
+            raise ValueError("Index was deleted; save a new index")
         path = self.root / "index.sqlite"
         db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
@@ -183,7 +259,7 @@ class Index:
                     pass
             result["operation"] = operation
             result["ingestion"] = read_json(self.root / "ingest-report.json")
-            if (self.root / "index.sqlite").exists():
+            if available(self.root, "index.sqlite") and (self.root / "index.sqlite").exists():
                 with closing(self.connect()) as db:
                     metadata = self.metadata(db)
                     metadata["size_bytes"] = db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0]
