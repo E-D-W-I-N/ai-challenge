@@ -101,8 +101,24 @@ def _payload(text, units, config, limit):
                 {"role": "user", "content": json.dumps({"units": numbered}, ensure_ascii=False)}]}
 
 
+def _contains_credential(value, credentials):
+    if isinstance(value, str):
+        return any(secret in value for secret in credentials)
+    if isinstance(value, dict):
+        return any(_contains_credential(k, credentials) or _contains_credential(v, credentials)
+                   for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_credential(item, credentials) for item in value)
+    return False
+
+
 def _call(client, config, payload, trace=None):
-    key = os.environ.get("RAG_CHUNKING_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+    preferred = os.environ.get("RAG_CHUNKING_API_KEY", "")
+    fallback = os.environ.get("OPENROUTER_API_KEY", "")
+    credentials = tuple(secret for secret in (preferred, fallback) if secret)
+    key = preferred or fallback
+    if _contains_credential(payload, credentials):
+        raise ValueError("Semantic request contains a runtime credential")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         response = client.post(config.base_url.rstrip("/") + "/chat/completions", json=payload, headers=headers)
@@ -115,6 +131,20 @@ def _call(client, config, payload, trace=None):
         body = response.json()
     except (ValueError, UnicodeError):
         raise ValueError("Semantic response is invalid JSON") from None
+    if _contains_credential(body, credentials):
+        raise ValueError("Semantic response contains a runtime credential")
+    # Content is itself JSON: escaped string values must not bypass the guard.
+    if isinstance(body, dict):
+        for choice in body.get("choices", []) if isinstance(body.get("choices"), list) else []:
+            if isinstance(choice, dict) and isinstance(choice.get("message"), dict):
+                content = choice["message"].get("content")
+                if isinstance(content, str):
+                    try:
+                        decoded_content = json.loads(content)
+                    except (ValueError, TypeError):
+                        continue
+                    if _contains_credential(decoded_content, credentials):
+                        raise ValueError("Semantic response contains a runtime credential")
     if trace is not None:
         trace(body)
     decoded = _decode_response(body)
