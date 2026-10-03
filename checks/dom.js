@@ -181,6 +181,11 @@ class El {
   append(...nodes) {
     nodes.forEach((n) => this.appendChild(n));
   }
+  replaceChildren(...nodes) {
+    for (const child of [...this.children]) this.removeChild(child);
+    this._text = ""; this._html = "";
+    this.append(...nodes);
+  }
   removeChild(node) {
     const i = this.children.indexOf(node);
     if (i >= 0) this.children.splice(i, 1);

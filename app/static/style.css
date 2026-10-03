@@ -808,3 +808,14 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 
 .mcp-button { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-height: 44px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
 .mcp-button:disabled, .mcp-config-actions .mem-add:disabled { opacity: .6; cursor: not-allowed; }
+
+/* Full-width read-only RAG inspector, within the existing workspace. */
+#tab-rag { min-width: 0; }
+#tab-rag > div { margin-block: 1rem; }
+.rag-stages { display: flex; flex-wrap: wrap; gap: 1.5rem; padding-left: 1.5rem; }
+.rag-stages .active { font-weight: 700; }
+.rag-item, .rag-pager { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-block: .5rem; }
+#rag-chunks > button { display: block; max-width: 100%; margin-block: .5rem; white-space: normal; text-align: left; }
+.rag-detail { margin-block: .7rem; }
+.rag-detail summary { cursor: pointer; overflow-wrap: anywhere; }
+.rag-detail pre, .rag-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: .8rem; background: var(--surface, #f5f5f5); }

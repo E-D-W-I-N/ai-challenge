@@ -5453,6 +5453,12 @@ def check_pipeline_http():
     return check_pipeline_http()
 
 
+@check("RAG: HTML/HTTP/CLI/SQLite/cache/atomic index and bounded inspector")
+def check_rag_index():
+    from checks.rag_check import check_rag
+    return check_rag()
+
+
 @check("клиент: экранирование, разбор markdown и панель проверены настоящими вызовами")
 def check_browser():
     """Клиентский код исполняется под node: payload на входе, утверждения

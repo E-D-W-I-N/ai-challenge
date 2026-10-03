@@ -82,6 +82,9 @@ const {
   addInvariantFromForm
 } = createRecords({ state, $, el, iconButton, api, json, fmt });
 
+const createRag = typeof module !== "undefined" ? require("./rag.js") : globalThis.createRagInspector;
+const ragInspector = createRag({ state, $, el, api });
+
 // Сколько пикселей от низа ленты ещё считается «читатель внизу».
 const STICK_SLACK = 80;
 
@@ -1329,7 +1332,7 @@ async function pollCurrentChat() {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp"];
+const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp", "rag"];
 
 const SETTINGS_PAGES = {
   model: ["Модель", "Параметры ответа и генерации", "Для текущего чата", "bot"],
@@ -1337,6 +1340,7 @@ const SETTINGS_PAGES = {
   memory: ["Память", "Реплики, записи о задаче и сведения надолго", "Рабочая — этот чат · долговременная — все чаты", "memory"],
   profile: ["Профиль", "Как ассистент отвечает вам", "Для всех чатов", "user"],
   invariants: ["Инварианты", "Правила, которые задаёт человек", "Для всех чатов", "shield"],
+  rag: ["Работа RAG", "Документы, чанки и фактическая индексация", "Для всего приложения", "memory"],
   mcp: ["Инструменты", "Серверы MCP и доступные инструменты", "Для всего приложения", "tools"],
 };
 
@@ -1362,6 +1366,7 @@ function loadVisibleSettings() {
   if (state.section === "profile") loadProfile();
   if (state.section === "invariants") loadInvariants();
   if (state.section === "mcp") loadMcp();
+  if (state.section === "rag") ragInspector.open();
 }
 
 // Эти переключения меняют видимость уже смонтированных областей. Они не
@@ -1370,6 +1375,7 @@ function showWorkspace(which, load = true) {
   if (which === state.workspace) return;
   if (state.workspace === "chat") state.feedScroll = $("#feed").scrollTop;
   stopMcpPolling();
+  ragInspector.stop();
   state.workspace = which;
   $("#chat-workspace").classList.toggle("hidden", which !== "chat");
   $("#panel").classList.toggle("hidden", which !== "settings");
@@ -1390,6 +1396,7 @@ function showSettings(which, load = true) {
   if (state.workspace === "settings") state.sectionScroll.set(state.section, $("#panel-body").scrollTop);
   showWorkspace("settings", false);
   stopMcpPolling();
+  ragInspector.stop();
   state.section = which;
   document.querySelectorAll(".tab").forEach((tab) => {
     const selected = tab.dataset.tab === which;

@@ -52,6 +52,38 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("RAG inspector reads saved state without chat/key, paginates and reveals actual vector", async () => {
+    const info = { index_id: "saved-1", words: 15555, size_bytes: 8192, rows: { documents: 1, chunks: 1 },
+      version: 1, strategy: "structural", dimension: 3, embedding_config: { model: "offline-test" } };
+    const operation = { kind: "index", state: "ready", stage: "save", duration_seconds: 1.25,
+      documents: 1, chunks: 1, computed: 1, cached: 0, dimension: 3, config: { model: "offline-test" } };
+    const doc = { document_id: "doc", title: "<script>archive</script>", words: 15555, characters: 50000 };
+    const chunk = { chunk_id: "chunk", document_id: "doc", section: "Раздел", start: 120, end: 170, text: "Реальный текст" };
+    const { client, server, $, click, requests } = freshClient({ agents: [] });
+    server.respond("GET", "/api/rag/status", { state: "ready", index: info, operation });
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25", { items: [doc] });
+    server.respond("GET", "/api/rag/documents/doc/chunks?offset=0&limit=25", { items: [chunk] });
+    server.respond("GET", "/api/rag/chunks/chunk", chunk);
+    server.respond("GET", "/api/rag/chunks/chunk?vector=true", { ...chunk, vector: [0.2, 0.4, 0.8] });
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("No chat/key needed for saved index and actual CLI counts", $("#rag-status").textContent === "Индекс готов"
+      && $("#rag-index").textContent.includes("15555") && $("#rag-operation").textContent.includes("1.25"));
+    $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    $("#rag-chunks").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    check("Metadata/clean text visible and vectors fetched lazily", $("#rag-chunk").textContent.includes("Реальный текст")
+      && $("#rag-chunk").textContent.includes("120") && requests("GET", "/api/rag/chunks/chunk?vector=true").length === 0);
+    const vector = $("#rag-chunk").querySelectorAll("details").at(-1); vector.open = true; await vector.ontoggle();
+    check("Actual saved vector displayed", vector.textContent.includes("[0.2,0.4,0.8]")
+      && requests("GET", "/api/rag/chunks/chunk?vector=true").length === 1);
+    const pending = deferred(); server.respond("GET", "/api/rag/status", () => pending.promise);
+    click("tab-btn-model"); click("tab-btn-rag"); await settle(); click("tab-btn-model");
+    pending.resolve(json({ state: "error", operation: { ...operation, error: "late error" }, index: info })); await settle();
+    check("Late inspector response cannot write after leaving page", $("#rag-error").textContent !== "late error");
+    server.respond("GET", "/api/rag/status", { state: "error", operation: { ...operation, state: "error", error: "embedding failed" }, index: info });
+    click("tab-btn-rag"); await settle();
+    check("Failure distinct from previous committed index", $("#rag-status").textContent === "Ошибка операции"
+      && $("#rag-error").textContent === "embedding failed" && $("#rag-index").textContent.includes("15555"));
+  });
   await scenario("Conditional selected-chat refresh uses revision and catches replacement", async () => {
     const old = { ...turns[1], content: "старый ответ" };
     const { client, server, $, requests } = freshClient({ agents: [{
