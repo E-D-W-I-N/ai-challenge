@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from urllib.parse import urlparse
 
@@ -54,8 +55,17 @@ class Embeddings:
         if self.config.dimensions is not None:
             payload["dimensions"] = self.config.dimensions
         def call(client):
-            response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload)
-            response.raise_for_status()
+            # Runtime credential only: never part of config, cache identity or state.
+            key = os.environ.get("RAG_EMBEDDING_API_KEY", "")
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            try:
+                response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload, headers=headers)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                raise ValueError(f"Embedding HTTP error: status {error.response.status_code}") from None
+            except (httpx.HTTPError, UnicodeError):
+                # Transport errors may contain request headers; keep persisted errors safe.
+                raise ValueError("Embedding HTTP request failed") from None
             body = response.json()
             if not isinstance(body, dict):
                 raise ValueError("Embedding response must be a JSON object")

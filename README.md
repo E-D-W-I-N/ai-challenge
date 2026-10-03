@@ -47,6 +47,10 @@ base URL и model ID задаёт оператор. Приложение не у
 endpoint/model/dimensions/revision и текста. Смена весов под тем же ID требует
 нового `--revision`. Неверный count/index, NaN/zero или mismatch размерности
 останавливает сборку. HTTP oMLX не наследует proxy окружения.
+Если сервер требует авторизацию, HTTP-запрос читает `RAG_EMBEDDING_API_KEY`
+из окружения и отправляет `Authorization: Bearer …`. Пустое/отсутствующее
+значение оставляет запрос без авторизации. Ключ не входит в конфиг, fingerprint,
+кэш, индекс или отчёты; его смена не требует перестройки кэша.
 
 Корпус предназначен для технических/исторических HTML `buran.ru`. Список URL,
 снимки, индексы, вопросы и отчёты — локальные данные оператора, не часть Git.
@@ -87,6 +91,21 @@ export RAG_DIR="$PWD/data/rag"
 .venv/bin/python -m rag status
 make run
 ```
+
+Для уже запущенного oMLX с авторизацией на порту 8005 в zsh введите ключ
+скрыто и укажите точный embedding model ID из списка моделей этого сервера:
+
+```zsh
+read -rs 'RAG_EMBEDDING_API_KEY?Ключ oMLX: '; print
+export RAG_EMBEDDING_API_KEY
+read -r 'RAG_EMBEDDING_MODEL?Embedding model ID сервера: '
+.venv/bin/python -m rag index --base-url http://127.0.0.1:8005/v1 \
+  --model "$RAG_EMBEDDING_MODEL" --batch-size 16
+unset RAG_EMBEDDING_API_KEY
+```
+
+Ключ вводится в prompt, без аргумента CLI и записи в историю команд;
+авторизация сервера остаётся включённой. CLI по-прежнему не читает `.env`.
 
 Ingest сохраняет frozen corpus.json и ingest-report.json с ошибками/словами и
 оценкой страниц; при любом отказе прежний корпус остаётся. Повторный index

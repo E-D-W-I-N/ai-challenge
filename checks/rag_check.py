@@ -13,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rag.chunks import chunk_documents
@@ -21,8 +23,9 @@ from rag.embeddings import EmbeddingConfig, Embeddings
 from rag.index import Index, Operation, build_index
 
 
+@patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": ""})
 def check_rag():
-    calls, mode = [], {"value": "ok"}
+    calls, authorization, mode = [], [], {"value": "ok", "key": None}
     class Server(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -30,6 +33,11 @@ def check_rag():
             assert self.path == "/v1/embeddings"
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             calls.append(body)
+            authorization.append(self.headers.get("Authorization"))
+            if mode["key"] is not None and self.headers.get("Authorization") != f'Bearer {mode["key"]}':
+                self.send_response(401); self.end_headers()
+                self.wfile.write(str(self.headers.get("Authorization")).encode())
+                return
             rows = []
             for i, text in enumerate(body["input"]):
                 raw = hashlib.sha256(text.encode()).digest()
@@ -93,13 +101,61 @@ def check_rag():
                 pass
             config = EmbeddingConfig(f"http://127.0.0.1:{server.server_port}/v1", "offline-test")
             # CLI's actual HTTP traffic and durable index survive process exit.
-            result = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "index", "--base-url", config.base_url, "--model", config.model, "--batch-size", "2"], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
+            command = [sys.executable, "-m", "rag", "--root", str(root), "index", "--base-url", config.base_url, "--model", config.model, "--batch-size", "2"]
+            fake_keys = ("offline-auth-first", "offline-auth-rotated", "offline-auth-rejected")
+            mode["key"] = fake_keys[0]
+            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[0]}):
+                result = subprocess.run(command, capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
             assert result.returncode == 0, result.stderr
+            assert authorization and set(authorization) == {f"Bearer {fake_keys[0]}"}
             metadata = json.loads(result.stdout); index = Index(root)
             assert index.status()["state"] == "ready" and metadata["dimension"] == 3
             initial_calls = len(calls)
-            cached = build_index(root, config)
+            mode["key"] = fake_keys[1]
+            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[1]}):
+                cached = build_index(root, config)
             assert len(calls) == initial_calls and cached["computed"] == 0 and cached["cached"] == cached["chunks"]
+            assert cached["embedding_fingerprint"] == metadata["embedding_fingerprint"] == config.fingerprint()
+            with httpx.Client(trust_env=False) as client:
+                embedder = Embeddings(config, client)
+                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[0]}):
+                    mode["key"] = fake_keys[0]
+                    embedder.embed(["runtime first"])
+                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[1]}):
+                    mode["key"] = fake_keys[1]
+                    embedder.embed(["runtime rotated"])
+            assert authorization[-2:] == [f"Bearer {key}" for key in fake_keys[:2]]
+            old_bytes = (root / "index.sqlite").read_bytes()
+            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[2]}):
+                denied = subprocess.run(command + ["--revision", "unauthorized"], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
+            assert denied.returncode == 1 and "401" in denied.stderr
+            assert (root / "index.sqlite").read_bytes() == old_bytes
+            assert index.status()["state"] == "error" and "401" in index.status()["operation"]["error"]
+            for key in fake_keys:
+                assert key not in result.stdout + result.stderr + denied.stdout + denied.stderr + repr(config) + repr(embedder) + json.dumps(index.status())
+                assert all(key.encode() not in path.read_bytes() for path in root.rglob("*") if path.is_file())
+            # Errors must remain safe even when a transport reflects the header.
+            def failed_transport(request):
+                raise httpx.ConnectError(request.headers["Authorization"], request=request)
+            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[2]}), httpx.Client(transport=httpx.MockTransport(failed_transport)) as client:
+                try:
+                    Embeddings(config, client).embed(["transport failure"])
+                    raise AssertionError("Transport failure accepted")
+                except ValueError as error:
+                    assert str(error) == "Embedding HTTP request failed"
+            for invalid_key in ("offline-auth-\u2603", "offline-auth\r\nreflected"):
+                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": invalid_key}):
+                    try:
+                        Embeddings(config).embed(["invalid header"])
+                        raise AssertionError("Invalid header accepted")
+                    except ValueError as error:
+                        assert str(error) == "Embedding HTTP request failed"
+            mode["key"] = None
+            Embeddings(config).embed(["empty key"])
+            with patch.dict(os.environ):
+                os.environ.pop("RAG_EMBEDDING_API_KEY", None)
+                Embeddings(config).embed(["missing key"])
+            assert authorization[-2:] == [None, None]
             update = Operation.update
             def fail_final_progress(operation, **values):
                 if values.get("state") == "ready":
@@ -169,6 +225,7 @@ def check_rag():
             write_json(root / "progress.json", {"state": "ready"})
             with patch.dict(os.environ, {"RAG_DIR": str(root), "MCP_DISABLED": "1", "OPENROUTER_API_KEY": ""}), TestClient(app) as api:
                 status = api.get("/api/rag/status").json()
+                assert all(key not in json.dumps(status) for key in fake_keys)
                 assert status["index"]["rows"]["chunks"] == refreshed["chunks"]
                 documents = api.get("/api/rag/documents?limit=1").json()["items"]
                 assert len(documents) == 1 and "text" not in documents[0]
@@ -186,7 +243,7 @@ def check_rag():
                 raise AssertionError("Stale index used")
             except ValueError:
                 pass
-            return "CP1251/layout/chunks; real HTTP CLI/cache/cosine; atomic failure/lock/status; bounded API"
+            return "CP1251/layout/chunks; HTTP CLI/auth rotation/cache/cosine; atomic failure/lock/status; bounded API"
     finally:
         server.shutdown(); server.server_close(); thread.join()
 
