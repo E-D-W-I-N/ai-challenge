@@ -1,14 +1,15 @@
-# Карта клиента дня 20
+# Карта клиента дня 21
 
-FastAPI отдаёт HTML, CSS и три обычных локальных скрипта; сборки нет.
-`index.html` загружает `text.js` → `records.js` → `app.js`.
+FastAPI отдаёт HTML, CSS и четыре обычных локальных скрипта; сборки нет.
+`index.html` загружает `text.js` → `records.js` → `rag.js` → `app.js`.
 
 | Файл | Граница |
 |---|---|
 | `app/static/text.js` | Чистые Markdown/экранирование, формат чисел, stop/JSON, сравнение значений, предупреждения параметров. В браузере `ChatText`, под Node объект CommonJS. |
 | `app/static/records.js` | `createChatRecords({state, $, el, iconButton, api, json, fmt})`: память, общий editor, профиль и меню, инварианты, ленивый MCP. State один, передаётся из app.js; запросов при создании фабрики нет. |
+| `app/static/rag.js` | `createRagInspector`: read-only CLI/index status, pages документов/чанков, lazy vector; без зависимости от чата/ключа. |
 | `app/static/app.js` | State и DOM/API-помощники, список чатов/ветки, лента/поток/промпт/метрики, команды задачи, настройки, sidebar/подтверждения и init. Фабрика возвращает только функции/карты, нужные этой оболочке. |
-| `app/static/style.css`, `index.html` | Светлая гибкая оболочка для ноутбука: sidebar, общая шапка, шесть страниц, нижние метрики. Компактные формы без отдельного phone/drawer режима. |
+| `app/static/style.css`, `index.html` | Светлая гибкая оболочка для ноутбука: sidebar, общая шапка, семь страниц, нижние метрики. Компактные формы без отдельного phone/drawer режима. |
 
 В Node `require(app/static/app.js)` подключает оба соседних модуля и отдаёт
 `init`, `state`, `renderMarkdown`, `readStopLines`, `parseCommand`,
@@ -34,6 +35,7 @@ FastAPI отдаёт HTML, CSS и три обычных локальных ск�
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оркестрация | app/mcp.py, agent.py; checks/run_checks.py | Порядок двух серверов/ids/SSE/metrics, полный live payload против API, initialize-down isolation | MCP; Оркестрация нескольких серверов |
+| Работа RAG | rag.js; app/rag_api.py; rag | CLI stages/counts и сохранённая SQLite; paged documents/chunks, lazy numerical vector, отмена late GET под Node; offline HTTP CLI/cache/atomic rebuild в Python | RAG: документы, индекс и инспектор |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
@@ -53,7 +55,7 @@ batch-100 и длинные серии 25/500 обменов больше не �
 Не обращайтесь к пользовательской базе, `.env` или живой LLM.
 
 1. Откройте desktop 1440 px, ноутбук 1100/900 px и окно с zoom 125–150%.
-   Пройдите все шесть страниц: формы доступны при прокрутке, длинные слова
+   Пройдите все семь страниц: формы доступны при прокрутке, длинные слова
    переносятся, код/JSON и нижняя строка метрик прокручиваются внутри области.
    В Network проверьте, что скрипты/CSS и остальные ресурсы локальны,
    нет CDN, сетевых шрифтов и библиотек.
@@ -85,3 +87,16 @@ payload, идентификаторов, отмены позднего GET и а
 срока должен появиться новый подписанный результат и реальные tool-бейджи.
 Проверьте два повтора, сохранение черновика/незаписанных настроек и переключение
 чата во время GET; скрытие окна прекращает poll, возвращение сразу обновляет.
+
+## Ручной просмотр индекса
+
+В отдельном временном `RAG_DIR` запустите CLI ingest/index с offline HTTP-фикстурой
+или просматривайте явно подготовленный оператором снимок без вызовов модели.
+Откройте «Настройки → Работа RAG» без выбранного чата и ключа. Проверьте стадии
+реальной CLI-операции и счётчики, затем сохранённую SQLite/объём/размерность;
+выберите документ и чанк, сопоставьте его границы с очищенным текстом и раскройте
+числовой вектор. Перезагрузите страницу после завершения — тот же index_id
+и данные должны читаться из SQLite. Ошибка новой операции должна быть видна
+рядом с прежним индексом; после остановки процесса running становится interrupted.
+Проверьте длинный source/chunk_id/vector и широкую страницу на 900/1100/1440 px.
+Смена вкладки/скрытие окна прекращает poll и поздний ответ не рисует скрытую страницу.

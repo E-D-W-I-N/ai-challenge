@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, llm, mcp
+from .rag_api import router as rag_router
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .config import has_key
 from .llm import MissingKeyError
@@ -95,6 +96,7 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="AI Challenge Agents", version="2.0.0", lifespan=_lifespan)
+app.include_router(rag_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
