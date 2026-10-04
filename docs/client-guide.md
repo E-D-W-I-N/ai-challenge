@@ -7,7 +7,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 |---|---|
 | `app/static/text.js` | Чистые Markdown/экранирование, формат чисел, stop/JSON, сравнение значений, предупреждения параметров. В браузере `ChatText`, под Node объект CommonJS. |
 | `app/static/records.js` | `createChatRecords({state, $, el, iconButton, api, json, fmt})`: память, общий editor, профиль и меню, инварианты, ленивый MCP. State один, передаётся из app.js; запросов при создании фабрики нет. |
-| `app/static/rag.js` | `createRagInspector`: read-only CLI/index status, pages документов/чанков, lazy vector; без зависимости от чата/ключа. |
+| `app/static/rag.js` | `createRagInspector`: durable stages UI/CLI, pages документов/чанков до публикации, lazy vector; без зависимости от чата/ключа. |
 | `app/static/app.js` | State и DOM/API-помощники, список чатов/ветки, лента/поток/промпт/метрики, команды задачи, настройки, sidebar/подтверждения и init. Фабрика возвращает только функции/карты, нужные этой оболочке. |
 | `app/static/style.css`, `index.html` | Светлая гибкая оболочка для ноутбука: sidebar, общая шапка, семь страниц, нижние метрики. Компактные формы без отдельного phone/drawer режима. |
 
@@ -35,7 +35,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оркестрация | app/mcp.py, agent.py; checks/run_checks.py | Порядок двух серверов/ids/SSE/metrics, полный live payload против API, initialize-down isolation | MCP; Оркестрация нескольких серверов |
-| Работа RAG | rag.js; app/rag_api.py; rag | CLI stages/counts и сохранённая SQLite; paged documents/chunks, lazy numerical vector, отмена late GET под Node; offline HTTP CLI/cache/atomic rebuild в Python | RAG: документы, индекс и инспектор |
+| Работа RAG | rag.js; app/rag_api.py; rag | UI stage payloads и CLI counts; staged documents/chunks, lazy vector, mounted details/drafts/focus и late GET под Node; offline HTTP/cache/fingerprints/deletion/atomic save в Python | RAG: документы, индекс и инспектор |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
 Проверки находятся в `checks/browser_check.js` (настоящий клиент),
@@ -100,3 +100,13 @@ payload, идентификаторов, отмены позднего GET и а
 рядом с прежним индексом; после остановки процесса running становится interrupted.
 Проверьте длинный source/chunk_id/vector и широкую страницу на 900/1100/1440 px.
 Смена вкладки/скрытие окна прекращает poll и поздний ответ не рисует скрытую страницу.
+
+UI workflow: задайте явные URL (или операторский RAG_MANIFEST), нажмите
+«Загрузить документы», просмотрите очищенный документ, выберите разбиение и
+размер в символах, затем «Разбить на чанки». «Создать эмбеддинги» обращается к
+отдельному embedding endpoint; «Сохранить индекс» публикует уже готовые векторы
+без вызова модели. Оставьте раскрытыми фактическое состояние и метаданные,
+измените поле модели и проверьте несколько polls: draft, focus, выбор и details
+сохраняются, ручное закрытие details учитывается. «Удалить эмбеддинги» сохраняет
+документы/чанки; «Удалить чанки» сохраняет документы. Оба удаляют опубликованный
+индекс и соответствующий кэш, повторное создание действительно вычисляет данные.

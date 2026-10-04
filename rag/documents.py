@@ -224,7 +224,7 @@ def normalize_html(data: bytes, source: str, content_type="") -> dict:
             "words": len(text.split()), "blocks": blocks}
 
 
-def ingest(inputs: list[dict], root: Path, *, client=None) -> dict:
+def ingest(inputs: list[dict], root: Path, *, client=None, operation=None) -> dict:
     """Inputs: {url} or {path, source?}; report errors without replacing corpus."""
     documents, errors, seen = [], [], set()
     with httpx.Client(timeout=30, follow_redirects=True) if client is None else _borrow(client) as http:
@@ -252,6 +252,8 @@ def ingest(inputs: list[dict], root: Path, *, client=None) -> dict:
                 documents.append(normalize_html(data, source, content_type))
             except (OSError, ValueError, LookupError, httpx.HTTPError) as error:
                 errors.append({"source": source, "error": str(error)})
+            if operation is not None:
+                operation.update(stage="documents", documents=len(documents), words=sum(d["words"] for d in documents), failed=len(errors), inputs_done=len(seen), inputs_total=len(inputs))
     report = {"documents": len(documents), "words": sum(d["words"] for d in documents), "errors": errors,
               "approx_pages": sum(d["words"] for d in documents) / 500, "at": now()}
     write_json(root / "ingest-report.json", report)

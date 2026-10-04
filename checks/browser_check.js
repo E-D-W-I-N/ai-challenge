@@ -75,6 +75,14 @@ async function main() {
     const vector = $("#rag-chunk").querySelectorAll("details").at(-1); vector.open = true; await vector.ontoggle();
     check("Actual saved vector displayed", vector.textContent.includes("[0.2,0.4,0.8]")
       && requests("GET", "/api/rag/chunks/chunk?vector=true").length === 1);
+    const actual = $("#rag-operation").querySelector("details"); actual.open = true;
+    const metadata = $("#rag-index").querySelector("details"); metadata.open = true;
+    const draft = $("#rag-model"); draft.value = "edited-before-poll"; draft.focus();
+    await settle(2100);
+    check("Repeated real polling preserves mounted details, vector, focus and draft", actual === $("#rag-operation").querySelector("details") && actual.open
+      && metadata.open && vector.open && $("#rag-chunk").textContent.includes("Реальный текст") && document.activeElement === draft && draft.value === "edited-before-poll");
+    actual.open = false; metadata.open = false; await settle(1100);
+    check("User closed details stay closed on next poll", !actual.open && !metadata.open);
     const pending = deferred(); server.respond("GET", "/api/rag/status", () => pending.promise);
     click("tab-btn-model"); click("tab-btn-rag"); await settle(); click("tab-btn-model");
     pending.resolve(json({ state: "error", operation: { ...operation, error: "late error" }, index: info })); await settle();
@@ -83,6 +91,59 @@ async function main() {
     click("tab-btn-rag"); await settle();
     check("Failure distinct from previous committed index", $("#rag-status").textContent === "Ошибка операции"
       && $("#rag-error").textContent === "embedding failed" && $("#rag-index").textContent.includes("15555"));
+  });
+  await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: []});
+    const stages = {corpus: {fingerprint: "corpus-one", documents: 1, words: 20, urls: ["https://example.test/one"]},
+      chunks: {fingerprint: "chunks-one", chunks: 1}, embeddings: null};
+    server.respond("GET", "/api/rag/status", {state: "missing", stages, operation: {state: "complete", kind: "chunks"}, index: null});
+    const doc = {document_id: "doc", title: "Neutral", words: 20};
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: [doc]});
+    server.respond("GET", "/api/rag/documents/doc?offset=0&limit=10000", {text: "Neutral clean document", characters: 22});
+    server.respond("GET", "/api/rag/documents/doc/chunks?offset=0&limit=25&working=true", {items: [{chunk_id: "chunk", start: 0, end: 22}]});
+    server.respond("GET", "/api/rag/chunks/chunk?working=true", {chunk_id: "chunk", text: "Neutral clean document"});
+    server.respond("POST", "/api/rag/operations/chunks", {operation_id: "split-one"});
+    server.respond("POST", "/api/rag/operations/embeddings", {operation_id: "embed-one"});
+    server.respond("DELETE", "/api/rag/stages/chunks", {cleared: "chunks"});
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
+    $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    $("#rag-chunks").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    check("Document and chunk preview available before embeddings", $("#rag-chunks").textContent.includes("Neutral clean document")
+      && $("#rag-chunk").textContent.includes("Neutral clean document") && $("#rag-chunk").querySelectorAll("details").at(-1).hidden);
+    $("#rag-strategy").value = "fixed"; $("#rag-size").value = "512"; $("#rag-overlap").value = "64";
+    click("rag-split"); await settle();
+    check("Chunk button sends configured character size and overlap", same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
+    $("#rag-strategy").value = "semantic"; $("#rag-strategy").dispatchEvent(new Evt("change"));
+    $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1"; $("#rag-semantic-model").value = "offline-boundaries";
+    click("rag-split"); await settle();
+    check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
+      {strategy: "semantic", size: 512, overlap: 64, semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
+    $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
+    $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
+    click("rag-embed"); await settle();
+    check("Embedding button uses mounted fields and never starts save", same(requests("POST", "/api/rag/operations/embeddings")[0]?.body,
+      {base_url: "http://127.0.0.1:8005/v1", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
+    stages.embeddings = {embedding_fingerprint: "vectors-one"};
+    const vectorPath = "/api/rag/chunks/chunk?vector=true&working=true";
+    server.respond("GET", vectorPath, {vector: [1, 0, 0]});
+    await settle(1100);
+    const vector = $("#rag-chunk").querySelectorAll("details").at(-1);
+    vector.open = true; await vector.ontoggle();
+    check("Embedding arrival keeps selected chunk and exposes actual vector", !vector.hidden && vector.textContent.includes("[1,0,0]"));
+    const oldVector = deferred(); stages.embeddings = {embedding_fingerprint: "vectors-two"};
+    server.respond("GET", vectorPath, () => oldVector.promise); await settle(1100);
+    stages.embeddings = {embedding_fingerprint: "vectors-three"};
+    server.respond("GET", vectorPath, {vector: [0, 0, 1]}); await settle(1100);
+    oldVector.resolve(json({vector: [0, 1, 0]})); await settle();
+    check("Changed model invalidates old and late vector while preserving selected chunk/details", vector.open && vector.textContent.includes("[0,0,1]")
+      && !vector.textContent.includes("[0,1,0]") && $("#rag-chunk").textContent.includes("Neutral clean document"));
+    server.respond("DELETE", "/api/rag/stages/embeddings", () => { stages.embeddings = null; return json({cleared: "embeddings"}); });
+    click("rag-delete-embeddings"); await settle();
+    check("Deleting embeddings removes mounted numerical vector and preserves chunk selection", vector.hidden && !vector.querySelector("pre")
+      && $("#rag-chunk").textContent.includes("Neutral clean document") && $("#rag-save").disabled);
+    click("rag-delete-chunks"); await settle();
+    check("Delete chunks uses whitelisted stage endpoint", requests("DELETE", "/api/rag/stages/chunks").length === 1);
   });
   await scenario("Conditional selected-chat refresh uses revision and catches replacement", async () => {
     const old = { ...turns[1], content: "старый ответ" };

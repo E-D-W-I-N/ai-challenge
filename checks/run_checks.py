@@ -5453,6 +5453,24 @@ def check_pipeline_http():
     return check_pipeline_http()
 
 
+@check("RAG: actual semantic HTTP/CLI and save boundary")
+def check_rag_workflow_http():
+    from checks.workflow_http_check import check_workflow_http
+    return check_workflow_http()
+
+
+@check("RAG: semantic exact source boundaries and cache validation")
+def check_rag_semantic():
+    from checks.semantic_check import check_semantic
+    return check_semantic()
+
+
+@check("RAG: durable workflow/deletion/async API")
+def check_rag_workflow():
+    from checks.workflow_check import check_workflow
+    return check_workflow()
+
+
 @check("RAG: HTML/HTTP/CLI/SQLite/cache/atomic index and bounded inspector")
 def check_rag_index():
     from checks.rag_check import check_rag

@@ -137,7 +137,33 @@ Ingest сохраняет frozen corpus.json и ingest-report.json с ошибк
 границами/текстом/метаданными. Раскрытие отдельно читает настоящий числовой
 вектор выбранного чанка. Refresh открывает сохранённый индекс; missing/stale/
 interrupted/error названы явно, предыдущий индекс при отказе виден отдельно.
-UI не запускает сборку и не сравнивает стратегии.
+UI запускает отдельные этапы «Загрузить документы» → «Разбить на чанки» →
+«Создать эмбеддинги» → «Сохранить индекс». Укажите явные URL; локальный HTML
+доступен только из операторского `RAG_MANIFEST`, без ввода путей в HTTP.
+Размер и перекрытие задаются в символах. В UI доступны «По размеру» и
+«Семантическое · LLM». Для semantic по умолчанию OpenRouter /
+`openai/gpt-4.1-mini`; endpoint и модель редактируются, auth берётся из
+`RAG_CHUNKING_API_KEY` или `OPENROUTER_API_KEY` процесса. LLM возвращает
+границы абзацев, а приложение сохраняет точные исходные срезы. Проверенный
+кэш исключает повторные вызовы на том же корпусе/конфиге; UI показывает
+фактические запросы и входные/выходные токены, trace остаётся приватным. Документ и чанки можно проверить до
+публикации; создание эмбеддингов не заменяет индекс. Авторизация oMLX берётся
+из окружения процесса приложения `RAG_EMBEDDING_API_KEY`. Открытые details,
+выбор, черновик и фокус сохраняются при опросе. Удаление эмбеддингов сохраняет
+документы/чанки, удаление чанков сохраняет документы; оба удаляют downstream
+индекс и кэш. UI не сравнивает стратегии.
+
+Отдельные CLI этапы (прежний `index` также поддерживается):
+
+```sh
+.venv/bin/python -m rag chunks --strategy fixed --size 1200 --overlap 180
+.venv/bin/python -m rag chunks --strategy semantic --size 1200 --overlap 180 \
+  --semantic-base-url https://openrouter.ai/api/v1 --semantic-model openai/gpt-4.1-mini
+.venv/bin/python -m rag embed --base-url http://127.0.0.1:8005/v1 --model YOUR_MODEL
+.venv/bin/python -m rag save
+.venv/bin/python -m rag clear embeddings
+.venv/bin/python -m rag clear chunks
+```
 
 ```sh
 make check

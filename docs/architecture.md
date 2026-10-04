@@ -540,10 +540,27 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   выравнивается в строку. Списки и строки технических таблиц
   остаются связанными блоками; layout-таблицы обходятся рекурсивно. Это эвристика,
   оператор просматривает нормализованный текст, особенно страницы без main.
-- Fixed: 1200 символов / 180 перекрытия. Structural по умолчанию: заголовки,
+- Fixed: по умолчанию 1200 символов / 180 перекрытия; размер 64–100000,
+  перекрытие 0 ≤ overlap < size, оба входят в fingerprint и chunk_id. Structural по умолчанию: заголовки,
   абзацы, пункты и строки таблиц пакуются внутри раздела до 1200 символов;
   длинный блок режется теми же окнами с перекрытием. Offset срезает точный
   очищенный документ; chunk_id стабилен для source/strategy/границ/hash/параметров.
+- Semantic: отдельная generative LLM выбирает только boundary IDs нумерованных
+  исходных units, не переписывает текст. Units сохраняют все символы корпуса;
+  oversized блок предварительно делится, окно ограничено 12000 символами и
+  256 units. Ordered unique IDs должны покрыть последнее unit, каждая группа
+  ограничена size-overlap; последующим чанкам добавляется точный исходный
+  overlap. Чанки — source slices, ошибочный JSON/границы не заменяются fixed.
+  `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
+  64–12000. Runtime `RAG_CHUNKING_API_KEY` или fallback `OPENROUTER_API_KEY`
+  читается только HTTP-границей, standalone не загружает `.env`.
+  `semantic-cache` хранит приватные проверенные per-document segmentation и
+  request/response traces без auth headers; identity включает document/hash,
+  config, prompt version, size/overlap, не ключ. Текущий report содержит actual
+  calls/tokens/cache counts/time; cache hit не начисляет прошлые токены. Report
+  исключён из chunks fingerprint: повторное разбиение сохраняет downstream
+  vectors, если реальные chunks/параметры неизменны. UI показывает два варианта:
+  fixed и semantic LLM, structural сохранён для CLI index/compare.
 - `EmbeddingConfig` фиксирует endpoint/model/dimensions/revision; fingerprint
   включает их все. Оператор меняет revision при замене весов под прежним ID.
   oMLX обслуживается отдельно, приложение не устанавливает/скачивает модели.
@@ -578,14 +595,34 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   операции показана отдельно от сохранённого предыдущего индекса. Stale значит
   fingerprint corpus отличается от индекса; ready требует читаемую SQLite,
   её version/metadata и фактические row counts/size, а не просто progress.ready.
-- `app/rag_api.py`: read-only status, documents/chunks pages ≤100, отдельный
-  chunk text; actual vector возвращается только по явному `vector=true` для
-  одного чанка. Ошибка/нет индекса — явный 409; чужой chunk —404. Чат/ключ
-  провайдера не нужны. `app/static/rag.js` открывается из настроек в широкой
-  странице и читает каждую секунду, пока видима. Уход/скрытие/pagehide отменяет
-  запрос; epoch не даёт позднему ответу перерисовать скрытую страницу. Новый
-  index_id обновляет списки; вектор загружается при раскрытии. Нет UI сравнения
-  стратегий, запуска build или переключателя RAG у чата в день 21.
+- Независимые durable этапы: `corpus.json` → `chunks.json` → `vectors.json` →
+  `index.sqlite`. У chunks записаны corpus fingerprint и параметры размера/
+  перекрытия, у vectors — chunks fingerprint и полный embedding config. Успешное
+  изменение предшествующего этапа делает старые downstream снимки недоступными
+  по fingerprint; ошибка сохраняет прежний валидный этап и индекс. «Создать
+  эмбеддинги» сохраняет vectors и кэш, не публикует SQLite. «Сохранить индекс»
+  проверяет снимки и делает atomic replace без HTTP. CLI `chunks`, `embed`, `save`
+  эквивалентны кнопкам, прежний `index` составляет эти этапы под одним lock.
+- `app/rag_api.py`: status, bounded working previews, published index inspection
+  и POST `/operations/{ingest,chunks,embeddings,save}`. Writer lock резервируется
+  до ответа 202; worker thread пишет только фактический progress, приложение
+  остаётся отзывчивым. Ошибка запуска/initial progress освобождает lock. HTTP не
+  принимает пути; локальный manifest выбирается только через операторский
+  `RAG_MANIFEST`, а URL перечисляются явно. Нет реестра нескольких корпусов.
+- DELETE `/stages/chunks` удаляет chunks/vectors/index, semantic/embedding caches
+  и сравнения; DELETE `/stages/embeddings` сохраняет corpus/chunks, удаляет vectors/
+  index/embedding cache и сравнения. Оба берут writer lock и отказывают при busy.
+  Atomic tombstone фиксирует невидимость старых артефактов до physical cleanup,
+  поэтому прерывание удаления не возвращает старый индекс. Успешный новый этап
+  снимает только собственную tombstone запись после durable write. Имена
+  артефактов фиксированы; HTTP никогда не принимает путь удаления.
+- `app/static/rag.js` читает status каждую секунду, пока видима. Уход/скрытие/
+  pagehide отменяет запрос; epoch и request ordering отсекают поздние ответы.
+  Status/details и формы mounted; poll меняет только текст, сохраняя open/close,
+  focus и draft. Списки и выбор сохраняются внутри одного поколения corpus/
+  chunks; новое поколение явно сбрасывает preview. Документы доступны до chunks,
+  chunks до vectors, настоящий вектор читается при явном раскрытии. Сохранённый
+  индекс показывается отдельно от выполняемой операции и staged данных.
 - `checks/rag_check.py` проверяет нейтральный CP1251 legacy HTML, реальные
   character slices/overlap/section boundaries, HTTP stub через отдельный CLI,
   cosine/cache fingerprint, vector validation, atomic failure, writer lock,
