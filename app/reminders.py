@@ -169,6 +169,8 @@ class ReminderScheduler:
         self.claims[(server.name, item["id"])]["started"] = True
         error = ""
         requests = []
+        rag_result = {}
+        done = None
         question = f"[Напоминание №{item['id']}] Срок наступил. Выполни сейчас, без нового планирования: {item['text']}"
 
         async def valid():
@@ -186,7 +188,7 @@ class ReminderScheduler:
             async with asyncio.timeout(RUN_SECONDS):
                 done = None
                 events = agent.ask(question, scheduled={"id": item["id"], "server": server.name},
-                                   can_run=valid, request_bodies=requests)
+                                   can_run=valid, request_bodies=requests, rag_result=rag_result)
                 async with contextlib.aclosing(events):
                     async for event in events:
                         if event["type"] == "done":
@@ -198,10 +200,10 @@ class ReminderScheduler:
                     error = error or "ошибка вызова инструмента"
                 if ((done or {}).get("metrics") or {}).get("tool_iterations"):
                     error = error or "исчерпан лимит цикла инструментов"
-                if error and await valid() and not (done or {}).get("committed"):
+                if error and not (done or {}).get("cancelled") and await valid() and not (done or {}).get("committed"):
                     agent._commit(question, "Ошибка напоминания: " + error, error,
                                   metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
-                                  request_bodies=requests)
+                                  request_bodies=requests, rag=rag_result or None)
         except asyncio.CancelledError:
             error = "исполнение остановлено; автоматического повтора нет"
             raise
@@ -212,7 +214,7 @@ class ReminderScheduler:
                 if await valid():
                     agent._commit(question, "Ошибка напоминания: " + error, error,
                                   metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
-                                  request_bodies=requests)
+                                  request_bodies=requests, rag=rag_result or None)
         finally:
             finish = asyncio.create_task(self._finish(server, item, token, error))
             try:

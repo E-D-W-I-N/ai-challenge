@@ -25,6 +25,7 @@ from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, capture_requests, stream_completion
 from .mcp import MANAGER
+from .rag import lookup as rag_lookup
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -584,6 +585,9 @@ class Turn:
     at: float = field(default_factory=time.time)
     """Время реплики: с ним она уезжает в базу и возвращается оттуда."""
 
+    rag: dict | None = None
+    """Immutable retrieval snapshot used by this assistant answer; None for OFF/legacy."""
+
     def as_message(self) -> dict:
         """Реплика в том виде, в каком она уходит в модель: в контекст
         возвращается ответ, а не путь к нему."""
@@ -742,6 +746,7 @@ class Agent:
                         metrics=m["metrics"],
                         at=m["at"],
                         request_bodies=m.get("request_bodies"),
+                        rag=m.get("rag"),
                     )
                     for m in store.load_messages(self.id)
                 ]
@@ -1331,9 +1336,11 @@ class Agent:
         metrics: dict | None = None,
         persist: bool = True,
         request_bodies: list[dict] | None = None,
+        rag: dict | None = None,
     ) -> None:
         self.history.append(
-            Turn(role=role, content=content, error=error, reasoning=reasoning, metrics=metrics, request_bodies=copy.deepcopy(request_bodies))
+            Turn(role=role, content=content, error=error, reasoning=reasoning,
+                 metrics=metrics, request_bodies=copy.deepcopy(request_bodies), rag=copy.deepcopy(rag))
         )
         if persist:
             self.persist()
@@ -1373,7 +1380,8 @@ class Agent:
         """
         return {
             "history": [
-                replace(turn, metrics=copy.deepcopy(turn.metrics))
+                replace(turn, metrics=copy.deepcopy(turn.metrics),
+                        request_bodies=copy.deepcopy(turn.request_bodies), rag=copy.deepcopy(turn.rag))
                 for turn in self.history[:at]
             ],
             "summaries": [
@@ -1563,7 +1571,8 @@ class Agent:
     # --- обмен ---------------------------------------------------------------
 
     async def ask(self, user_text: str, *, scheduled: dict | None = None,
-                  can_run=None, request_bodies: list[dict] | None = None) -> AsyncIterator[dict]:
+                  can_run=None, request_bodies: list[dict] | None = None,
+                  rag_result: dict | None = None) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
         События: `compressing`, `start`, `reasoning`, `delta`, `tool_call`,
@@ -1603,79 +1612,126 @@ class Agent:
             spec = copy_spec(self.spec)
             context_length = self.context_length
 
-            # Служебные вызовы — лениво и **до** сборки промпта: этот же
-            # обмен уедет уже сжатым и уже с обновлённой памятью, и экономия
-            # видна во входных токенах его собственного ответа, а не
-            # следующего.
-            #
-            # Перед каждым — событие о том, что он будет: вызов идёт к модели
-            # раньше самого ответа, и без события клиент узнал бы о паузе,
-            # только когда она уже кончилась. Шлём ровно тогда, когда вызов
-            # правда состоится, и называем какой: строка состояния обещает
-            # паузу, которая будет, и говорит, из-за чего она. Вызовов бывает
-            # два — ведение памяти идёт при любой стратегии, и сворачивание,
-            # перевалившее за порог, встречается с ним на одном обмене.
-            for call in self.service_plan(spec):
-                yield {"type": "compressing", "strategy": call}
-                await self.compress(spec, context_length)
-            cut, _ = self.context_cut(spec)
+            rag_snapshot = None
+            if rag_result is not None:
+                rag_result.clear()
+            preparation_requests = []
+            try:
+                if spec.rag_enabled:
+                    yield {"type": "retrieval", "stage": "retrieval", "query": user_text}
+                    if not cancel.is_set():
+                        rag_snapshot = copy.deepcopy(await rag_lookup(user_text))
+                        if rag_result is not None:
+                            rag_result.update(copy.deepcopy(rag_snapshot))
+                if cancel.is_set() or (can_run is not None and not await can_run()):
+                    yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                           "answer_index": None, "committed": False, "cancelled": True,
+                           "question": user_text, "error": "генерация отменена", "rag": None}
+                    return
+                with capture_requests() as preparation_requests:
+                    # Служебные вызовы — лениво и **до** сборки промпта: этот же
+                    # обмен уедет уже сжатым и уже с обновлённой памятью, и экономия
+                    # видна во входных токенах его собственного ответа, а не
+                    # следующего.
+                    #
+                    # Перед каждым — событие о том, что он будет: вызов идёт к модели
+                    # раньше самого ответа, и без события клиент узнал бы о паузе,
+                    # только когда она уже кончилась. Шлём ровно тогда, когда вызов
+                    # правда состоится, и называем какой: строка состояния обещает
+                    # паузу, которая будет, и говорит, из-за чего она. Вызовов бывает
+                    # два — ведение памяти идёт при любой стратегии, и сворачивание,
+                    # перевалившее за порог, встречается с ним на одном обмене.
+                    for call in self.service_plan(spec):
+                        yield {"type": "compressing", "strategy": call}
+                        if cancel.is_set() or (can_run is not None and not await can_run()):
+                            yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                           "answer_index": None, "committed": False, "cancelled": True,
+                                   "question": user_text, "error": "генерация отменена", "rag": None}
+                            return
+                        await self.compress(spec, context_length)
+                    cut, _ = self.context_cut(spec)
 
-            # Долговременная память читается **один раз на обмен** и уезжает
-            # и в сборку промпта, и в оба слота. Прочитай их по отдельности —
-            # запись, добавленная из соседней вкладки между этими двумя
-            # чтениями, попала бы в промпт, но не в номера врезок (или
-            # наоборот), и просмотр промпта подписал бы чужие роли.
-            #
-            # Читается после служебного вызова, а не до: сворачивание идёт
-            # к модели и длится сколько угодно, и память, записанную за это
-            # время, честнее взять свежей.
-            memory = self.memory_items(spec)
-            # Профиль — тем же порядком и по тому же доводу: прочитан один
-            # раз на обмен и уезжает и в промпт, и в номера врезок. Он
-            # заводит собой системное сообщение, и прочитанный дважды
-            # развёл бы промпт с номерами сильнее любой врезки.
-            profile = self.profile_items()
-            # Инварианты — тем же порядком и по тому же доводу: прочитаны
-            # один раз на обмен и уезжают и в промпт, и в номера врезок.
-            # Они дописываются в системное сообщение, и прочитанные дважды
-            # развели бы промпт с номерами так же, как профиль.
-            invariants = self.invariant_items()
+                    # Долговременная память читается **один раз на обмен** и уезжает
+                    # и в сборку промпта, и в оба слота. Прочитай их по отдельности —
+                    # запись, добавленная из соседней вкладки между этими двумя
+                    # чтениями, попала бы в промпт, но не в номера врезок (или
+                    # наоборот), и просмотр промпта подписал бы чужие роли.
+                    #
+                    # Читается после служебного вызова, а не до: сворачивание идёт
+                    # к модели и длится сколько угодно, и память, записанную за это
+                    # время, честнее взять свежей.
+                    memory = self.memory_items(spec)
+                    # Профиль — тем же порядком и по тому же доводу: прочитан один
+                    # раз на обмен и уезжает и в промпт, и в номера врезок. Он
+                    # заводит собой системное сообщение, и прочитанный дважды
+                    # развёл бы промпт с номерами сильнее любой врезки.
+                    profile = self.profile_items()
+                    # Инварианты — тем же порядком и по тому же доводу: прочитаны
+                    # один раз на обмен и уезжают и в промпт, и в номера врезок.
+                    # Они дописываются в системное сообщение, и прочитанные дважды
+                    # развели бы промпт с номерами так же, как профиль.
+                    invariants = self.invariant_items()
 
-            prompt = self.build_prompt(
-                user_text,
-                spec=spec,
-                memory=memory,
-                profile=profile,
-                invariants=invariants,
-            )
+                    prompt = self.build_prompt(
+                        user_text,
+                        spec=spec,
+                        memory=memory,
+                        profile=profile,
+                        invariants=invariants,
+                    )
 
-            # `summary_at` — место врезки стратегии в промпте, `memory_at`
-            # и `working_at` — места врезок памяти; `None` у любого из них
-            # значит, что этой врезки в промпте нет. Сам промпт клиент и так
-            # получает; без этих чисел он различал бы врезки разбором текста,
-            # то есть повторял бы у себя устройство `build_prompt` и
-            # расходился бы с ним молча. Подписывает роли в просмотре промпта
-            # тоже сервер, а не догадка клиента по первой строке сообщения.
-            #
-            # Слота три, потому что врезок в одном промпте бывает три:
-            # оба слоя памяти едут при любой стратегии и ни одну из них
-            # не отменяют. Считает их все `prompt_slots` — одним ответом и
-            # по тому же порядку, каким промпт и собран: перечисли их здесь
-            # по одному, и четвёртая врезка приехала бы без номера.
-            yield {
-                "type": "start",
-                "resolved_messages": prompt,
-                "question": user_text,
-                **self.prompt_slots(spec, memory, profile, invariants),
-                "strategy": spec.strategy,
-            }
+                    rag_at = None
+                    if rag_snapshot is not None:
+                        rag_at = len(prompt) - 1
+                        prompt.insert(rag_at, {"role": "user", "content": rag_snapshot["context"]})
+
+                    # `summary_at` — место врезки стратегии в промпте, `memory_at`
+                    # и `working_at` — места врезок памяти; `None` у любого из них
+                    # значит, что этой врезки в промпте нет. Сам промпт клиент и так
+                    # получает; без этих чисел он различал бы врезки разбором текста,
+                    # то есть повторял бы у себя устройство `build_prompt` и
+                    # расходился бы с ним молча. Подписывает роли в просмотре промпта
+                    # тоже сервер, а не догадка клиента по первой строке сообщения.
+                    #
+                    # Слота три, потому что врезок в одном промпте бывает три:
+                    # оба слоя памяти едут при любой стратегии и ни одну из них
+                    # не отменяют. Считает их все `prompt_slots` — одним ответом и
+                    # по тому же порядку, каким промпт и собран: перечисли их здесь
+                    # по одному, и четвёртая врезка приехала бы без номера.
+                    yield {
+                        "type": "start",
+                        "resolved_messages": prompt,
+                        "question": user_text,
+                        "rag": copy.deepcopy(rag_snapshot),
+                        "rag_at": rag_at,
+                        **self.prompt_slots(spec, memory, profile, invariants),
+                        "strategy": spec.strategy,
+                    }
+
+            except asyncio.CancelledError:
+                if request_bodies is not None:
+                    request_bodies[:] = copy.deepcopy(preparation_requests)
+                raise
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                if request_bodies is not None:
+                    request_bodies[:] = copy.deepcopy(preparation_requests)
+                yield {"type": "error", "message": failure, "metrics": None}
+                yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                           "answer_index": None, "committed": False, "question": user_text,
+                       "error": failure, "cancelled": False, "rag": copy.deepcopy(rag_snapshot),
+                       "request_bodies": copy.deepcopy(preparation_requests) if scheduled else None}
+                return
+            finally:
+                if request_bodies is not None:
+                    request_bodies[:] = copy.deepcopy(preparation_requests)
 
             text = ""
             reasoning = ""
             final_metrics: dict | None = None
             failure: str | None = None
             cancelled = False
-            requests = []
+            requests = copy.deepcopy(preparation_requests)
 
             tool_runs: list[dict] = []
             iteration_metrics: list[dict] = []
@@ -1689,6 +1745,7 @@ class Agent:
             try:
                 async with MANAGER.lease():
                     with capture_requests() as requests:
+                        requests.extend(copy.deepcopy(preparation_requests))
                         # Объявления берутся под lease, как и все раунды обмена.
                         # Пустой реестр не меняет тело запроса.
                         tools = declared_tools(MANAGER)
@@ -1700,7 +1757,7 @@ class Agent:
                         # зовущая инструменты бесконечно, получает честный отказ,
                         # а не зависание.
                         while True:
-                            if can_run is not None and not await can_run():
+                            if cancel.is_set() or (can_run is not None and not await can_run()):
                                 cancelled = True
                                 break
                             piece = ""
@@ -1808,7 +1865,7 @@ class Agent:
                 # Клиент ушёл: частичный ответ всё равно записываем — он уже
                 # оплачен, а следующий вопрос должен видеть, чем кончилось.
                 if scheduled is None:
-                    self._commit(user_text, text, "вызов прерван", reasoning, final_metrics, requests)
+                    self._commit(user_text, text, "вызов прерван", reasoning, final_metrics, requests, rag_snapshot)
                 raise
             except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
                 failure = f"{type(exc).__name__}: {exc}"
@@ -1866,7 +1923,7 @@ class Agent:
                 final_metrics = {**(final_metrics or {}), BANNED_METRIC: hits}
 
             allowed = can_run is None or await can_run()
-            committed = self._commit(user_text, text, failure, reasoning, final_metrics, requests) if allowed else False
+            committed = self._commit(user_text, text, failure, reasoning, final_metrics, requests, rag_snapshot) if allowed else False
 
             done: dict = {
                 "type": "done",
@@ -1878,6 +1935,7 @@ class Agent:
                 "committed": committed,
                 "answer_index": len(self.history) - 1 if committed else None,
                 "request_bodies": requests if scheduled else None,
+                "rag": copy.deepcopy(rag_snapshot),
             }
             if not committed:
                 # Обмена не было: вопрос нельзя оставлять в ленте клиента —
@@ -1893,6 +1951,7 @@ class Agent:
         reasoning: str = "",
         metrics: dict | None = None,
         request_bodies: list[dict] | None = None,
+        rag: dict | None = None,
     ) -> bool:
         """Пишет обмен в историю. Возвращает False, если писать было нечего."""
         if not answer.strip():
@@ -1905,7 +1964,7 @@ class Agent:
             # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
             # следующий вопрос должен видеть, что предыдущий ответ неполный.
             self.remember(
-                "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies
+                "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies, rag=rag
             )
         return True
 
@@ -1960,6 +2019,7 @@ def spec_as_dict(
         "id": agent_id,
         "label": spec.label,
         "model": spec.model,
+        "rag_enabled": spec.rag_enabled,
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2008,4 +2068,5 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
     if not known.get("model"):
         return fallback
     known.setdefault("label", fallback.label)
+    known["rag_enabled"] = known.get("rag_enabled") is True
     return AgentSpec(**known)

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS messages (
     error       TEXT,
     metrics     TEXT,
     request_bodies TEXT,
+    rag TEXT,
     at          REAL NOT NULL,
     PRIMARY KEY (session_id, seq)
 );
@@ -526,6 +527,9 @@ class Store:
             if "request_bodies" not in columns:
                 conn.execute("ALTER TABLE messages ADD COLUMN request_bodies TEXT")
                 done.append("messages.request_bodies")
+            if "rag" not in columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN rag TEXT")
+                done.append("messages.rag")
             # Колонка авторства прожила один день — ровно тот, в который
             # в оба слоя памяти писал ещё и служебный вызов. Вызова не стало,
             # писать осталось некому, кроме человека, и поле перестало
@@ -771,6 +775,7 @@ class Store:
                 _dumps(turn.metrics) if turn.metrics else None,
                 turn.at,
                 _dumps(turn.request_bodies) if turn.request_bodies is not None else None,
+                _dumps(turn.rag) if turn.rag is not None else None,
             )
             for seq, turn in enumerate(turns)
         ]
@@ -778,8 +783,8 @@ class Store:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             if rows:
                 conn.executemany(
-                    "INSERT INTO messages (session_id, seq, role, content, error, metrics, at, request_bodies) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages (session_id, seq, role, content, error, metrics, at, request_bodies, rag) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
             conn.execute(
@@ -789,7 +794,7 @@ class Store:
     def load_messages(self, session_id: str) -> list[dict]:
         with self.reading() as conn:
             rows = conn.execute(
-                "SELECT role, content, error, metrics, at, request_bodies FROM messages "
+                "SELECT role, content, error, metrics, at, request_bodies, rag FROM messages "
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
@@ -801,6 +806,7 @@ class Store:
                 "metrics": _loads(r["metrics"], None) if r["metrics"] else None,
                 "at": r["at"],
                 "request_bodies": _loads(r["request_bodies"], None),
+                "rag": _loads(r["rag"], None),
             }
             for r in rows
         ]

@@ -158,9 +158,17 @@ async def execution(config, git_root, restart_service):
             return httpx.Response(200, text="data: " + json.dumps(frame) + "\n\n"
                 + "data: " + json.dumps(ending) + "\n\n" + "data: [DONE]\n\n")
 
-        timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider"))
+        timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider", rag_enabled=True))
+        retrieval_queries = []
+        async def timeout_lookup(query):
+            retrieval_queries.append(query)
+            return {"version": 1, "query": query, "top_k": 5,
+                    "index": {"index_id": "neutral-scheduled-index"}, "hits": [],
+                    "context": "Neutral scheduled source data", "duration_seconds": 0}
+
         async with httpx.AsyncClient(transport=httpx.MockTransport(timeout_provider)) as offline_client:
             with patch("app.reminders.RUN_SECONDS", 1), \
+                    patch.object(agent_module, "rag_lookup", timeout_lookup), \
                     patch.object(agent_module, "stream_completion", llm.stream_completion), \
                     patch.object(llm, "shared_client", return_value=offline_client), \
                     patch.object(llm, "api_key", return_value="offline-fixture"), \
@@ -174,8 +182,12 @@ async def execution(config, git_root, restart_service):
                 assert "TimeoutError" in error.content and "TimeoutError" in error.error
                 expected = json.loads(json.dumps(captured[1:]))
                 assert error.request_bodies == expected, "timeout lost actually sent model JSON"
+                assert len(retrieval_queries) == 2 and error.rag["query"] == retrieval_queries[-1]
+                assert error.rag["index"]["index_id"] == "neutral-scheduled-index"
+                assert all(any(m.get("content") == error.rag["context"] for m in body["messages"]) for body in expected)
                 restored = AgentRegistry(store=store).require(timeout_agent.id)
                 assert restored.history[-1].request_bodies == expected
+                assert restored.history[-1].rag == error.rag
                 captured[-1]["model"] = "mutated after receipt"
                 assert error.request_bodies == expected and restored.history[-1].request_bodies == expected
                 listing = await manager.reminder_protocol(remote, "reminders", {})
