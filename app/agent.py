@@ -1618,6 +1618,8 @@ class Agent:
             preparation_requests = []
             try:
                 if spec.rag_enabled:
+                    if "messages" in spec.extra_body:
+                        raise ValueError("RAG несовместим с extra_body.messages: контекст запроса задаёт приложение")
                     yield {"type": "retrieval", "stage": "retrieval", "query": user_text}
                     if not cancel.is_set():
                         rag_snapshot = copy.deepcopy(await rag_lookup(user_text))

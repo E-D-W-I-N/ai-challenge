@@ -229,7 +229,10 @@ def check_rag_chat():
                 try:
                     await manager.configure([{"name": "neutral", "url": url, "enabled": True}], 0)
                     assert manager.servers[0].status == "ok", manager.servers[0].error
-                    async def lookup(query): return copy.deepcopy(snapshot)
+                    lookup_queries = []
+                    async def lookup(query):
+                        lookup_queries.append(query)
+                        return copy.deepcopy(snapshot)
                     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as provider_client:
                         with patch.object(agents, "MANAGER", manager), patch.object(agents, "rag_lookup", lookup), \
                              patch.object(agents, "stream_completion", llm.stream_completion), \
@@ -242,6 +245,27 @@ def check_rag_chat():
                             assert any(e["type"] == "tool_call" and e["result"] == "pong neutral" for e in result)
                             assert all(any(m.get("content") == snapshot["context"] for m in body["messages"]) for body in received)
                             assert received[-1]["messages"][-1]["role"] == "tool"
+                            # ON must reject a provider override before lookup,
+                            # compression or actual model traffic; regenerate
+                            # restores the original snapshot instead of lying
+                            # about context omitted from the outbound payload.
+                            override = [{"role": "user", "content": "Neutral replacement"}]
+                            chat.spec.extra_body = {"messages": override}
+                            saved_answer = copy.deepcopy(chat.history[-1])
+                            with patch.object(chat, "service_plan", side_effect=AssertionError("conflict started compression")):
+                                rejected = await drain(chat.ask("conflicting request"))
+                                taken = chat.take_last_exchange()
+                                restored = await drain(main._regenerate_events(chat, taken))
+                            assert [e["type"] for e in rejected] == ["error", "done"]
+                            assert rejected[-1]["rag"] is None and not rejected[-1]["committed"]
+                            assert rejected[-1]["question"] == "conflicting request" and "extra_body.messages" in rejected[-1]["error"]
+                            assert restored[-1]["restored"] and chat.history[-1] == saved_answer
+                            assert lookup_queries == ["tool question"] and len(received) == 2
+                            off = agents.Agent(AgentSpec(label="legacy override", model="stub/model", extra_body={"messages": override}))
+                            result = await drain(off.ask("original OFF question"))
+                            assert result[-1]["committed"] and off.history[-1].rag is None
+                            assert received[-1]["messages"] == override and off.history[-1].request_bodies == received[-1:]
+                            assert lookup_queries == ["tool question"]
                 finally:
                     await manager.stop()
             asyncio.run(mcp_exchange())

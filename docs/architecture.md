@@ -708,6 +708,9 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   актуальную публикацию. Fixed/structural/semantic strategy не ограничивает поиск.
   Query embedding использует published endpoint/model/dimensions/revision;
   mismatch, missing/deleted/stale/corrupt index и HTTP/векторная ошибка явны.
+  При ON `extra_body.messages` отклоняется до retrieval/compression/LLM через
+  error/done: оно заменило бы собранный RAG-контекст и исказило snapshot.
+  При OFF прежняя семантика extra_body сохраняется.
 - `app/rag.py` выполняет синхронный HTTP/SQLite lookup в worker thread без Store
   транзакции и блокировки event loop. Worker возвращает только данные; после
   возврата Agent проверяет cancel/can_run до compression/LLM. Сам HTTP worker

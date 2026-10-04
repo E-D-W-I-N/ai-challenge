@@ -4029,6 +4029,8 @@ def check_config_survives_by_construction():
         kind = str(f.type)
         if f.name == "model":
             probes[f.name] = "проверка/модель"
+        elif kind == "bool":
+            probes[f.name] = True
         elif "list[str]" in kind:
             probes[f.name] = [f"СТОП-{f.name}"]
         elif "str" in kind:
