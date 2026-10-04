@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -27,7 +28,7 @@ def document(text):
 
 @patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "", "OPENROUTER_API_KEY": ""})
 def check_semantic():
-    requests, mode, auth = [], {"value": "ok"}, []
+    requests, mode, auth = [], {"value": "ok", "cost": 0.00125}, []
     def server(request):
         payload = json.loads(request.content)
         requests.append(payload)
@@ -52,7 +53,9 @@ def check_semantic():
         usage = {"prompt_tokens": 51, "completion_tokens": 9, "total_tokens": 60}
         if mode["value"] == "usage":
             usage["prompt_tokens"] = True
-        body = {"model": payload["model"], "choices": [{"finish_reason":
+        if mode["cost"] != "missing":
+            usage["cost"] = mode["cost"]
+        body = {"model": "actual-neutral-model", "choices": [{"finish_reason":
             "length" if mode["value"] == "truncated" else "stop", "message": {"content": content}}], "usage": usage}
         if mode["value"] == "reflected":
             body["provider_metadata"] = {"headers": {"Authorization": request.headers.get("Authorization")}}
@@ -67,6 +70,8 @@ def check_semantic():
         doc = document(text)
         chunks, report = semantic_chunks([doc], config, size=90, overlap=15, root=root, client=client)
         assert report["calls"] > 1 and report["computed"] == 1
+        assert report["model"] == "actual-neutral-model"
+        assert math.isclose(report["cost_usd"], 0.00125 * report["calls"])
         assert report["usage"]["prompt_tokens"] == 51 * report["calls"]
         assert report["usage"]["completion_tokens"] == 9 * report["calls"]
         assert auth == [None] * report["calls"]
@@ -83,6 +88,7 @@ def check_semantic():
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
         assert same == chunks and len(requests) == before and cached["calls"] == 0
         assert cached["usage"] == {} and cached["cached"] == 1
+        assert cached["cost_usd"] == 0 and cached["model"] == "actual-neutral-model"
         cache_path = root / cached["trace_files"][0]
         saved = json.loads(cache_path.read_text())
         saved["spans"][0][1] += 1
@@ -93,6 +99,21 @@ def check_semantic():
             assert semantic_chunks([doc], changed, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([document(text + "Changed neutral ending.")], config, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([doc], config, 100, 15, root=root, client=client)[1]["calls"] > 0
+        # Complete zero costs are valid; unavailable or malformed charges are never zero.
+        for cost in (0, "missing", True, -1, "0.1", 10 ** 400):
+            mode["cost"] = cost
+            with tempfile.TemporaryDirectory() as accounting:
+                _, billed = semantic_chunks([doc], config, 90, 15, root=accounting, client=client)
+                assert billed["cost_usd"] == (0 if type(cost) is int and cost == 0 else None)
+        partial_calls = []
+        def partial(request):
+            partial_calls.append(request)
+            mode["cost"] = 0.00125 if len(partial_calls) == 1 else "missing"
+            return server(request)
+        with tempfile.TemporaryDirectory() as accounting, httpx.Client(transport=httpx.MockTransport(partial)) as partial_client:
+            _, billed = semantic_chunks([doc], config, 90, 15, root=accounting, client=partial_client)
+            assert billed["calls"] > 1 and billed["cost_usd"] is None
+        mode["cost"] = 0.00125
         short = document("First short topic.\nSecond short topic.\nThird short topic.\n")
         for bad in ("unknown", "duplicate", "missing", "oversize", "malformed", "truncated", "usage", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad

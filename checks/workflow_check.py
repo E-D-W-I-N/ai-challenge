@@ -75,10 +75,14 @@ def check_workflow():
             semantic_calls.append(request)
             units = json.loads(json.loads(request.content)["messages"][-1]["content"])["units"]
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
-                "content": json.dumps({"end_unit_ids": [item["id"] for item in units]})}}]})
+                "content": json.dumps({"end_unit_ids": [item["id"] for item in units]})}}],
+                "model": "actual-offline-boundaries", "usage": {"total_tokens": 17, "cost": 0.002}})
         with httpx.Client(transport=httpx.MockTransport(semantic)) as client:
             stage_chunks(root, "semantic", 400, 40, client=client)
             cache_count = len(semantic_calls)
+            durable = workflow.stages(root)["chunks"]["report"]
+            assert durable["model"] == "actual-offline-boundaries" and durable["usage"]["total_tokens"] == 17 * cache_count
+            assert abs(durable["cost_usd"] - 0.002 * cache_count) < 1e-12
             with patch("shutil.rmtree", side_effect=OSError("offline cleanup denied")):
                 try:
                     with Operation(root, "delete_chunks") as operation:
@@ -91,6 +95,7 @@ def check_workflow():
                     raise AssertionError("Revived deleted semantic cache after failed cleanup")
                 except OSError:
                     pass
+            assert workflow.stages(root)["chunks"] is None
             assert not available(root, "semantic-cache") and (root / "semantic-cache").exists()
             assert len(semantic_calls) == cache_count
             retry = stage_chunks(root, "semantic", 400, 40, client=client)

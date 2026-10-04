@@ -557,7 +557,12 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   `semantic-cache` хранит приватные проверенные per-document segmentation и
   request/response traces без auth headers; identity включает document/hash,
   config, prompt version, size/overlap, не ключ. Текущий report содержит actual
-  calls/tokens/cache counts/time; cache hit не начисляет прошлые токены. Report
+  calls/tokens/cache counts/time и модель из response (при отсутствии — requested).
+  cost_usd суммирует только actual usage.cost провайдера, без тарифных оценок:
+  при missing/нечисловой/неконечной/отрицательной стоимости хотя бы одного вызова
+  total недоступен (null); cache-only run имеет ноль токенов и USD.
+  Cache hit не начисляет прошлые токены или стоимость. Старый report без cost
+  читается как недоступная стоимость. Report
   исключён из chunks fingerprint: повторное разбиение сохраняет downstream
   vectors, если реальные chunks/параметры неизменны. UI показывает два варианта:
   fixed и semantic LLM, structural сохранён для CLI index/compare.
@@ -618,7 +623,13 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   артефактов фиксированы; HTTP никогда не принимает путь удаления.
 - `app/static/rag.js` читает status каждую секунду, пока видима. Уход/скрытие/
   pagehide отменяет запрос; epoch и request ordering отсекают поздние ответы.
-  Status/details и формы mounted; poll меняет только текст, сохраняя open/close,
+  Карточка статуса операции находится первой. Следующие формы появляются по
+  валидным status.stages: corpus открывает разбиение, chunks — embeddings,
+  vectors — save; старый опубликованный индекс и progress.complete ворота не
+  открывают. При удалении/инвалидации формы снова скрываются. Модель, токены и
+  actual USD справа от удаления чанков читаются только из durable report текущих
+  semantic chunks; progress.semantic_report не восстанавливает удалённую сводку.
+  Status/details и формы mounted; poll меняет только текст/hidden, сохраняя open/close,
   focus и draft. Списки и выбор сохраняются внутри одного поколения corpus/
   chunks; новое поколение явно сбрасывает preview. Документы доступны до chunks,
   chunks до vectors, настоящий вектор читается при явном раскрытии. Сохранённый

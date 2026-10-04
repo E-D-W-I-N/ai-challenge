@@ -202,7 +202,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
     directory = Path(root) / "semantic-cache"
     directory.mkdir(parents=True, exist_ok=True)
     report = {"calls": 0, "cached": 0, "computed": 0, "model": config.model,
-              "usage": {}, "trace_files": [], "duration_seconds": 0}
+              "usage": {}, "cost_usd": 0, "trace_files": [], "duration_seconds": 0}
+    cost_total, cost_calls, actual_models = 0.0, 0, []
     chunks = []
     for document in documents:
         text = document["text"]
@@ -219,14 +220,26 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
             pass
         if spans is not None:
             report["cached"] += 1
+            for round_ in record["rounds"]:
+                model = round_["response"].get("model")
+                if isinstance(model, str) and model and model not in actual_models:
+                    actual_models.append(model)
+            if actual_models:
+                report["model"] = " / ".join(actual_models)
         else:
             spans, rounds = [], []
             for batch in _windows(units):
                 payload = _payload(text, batch, config, limit)
                 report["calls"] += 1
+                report["cost_usd"] = None
                 if operation:
                     operation.update(semantic_report=report.copy())
                 def save_trace(response):
+                    nonlocal cost_total, cost_calls
+                    model = response.get("model") if isinstance(response, dict) else None
+                    if isinstance(model, str) and model and model not in actual_models:
+                        actual_models.append(model)
+                        report["model"] = " / ".join(actual_models)
                     trace_path = directory / ("round-" + uuid.uuid4().hex + ".json")
                     write_json(trace_path, {"request": payload, "response": response})
                     report["trace_files"].append(str(trace_path.relative_to(root)))
@@ -236,6 +249,17 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                             value = usage.get(field)
                             if type(value) is int and value >= 0:
                                 report["usage"][field] = report["usage"].get(field, 0) + value
+                        cost = usage.get("cost")
+                        if type(cost) in (int, float) and cost >= 0:
+                            try:
+                                cost = float(cost)
+                            except OverflowError:
+                                cost = math.inf
+                            if math.isfinite(cost):
+                                cost_total += cost
+                                cost_calls += 1
+                    # Partial or missing provider accounting cannot stand for the total.
+                    report["cost_usd"] = cost_total if cost_calls == report["calls"] and math.isfinite(cost_total) else None
                     if operation:
                         operation.update(semantic_report=report.copy())
                 decoded, response = _call(client, config, payload, save_trace)

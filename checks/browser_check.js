@@ -92,6 +92,51 @@ async function main() {
     check("Failure distinct from previous committed index", $("#rag-status").textContent === "Ошибка операции"
       && $("#rag-error").textContent === "embedding failed" && $("#rag-index").textContent.includes("15555"));
   });
+  await scenario("RAG reveals validated stages and keeps only durable current semantic accounting", async () => {
+    const {client, server, $, click} = freshClient({agents: []});
+    const stages = {corpus: null, chunks: null, embeddings: null};
+    const report = {model: "actual-boundaries", calls: 2, usage: {total_tokens: 120}, cost_usd: 0.003};
+    const status = {state: "ready", stages, operation: {kind: "chunks", state: "complete", semantic_report: report},
+      index: {index_id: "old-index", words: 10, size_bytes: 100, rows: {documents: 1, chunks: 1}, embedding_config: {model: "old"}}};
+    server.respond("GET", "/api/rag/status", status);
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25", {items: []});
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    const gate = (name) => $("#rag-" + name + "-controls");
+    const usage = $("#rag-chunk-usage");
+    check("Old published index and complete operation cannot reveal stage forms or stale report", gate("chunks").hidden && gate("embeddings").hidden && gate("save").hidden && usage.hidden);
+    stages.corpus = {fingerprint: "current-corpus", documents: 1, urls: []};
+    await settle(1100);
+    check("Valid corpus reveals only chunk controls", !gate("chunks").hidden && gate("embeddings").hidden && gate("save").hidden);
+    stages.chunks = {fingerprint: "semantic-one", strategy: "semantic", report};
+    await settle(1100);
+    const draft = $("#rag-model"), parameters = gate("embeddings").querySelector("details");
+    draft.value = "draft-to-preserve"; draft.focus(); parameters.open = true;
+    check("Current semantic chunks reveal embeddings and actual durable model/tokens/USD", !gate("embeddings").hidden && gate("save").hidden
+      && !usage.hidden && usage.textContent.includes("actual-boundaries") && usage.textContent.includes("120") && usage.textContent.includes("0.003 USD"));
+    stages.embeddings = {embedding_fingerprint: "current-vectors"};
+    await settle(1100);
+    check("Vectors reveal save without remounting draft, focus or details", !gate("save").hidden && draft.value === "draft-to-preserve"
+      && document.activeElement === draft && parameters.open && gate("embeddings").querySelector("details") === parameters);
+    $("#rag-semantic-model").value = "edited-requested-alias";
+    report.cost_usd = 0.000000000001; await settle(1100);
+    check("Small positive actual USD stays nonzero and edited model cannot replace durable model", usage.textContent.includes("0.000000000001 USD") && usage.textContent.includes("actual-boundaries")
+      && !usage.textContent.includes("edited-requested-alias"));
+    delete report.cost_usd; await settle(1100);
+    check("Legacy durable report has unavailable USD while later operation report is ignored", usage.textContent.includes("стоимость: недоступна"));
+    stages.chunks = {fingerprint: "fixed-two", strategy: "fixed"}; stages.embeddings = null;
+    await settle(1100);
+    check("Fixed chunks hide semantic accounting and invalidated vectors hide save", usage.hidden && usage.textContent === "" && gate("save").hidden);
+    stages.chunks = {fingerprint: "cached-three", strategy: "semantic", report: {model: "cached-model", calls: 0, usage: {total_tokens: 999}}};
+    await settle(1100);
+    check("Cache-only semantic summary bills zero current tokens and USD", usage.textContent.includes("токены: 0") && usage.textContent.includes("стоимость: 0 USD"));
+    server.respond("DELETE", "/api/rag/stages/chunks", () => { stages.chunks = null; return json({cleared: "chunks"}); });
+    click("rag-delete-chunks"); await settle();
+    check("Deletion hides next stages and summary despite stale complete semantic_report", gate("embeddings").hidden && gate("save").hidden && usage.hidden && usage.textContent === ""
+      && draft.value === "draft-to-preserve" && parameters.open);
+    stages.corpus = null; await settle(1100);
+    check("Corpus invalidation hides chunk controls again", gate("chunks").hidden);
+  });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
     const stages = {corpus: {fingerprint: "corpus-one", documents: 1, words: 20, urls: ["https://example.test/one"]},
