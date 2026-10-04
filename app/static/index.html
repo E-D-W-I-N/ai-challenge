@@ -83,9 +83,10 @@
           </header>
           <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель, агента и поиск RAG для чата.</p>
         <section class="tab-page hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
-          <div id="rag-current-chat" class="settings-card">
-            <h3>Для текущего чата</h3>
-            <p class="hint">Настройки применяются к следующим ответам; сохранённый снимок ниже остаётся прежним.</p>
+          <div id="rag-current-chat">
+            <span class="scope-badge">Для текущего чата</span>
+            <div class="settings-card">
+            <p class="hint">Настройки применяются к следующим ответам.</p>
             <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
             <p id="rag-chat-help" class="hint">Поиск в опубликованном индексе. Источники сохраняются вместе с ответом.</p>
             <div id="rag-chat-settings" class="rag-chat-settings hidden">
@@ -103,9 +104,11 @@
                 <p class="hint">Фильтр оставляет фрагменты с cosine не ниже порога и ограничивает их количество. Итоговый лимит не больше числа кандидатов. При выключенном RAG этапы поиска пропускаются.</p>
               </details>
             </div>
+            </div>
           </div>
           <div id="rag-answer-snapshot" class="settings-card" hidden></div>
           <div id="rag-workflow">
+          <span class="scope-badge">Для всего приложения</span>
           <div class="settings-card rag-operation-card">
             <p id="rag-status" role="status"></p><p id="rag-error" class="warn" role="alert"></p>
             <nav id="rag-navigation" class="rag-stages" aria-label="Этапы работы RAG"></nav>

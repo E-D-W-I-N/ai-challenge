@@ -479,8 +479,17 @@ function createRagInspector({ state, $, el, api }) {
     $("#settings-description").textContent = saved ? "Источники и контекст конкретного ответа" : "Документы, чанки и фактическая индексация";
     $("#settings-scope").textContent = saved ? "Для сохранённого ответа" : "Для всего приложения";
   }
+  function syncChatControls() {
+    const unavailable = historical || !state.current;
+    $("#rag-current-chat").hidden = unavailable;
+    $("#rag-current-chat").querySelectorAll(".control").forEach((field) => { field.disabled = unavailable; });
+    if (state.section === "rag") {
+      $("#settings-scope").hidden = !historical;
+      $("#save-status").classList.toggle("hidden", unavailable);
+    }
+  }
   function showSnapshot(snapshot) {
-    stop(); historical = true; snapshotHeader(true);
+    stop(); historical = true; snapshotHeader(true); syncChatControls();
     $("#rag-workflow").hidden = true;
     const target = $("#rag-answer-snapshot"); target.hidden = false;
     const back = button("К текущему индексу", open);
@@ -529,19 +538,19 @@ function createRagInspector({ state, $, el, api }) {
   }
   function clearSnapshot() {
     if (!historical) return;
-    stop(); historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false;
+    stop(); historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = false;
     $("#rag-answer-snapshot").hidden = true; $("#rag-answer-snapshot").replaceChildren();
     if (visible()) { refresh(); loadModelsForStage(); }
   }
   function open() {
-    historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
+    historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
     stop(); refresh(); loadModelsForStage();
   }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
     document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadModelsForStage(); } });
   }
-  return { open, stop, showSnapshot, clearSnapshot };
+  return { open, stop, showSnapshot, clearSnapshot, syncChatControls };
 }
 if (typeof module !== "undefined") module.exports = createRagInspector;
 else globalThis.createRagInspector = createRagInspector;
