@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -84,8 +85,14 @@ def _boundaries(body, units, limit):
         raise ValueError("Semantic boundary IDs must be ordered, unique and cover the final unit")
     spans, previous = [], 0
     for end in ids:
-        if end > len(units) or units[end - 1][1] - units[previous][0] > limit:
-            raise ValueError("Semantic group exceeds chunk size or has an invalid unit ID")
+        # Retain every model-selected boundary, splitting oversized groups only
+        # at existing source unit ends. No rewritten or discarded source text.
+        for position in range(previous, end):
+            if units[position][1] - units[position][0] > limit:
+                raise ValueError("Semantic source unit exceeds chunk size")
+            if units[position][1] - units[previous][0] > limit:
+                spans.append((units[previous][0], units[position - 1][1]))
+                previous = position
         spans.append((units[previous][0], units[end - 1][1]))
         previous = end
     return spans
@@ -115,6 +122,31 @@ def _contains_credential(value, credentials):
     return False
 
 
+def _http_error(response, credentials):
+    """Expose only bounded structured provider diagnostics, never raw bodies."""
+    message = f"Semantic HTTP error: status {response.status_code}"
+    if len(response.content) > 65536:
+        return message
+    try:
+        body = response.json()
+    except (ValueError, UnicodeError):
+        return message
+    if _contains_credential(body, credentials) or not isinstance(body, dict):
+        return message
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return message
+    code = error.get("code")
+    if (type(code) is int and abs(code) <= 999999999) or (isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code)):
+        message += f"; code {code}"
+    detail = error.get("message")
+    if isinstance(detail, str) and not re.search(r"[<>]|\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]+", detail, re.IGNORECASE):
+        detail = " ".join("".join(c for c in detail if c.isprintable() or c.isspace()).split())
+        if detail:
+            message += ": " + detail[:400]
+    return message
+
+
 def _call(client, config, payload, trace=None):
     raw_key = os.environ.get("OPENROUTER_API_KEY" if config.auth_mode == "openrouter" else "RAG_EMBEDDING_API_KEY", "")
     key = raw_key.strip()
@@ -127,7 +159,7 @@ def _call(client, config, payload, trace=None):
         response = client.post(config.base_url.rstrip("/") + "/chat/completions", json=payload, headers=headers)
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
-        raise ValueError(f"Semantic HTTP error: status {error.response.status_code}") from None
+        raise ValueError(_http_error(error.response, credentials)) from None
     except (httpx.HTTPError, UnicodeError):
         raise ValueError("Semantic HTTP request failed") from None
     try:
@@ -156,22 +188,32 @@ def _call(client, config, payload, trace=None):
 
 
 def _decode_response(body):
+    if not isinstance(body, dict):
+        raise ValueError("Semantic response must be a JSON object")
+    choices = body.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise ValueError("Semantic response must contain exactly one completion choice")
+    reason = choices[0].get("finish_reason")
+    if reason == "length":
+        raise ValueError("Semantic completion reached its token limit before finishing")
+    if reason == "content_filter":
+        raise ValueError("Semantic completion was blocked by a content filter")
+    if reason != "stop":
+        raise ValueError("Semantic completion did not finish with stop")
+    message = choices[0].get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        raise ValueError("Semantic completion must contain JSON text")
     try:
-        if not isinstance(body, dict):
-            raise ValueError
-        choices = body["choices"]
-        if not isinstance(choices, list) or len(choices) != 1 or choices[0]["finish_reason"] != "stop":
-            raise ValueError
-        content = choices[0]["message"]["content"]
         decoded = json.loads(content)
-        usage = body.get("usage", {})
-        if not isinstance(usage, dict):
-            raise ValueError
-        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            if field in usage and (type(usage[field]) is not int or usage[field] < 0):
-                raise ValueError
-    except (ValueError, TypeError, KeyError, IndexError):
-        raise ValueError("Semantic response is invalid JSON, incomplete or has invalid usage") from None
+    except (ValueError, TypeError):
+        raise ValueError("Semantic completion content is invalid JSON; expected end_unit_ids") from None
+    usage = body.get("usage", {})
+    if not isinstance(usage, dict):
+        raise ValueError("Semantic response has invalid usage accounting")
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if field in usage and (type(usage[field]) is not int or usage[field] < 0):
+            raise ValueError("Semantic response has invalid usage accounting")
     return decoded
 
 
@@ -199,13 +241,15 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
         raise ValueError("Semantic size must be <= 12000; overlap must be nonnegative and smaller")
     config = config or SemanticConfig()
     if client is None:
-        with httpx.Client(timeout=config.timeout_seconds, trust_env=False) as local_client:
+        # OpenRouter follows the chat transport's operator proxy settings;
+        # local oMLX must remain direct even when those settings are present.
+        with httpx.Client(timeout=config.timeout_seconds, trust_env=config.auth_mode == "openrouter") as local_client:
             return semantic_chunks(documents, config, size, overlap, root=root, client=local_client, operation=operation)
     started = time.monotonic()
     directory = Path(root) / "semantic-cache"
     directory.mkdir(parents=True, exist_ok=True)
     report = {"calls": 0, "cached": 0, "computed": 0, "model": config.model,
-              "usage": {}, "cost_usd": 0, "trace_files": [], "duration_seconds": 0}
+              "usage": {}, "cost_usd": 0, "trace_files": [], "duration_seconds": 0, "size_splits": 0}
     cost_total, cost_calls, actual_models = 0.0, 0, []
     chunks = []
     for document in documents:
@@ -223,6 +267,7 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
             pass
         if spans is not None:
             report["cached"] += 1
+            report["size_splits"] += len(spans) - sum(len(_decode_response(r["response"])["end_unit_ids"]) for r in record["rounds"])
             for round_ in record["rounds"]:
                 model = round_["response"].get("model")
                 if isinstance(model, str) and model and model not in actual_models:
@@ -266,7 +311,9 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                     if operation:
                         operation.update(semantic_report=report.copy())
                 decoded, response = _call(client, config, payload, save_trace)
-                spans.extend(_boundaries(decoded, batch, limit))
+                selected = _boundaries(decoded, batch, limit)
+                report["size_splits"] += len(selected) - len(decoded["end_unit_ids"])
+                spans.extend(selected)
                 rounds.append({"request": payload, "response": response})
             write_json(path, {"identity": identity, "spans": spans, "rounds": rounds})
             report["computed"] += 1
