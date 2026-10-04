@@ -10,8 +10,8 @@ function createRagInspector({ state, $, el, api }) {
   const steps = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Индекс"]];
   const navigation = new Map();
   for (const [id, title] of steps) {
-    const node = button(title, () => { selectedStep = id; updateControls(); });
-    node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
+    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); });
+    node.className = "mcp-button rag-step"; node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
   }
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
@@ -89,11 +89,11 @@ function createRagInspector({ state, $, el, api }) {
         vector.append(el("pre", "", JSON.stringify(saved.vector))); loaded = true;
       } catch (error) { showError(error); }
     };
-    vector.hidden = !hasVectors || selectedStep !== "embeddings"; target.append(vector);
+    vector.hidden = !hasVectors || !["embeddings", "save"].includes(selectedStep); target.append(vector);
     vectorView = { node: vector, invalidate: () => {
       loaded = false;
       for (const node of [...vector.querySelectorAll("pre")]) node.remove();
-      vector.hidden = !hasVectors || selectedStep !== "embeddings";
+      vector.hidden = !hasVectors || !["embeddings", "save"].includes(selectedStep);
       if (hasVectors && vector.open) vector.ontoggle();
     }};
   }
@@ -135,24 +135,32 @@ function createRagInspector({ state, $, el, api }) {
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
       updateControls();
-      const generation = stages?.corpus ? `${stages.corpus.fingerprint}:${stages.chunks?.fingerprint || ""}` : data.index?.index_id;
-      const nextVectorFingerprint = stages?.corpus ? stages.embeddings?.embedding_fingerprint : data.index?.embedding_fingerprint;
-      working = !!stages?.corpus; hasChunks = !working || !!stages?.chunks; hasVectors = !working || !!stages?.embeddings;
-      if (generation && (indexId !== generation || !$("#rag-documents").children.length)) {
-        vectorView = null; previewEpoch++; indexId = generation; selectedDocument = null; selectedChunk = null;
-        $("#rag-document-preview").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
-        await documents(0);
-      } else if (!generation) {
-        vectorView = null; previewEpoch++; indexId = null; $("#rag-documents").replaceChildren(); $("#rag-document-preview").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
-      }
-      if (vectorFingerprint !== nextVectorFingerprint) {
-        vectorFingerprint = nextVectorFingerprint; vectorVersion++;
-        vectorView?.invalidate();
-      }
+      await syncPreview();
     } catch (error) { if (error.name !== "AbortError" && token === epoch) showError(error); }
     finally {
       if (token === epoch) { controller = null; if (visible()) timer = setTimeout(refresh, 1000); }
     }
+  }
+  async function syncPreview() {
+    const data = lastStatus || {}, stages = data.stages || {};
+    working = selectedStep !== "save" ? !!stages.corpus : !data.index && !!stages.corpus;
+    hasChunks = working ? !!stages.chunks : !!data.index;
+    hasVectors = working ? !!stages.embeddings : !!data.index;
+    const generation = working ? `working:${stages.corpus.fingerprint}:${stages.chunks?.fingerprint || ""}`
+      : data.index ? `published:${data.index.index_id}` : null;
+    const nextVectorFingerprint = working ? stages.embeddings?.embedding_fingerprint : data.index?.embedding_fingerprint;
+    let preview = previewEpoch;
+    if (generation !== indexId || (generation && !$("#rag-documents").children.length)) {
+      vectorView = null; preview = ++previewEpoch; indexId = generation; selectedDocument = null; selectedChunk = null;
+      for (const id of ["documents", "document-preview", "chunks", "chunk"]) $("#rag-" + id).replaceChildren();
+      if (generation) await documents(0);
+    }
+    if (generation !== indexId || preview !== previewEpoch || !visible()) return;
+    if (vectorFingerprint !== nextVectorFingerprint) {
+      vectorFingerprint = nextVectorFingerprint; vectorVersion++;
+      vectorView?.invalidate();
+    }
+    updateControls();
   }
   // Patch mounted nodes; polling never detaches focused controls or details.
   let opNodes = null, savedNodes = null;
@@ -160,18 +168,17 @@ function createRagInspector({ state, $, el, api }) {
     const target = $("#rag-operation");
     if (!opNodes) {
       const summary = el("p"), counts = el("p"), model = el("p");
-      const list = el("ol", "rag-stages"), stages = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Сохранение"]].map(([stage, title]) => {
-        const node = el("li", "", title); node.dataset.stage = stage; return node;
-      });
-      list.append(...stages);
-      const actual = detail("Фактическое состояние операции", {}); target.append(summary, list, counts, model, actual);
-      opNodes = {summary, counts, model, stages, actual};
+      const actual = detail("Фактическое состояние операции", {}); target.append(summary, counts, model, actual);
+      opNodes = {summary, counts, model, actual};
     }
     target.hidden = !op; if (!op) return;
-    opNodes.summary.textContent = `Операция: ${op.kind} · ${labels[op.state] || op.state} · ${op.duration_seconds} с`;
-    opNodes.counts.textContent = `Документов: ${op.documents} · чанков: ${op.chunks} · из кэша: ${op.cached} · вычислено: ${op.computed}`;
+    const kinds = {ingest: "Загрузка документов", chunks: "Разбиение на чанки", embeddings: "Создание эмбеддингов", save: "Сохранение индекса", index: "Построение индекса"};
+    opNodes.summary.textContent = `${kinds[op.kind] || "Операция"} · ${labels[op.state] || op.state}${op.duration_seconds == null ? "" : ` · ${op.duration_seconds} с`}`;
+    opNodes.counts.textContent = [["Документов", op.documents], ["чанков", op.chunks], ["из кэша", op.cached], ["вычислено", op.computed]]
+      .filter(([, value]) => value != null).map(([title, value]) => `${title}: ${value}`).join(" · ");
+    opNodes.counts.hidden = !opNodes.counts.textContent;
     opNodes.model.textContent = op.config ? `Модель: ${op.config.model} · размерность: ${op.dimension ?? "ещё неизвестна"}` : "";
-    opNodes.stages.forEach(node => node.className = node.dataset.stage === op.stage ? "active" : "");
+    opNodes.model.hidden = !opNodes.model.textContent;
     opNodes.actual.querySelector("pre").textContent = JSON.stringify(op, null, 2);
   }
   function renderIndex(info, ingestion) {
@@ -206,18 +213,21 @@ function createRagInspector({ state, $, el, api }) {
       const node = navigation.get(id); node.disabled = !available[id];
       if (selectedStep === id) node.setAttribute("aria-current", "step");
       else node.removeAttribute("aria-current");
+      node.className = "mcp-button rag-step" + (data.operation?.state === "running" && data.operation.stage === id ? " running" : "");
+      node.title = data.operation?.state === "running" && data.operation.stage === id ? "Выполняется сейчас" : "";
     }
-    $("#rag-index").hidden = selectedStep !== "save";
-    $("#rag-ingestion").hidden = selectedStep !== "documents";
-    $("#rag-documents").hidden = selectedStep === "save";
+    $("#rag-index").hidden = selectedStep !== "save" || !data.index;
+    $("#rag-ingestion").hidden = selectedStep !== "documents" || !data.ingestion;
+    $("#rag-documents").hidden = false;
     $("#rag-document-preview").hidden = !["documents", "chunks"].includes(selectedStep);
-    $("#rag-chunks").hidden = !["chunks", "embeddings"].includes(selectedStep);
-    $("#rag-chunk").hidden = !["chunks", "embeddings"].includes(selectedStep);
-    if (vectorView) vectorView.node.hidden = !hasVectors || selectedStep !== "embeddings";
+    $("#rag-chunks").hidden = !["chunks", "embeddings", "save"].includes(selectedStep);
+    $("#rag-chunk").hidden = !["chunks", "embeddings", "save"].includes(selectedStep);
+    if (vectorView) vectorView.node.hidden = !hasVectors || !["embeddings", "save"].includes(selectedStep);
     $("#rag-delete-index").hidden = !data.index;
     for (const [id, enabled] of [["ingest", true], ["split", !!stages.corpus], ["embed", !!stages.chunks], ["save", !!stages.embeddings], ["delete-chunks", !!stages.chunks || !!data.index], ["delete-embeddings", !!stages.embeddings || !!data.index], ["delete-index", !!data.index]]) {
       const node = $("#rag-" + id); if (node) node.disabled = busy || !enabled;
     }
+    $("#rag-stage-heading").textContent = steps.find(([id]) => id === selectedStep)[1];
     const summary = $("#rag-stage-status");
     if (summary) {
       summary.textContent = selectedStep === "documents" ? `Загружено документов: ${stages.corpus?.documents ?? 0}`
