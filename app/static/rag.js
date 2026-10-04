@@ -1,7 +1,7 @@
 "use strict";
 
 // Durable stages and published index share the operator-configured directory.
-function createRagInspector({ state, $, el, api, modelSelectors }) {
+function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex }) {
   let historical = false;
   let epoch = 0, controller = null, timer = null, indexId = null;
   let previewEpoch = 0, documentRequest = 0, chunkRequest = 0, textRequest = 0;
@@ -17,7 +17,7 @@ function createRagInspector({ state, $, el, api, modelSelectors }) {
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
   const workingQuery = () => working ? "&working=true" : "";
-  const visible = () => !historical && state.workspace === "settings" && state.section === "rag" && document.visibilityState !== "hidden";
+  const visible = () => !historical && state.workspace === "settings" && state.settingsScope === "app" && state.section === "rag" && document.visibilityState !== "hidden";
   const labels = { missing: "Индекс отсутствует", stale: "Корпус изменён — перестройте индекс", running: "Операция выполняется",
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
@@ -353,12 +353,13 @@ function createRagInspector({ state, $, el, api, modelSelectors }) {
     const node = $("#rag-" + id); if (node) node.onclick = () => start(kind);
   }
   function snapshotHeader(saved) {
-    if (state.section !== "rag") return;
+    if (state.section !== "rag" || (!saved && state.settingsScope !== "app")) return;
     $("#settings-description").textContent = saved ? "Источники и контекст конкретного ответа" : "Документы, чанки и фактическая индексация";
     $("#settings-scope").textContent = saved ? "Для сохранённого ответа" : "Для всего приложения";
   }
   function syncChatControls() {
-    const unavailable = historical || !state.current;
+    const unavailable = historical || state.settingsScope !== "chat" || !state.current;
+    $("#rag-workflow").hidden = historical || state.settingsScope !== "app";
     $("#rag-current-chat").hidden = unavailable;
     $("#rag-current-chat").querySelectorAll(".control").forEach((field) => { field.disabled = unavailable; });
     if (state.section === "rag") {
@@ -370,7 +371,7 @@ function createRagInspector({ state, $, el, api, modelSelectors }) {
     stop(); historical = true; snapshotHeader(true); syncChatControls();
     $("#rag-workflow").hidden = true;
     const target = $("#rag-answer-snapshot"); target.hidden = false;
-    const back = button("К текущему индексу", open);
+    const back = button("К текущему индексу", onCurrentIndex || open);
     // Presentation follows the immutable answer flags, never the current chat controls.
     const rewriteEnabled = snapshot.config?.rewrite_enabled ?? snapshot.rewrite?.enabled ?? false;
     const filterEnabled = snapshot.config?.filter_enabled === true;
@@ -440,12 +441,12 @@ function createRagInspector({ state, $, el, api, modelSelectors }) {
   }
   function clearSnapshot() {
     if (!historical) return;
-    stop(); historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = false;
+    stop(); historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = state.settingsScope !== "app";
     $("#rag-answer-snapshot").hidden = true; $("#rag-answer-snapshot").replaceChildren();
     if (visible()) { refresh(); loadModelsForStage(); }
   }
   function open() {
-    historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
+    historical = false; snapshotHeader(false); syncChatControls(); $("#rag-workflow").hidden = state.settingsScope !== "app"; $("#rag-answer-snapshot").hidden = true;
     stop(); refresh(); loadModelsForStage();
   }
   if (typeof window !== "undefined") {

@@ -1,4 +1,4 @@
-/* Светлый клиент без сборки: гибкая область чата и шесть страниц настроек. */
+/* Светлый клиент без сборки: чат и две области настроек. */
 
 :root {
   --bg: #ffffff;
@@ -942,3 +942,22 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-stages .mcp-button { padding: 8px 10px; }
 #rag-answer-snapshot > .rag-detail { border: 0; border-radius: 0; }
 #rag-answer-snapshot > .rag-detail > summary { padding: 4px 0; }
+
+/* Two settings domains share mounted forms. */
+[hidden] { display: none !important; }
+.workspace-return { border: 1px solid var(--line); background: white; color: var(--muted); border-radius: 8px; padding: 7px 12px; cursor: pointer; font: inherit; font-size: 12px; }
+.settings-domain { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.item-actions { gap: 2px; }
+.item-settings { opacity: .7; }
+.item-settings:hover { opacity: 1; }
+.settings-group { display: grid; gap: 10px; }
+
+.item-title { white-space: nowrap; overflow-wrap: normal; display: block; }
+.item-text { min-width: 0; }
+.item-open { gap: 7px; padding-left: 8px; }
+.item-icon svg { width: 16px; height: 16px; }
+
+.profile-menu-action { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; font: inherit; font-size: 13px; cursor: pointer; }
+.profile-menu-action:hover, .profile-menu-action:focus-visible { background: var(--accent-soft); color: var(--accent); }
+.profile-menu-action svg { width: 17px; height: 17px; flex: 0 0 auto; }
+.panel.history-view { grid-template-columns: minmax(0, 1fr); }

@@ -53,7 +53,7 @@ function buildServer(options = {}) {
   const respond = (method, path, answer) => routes.set(method + " " + path, answer);
   async function fetchStub(path, init = {}) {
     const request = { method: (init.method || "GET").toUpperCase(), path,
-      body: init.body ? JSON.parse(init.body) : null, signal: init.signal };
+      body: init.body ? JSON.parse(init.body) : null, signal: init.signal, headers: {...(init.headers || {})} };
     state.requests.push(request);
     const key = request.method + " " + path;
     if (routes.has(key)) {
