@@ -38,7 +38,8 @@ def check_workflow_http():
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="workflow-http-") as temporary, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "  offline-chunk-key  ", "RAG_CHUNKING_API_KEY": "ignored-old-key", "RAG_EMBEDDING_API_KEY": "offline-embed-key"}):
+                "OPENROUTER_API_KEY": "  offline-chunk-key  ", "RAG_CHUNKING_API_KEY": "ignored-old-key", "RAG_EMBEDDING_API_KEY": "offline-embed-key",
+                "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}):
             root = Path(temporary)
             source = root / "neutral.html"
             source.write_text('<article><h1>Neutral</h1><p>' + 'Neutral sample text. ' * 100 + '</p><p>Next neutral topic.</p></article>', encoding="utf-8")

@@ -6,7 +6,9 @@ import math
 import os
 import sys
 import tempfile
+import threading
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +16,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import digest
-from rag.semantic import SemanticConfig, semantic_chunks
+from rag.semantic import SemanticConfig, _boundaries, _http_error, semantic_chunks
 
 
 def document(text):
@@ -28,6 +30,18 @@ def document(text):
 
 @patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "", "OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""})
 def check_semantic():
+    units = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 70)]
+    # The requested end at 30 survives even though greedy whole-document
+    # packing would choose 40. Subsequent semantic group is capped separately.
+    spans = _boundaries({"end_unit_ids": [3, 7]}, units, 20)
+    assert spans == [(0, 20), (20, 30), (30, 50), (50, 70)]
+    for ids in ([3, 8], [0, 7], [3, 3, 7], [7, 3], [3], [True, 7], [1.0, 7]):
+        try:
+            _boundaries({"end_unit_ids": ids}, units, 20)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Invalid boundaries accepted: {ids}")
     requests, mode, auth = [], {"value": "ok", "cost": 0.00125}, []
     def server(request):
         payload = json.loads(request.content)
@@ -48,6 +62,8 @@ def check_semantic():
         if mode["value"] == "oversize":
             ids = [len(ids)]
         content = json.dumps({"end_unit_ids": ids})
+        if mode["value"] == "null-content":
+            content = None
         if mode["value"] == "malformed":
             content = "```json\n" + content
         usage = {"prompt_tokens": 51, "completion_tokens": 9, "total_tokens": 60}
@@ -115,13 +131,30 @@ def check_semantic():
             assert billed["calls"] > 1 and billed["cost_usd"] is None
         mode["cost"] = 0.00125
         short = document("First short topic.\nSecond short topic.\nThird short topic.\n")
-        for bad in ("unknown", "duplicate", "missing", "oversize", "malformed", "truncated", "usage", "http", "transport", "reflected", "escaped-reflected"):
+        # A valid oversized semantic group keeps its end and every source byte;
+        # deterministic extra boundaries require no extra paid request.
+        mode["value"] = "oversize"
+        with tempfile.TemporaryDirectory() as split_root:
+            before = len(requests)
+            bounded, normalized = semantic_chunks([short], config, 35, 5, root=split_root, client=client)
+            assert len(requests) == before + 1 and normalized["size_splits"] == len(bounded) - 1 > 0
+            assert bounded[0]["start"] == 0 and bounded[-1]["end"] == len(short["text"])
+            assert all(c["text"] == short["text"][c["start"]:c["end"]] and len(c["text"]) <= 35 for c in bounded)
+            assert all(a["end"] - b["start"] == 5 for a, b in zip(bounded, bounded[1:]))
+            same, cached = semantic_chunks([short], config, 35, 5, root=split_root, client=client)
+            assert same == bounded and cached["size_splits"] == normalized["size_splits"]
+            assert len(requests) == before + 1 and cached["calls"] == 0 and cached["cost_usd"] == 0
+        expected_errors = {"malformed": "content is invalid JSON", "truncated": "token limit", "usage": "usage accounting",
+                           "null-content": "must contain JSON text"}
+        for bad in ("unknown", "duplicate", "missing", "malformed", "truncated", "usage", "null-content", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
             with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
                 try:
                     semantic_chunks([short], config, 35, 5, root=rejected, client=client)
                 except ValueError as error:
                     assert "credential-injected-secret" not in str(error)
+                    if bad in expected_errors:
+                        assert expected_errors[bad] in str(error), str(error)
                 else:
                     raise AssertionError(bad)
                 artifacts = list((Path(rejected) / "semantic-cache").glob("*.json"))
@@ -171,7 +204,85 @@ def check_semantic():
             pass
         else:
             raise AssertionError("Unknown auth mode accepted")
+    check_http_diagnostics()
     print("semantic checks passed")
+
+
+def check_http_diagnostics():
+    """Both auth modes over real offline HTTP; proxy routing and safe 403 text."""
+    for error, credential in (({"message": "offline\tprivate\ncredential"}, "offline private credential"),
+                              ({"code": "guardrail", "message": "Denied"}, "guardrail: Denied")):
+        response = httpx.Response(403, json={"error": error})
+        assert _http_error(response, (credential,)) == "Semantic HTTP error: status 403"
+    calls, reply = [], {"status": 403, "body": {"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}}
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            calls.append((self.path, self.headers.get("Authorization")))
+            self.send_response(reply["status"])
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(reply["body"]).encode())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    proxy = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with patch.dict(os.environ, {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy, "NO_PROXY": "",
+                "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy, "no_proxy": "",
+                "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  ",
+                "RAG_CHUNKING_API_KEY": "  offline-unused-secret  "}):
+            for auth_mode in ("openrouter", "omlx"):
+                # OpenRouter request must go through our offline proxy. oMLX
+                # must reach the local endpoint directly despite the same env.
+                base = "http://127.0.0.1:1/v1" if auth_mode == "openrouter" else proxy + "/v1"
+                config = SemanticConfig(base_url=base, auth_mode=auth_mode)
+                fixtures = [
+                    ({"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}, "guardrail_violation: Model denied by guardrail"),
+                    ({"error": {"message": "Denied\n by\tguardrail"}}, ": Denied by guardrail"),
+                    ({"error": {"code": 403, "message": "x" * 1000}}, "; code 403: " + "x" * 400),
+                    ("<html>Cloudflare denial</html>", None),
+                    ({"error": {"message": "<html>blocked</html>"}}, None),
+                    ({"error": {"message": "Bearer unrecognized-secret"}}, None),
+                    ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
+                    ({"error": {"code": "guardrail", "message": "sk-unknown-fixture-key"}}, None),
+                    ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
+                    ({"error": {"code": "sk-\x00unknown-fixture-key"}}, None),
+                ]
+                for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret", "offline-unused-secret"):
+                    fixtures.append(({"error": {"code": 403, "message": json.loads(json.dumps(secret).replace("offline", "\\u006fffline"))}}, None))
+                    escaped = "".join("\\u%04x" % ord(c) for c in secret)
+                    for reflected in (escaped, escaped.replace("\\", "\\\\")):
+                        fixtures.append(({"error": {"code": 403, "message": "Credential " + reflected}}, None))
+                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
+                    for control in ("\x00", "\x1b", "\u200b"):
+                        reflected = secret[:7] + control + secret[7:]
+                        fixtures.append(({"error": {"code": 403, "message": reflected}}, None))
+                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
+                for body, detail in fixtures:
+                    reply["body"] = body
+                    with tempfile.TemporaryDirectory() as root:
+                        before = len(calls)
+                        try:
+                            semantic_chunks([document("Neutral sample.")], config, 100, 0, root=root)
+                        except ValueError as error:
+                            text = str(error)
+                            assert text.startswith("Semantic HTTP error: status 403"), text
+                            assert (detail in text if detail else text == "Semantic HTTP error: status 403"), text
+                            assert "secret" not in text and len(text) < 520
+                        else:
+                            raise AssertionError("403 accepted")
+                        assert len(calls) == before + 1
+                        path, authorization = calls[-1]
+                        assert path == ("http://127.0.0.1:1/v1/chat/completions" if auth_mode == "openrouter" else "/v1/chat/completions")
+                        assert authorization == ("Bearer offline-chat-secret" if auth_mode == "openrouter" else "Bearer offline-local-secret")
+                        assert not list((Path(root) / "semantic-cache").glob("*.json"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 if __name__ == "__main__":

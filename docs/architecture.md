@@ -549,8 +549,11 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   исходных units, не переписывает текст. Units сохраняют все символы корпуса;
   oversized блок предварительно делится, окно ограничено 12000 символами и
   256 units. Ordered unique IDs должны покрыть последнее unit, каждая группа
-  ограничена size-overlap; последующим чанкам добавляется точный исходный
-  overlap. Чанки — source slices, ошибочный JSON/границы не заменяются fixed.
+  ограничена size-overlap; превышающая лимит группа делится только на границах
+  исходных units, сохраняя каждую выбранную моделью границу и все символы.
+  Число дополнительных границ записывается в report.size_splits, включая cache hit;
+  повторного LLM-вызова нет. Последующим чанкам добавляется точный исходный
+  overlap. Чанки — source slices, ошибочный JSON/IDs не заменяются fixed.
   `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
   64–12000. `auth_mode` выбирает OpenRouter (по умолчанию, тот же runtime
   `OPENROUTER_API_KEY.strip()`, что в чате) или oMLX (`RAG_EMBEDDING_API_KEY.strip()`).
@@ -559,6 +562,11 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   прежний `RAG_CHUNKING_API_KEY` не выбирает авторизацию. Auth mode входит в
   nonsecret config/cache identity, ротация ключа identity не меняет.
   Отражённые raw/нормализованные runtime ключи отсекаются до записи trace.
+  OpenRouter наследует proxy environment как HTTP-клиент чата; oMLX идёт
+  напрямую без proxy environment. HTTP-ошибка показывает status и ограниченные
+  error.code/message структурированного JSON, отсекая отражённые runtime ключи;
+  сырые тела/headers и HTML не попадают в сообщение. Ошибки JSON, незавершённой
+  генерации, usage и IDs различаются без автоматического платного повтора.
   `semantic-cache` хранит приватные проверенные per-document segmentation и
   request/response traces без auth headers; identity включает document/hash,
   config, prompt version, size/overlap, не ключ. Текущий report содержит actual
