@@ -131,7 +131,7 @@ async function main() {
       && document.activeElement === draft && parameters.open && gate("embeddings").querySelector("details") === parameters);
     click("rag-step-save");
     check("Index selection shows only save controls and index results", !gate("save").hidden && gate("embeddings").hidden && gate("chunks").hidden
-      && $("#rag-documents").hidden && $("#rag-chunks").hidden && $("#rag-chunk").hidden && !$("#rag-index").hidden && !$("#rag-delete-index").hidden);
+      && !$("#rag-documents").hidden && !$("#rag-chunks").hidden && !$("#rag-chunk").hidden && !$("#rag-index").hidden && !$("#rag-delete-index").hidden);
     server.respond("DELETE", "/api/rag/stages/index", () => { status.index = null; return json({cleared: "index"}); });
     click("rag-delete-index"); await settle();
     check("Index deletion keeps selected index stage and upstream availability", !gate("save").hidden && !$("#rag-step-save").disabled
@@ -159,6 +159,61 @@ async function main() {
     check("Unavailable future navigation stays disabled", $("#rag-step-embeddings").disabled && !gate("chunks").hidden);
     stages.corpus = null; await settle(1100);
     check("Corpus invalidation returns to documents and keeps future steps locked", gate("chunks").hidden && !gate("documents").hidden && $("#rag-step-chunks").disabled);
+  });
+  await scenario("RAG status steps keep operation separate and inspect one source through late responses", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: []});
+    const stages = {corpus: {fingerprint: "new-corpus", documents: 1, urls: []}, chunks: {fingerprint: "new-chunks", chunks: 1},
+      embeddings: {embedding_fingerprint: "new-vectors", dimension: 3}};
+    const status = {state: "stale", stages, index: {index_id: "saved-old", embedding_fingerprint: "old-vectors", words: 10,
+      size_bytes: 100, rows: {documents: 1, chunks: 1}, embedding_config: {model: "old"}}, operation: null};
+    const savedDoc = {document_id: "old", title: "Saved neutral document", words: 10, characters: 30};
+    const workingDoc = {document_id: "new", title: "Working neutral document", words: 20, characters: 40};
+    const savedChunk = {chunk_id: "old-chunk", section: "Saved", start: 0, end: 30, text: "Saved neutral text"};
+    const workingChunk = {chunk_id: "new-chunk", section: "Working", start: 0, end: 40, text: "Working neutral text"};
+    server.respond("GET", "/api/rag/status", status);
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25", {items: [savedDoc]});
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: [workingDoc]});
+    server.respond("GET", "/api/rag/documents/old/chunks?offset=0&limit=25", {items: [savedChunk]});
+    server.respond("GET", "/api/rag/documents/new?offset=0&limit=10000", {text: workingChunk.text, characters: 40});
+    server.respond("GET", "/api/rag/documents/new/chunks?offset=0&limit=25&working=true", {items: [workingChunk]});
+    server.respond("GET", "/api/rag/chunks/old-chunk", savedChunk);
+    server.respond("GET", "/api/rag/chunks/new-chunk?working=true", workingChunk);
+    server.respond("GET", "/api/rag/chunks/old-chunk?vector=true", {vector: [1, 0, 0]});
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("Single mounted status navigation works without an operation", $("#rag-navigation").parentElement.classList.contains("rag-operation-card")
+      && $("#rag-navigation").querySelectorAll("button").length === 4 && $("#rag-operation").hidden && $("#rag-step-save").attributes["aria-current"] === "step");
+    check("Stale index uses saved documents despite current corpus", $("#rag-documents").textContent.includes(savedDoc.title)
+      && !$("#rag-documents").textContent.includes(workingDoc.title));
+    const select = async (id) => { $("#" + id).querySelector("button").dispatchEvent(new Evt("click")); await settle(); };
+    await select("rag-documents"); await select("rag-chunks");
+    let vector = $("#rag-chunk").querySelectorAll("details").at(-1);
+    check("Index inspector reads saved metadata and text and delays its vector", !$("#rag-chunks").hidden && !$("#rag-chunk").hidden
+      && $("#rag-chunk").textContent.includes(savedChunk.text) && !vector.hidden && requests("GET", "/api/rag/chunks/old-chunk?vector=true").length === 0);
+    vector.open = true; await vector.ontoggle();
+    check("Index exposes actual saved vector", vector.textContent.includes("[1,0,0]"));
+    click("rag-step-embeddings"); await settle(); await select("rag-documents"); await select("rag-chunks");
+    const lateVector = deferred(); server.respond("GET", "/api/rag/chunks/new-chunk?vector=true&working=true", () => lateVector.promise);
+    vector = $("#rag-chunk").querySelectorAll("details").at(-1); vector.open = true; const loading = vector.ontoggle();
+    click("rag-step-save"); await settle(); await select("rag-documents"); await select("rag-chunks");
+    lateVector.resolve(json({vector: [0, 1, 0]})); await loading; await settle();
+    check("Late working vector cannot enter published inspector", $("#rag-chunk").textContent.includes(savedChunk.text)
+      && !$("#rag-chunk").textContent.includes("[0,1,0]"));
+    const lateDocuments = deferred(); server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", () => lateDocuments.promise);
+    click("rag-step-chunks"); await settle(); click("rag-step-save"); await settle();
+    lateDocuments.resolve(json({items: [workingDoc]})); await settle();
+    check("Late working document page cannot replace published documents", $("#rag-documents").textContent.includes(savedDoc.title)
+      && !$("#rag-documents").textContent.includes(workingDoc.title));
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: [workingDoc]});
+    const lateChunk = deferred(); server.respond("GET", "/api/rag/chunks/new-chunk?working=true", () => lateChunk.promise);
+    click("rag-step-chunks"); await settle(); await select("rag-documents"); await select("rag-chunks");
+    click("rag-step-save"); await settle(); await select("rag-documents"); await select("rag-chunks");
+    lateChunk.resolve(json(workingChunk)); await settle();
+    check("Late working chunk text cannot replace published chunk", $("#rag-chunk").textContent.includes(savedChunk.text)
+      && !$("#rag-chunk").textContent.includes(workingChunk.text));
+    status.operation = {state: "running", kind: "embeddings", stage: "embeddings"}; await settle(1100);
+    click("rag-step-documents"); await settle();
+    check("Manual navigation and running operation stay distinct across poll", $("#rag-step-documents").attributes["aria-current"] === "step"
+      && $("#rag-step-embeddings").classList.contains("running") && !$("#rag-step-documents").classList.contains("running") && $("#rag-save").disabled);
   });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
