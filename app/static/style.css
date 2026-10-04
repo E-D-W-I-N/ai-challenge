@@ -832,6 +832,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-operation-card { margin-bottom: 1.25rem; padding: 1rem 1.15rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-soft); }
 .rag-operation-card > p:first-child { margin-top: 0; font-weight: 600; }
 .rag-operation-card p { margin-block: .5rem; }
+#rag-error:empty { display: none; }
 .rag-operation-card .rag-stages { list-style: none; padding: 0; gap: .5rem; }
 .rag-operation-card .rag-stages li { padding: .35rem .65rem; border-radius: 6px; color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
 .rag-operation-card .rag-stages .active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
