@@ -1409,11 +1409,13 @@ function renderWorkspaceHead() {
 
 function syncChatControls() {
   const noChat = !state.current;
-  $("#settings-no-chat").classList.toggle("hidden", !noChat || !["model", "agent"].includes(state.section));
-  $("#save-status").classList.toggle("hidden", noChat || !["model", "agent"].includes(state.section));
+  $("#settings-no-chat").classList.toggle("hidden", !noChat || !["model", "agent", "rag"].includes(state.section));
+  $("#save-status").classList.toggle("hidden", noChat || !["model", "agent", "rag"].includes(state.section));
+  $("#rag-current-chat").hidden = noChat;
   ["model", "agent"].forEach((name) => {
     $("#tab-" + name).querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
   });
+  $("#rag-current-chat").querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
 }
 
 function loadVisibleSettings() {
@@ -1465,7 +1467,7 @@ function showSettings(which, load = true) {
   $("#settings-title").textContent = title;
   $("#settings-description").textContent = description;
   $("#settings-scope").textContent = scope;
-  $("#save-status").classList.toggle("hidden", !["model", "agent"].includes(which));
+  $("#save-status").classList.toggle("hidden", !["model", "agent", "rag"].includes(which));
   $("#panel-body").scrollTop = state.sectionScroll.get(which) || 0;
   syncChatControls();
   if (load) loadVisibleSettings();
@@ -1587,6 +1589,7 @@ function syncStrategyFields() {
 function syncRagFields() {
   const enabled = $("#f-rag_enabled").checked;
   $("#rag-chat-settings").classList.toggle("hidden", !enabled);
+  $("#rag-rewrite-help").classList.toggle("hidden", !enabled || !$("#f-rag_rewrite_enabled").checked);
   $("#rag-chat-parameters").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
 }
 
@@ -1655,7 +1658,7 @@ function readNumber(name) {
 function saveStatus(text, isError) {
   const el = $("#save-status");
   el.className = "save-status" + (isError ? " error" : "")
-    + (!["model", "agent"].includes(state.section) ? " hidden" : "");
+    + (!["model", "agent", "rag"].includes(state.section) ? " hidden" : "");
   el.textContent = text || "";
   if (state.statusTimer) clearTimeout(state.statusTimer);
   state.statusTimer = null;
@@ -1959,7 +1962,7 @@ function init() {
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
     // которое уже ни на что не влияет, — значит снова обещать не то.
     if (id === "f-strategy") syncStrategyFields();
-    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled") syncRagFields();
+    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled" || id === "f-rag_rewrite_enabled") syncRagFields();
     applySettings();
   });
   $("#panel-body").addEventListener("input", (ev) => {

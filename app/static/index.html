@@ -81,8 +81,29 @@
             <div><h2 id="settings-title">Модель</h2><p id="settings-description">Параметры ответа и генерации</p><span class="scope-badge" id="settings-scope">Для текущего чата</span></div>
             <div class="save-status" id="save-status" role="status"></div>
           </header>
-          <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель и агента.</p>
+          <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель, агента и поиск RAG для чата.</p>
         <section class="tab-page hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
+          <div id="rag-current-chat" class="settings-card">
+            <h3>Для текущего чата</h3>
+            <p class="hint">Настройки применяются к следующим ответам; сохранённый снимок ниже остаётся прежним.</p>
+            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
+            <p id="rag-chat-help" class="hint">Поиск в опубликованном индексе. Источники сохраняются вместе с ответом.</p>
+            <div id="rag-chat-settings" class="rag-chat-settings hidden">
+              <div class="rag-chat-options">
+                <label class="rag-toggle"><input id="f-rag_rewrite_enabled" class="control" type="checkbox"> Уточнение запроса (Rewrite)</label>
+                <label class="rag-toggle"><input id="f-rag_filter_enabled" class="control" type="checkbox"> Отбор по релевантности (Filtering)</label>
+              </div>
+              <p id="rag-rewrite-help" class="hint hidden">Переформулирование использует модель чата и последние 3 пары вопрос/ответ; исходный вопрос остаётся в запросе ответа.</p>
+              <details id="rag-chat-parameters" class="rag-chat-parameters hidden"><summary>Параметры поиска</summary>
+                <div class="rag-chat-numbers">
+                  <label class="field"><span class="field-label">Кандидатов до фильтра</span><input id="f-rag_candidates_k" class="control" type="number" min="1" max="100" step="1" value="20"></label>
+                  <label class="field"><span class="field-label">Фрагментов после фильтра</span><input id="f-rag_final_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
+                  <label class="field"><span class="field-label">Минимальный cosine</span><input id="f-rag_similarity_threshold" class="control" type="number" min="-1" max="1" step="0.05" value="0.3"></label>
+                </div>
+                <p class="hint">Фильтр оставляет фрагменты с cosine не ниже порога и ограничивает их количество. Итоговый лимит не больше числа кандидатов. При выключенном RAG этапы поиска пропускаются.</p>
+              </details>
+            </div>
+          </div>
           <div id="rag-answer-snapshot" class="settings-card" hidden></div>
           <div id="rag-workflow">
           <div class="settings-card rag-operation-card">
@@ -219,25 +240,7 @@
         <section class="tab-page hidden" id="tab-agent" role="tabpanel" aria-labelledby="tab-btn-agent" tabindex="0">
 
           <p class="branch-note hidden" id="branch-note" role="note"></p>
-          <div class="settings-card">
-            <h3>Поиск по документам</h3>
-            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
-            <p id="rag-chat-help" class="hint">Поиск в опубликованном индексе. Переформулирование использует модель чата и последние 3 пары вопрос/ответ; исходный вопрос остаётся в запросе ответа. Источники сохраняются вместе с ответом.</p>
-            <div id="rag-chat-settings" class="rag-chat-settings hidden">
-              <div class="rag-chat-options">
-                <label class="rag-toggle"><input id="f-rag_rewrite_enabled" class="control" type="checkbox"> Уточнение запроса (Rewrite)</label>
-                <label class="rag-toggle"><input id="f-rag_filter_enabled" class="control" type="checkbox"> Отбор по релевантности (Filtering)</label>
-              </div>
-              <details id="rag-chat-parameters" class="rag-chat-parameters hidden"><summary>Параметры поиска</summary>
-                <div class="rag-chat-numbers">
-                  <label class="field"><span class="field-label">Кандидатов до фильтра</span><input id="f-rag_candidates_k" class="control" type="number" min="1" max="100" step="1" value="20"></label>
-                  <label class="field"><span class="field-label">Фрагментов после фильтра</span><input id="f-rag_final_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
-                  <label class="field"><span class="field-label">Минимальный cosine</span><input id="f-rag_similarity_threshold" class="control" type="number" min="-1" max="1" step="0.05" value="0.3"></label>
-                </div>
-                <p class="hint">Фильтр оставляет фрагменты с cosine не ниже порога и ограничивает их количество. Итоговый лимит не больше числа кандидатов. При выключенном RAG этапы поиска пропускаются.</p>
-              </details>
-            </div>
-          </div>
+
 
           <div class="settings-card prompt-card"><label class="field">
             <span class="field-label">Системный промпт</span>
