@@ -149,7 +149,7 @@ async function main() {
       && requests("GET", "/api/rag/chunks/chunk?vector=true").length === 1);
     const actual = $("#rag-operation").querySelector("details"); actual.open = true;
     const metadata = $("#rag-index").querySelector("details"); metadata.open = true;
-    const draft = $("#rag-model"); draft.value = "edited-before-poll"; draft.focus();
+    const draft = $("#rag-revision"); draft.value = "edited-before-poll"; draft.focus();
     await settle(2100);
     check("Repeated real polling preserves mounted details, vector, focus and draft", actual === $("#rag-operation").querySelector("details") && actual.open
       && metadata.open && vector.open && $("#rag-chunk").textContent.includes("Реальный текст") && document.activeElement === draft && draft.value === "edited-before-poll");
@@ -334,7 +334,7 @@ async function main() {
   });
   await scenario("RAG embedding catalogue preserves saved choice and rejects late endpoint responses", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
-    const defaults = {base_url: "http://127.0.0.1:8005/v1", model: "saved-vector-id", dimensions: 3, revision: "saved"};
+    const defaults = {base_url: "http://127.0.0.1:8005/v1", model: "mlx-community/Qwen3-Embedding-0.6B-8bit", dimensions: 3, revision: "saved"};
     const status = {state: "missing", embedding_defaults: defaults, stages: {
       corpus: {fingerprint: "embedding-corpus", documents: 1, urls: []}, chunks: {fingerprint: "embedding-chunks", chunks: 1}}};
     server.respond("GET", "/api/rag/status", () => json(status));
@@ -344,19 +344,37 @@ async function main() {
     server.respond("POST", "/api/rag/operations/embeddings", {});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     const model = $("#rag-model"), endpoint = $("#rag-base-url"), message = $("#rag-embedding-model-status");
-    check("Embedding saved ID stays selectable while its own catalogue loads", model.tagName === "SELECT" && model.value === "saved-vector-id"
-      && requests("GET", cataloguePath(defaults.base_url)).length === 1);
-    initial.resolve(json({models: [{id: "vector-a"}, {id: "vector-b"}]})); await settle();
-    check("Unavailable saved embedding ID remains as explicit catalogue option", model.value === "saved-vector-id" && message.textContent.includes("выбор сохранён"));
+    check("Embedding loading uses a placeholder with no synthetic saved model option", model.tagName === "SELECT" && model.value === ""
+      && model.children.length === 1 && requests("GET", cataloguePath(defaults.base_url)).length === 1);
+    click("rag-embed"); await settle();
+    check("Empty embedding selection never posts", $("#rag-embed").disabled && requests("POST", "/api/rag/operations/embeddings").length === 0);
+    initial.resolve(failure("neutral catalogue error", 502)); await settle();
+    check("Catalogue failure keeps intent private without a phantom option", model.value === "" && model.children.length === 1 && message.textContent.includes("Не удалось"));
+    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "other/Qwen3-Embedding-0.6B-8bit"}]});
+    click("rag-embedding-model-refresh"); await settle();
+    check("Embedding aliases never match another namespace", model.value === "" && model.children.length === 2);
+    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: defaults.model}, {id: "Qwen3-Embedding-0.6B-8bit"}]});
+    click("rag-embedding-model-refresh"); await settle();
+    check("Exact embedding catalogue ID takes priority over namespace alias", model.value === defaults.model && !model.textContent.includes("нет в списке"));
+    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "Qwen3-Embedding-0.6B-8bit"}, {id: "vector-a"}, {id: "vector-b"}]});
+    click("rag-embedding-model-refresh"); await settle();
+    check("Successful oMLX catalogue resolves stored mlx-community prefix to its exact server ID", model.value === "Qwen3-Embedding-0.6B-8bit"
+      && !model.textContent.includes("mlx-community/") && !model.textContent.includes("нет в списке"));
+    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "vector-a"}, {id: "vector-b"}]});
+    click("rag-embedding-model-refresh"); await settle();
+    check("Missing embedding ID selects only the placeholder without choosing a different model", model.value === "" && model.children.length === 3
+      && message.textContent.includes("Выберите модель") && $("#rag-embed").disabled);
     model.value = "vector-a"; model.dispatchEvent(new Evt("change")); model.focus();
-    const refresh = deferred(); server.respond("GET", cataloguePath(defaults.base_url), () => refresh.promise);
+    const refresh = deferred(), beforeRefresh = requests("GET", cataloguePath(defaults.base_url)).length;
+    server.respond("GET", cataloguePath(defaults.base_url), () => refresh.promise);
     click("rag-embedding-model-refresh"); await settle(); model.value = "vector-b"; model.dispatchEvent(new Evt("change"));
     refresh.resolve(json({models: [{id: "vector-a"}, {id: "vector-b"}]})); await settle(1100);
     check("Embedding refresh and status poll preserve selected draft and focus without refetch", model.value === "vector-b" && document.activeElement === model
-      && requests("GET", cataloguePath(defaults.base_url)).length === 2);
+      && requests("GET", cataloguePath(defaults.base_url)).length === beforeRefresh + 1);
     const oldBase = "http://127.0.0.1:9007/v1", newBase = "http://127.0.0.1:9008/v1", late = deferred();
     server.respond("GET", cataloguePath(oldBase), () => late.promise);
     endpoint.value = oldBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    check("Changed embedding endpoint clears old catalogue options until its own response", model.value === "" && model.children.length === 1 && $("#rag-embed").disabled);
     server.respond("GET", cataloguePath(newBase), {models: [{id: "vector-b"}, {id: "new-vector"}]});
     endpoint.value = newBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
     late.resolve(json({models: [{id: "late-vector"}]})); await settle();

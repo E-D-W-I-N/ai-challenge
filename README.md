@@ -143,7 +143,7 @@ interrupted/stale, bounded API и настоящий клиент под Node с
 ```sh
 .venv/bin/python -m rag ingest --manifest data/rag/inputs.json
 .venv/bin/python -m rag index --base-url http://127.0.0.1:8005/v1 \
-  --model mlx-community/Qwen3-Embedding-0.6B-8bit --batch-size 16
+  --model Qwen3-Embedding-0.6B-8bit --batch-size 16
 .venv/bin/python -m rag status
 make run
 ```
@@ -176,7 +176,7 @@ Ingest сохраняет frozen corpus.json и ingest-report.json с ошибк
 
 ```sh
 .venv/bin/python -m rag compare --base-url http://127.0.0.1:8005/v1 \
-  --model mlx-community/Qwen3-Embedding-0.6B-8bit
+  --model Qwen3-Embedding-0.6B-8bit
 ```
 
 Оба индекса сохраняются в `comparisons/fixed` и `comparisons/structural`,
