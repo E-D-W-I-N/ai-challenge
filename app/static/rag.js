@@ -485,9 +485,28 @@ function createRagInspector({ state, $, el, api }) {
     const target = $("#rag-answer-snapshot"); target.hidden = false;
     const back = button("К текущему индексу", open);
     target.replaceChildren(el("h3", "", "Контекст сохранённого ответа"),
-      el("p", "hint", "Этот снимок использован при генерации ответа и не меняется при перестройке индекса."), back,
-      el("h3", "", "Запрос"), el("p", "rag-snapshot-query", snapshot.query || ""),
-      detail("Индекс и параметры поиска", {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k, duration_seconds: snapshot.duration_seconds}));
+      el("p", "hint", "Этот снимок сохранён вместе с ответом и не меняется при перестройке индекса."), back,
+      el("h3", "", "Исходный запрос"), el("p", "rag-snapshot-original-query", snapshot.original_query ?? snapshot.query ?? ""),
+      el("h3", "", "Запрос для поиска"), el("p", "rag-snapshot-query", snapshot.query || ""),
+      detail("Индекс и параметры поиска", {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k, config: snapshot.config, duration_seconds: snapshot.duration_seconds, timings: snapshot.timings}));
+    if (snapshot.rewrite) {
+      const rewrite = snapshot.rewrite;
+      target.append(el("p", "hint", rewrite.enabled ? "Переформулирование включено" : "Переформулирование выключено"),
+        detail("Переформулирование: модель, токены и стоимость", {...rewrite, usage: rewrite.usage ?? "Неизвестно"}),
+        detail("История для переформулирования", snapshot.history_used || []));
+    }
+    if (snapshot.candidates) {
+      target.append(el("h3", "", "Кандидаты поиска"));
+      const decisions = {kept: "Включён в контекст", threshold: "Исключён: ниже порога cosine", final_cap: "Исключён: лимит фрагментов"};
+      for (const [i, hit] of snapshot.candidates.entries()) {
+        const node = el("details", "rag-detail rag-snapshot-candidate");
+        node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"} · ${decisions[hit.decision] || hit.decision || "—"}`));
+        const {text, ...metadata} = hit;
+        node.append(el("pre", "rag-snapshot-text", text || ""), detail("Метаданные кандидата", metadata)); target.append(node);
+      }
+    }
+    target.append(el("h3", "", "Фрагменты в контексте"));
+    if (!(snapshot.hits || []).length) target.append(el("p", "hint", "Подходящих фрагментов нет"));
     for (const [i, hit] of (snapshot.hits || []).entries()) {
       const node = el("details", "rag-detail rag-snapshot-hit");
       node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"}`));
