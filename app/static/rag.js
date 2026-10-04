@@ -151,7 +151,9 @@ function createRagInspector({ state, $, el, api }) {
     const target = $("#rag-operation");
     if (!opNodes) {
       const summary = el("p"), counts = el("p"), model = el("p");
-      const list = el("ol", "rag-stages"), stages = ["documents", "chunks", "embeddings", "save"].map(stage => el("li", "", stage));
+      const list = el("ol", "rag-stages"), stages = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Сохранение"]].map(([stage, title]) => {
+        const node = el("li", "", title); node.dataset.stage = stage; return node;
+      });
       list.append(...stages);
       const actual = detail("Фактическое состояние операции", {}); target.append(summary, list, counts, model, actual);
       opNodes = {summary, counts, model, stages, actual};
@@ -160,7 +162,7 @@ function createRagInspector({ state, $, el, api }) {
     opNodes.summary.textContent = `Операция: ${op.kind} · ${labels[op.state] || op.state} · ${op.duration_seconds} с`;
     opNodes.counts.textContent = `Документов: ${op.documents} · чанков: ${op.chunks} · из кэша: ${op.cached} · вычислено: ${op.computed}`;
     opNodes.model.textContent = op.config ? `Модель: ${op.config.model} · размерность: ${op.dimension ?? "ещё неизвестна"}` : "";
-    opNodes.stages.forEach(node => node.className = node.textContent === op.stage ? "active" : "");
+    opNodes.stages.forEach(node => node.className = node.dataset.stage === op.stage ? "active" : "");
     opNodes.actual.querySelector("pre").textContent = JSON.stringify(op, null, 2);
   }
   function renderIndex(info, ingestion) {
@@ -184,14 +186,28 @@ function createRagInspector({ state, $, el, api }) {
   function updateControls() {
     const data = lastStatus || {}, stages = data.stages || {};
     const busy = submitting || data.operation?.state === "running";
+    for (const [id, available] of [["chunks", !!stages.corpus], ["embeddings", !!stages.chunks], ["save", !!stages.embeddings]]) {
+      $("#rag-" + id + "-controls").hidden = !available;
+    }
     for (const [id, available] of [["ingest", true], ["split", !!stages.corpus], ["embed", !!stages.chunks], ["save", !!stages.embeddings], ["delete-chunks", !!stages.chunks || !!data.index], ["delete-embeddings", !!stages.embeddings || !!data.index]]) {
       const node = $("#rag-" + id); if (node) node.disabled = busy || !available;
     }
     const summary = $("#rag-stage-status");
     if (summary) {
       summary.textContent = `Загружено документов: ${stages.corpus?.documents ?? 0} · чанков: ${stages.chunks?.chunks ?? 0} · эмбеддинги: ${stages.embeddings ? "готовы" : "не созданы"}`;
-      const report = data.operation?.kind === "chunks" && data.operation?.semantic_report || stages.chunks?.report;
-      if (report) summary.textContent += ` · LLM запросов: ${report.calls} · документов из кэша: ${report.cached} · токены вход/выход: ${report.usage?.prompt_tokens ?? (report.calls === 0 ? 0 : "не сообщены")}/${report.usage?.completion_tokens ?? (report.calls === 0 ? 0 : "не сообщены")}`;
+    }
+    const usage = $("#rag-chunk-usage"), chunks = stages.chunks;
+    const report = chunks?.strategy === "semantic" ? chunks.report : null;
+    usage.hidden = !report;
+    usage.textContent = "";
+    if (report) {
+      const tokens = report.calls === 0 ? 0 : report.usage?.total_tokens
+        ?? (Number.isInteger(report.usage?.prompt_tokens) && Number.isInteger(report.usage?.completion_tokens)
+          ? report.usage.prompt_tokens + report.usage.completion_tokens : "не сообщены");
+      const cost = report.calls === 0 ? 0 : report.cost_usd;
+      const billed = typeof cost === "number" && Number.isFinite(cost) && cost >= 0
+        ? `${cost.toLocaleString("en-US", {maximumSignificantDigits: 12})} USD` : "недоступна";
+      usage.textContent = `LLM: ${report.model || chunks.semantic_config?.model || "не сообщена"} · токены: ${tokens} · стоимость: ${billed}`;
     }
   }
   function chunkOptions() {

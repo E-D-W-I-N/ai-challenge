@@ -83,11 +83,16 @@
           </header>
           <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель и агента.</p>
         <section class="tab-page settings-card hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
+          <div class="rag-operation-card">
+            <p id="rag-status" role="status"></p><p id="rag-error" class="warn" role="alert"></p>
+            <div id="rag-operation"></div>
+          </div>
           <p>Выполните четыре этапа последовательно. Документы и чанки доступны для просмотра до сохранения индекса.</p>
           <div id="rag-controls" class="rag-controls">
             <label>URL документов, по одному на строку<textarea class="control" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
             <button id="rag-ingest" class="primary-btn" type="button">Загрузить документы</button>
+            <div id="rag-chunks-controls" class="rag-stage-controls" hidden>
             <label>Способ разбиения<select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
             <div id="rag-semantic-fields" hidden>
               <label>URL сервера LLM<input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
@@ -99,7 +104,10 @@
             <div class="rag-actions">
             <button id="rag-split" class="primary-btn" type="button">Разбить на чанки</button>
             <button id="rag-delete-chunks" class="mcp-button danger" type="button">Удалить чанки</button>
+            <span id="rag-chunk-usage" class="muted rag-chunk-usage" role="status" hidden></span>
             </div>
+            </div>
+            <div id="rag-embeddings-controls" class="rag-stage-controls" hidden>
             <label>URL сервера эмбеддингов<input class="control" id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
             <label>Модель эмбеддингов<input class="control" id="rag-model" type="text" value="mlx-community/Qwen3-Embedding-0.6B-8bit"></label>
             <details><summary>Параметры эмбеддингов</summary><label>Размерность (пусто — от сервера)<input class="control" id="rag-dimensions" type="number" min="1"></label><label>Ревизия модели<input class="control" id="rag-revision" type="text" value="1"></label></details>
@@ -108,11 +116,13 @@
             <button id="rag-embed" class="primary-btn" type="button">Создать эмбеддинги</button>
             <button id="rag-delete-embeddings" class="mcp-button danger" type="button">Удалить эмбеддинги</button>
             </div>
+            </div>
+            <div id="rag-save-controls" class="rag-stage-controls" hidden>
             <button id="rag-save" class="primary-btn" type="button">Сохранить индекс</button>
+            </div>
             <p id="rag-stage-status" role="status"></p>
           </div>
-          <p id="rag-status" role="status"></p><p id="rag-error" class="warn" role="alert"></p>
-          <div id="rag-operation"></div><div id="rag-index"></div>
+          <div id="rag-index"></div>
           <div id="rag-documents"></div><div id="rag-chunks"></div><div id="rag-chunk"></div>
         </section>
         <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
