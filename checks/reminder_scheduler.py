@@ -159,7 +159,7 @@ async def execution(config, git_root, restart_service):
                 + "data: " + json.dumps(ending) + "\n\n" + "data: [DONE]\n\n")
 
         timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider", rag_enabled=True,
-                                                   rag_rewrite_enabled=False, rag_filter_enabled=False))
+                                                   rag_rewrite_enabled=False))
         retrieval_queries = []
         async def timeout_lookup(query, **options):
             retrieval_queries.append(query)

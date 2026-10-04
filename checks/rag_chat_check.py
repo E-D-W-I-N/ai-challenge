@@ -80,7 +80,7 @@ def check_rag_chat():
                  patch.object(Index, "retrieve", offline_retrieve), \
                  patch.object(agents, "stream_completion", _stub.make()):
                 store = Store(str(root / "chat.db")).init()
-                agent = agents.Agent(AgentSpec(label="RAG", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False), store=store)
+                agent = agents.Agent(AgentSpec(label="RAG", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False), store=store)
                 _stub.reset(); count = len(calls)
                 events = asyncio.run(drain(agent.ask("neutral question")))
                 start = next(e for e in events if e["type"] == "start")
@@ -161,7 +161,7 @@ def check_rag_chat():
             ready, release = asyncio.Event(), asyncio.Event()
             async def lookup(query, **options):
                 ready.set(); await release.wait(); return snapshot
-            agent = agents.Agent(AgentSpec(label="cancel", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
+            agent = agents.Agent(AgentSpec(label="cancel", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False))
             with patch.object(agents, "rag_lookup", lookup), patch.object(agents, "stream_completion", _stub.make()):
                 _stub.reset(); task = asyncio.create_task(drain(agent.ask("cancel query")))
                 await ready.wait(); agent.cancel(); agent.spec.rag_enabled = False; release.set()
@@ -190,7 +190,7 @@ def check_rag_chat():
                 if not finish.wait(5):
                     raise TimeoutError("Neutral worker fixture was not released")
                 return copy.deepcopy(snapshot)
-            chat = agents.Agent(AgentSpec(label="worker", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
+            chat = agents.Agent(AgentSpec(label="worker", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False))
             with patch.object(retrieval, "retrieve", blocked), patch.object(agents, "stream_completion", _stub.make()):
                 _stub.reset(); task = asyncio.create_task(drain(chat.ask("worker query")))
                 try:
@@ -238,7 +238,7 @@ def check_rag_chat():
                              patch.object(agents, "stream_completion", llm.stream_completion), \
                              patch.object(llm, "shared_client", return_value=provider_client), \
                              patch.object(llm, "api_key", return_value="offline-provider-key"):
-                            chat = agents.Agent(AgentSpec(label="tools", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
+                            chat = agents.Agent(AgentSpec(label="tools", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False))
                             result = await drain(chat.ask("tool question"))
                             assert result[-1]["committed"] and len(received) == 2
                             assert chat.history[-1].request_bodies == received and chat.history[-1].rag == snapshot
@@ -274,7 +274,7 @@ def check_rag_chat():
         # Preparation failures expose completed service requests to scheduler
         # callers, and don't discard them on task cancellation.
         async def preparation_failure():
-            chat = agents.Agent(AgentSpec(label="service", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
+            chat = agents.Agent(AgentSpec(label="service", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False))
             request_sink, rag_sink = [], {}
             async def lookup(query, **options): return copy.deepcopy(snapshot)
             async def compression(*args):
@@ -294,7 +294,7 @@ def check_rag_chat():
         from app.reminders import ReminderScheduler
         async def cancelled_reminder():
             store = Store(str(root / "cancel-reminder.db")).init()
-            chat = agents.Agent(AgentSpec(label="cancel reminder", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False), store=store)
+            chat = agents.Agent(AgentSpec(label="cancel reminder", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False), store=store)
             server = SimpleNamespace(name="neutral", status="ok", timeout_s=1)
             manager = SimpleNamespace(servers=[server], reminder_protocol=AsyncMock(return_value=True))
             scheduler = ReminderScheduler(manager, SimpleNamespace(store=store))
@@ -316,7 +316,7 @@ def check_rag_chat():
             route = f"/api/agents/{aid}"
             for bad in (None, 1, "true"):
                 assert client.patch(route, json={"rag_enabled": bad}).status_code == 400
-            assert client.patch(route, json={"rag_enabled": True, "rag_rewrite_enabled": False, "rag_filter_enabled": False}).json()["rag_enabled"] is True
+            assert client.patch(route, json={"rag_enabled": True, "rag_rewrite_enabled": False}).json()["rag_enabled"] is True
             assert main.REGISTRY.store.load_session(aid)["config"]["rag_enabled"] is True
             with patch.object(agents, "rag_lookup", side_effect=ValueError("Unavailable neutral index")):
                 response = client.post(route + "/messages", json={"text": "restore input"})

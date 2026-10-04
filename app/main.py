@@ -199,8 +199,8 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 
 PATCHABLE = (
     "label",
-    "rag_enabled", "rag_rewrite_enabled", "rag_filter_enabled",
-    "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model",
+    "rag_enabled", "rag_rewrite_enabled",
+    "rag_candidates_k", "rag_final_k", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model",
     "provider",
     "system",
     "model",
@@ -222,20 +222,18 @@ def _rag_enabled(payload: dict, where: str = "") -> bool:
 
 def _rag_settings(payload: dict, where: str = "") -> dict:
     values = {}
-    for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_rerank_enabled"):
+    for name in ("rag_rewrite_enabled", "rag_rerank_enabled"):
         value = payload.get(name, name != "rag_rerank_enabled")
         if type(value) is not bool:
             raise HTTPException(400, detail=f"{where}{name}: boolean true/false")
         values[name] = value
-    for name, default in (("rag_top_k", 5),):
+    for name, default in (("rag_candidates_k", 20), ("rag_final_k", 5)):
         value = payload.get(name, default)
         if type(value) is not int or not 1 <= value <= 100:
             raise HTTPException(400, detail=f"{where}{name}: integer 1..100")
         values[name] = value
-    value = payload.get("rag_similarity_threshold", 0.3)
-    if type(value) not in (int, float) or not -1 <= value <= 1:
-        raise HTTPException(400, detail=f"{where}rag_similarity_threshold: number -1..1")
-    values["rag_similarity_threshold"] = float(value)
+    if values["rag_final_k"] > values["rag_candidates_k"]:
+        raise HTTPException(400, detail=f"{where}rag_final_k must not exceed rag_candidates_k")
     values["rag_rerank_provider"] = _choice_field(payload, "rag_rerank_provider", ("openrouter", "compatible"), "openrouter", where)
     model = payload.get("rag_rerank_model", DEFAULT_GENERATIVE_MODEL)
     if not isinstance(model, str) or not model.strip():
@@ -672,7 +670,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
     rag_enabled = _rag_enabled(payload)
-    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
+    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
     # Validate the complete patch before mutating the live configuration.
     validated = {}
     for name, parser in (("model", _model_field), ("label", _label_field),

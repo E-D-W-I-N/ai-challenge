@@ -1202,7 +1202,7 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "retrieval":
-            const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", filter: "Фильтрация фрагментов", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
+            const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
             if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = retrievalStatus;
             scrollFeed();
@@ -1651,8 +1651,8 @@ function fillPanel(agent) {
   });
   fillStrategy(agent.strategy);
   $("#f-rag_enabled").checked = agent.rag_enabled === true;
-  for (const name of ["rag_rewrite_enabled", "rag_filter_enabled", "rag_rerank_enabled"]) $("#f-" + name).checked = agent[name] === true;
-  for (const [name, fallback] of Object.entries({rag_top_k: agent.rag_final_k ?? 5, rag_similarity_threshold: .3})) {
+  for (const name of ["rag_rewrite_enabled", "rag_rerank_enabled"]) $("#f-" + name).checked = agent[name] === true;
+  for (const [name, fallback] of Object.entries({rag_candidates_k: agent.rag_top_k != null ? Math.max(20, agent.rag_top_k) : Math.max(agent.rag_candidates_k ?? 20, agent.rag_final_k ?? 5), rag_final_k: agent.rag_top_k ?? agent.rag_final_k ?? 5})) {
     $("#f-" + name).value = String(agent[name] ?? fallback);
   }
   $("#f-system").value = agent.system || "";
@@ -1702,7 +1702,6 @@ function syncRagFields() {
   const enabled = $("#f-rag_enabled").checked;
   $("#rag-chat-settings").classList.toggle("hidden", !enabled);
   $("#rag-chat-parameters").classList.toggle("hidden", !enabled);
-  $("#rag-threshold-field").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
   const rerank = enabled && $("#f-rag_rerank_enabled").checked;
   $("#rag-rerank-fields").classList.toggle("hidden", !rerank);
   if (rerank) rerankModelPicker.load(); else rerankModelPicker.stop();
@@ -1779,18 +1778,18 @@ function readPanel() {
     strategy: $("#f-strategy").value,
     rag_enabled: $("#f-rag_enabled").checked,
     rag_rewrite_enabled: $("#f-rag_rewrite_enabled").checked,
-    rag_filter_enabled: $("#f-rag_filter_enabled").checked,
     rag_rerank_enabled: $("#f-rag_rerank_enabled").checked,
     rag_rerank_provider: $("#f-rag_rerank_provider").value,
     rag_rerank_model: $("#f-rag_rerank_model").value.trim(),
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
-  for (const [name, min, max, integer] of [["rag_top_k", 1, 100, true], ["rag_similarity_threshold", -1, 1, false]]) {
+  for (const [name, min, max, integer] of [["rag_candidates_k", 1, 100, true], ["rag_final_k", 1, 100, true]]) {
     const value = readNumber(name);
     if (value === null || value < min || value > max || (integer && !Number.isInteger(value))) throw new Error(name + ": " + (integer ? "целое число" : "число") + " от " + min + " до " + max);
     patch[name] = value;
   }
   if (!patch.model) throw new Error("Выберите модель ответа или введите её ID");
+  if (patch.rag_final_k > patch.rag_candidates_k) throw new Error("Чанков в ответе не может быть больше кандидатов для поиска");
   if (patch.rag_rerank_enabled && !patch.rag_rerank_model) throw new Error("Выберите модель ранжирования или введите её ID");
   return patch;
 }
@@ -2064,7 +2063,7 @@ function init() {
     // которое уже ни на что не влияет, — значит снова обещать не то.
     if (id === "f-strategy") syncStrategyFields();
     if (id === "f-provider") setBusy(state.busy);
-    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled" || id === "f-rag_rewrite_enabled" || id === "f-rag_rerank_enabled") syncRagFields();
+    if (id === "f-rag_enabled" || id === "f-rag_rewrite_enabled" || id === "f-rag_rerank_enabled") syncRagFields();
     applySettings();
   });
   $("#panel-body").addEventListener("focusin", ev => {
