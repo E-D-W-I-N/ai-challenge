@@ -25,6 +25,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = ROOT / "mcp.json"
 """Корень репозитория: cwd дочерних процессов и умолчательное место конфига."""
 
 CHILD_ENV_KEYS = ("PATH", "HOME", "LANG")
@@ -142,12 +143,12 @@ class McpManager:
     serializes tool exchanges against config changes, reconnect and shutdown.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, disabled: bool = False) -> None:
         self.servers: list[McpServer] = []
         self.tools: dict[str, ToolRef] = {}
         self.config = {"revision": 0, "servers": []}
         self.store = None
-        self.disabled = False
+        self.disabled = disabled
         self._lock = asyncio.Lock()
         self._owner = ContextVar("mcp_lease", default=None)
         self.context_namespace = ""
@@ -189,7 +190,6 @@ class McpManager:
 
     async def start(self, store=None) -> None:
         self.store = store
-        self.disabled = os.environ.get("MCP_DISABLED") == "1"
         self.config = store.load_mcp_config() if store else {"revision": 0, "servers": []}
         if self.disabled:
             return
@@ -198,8 +198,7 @@ class McpManager:
         if self.config["revision"]:
             await self._replace(self.config["servers"])
             return
-        raw = os.environ.get("MCP_CONFIG_PATH")
-        path = Path(raw) if raw else ROOT / "mcp.json"
+        path = DEFAULT_CONFIG_PATH
         if not path.is_file():
             return
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -389,7 +388,7 @@ class McpManager:
                 if row is None:
                     raise ValueError("Сначала сохраните URL сервера")
                 if self.disabled and enabled:
-                    raise ValueError("MCP выключен через MCP_DISABLED=1")
+                    raise ValueError("MCP подключение отключено")
                 rows = deepcopy(self.config["servers"])
                 next(r for r in rows if r["name"] == name)["enabled"] = enabled
                 self._save(rows, revision)

@@ -76,7 +76,7 @@ def check_rag_chat():
             real_retrieve = Index.retrieve
             def offline_retrieve(index, query, *args, **kwargs):
                 return real_retrieve(index, query, *args, client=embedding, **kwargs)
-            with patch.dict(os.environ, {"RAG_DIR": str(root), "OPENROUTER_API_KEY": fake_key}), \
+            with patch("rag.index.storage_root", lambda: root), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key}), \
                  patch.object(Index, "retrieve", offline_retrieve), \
                  patch.object(agents, "stream_completion", _stub.make()):
                 store = Store(str(root / "chat.db")).init()

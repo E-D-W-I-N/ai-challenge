@@ -7,11 +7,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_DOTENV_LOADED = False
 
 
 def _load_dotenv() -> None:
     """Читает .env в корне репозитория. Уже заданные переменные окружения
     сильнее файла: так стенд подставляет свои, не трогая .env."""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
     env_file = ROOT / ".env"
     if not env_file.exists():
         return
@@ -22,14 +27,14 @@ def _load_dotenv() -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if key in {"OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY"} and key not in os.environ:
             os.environ[key] = value
 
 
-_load_dotenv()
 
 
 def api_key() -> str | None:
+    _load_dotenv()
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     return key or None
 
@@ -39,11 +44,4 @@ def has_key() -> bool:
 
 
 def attribution_headers() -> dict[str, str]:
-    headers: dict[str, str] = {}
-    site = os.environ.get("OPENROUTER_SITE_URL", "").strip()
-    name = os.environ.get("OPENROUTER_SITE_NAME", "").strip()
-    if site:
-        headers["HTTP-Referer"] = site
-    if name:
-        headers["X-Title"] = name
-    return headers
+    return {}

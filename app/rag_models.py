@@ -1,4 +1,4 @@
-"""Read-only generation model catalogues; credentials stay at the HTTP boundary."""
+"""Read-only model catalogues; credentials stay at the HTTP boundary."""
 from __future__ import annotations
 
 import json
@@ -15,7 +15,9 @@ _MAX_BYTES = 2 * 1024 * 1024
 _MAX_MODELS = 5000
 
 
-async def models(auth_mode: str, base_url: str) -> dict:
+async def models(auth_mode: str, base_url: str, purpose: str = "generation") -> dict:
+    if purpose not in {"generation", "embedding"}:
+        raise HTTPException(422, "Неизвестное назначение модели.")
     try:
         SemanticConfig(base_url=base_url, model="catalogue", auth_mode=auth_mode)
         parsed = urlparse(base_url)
@@ -49,18 +51,25 @@ async def models(auth_mode: str, base_url: str) -> dict:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or len(data) > _MAX_MODELS:
             raise ValueError("Invalid catalogue")
-        secrets = [value for value in (key, os.environ.get("RAG_EMBEDDING_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", ""),
-                                      os.environ.get("RAG_CHUNKING_API_KEY", "")) if value.strip()]
-        identifiers = set()
+        secrets = [value for value in (key, os.environ.get("RAG_EMBEDDING_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", "")) if value.strip()]
+        identifiers = {}
         for row in data:
             identifier = row.get("id") if isinstance(row, dict) else None
             if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 512:
                 raise ValueError("Invalid model ID")
             if any(secret in identifier or secret.strip() in identifier for secret in secrets):
                 raise ValueError("Invalid model ID")
-            identifiers.add(identifier)
-        # oMLX /v1/models does not promise model_type. Do not guess by ID/name.
-        rows = [{"id": identifier} for identifier in sorted(identifiers)]
+            model_type = row.get("model_type", row.get("type"))
+            model_type = model_type.strip().lower() if isinstance(model_type, str) and model_type.strip() else None
+            if identifier in identifiers and identifiers[identifier] != model_type:
+                model_type = None
+            identifiers[identifier] = model_type
+        # Standard oMLX has no type metadata. Incomplete extension metadata is
+        # insufficient to hide IDs; only filter a fully typed catalogue.
+        typed = bool(identifiers) and all(value in {"embedding", "embeddings", "llm", "vlm", "reranker", "audio_stt", "audio_tts", "audio_sts"}
+                                             for value in identifiers.values())
+        rows = [{"id": identifier} for identifier in sorted(identifiers)
+                if purpose != "embedding" or not typed or identifiers[identifier] in {"embedding", "embeddings"}]
         return {"models": rows, "total": len(rows)}
     except HTTPException:
         raise

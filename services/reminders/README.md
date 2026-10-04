@@ -7,11 +7,11 @@ no model API key. Start it manually in a separate terminal:
 ```sh
 python3.11 -m venv /private/tmp/reminder-service-venv
 /private/tmp/reminder-service-venv/bin/python -m pip install -r services/reminders/requirements.txt
-REMIND_DB_PATH=/absolute/path/reminders.db REMIND_PORT=8001 /private/tmp/reminder-service-venv/bin/python -m services.reminders.server
+/private/tmp/reminder-service-venv/bin/python -m services.reminders.server --db /absolute/path/reminders.db --port 8001
 ```
 
 The Streamable HTTP MCP endpoint is `http://127.0.0.1:8001/mcp`. The default host
-is loopback (`REMIND_HOST` overrides it); default database is
+is loopback (`--host` overrides it); default database is
 `services/reminders/data/reminders.db`. The application connects to this URL;
 closing its connection does not stop the service. Authentication and remote
 deployment are outside this local service's contract. Keep it on loopback.

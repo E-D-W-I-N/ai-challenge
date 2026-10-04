@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import os
+import argparse
 import sqlite3
 import time
 from pathlib import Path
@@ -18,6 +18,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "data" / "reminders.db"
 CLAIM_SECONDS = 300
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reminders (
@@ -38,8 +39,7 @@ STATES = {"pending": "ждёт", "running": "выполняется", "done": "�
 
 
 def db_path() -> Path:
-    raw = os.environ.get("REMIND_DB_PATH")
-    return Path(raw) if raw else ROOT / "data" / "reminders.db"
+    return DATABASE
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -158,8 +158,7 @@ def finish_reminder(rid: int, token: str, error: str = "", *,
         return True
 
 
-server = FastMCP("remind", host=os.environ.get("REMIND_HOST", "127.0.0.1"),
-                 port=int(os.environ.get("REMIND_PORT", "8001")))
+server = FastMCP("remind", host="127.0.0.1", port=8001)
 
 
 @server.tool(description="Запланировать выполнение задачи text в этом чате через in_seconds секунд; "
@@ -210,5 +209,17 @@ def _reminder_finish(id: int, token: str, error: str = "") -> str:
     return json.dumps(finish_reminder(id, token, error))
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    global DATABASE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", type=Path, default=DATABASE)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8001)
+    args = parser.parse_args(argv)
+    DATABASE = args.db.resolve()
+    server.settings.host, server.settings.port = args.host, args.port
     server.run(transport="streamable-http")
+
+
+if __name__ == "__main__":
+    main()

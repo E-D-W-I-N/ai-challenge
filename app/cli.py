@@ -26,7 +26,9 @@ from .store import StoreBusyError
 SESSIONS_SHOWN = 30
 """Сколько сессий печатает `/сессии`. Остальные не спрятаны — их число видно."""
 
-DEFAULT_MODEL = "openai/gpt-4o-mini"
+from rag.defaults import DEFAULT_GENERATIVE_MODEL
+
+DEFAULT_MODEL = DEFAULT_GENERATIVE_MODEL
 DEFAULT_SYSTEM = "Ты — полезный ассистент. Отвечай по-русски, коротко и по делу."
 
 

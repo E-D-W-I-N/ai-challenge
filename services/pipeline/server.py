@@ -40,11 +40,10 @@ server = FastMCP("pipeline")
 
 
 def files_dir() -> Path:
-    """CLI output directory, or the explicit legacy fixture's environment."""
+    """Explicit CLI output directory, or the fixed legacy stdio default."""
     if OUTPUT is not None:
         return OUTPUT
-    raw = os.environ.get("PIPELINE_FILES_DIR")
-    return Path(raw) if raw else ROOT / "files"
+    return ROOT / "files"
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:

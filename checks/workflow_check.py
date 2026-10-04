@@ -115,7 +115,7 @@ def check_workflow():
             entered.set()
             assert release.wait(5)
             return original(*args, **kwargs)
-        with patch.dict(os.environ, {"RAG_DIR": str(root), "MCP_DISABLED": "1", "RAG_EMBEDDING_API_KEY": "offline-key"}), TestClient(app) as api:
+        with patch("rag.index.storage_root", lambda: root), patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "offline-key"}), TestClient(app) as api:
             with patch("app.rag_api.threading.Thread", side_effect=RuntimeError("offline start denied")):
                 assert api.post("/api/rag/operations/chunks", json={"size": 400, "overlap": 40}).status_code == 503
             with Operation(root, "chunks"):

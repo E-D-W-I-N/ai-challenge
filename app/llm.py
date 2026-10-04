@@ -12,7 +12,7 @@
 пользователь списывает это на модель.
 
 HTTP-клиент на процесс один, и одновременных вызовов не больше
-`LLM_MAX_CONCURRENCY`: клиент внутри каждого вызова — это на сотне агентов
+16: клиент внутри каждого вызова — это на сотне агентов
 сотня пулов соединений и сотня одновременных запросов к OpenRouter.
 """
 
@@ -23,7 +23,6 @@ import contextlib
 from contextvars import ContextVar
 from copy import deepcopy
 import json
-import os
 import time
 import weakref
 from collections import deque
@@ -40,17 +39,12 @@ _SPEED_WINDOW_SECONDS = 5.0
 _TIMEOUT = httpx.Timeout(180.0, connect=20.0)
 
 DEFAULT_MAX_CONCURRENCY = 16
-"""Сколько вызовов к модели идёт одновременно, если LLM_MAX_CONCURRENCY не задан."""
+"""Сколько вызовов к модели идёт одновременно, в общем процессе."""
 
 
 def max_concurrency() -> int:
-    """LLM_MAX_CONCURRENCY. Лишние вызовы не падают, а ждут на семафоре."""
-    raw = os.environ.get("LLM_MAX_CONCURRENCY", "").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return DEFAULT_MAX_CONCURRENCY
-    return max(1, value)
+    """Fixed concurrency; excess calls wait on the shared semaphore."""
+    return DEFAULT_MAX_CONCURRENCY
 
 
 # Клиент и семафор привязаны к циклу событий, в котором их создали: у httpx

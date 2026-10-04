@@ -76,7 +76,7 @@ def check_pipeline_http():
         store = Store(path).init()
         manager = mcp.McpManager()
         with service("services.pipeline", tmp, "--repo", str(repo), "--files-dir", str(output)) as (external, url):
-            with patch.object(main.REGISTRY, "store", store), patch.object(mcp, "MANAGER", manager), patch.object(agent, "MANAGER", manager), patch.dict(os.environ, {"MCP_DISABLED": "0", "MCP_CONFIG_PATH": str(Path(tmp) / "missing.json")}):
+            with patch.object(main.REGISTRY, "store", store), patch.object(mcp, "MANAGER", manager), patch.object(agent, "MANAGER", manager), patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(tmp) / "missing.json"):
                 with TestClient(main.app) as api:
                     # The exact save/connect routes used by the Tools URL form.
                     answer = api.put("/api/mcp/config", json={"revision": 0, "servers": [{"name": "chosen-pipeline", "url": url, "enabled": False}]})

@@ -54,7 +54,7 @@ def check_url_api():
         db = str(Path(tmp) / "app.sqlite")
         store = Store(db).init()
         manager = mcp.McpManager()
-        with patch.object(main.REGISTRY, "store", store), patch.object(mcp, "MANAGER", manager), patch.dict(os.environ, {"MCP_DISABLED": "0", "MCP_CONFIG_PATH": str(Path(tmp) / "missing.json")}):
+        with patch.object(main.REGISTRY, "store", store), patch.object(mcp, "MANAGER", manager), patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(tmp) / "missing.json"):
             with TestClient(main.app) as client:
                 initial = client.get("/api/mcp").json()
                 assert initial["servers"] == [] and initial["config"] == {"revision": 0, "servers": []}
@@ -79,7 +79,7 @@ def check_url_api():
         store.close()
         reopened = Store(db).init()
         manager = mcp.McpManager()
-        with patch.object(main.REGISTRY, "store", reopened), patch.object(mcp, "MANAGER", manager), patch.dict(os.environ, {"MCP_DISABLED": "0", "MCP_CONFIG_PATH": str(Path(tmp) / "missing.json")}):
+        with patch.object(main.REGISTRY, "store", reopened), patch.object(mcp, "MANAGER", manager), patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(tmp) / "missing.json"):
             with TestClient(main.app) as client:
                 restored = client.get("/api/mcp").json()
                 assert restored["config"]["revision"] == 2 and restored["servers"][0]["status"] == "ok", restored
@@ -111,7 +111,7 @@ def check_url_race():
     with tempfile.TemporaryDirectory(prefix="mcp-race-") as tmp, service("checks._mcp_http", tmp) as (external, url):
         async def scenario():
             manager = mcp.McpManager()
-            with patch.dict(os.environ, {"MCP_DISABLED": "0", "MCP_CONFIG_PATH": str(Path(tmp) / "none")}):
+            with patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(tmp) / "none"):
                 await manager.start()
                 await manager.configure([{"name": "custom", "url": url, "enabled": True}], 0)
                 server = manager.servers[0]
