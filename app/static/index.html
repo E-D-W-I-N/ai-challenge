@@ -101,6 +101,7 @@
               <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-preparation-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
               <label class="field"><span class="field-label">Модель подготовки документов</span><select class="control" id="rag-preparation-model" aria-describedby="rag-preparation-model-status"><option value="openai/gpt-4.1-mini">openai/gpt-4.1-mini</option></select></label>
               <div class="rag-actions"><button id="rag-preparation-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-preparation-model-status" class="hint" role="status"></span></div>
+              <label class="field"><span class="field-label">Ожидание ответа, с</span><input class="control" id="rag-preparation-timeout-seconds" type="number" min="1" max="3600" value="600"></label>
               <p class="hint">LLM очищает HTML и восстанавливает структуру документа без пересказа.</p>
             </div>
             <button id="rag-ingest" class="primary-btn" type="button">Загрузить документы</button>

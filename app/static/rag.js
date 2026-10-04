@@ -151,6 +151,8 @@ function createRagInspector({ state, $, el, api }) {
         const strategy = $("#rag-preparation-strategy");
         if (!strategy.dataset.dirty) strategy.value = stages?.corpus?.preparation_strategy || "programmatic";
         if (preparation) preparationPicker.restore(preparation);
+        const timeout = $("#rag-preparation-timeout-seconds");
+        if (!timeout.dataset.dirty) timeout.value = data.operation?.preparation_report?.config?.timeout_seconds ?? preparation?.timeout_seconds ?? 600;
         updatePreparationFields();
         if (stages?.chunks) {
           const saved = stages.chunks;
@@ -286,6 +288,7 @@ function createRagInspector({ state, $, el, api }) {
     const body = {urls: $("#rag-urls").value.split(/\n/).map(x => x.trim()).filter(Boolean), use_manifest: $("#rag-manifest").checked,
       preparation_strategy: $("#rag-preparation-strategy").value};
     if (body.preparation_strategy === "llm") {
+      body.preparation_timeout_seconds = Number($("#rag-preparation-timeout-seconds").value);
       for (const key of ["auth_mode", "base_url", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
     }
     return body;
@@ -439,7 +442,7 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-size").max = semantic ? "12000" : "100000";
     if (semantic) loadGenerationModels(); else semanticPicker.cancel();
   };
-  for (const id of ["preparation-strategy", "preparation-base-url", "preparation-model", "preparation-auth-mode", "urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
+  for (const id of ["preparation-timeout-seconds", "preparation-strategy", "preparation-base-url", "preparation-model", "preparation-auth-mode", "urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input && !input.oninput) input.oninput = () => { input.dataset.dirty = "true"; };
   }
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {
