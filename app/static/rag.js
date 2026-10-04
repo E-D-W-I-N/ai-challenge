@@ -18,7 +18,7 @@ function createRagInspector({ state, $, el, api }) {
     controller?.abort(); controller = null;
   }
   function button(text, action) {
-    const node = el("button", "btn", text); node.type = "button"; node.onclick = action; return node;
+    const node = el("button", "mcp-button", text); node.type = "button"; node.onclick = action; return node;
   }
   function detail(title, data, open = false) {
     const node = el("details", "rag-detail"); node.open = open;

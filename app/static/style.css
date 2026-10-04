@@ -824,4 +824,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-controls label { display: grid; gap: .3rem; }
 .rag-controls label[hidden] { display: none; }
 .rag-controls input:not([type="checkbox"]), .rag-controls textarea, .rag-controls select { width: 100%; }
-.rag-controls .btn { justify-self: start; }
+.rag-controls > .primary-btn { justify-self: start; }
+.rag-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+.rag-controls .primary-btn:disabled { opacity: .6; cursor: not-allowed; }
+.rag-actions .danger { color: var(--danger); }
