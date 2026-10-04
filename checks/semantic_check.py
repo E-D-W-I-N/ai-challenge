@@ -52,8 +52,14 @@ def check_semantic():
         usage = {"prompt_tokens": 51, "completion_tokens": 9, "total_tokens": 60}
         if mode["value"] == "usage":
             usage["prompt_tokens"] = True
-        return httpx.Response(200, json={"model": payload["model"], "choices": [{"finish_reason":
-            "length" if mode["value"] == "truncated" else "stop", "message": {"content": content}}], "usage": usage})
+        body = {"model": payload["model"], "choices": [{"finish_reason":
+            "length" if mode["value"] == "truncated" else "stop", "message": {"content": content}}], "usage": usage}
+        if mode["value"] == "reflected":
+            body["provider_metadata"] = {"headers": {"Authorization": request.headers.get("Authorization")}}
+        if mode["value"] == "escaped-reflected":
+            body["choices"][0]["message"]["content"] = json.dumps({"end_unit_ids": ids,
+                "unexpected": "credential-injected-secret"}).replace("credential", "\\u0063redential")
+        return httpx.Response(200, json=body)
     with tempfile.TemporaryDirectory() as temporary, httpx.Client(transport=httpx.MockTransport(server)) as client:
         root = Path(temporary)
         config = SemanticConfig(base_url="http://neutral.test/v1")
@@ -88,7 +94,7 @@ def check_semantic():
         assert semantic_chunks([document(text + "Changed neutral ending.")], config, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([doc], config, 100, 15, root=root, client=client)[1]["calls"] > 0
         short = document("First short topic.\nSecond short topic.\nThird short topic.\n")
-        for bad in ("unknown", "duplicate", "missing", "oversize", "malformed", "truncated", "usage", "http", "transport"):
+        for bad in ("unknown", "duplicate", "missing", "oversize", "malformed", "truncated", "usage", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
             with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "credential-injected-secret"}):
                 try:
@@ -97,8 +103,21 @@ def check_semantic():
                     assert "credential-injected-secret" not in str(error)
                 else:
                     raise AssertionError(bad)
-                assert not [p for p in (Path(rejected) / "semantic-cache").glob("*.json") if not p.name.startswith("round-")]
+                artifacts = list((Path(rejected) / "semantic-cache").glob("*.json"))
+                assert not [p for p in artifacts if not p.name.startswith("round-")]
+                assert all("credential-injected-secret" not in p.read_text() for p in artifacts)
+                if bad in {"reflected", "escaped-reflected"}:
+                    assert not artifacts
         mode["value"] = "ok"
+        with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "credential-injected-secret"}):
+            before = len(requests)
+            try:
+                semantic_chunks([document("Text credential-injected-secret end.")], config, 100, 0, root=rejected, client=client)
+            except ValueError as error:
+                assert "credential-injected-secret" not in str(error)
+            else:
+                raise AssertionError("request credential guard")
+            assert len(requests) == before and not list((Path(rejected) / "semantic-cache").glob("*.json"))
         with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "fallback-neutral"}):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
