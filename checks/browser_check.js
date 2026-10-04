@@ -233,6 +233,7 @@ async function main() {
     check("OpenRouter prices reuse chat catalogue and keep missing persisted ID", client.state.models.length === 2 && model.value === "persisted-alias"
       && model.textContent.includes("$1.2 / $3.4") && status.textContent.includes("выбор сохранён"));
     model.value = "cloud-a"; model.dispatchEvent(new Evt("change")); model.focus();
+    check("Choosing a listed model clears the missing-ID hint", status.textContent === "Доступно моделей: 2");
     const refresh = deferred(); server.respond("GET", "/api/models", () => refresh.promise); click("rag-model-refresh"); await settle();
     model.value = "cloud-b"; model.dispatchEvent(new Evt("change"));
     refresh.resolve(json({models: cloud})); await settle(1100);
@@ -266,6 +267,24 @@ async function main() {
     server.respond("GET", localPath(emptyBase), () => failure("neutral upstream failure", 502)); click("rag-model-refresh"); await settle();
     check("Unavailable catalogue preserves fallback choice and offers refresh inline", model.value === "neutral-generative"
       && status.textContent.includes("Не удалось загрузить") && !$("#rag-model-refresh").disabled);
+    const resumeBase = "http://127.0.0.1:9004/v1", hiddenReply = deferred();
+    server.respond("GET", localPath(resumeBase), () => hiddenReply.promise);
+    endpoint.value = resumeBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    document.visibilityState = "hidden"; document.fire(new Evt("visibilitychange")); await settle();
+    const cancelled = requests("GET", localPath(resumeBase))[0].signal.aborted;
+    server.respond("GET", localPath(resumeBase), {models: [{id: "neutral-generative"}, {id: "resumed-model"}]});
+    document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(1100);
+    hiddenReply.resolve(json({models: [{id: "late-hidden-model"}]})); await settle();
+    check("Visibility resume restarts cancelled catalogue once and ignores old response", cancelled && requests("GET", localPath(resumeBase)).length === 2
+      && model.value === "neutral-generative" && model.textContent.includes("resumed-model") && !model.textContent.includes("late-hidden-model")
+      && status.textContent === "Доступно моделей: 2");
+    const warmReply = deferred(); server.respond("GET", localPath(resumeBase), () => warmReply.promise);
+    click("rag-model-refresh"); await settle(); document.visibilityState = "hidden"; document.fire(new Evt("visibilitychange"));
+    server.respond("GET", localPath(resumeBase), {models: [{id: "neutral-generative"}, {id: "refreshed-model"}]});
+    document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(1100);
+    warmReply.resolve(json({models: [{id: "late-warm-model"}]})); await settle();
+    check("Cancelled explicit refresh also resumes once despite existing catalogue cache", requests("GET", localPath(resumeBase)).length === 4
+      && model.value === "neutral-generative" && model.textContent.includes("refreshed-model") && !model.textContent.includes("late-warm-model"));
   });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});

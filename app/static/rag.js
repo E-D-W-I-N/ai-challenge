@@ -21,6 +21,8 @@ function createRagInspector({ state, $, el, api }) {
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
     epoch++;
+    const interrupted = modelCatalogues.get(pendingModelSource);
+    if (interrupted) interrupted.retry = true;
     cancelModelRequest();
     clearTimeout(timer); timer = null;
     controller?.abort(); controller = null;
@@ -276,7 +278,7 @@ function createRagInspector({ state, $, el, api }) {
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (lastStatus) lastStatus.operation = {...lastStatus.operation, state: "running"};
       $("#rag-error").textContent = "";
-      stop(); refresh();
+      open();
     } catch (error) { showError(error); }
     finally { submitting = false; updateControls(); }
   }
@@ -285,7 +287,7 @@ function createRagInspector({ state, $, el, api }) {
     submitting = true; updateControls();
     try {
       await api(`/api/rag/stages/${kind}`, {method: "DELETE"});
-      stop(); refresh();
+      open();
     } catch (error) { showError(error); }
     finally { submitting = false; updateControls(); }
   }
@@ -325,7 +327,7 @@ function createRagInspector({ state, $, el, api }) {
     if (!visible() || selectedStep !== "chunks" || $("#rag-strategy").value !== "semantic") return;
     const source = modelSource(), select = $("#rag-semantic-model"), status = $("#rag-model-status");
     const cached = modelCatalogues.get(source.key);
-    if (!force && cached) {
+    if (!force && cached && !cached.retry) {
       setSemanticModels(cached.models, select.value); status.textContent = catalogueMessage(cached, select.value); return;
     }
     if (!force && pendingModelSource === source.key) return;
@@ -336,7 +338,7 @@ function createRagInspector({ state, $, el, api }) {
     status.textContent = "Загрузка моделей…"; $("#rag-model-refresh").disabled = true;
     try {
       const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
-      const data = official && state.models.length && !force ? {models: state.models}
+      const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
         : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}`, {signal});
       if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
       const models = data.models || [];
@@ -386,11 +388,15 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-model-status").textContent = "URL изменён — обновите список моделей.";
   };
   semanticEndpoint.onchange = () => loadSemanticModels();
-  $("#rag-semantic-model").onchange = () => { $("#rag-semantic-model").dataset.dirty = "true"; };
+  $("#rag-semantic-model").onchange = () => {
+    const model = $("#rag-semantic-model"); model.dataset.dirty = "true";
+    const entry = modelCatalogues.get(modelSource().key);
+    if (entry && !modelController) $("#rag-model-status").textContent = catalogueMessage(entry, model.value);
+  };
   function open() { stop(); refresh(); loadSemanticModels(); }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
-    document.addEventListener("visibilitychange", () => { stop(); if (visible()) refresh(); });
+    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadSemanticModels(); } });
   }
   return { open, stop };
 }

@@ -27,7 +27,7 @@ def check_rag_models():
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     base = f"http://127.0.0.1:{server.server_port}/v1"
     try:
-        with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "  neutral-local-key  ", "OPENROUTER_API_KEY": "  neutral-router-key  ",
+        with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "  neutral-local-key  ", "OPENROUTER_API_KEY": "  neutral-router-key  ", "RAG_CHUNKING_API_KEY": "  neutral-unused-key  ",
                 "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "", "no_proxy": ""}):
             from app.rag_api import router
             from app import rag_models
@@ -62,10 +62,11 @@ def check_rag_models():
                 assert "neutral-local-key" not in response.text
                 state.update(status=200, payload={"data": []})
                 assert api.get("/api/rag/models", params=params).json() == {"models": [], "total": 0}
-                for invalid in [{"bad": []}, {"data": [{"id": "neutral-local-key"}]}, {"data": [{"id": "x" * 513}]}, {"data": [None]}]:
+                for invalid in [{"bad": []}, {"data": [{"id": "neutral-local-key"}]}, {"data": [{"id": "  neutral-unused-key  "}]},
+                                {"data": [{"id": "neutral-unused-key"}]}, {"data": [{"id": "x" * 513}]}, {"data": [None]}]:
                     state["payload"] = invalid
                     response = api.get("/api/rag/models", params=params)
-                    assert response.status_code == 502 and "neutral-local-key" not in response.text
+                    assert response.status_code == 502 and "neutral-local-key" not in response.text and "neutral-unused-key" not in response.text
                 state["payload"] = {"data": [{"id": "x" * (2 * 1024 * 1024)}]}
                 response = api.get("/api/rag/models", params=params)
                 assert response.status_code == 502 and len(response.text) < 300

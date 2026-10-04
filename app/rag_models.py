@@ -49,7 +49,8 @@ async def models(auth_mode: str, base_url: str) -> dict:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or len(data) > _MAX_MODELS:
             raise ValueError("Invalid catalogue")
-        secrets = [value for value in (key, os.environ.get("RAG_EMBEDDING_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", "")) if value.strip()]
+        secrets = [value for value in (key, os.environ.get("RAG_EMBEDDING_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", ""),
+                                      os.environ.get("RAG_CHUNKING_API_KEY", "")) if value.strip()]
         identifiers = set()
         for row in data:
             identifier = row.get("id") if isinstance(row, dict) else None
