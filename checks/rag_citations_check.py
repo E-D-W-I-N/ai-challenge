@@ -21,7 +21,7 @@ def check_rag_citations():
              "section": "Facts", "text": "The neutral item is blue.", "score": 0.3},
             {"chunk_id": "neutral-second", "source": "fixture:second", "title": "Second",
              "section": "Notes", "text": "The second item is green.", "score": 0.2}]
-    def retrieved(index, query, top_k):
+    def retrieved(index, query, top_k, **options):
         return {"query": query, "index": {"index_id": "neutral-pinned"}, "hits": copy.deepcopy(hits)}
     valid = {"answer": "The second item is green [2].",
              "citations": [{"source_id": 2, "quote": "second item is green"}]}
@@ -116,6 +116,7 @@ def check_rag_citations():
         assert chat.history[-1].metrics["cost_usd"] == 0.000123
 
         # Inclusive gate always applies, independently of filtering, before compression/model lease.
+        chat.spec.rag_rerank_enabled = True
         for filtering in (False, True):
             chat.spec.rag_filter_enabled = filtering
             chat.spec.rag_similarity_threshold = 0.31
@@ -128,6 +129,30 @@ def check_rag_citations():
             assert len(refused[-1]["rag"]["hits"]) == (0 if filtering else 2)
         chat.spec.rag_filter_enabled = False
         chat.spec.rag_similarity_threshold = 0.3
+        chat.spec.rag_rerank_enabled = False
+
+        # Reordering assigns citation IDs from final context order for both providers.
+        for provider in ("openrouter", "compatible"):
+            ranked = agents.Agent(AgentSpec(label="ranked citations", model="neutral-final", provider=provider,
+                rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False,
+                rag_rerank_enabled=True, rag_rerank_provider=provider, rag_rerank_model="neutral-ranker"), store=store)
+            ordered_answer = {"answer": "The second item is green [1].",
+                              "citations": [{"source_id": 1, "quote": "second item is green"}]}
+            _stub.reset()
+            def ranked_reply(messages, index):
+                return '{"source_ids":[2,1]}' if index == 0 else json.dumps(ordered_answer)
+            with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(ranked_reply)):
+                completed = await drain(ranked.ask("neutral rank request"))
+            assert completed[-1]["committed"] and completed[-1]["metrics"]["total_tokens"] == 200
+            saved = ranked.history[-1]
+            sources = json.loads(saved.rag["context"].split("\n", 1)[1])
+            assert [(h["source_id"], h["chunk_id"]) for h in sources] == [(1, "neutral-second"), (2, "neutral-first")]
+            assert saved.rag["answer"]["citations"][0]["chunk_id"] == "neutral-second"
+            assert saved.rag["answer"]["citations"][0]["source_id"] == 1
+            assert saved.rag["context"] == _stub.CALLS[-1]["messages"][-2]["content"]
+            assert saved.request_bodies == [call["payload"] for call in _stub.CALLS]
+            assert len(saved.rag["hits"]) == 2 and saved.rag["rerank"]["source_ids"] == [2, 1]
+            assert ("provider" in saved.request_bodies[0]) == (provider == "openrouter")
 
         # Cancellation at the newly buffered publication boundary cannot commit the answer.
         depth = len(chat.history)
@@ -156,6 +181,33 @@ def check_rag_citations():
         assert error.metrics["cost_usd"] == 0.000123 and error.metrics["reminder_execution"]["id"] == 4
         assert error.request_bodies == [_stub.CALLS[0]["payload"]]
         assert "answer" not in error.rag and error.rag["index"]["index_id"] == "neutral-pinned"
+        # Scheduler timeout after paid rerank retains its actual usage and requests.
+        from app import reminders
+        chat.spec.rag_rerank_enabled = True
+        chat.spec.rag_rerank_model = "neutral-ranker"
+        _stub.reset()
+        async def ranking_then_timeout(session, **options):
+            if session.model == "neutral-ranker":
+                async for event in _stub.make('{"source_ids":[2,1]}')(session, **options):
+                    yield event
+            else:
+                # A cumulative usage update is observed twice but charged once.
+                stub = _stub.make(json.dumps(valid))
+                async for event in stub(session, **options):
+                    if event["type"] == "metrics":
+                        yield event
+                        yield copy.deepcopy(event)
+                        await asyncio.sleep(10)
+                    else:
+                        yield event
+        with patch.object(scheduler, "receipt", return_value=True), patch.object(rag.Index, "retrieve", retrieved), \
+             patch.object(agents, "stream_completion", ranking_then_timeout), patch.object(reminders, "RUN_SECONDS", .05):
+            await scheduler._execute(server, item, "neutral timeout token", chat)
+        timeout_error = chat.history[-1]
+        assert timeout_error.error and "TimeoutError" in timeout_error.error
+        assert timeout_error.metrics["total_tokens"] == 200 and timeout_error.metrics["cost_usd"] == .000246
+        assert timeout_error.rag["rerank"]["source_ids"] == [2, 1] and "answer" not in timeout_error.rag
+        assert timeout_error.request_bodies == [call["payload"] for call in _stub.CALLS] and len(_stub.CALLS) == 2
         store.close()
 
     with tempfile.TemporaryDirectory(prefix="rag-citations-") as temp:

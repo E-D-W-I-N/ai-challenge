@@ -32,21 +32,8 @@
       <header class="workspace-head">
         <button class="icon-btn" id="restore-sidebar" type="button" aria-label="Показать список чатов" aria-controls="sidebar" aria-expanded="true"></button>
         <h1 id="chat-title">AI Challenge</h1>
-        <div class="workspace-switch" role="tablist" aria-label="Рабочая область">
-          <button id="workspace-chat" class="workspace-tab active" type="button" role="tab" aria-selected="true" aria-controls="chat-workspace">Чат</button>
-          <button id="workspace-settings" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="panel" tabindex="-1">Настройки</button>
-        </div>
-        <div class="profile-control">
-          <button id="profile-toggle" class="profile-toggle" type="button" aria-label="Профиль пользователя" aria-expanded="false" aria-controls="profile-menu">
-            <span class="avatar" aria-hidden="true"></span><span class="profile-chevron" aria-hidden="true"></span>
-          </button>
-          <section class="profile-menu hidden" id="profile-menu" aria-label="Профиль пользователя">
-            <h2>Профиль пользователя</h2>
-            <p class="hint">Как ассистент отвечает вам во всех чатах</p>
-            <div id="profile-summary" role="status"></div>
-            <button id="profile-edit" class="primary-btn" type="button">Редактировать профиль</button>
-          </section>
-        </div>
+        <button id="workspace-chat" class="workspace-return" type="button" aria-controls="chat-workspace" hidden>← Вернуться в чат</button>
+        <button id="app-settings" class="icon-btn app-settings-button" type="button" aria-label="Настройки приложения" title="Настройки приложения" aria-controls="panel"></button>
       </header>
       <div class="task-head hidden" id="task-head" role="status"></div>
     <section class="chat" id="chat-workspace" role="tabpanel" aria-labelledby="workspace-chat">
@@ -64,21 +51,22 @@
       </form>
     </section>
 
-      <section class="panel hidden" id="panel" role="tabpanel" aria-labelledby="workspace-settings">
+      <section class="panel hidden" id="panel" role="tabpanel" aria-labelledby="settings-domain">
         <nav class="settings-nav" aria-label="Разделы настроек">
+          <p id="settings-domain" class="settings-domain">Настройки чата</p>
           <div class="tabs" role="tablist" aria-label="Настройки" aria-orientation="vertical">
-<button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab" aria-controls="tab-model" aria-selected="true" tabindex="0"><span class="tab-icon" aria-hidden="true"></span>Модель</button>
-<button class="tab" id="tab-btn-agent" data-tab="agent" type="button" role="tab" aria-controls="tab-agent" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Агент</button>
-<button class="tab" id="tab-btn-memory" data-tab="memory" type="button" role="tab" aria-controls="tab-memory" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Память</button>
-<button class="tab" id="tab-btn-profile" data-tab="profile" type="button" role="tab" aria-controls="tab-profile" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Профиль</button>
-<button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button" role="tab" aria-controls="tab-invariants" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Инварианты</button>
-<button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button" role="tab" aria-controls="tab-mcp" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Инструменты</button>
-<button class="tab" id="tab-btn-rag" data-tab="rag" type="button" role="tab" aria-controls="tab-rag" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span>Работа RAG</button>
+<button class="tab active" id="tab-btn-model" data-tab="model" type="button" role="tab" aria-controls="tab-model" aria-selected="true" tabindex="0"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Модель</span></button>
+<button class="tab" id="tab-btn-agent" data-tab="agent" type="button" role="tab" aria-controls="tab-agent" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Агент</span></button>
+<button class="tab" id="tab-btn-memory" data-tab="memory" type="button" role="tab" aria-controls="tab-memory" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Память</span></button>
+<button class="tab" id="tab-btn-profile" data-tab="profile" type="button" role="tab" aria-controls="tab-profile" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Профиль</span></button>
+<button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button" role="tab" aria-controls="tab-invariants" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Инварианты</span></button>
+<button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button" role="tab" aria-controls="tab-mcp" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Инструменты</span></button>
+<button class="tab" id="tab-btn-rag" data-tab="rag" type="button" role="tab" aria-controls="tab-rag" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Работа RAG</span></button>
           </div>
         </nav>
         <div class="panel-body" id="panel-body">
           <header class="settings-head">
-            <div><h2 id="settings-title">Модель</h2><p id="settings-description">Параметры ответа и генерации</p><span class="scope-badge" id="settings-scope">Для текущего чата</span></div>
+            <div><h2 id="settings-title">Модель</h2><p id="settings-description">Параметры ответа и генерации</p><span class="scope-badge" id="settings-scope" hidden>Для текущего чата</span></div>
             <div class="save-status" id="save-status" role="status"></div>
           </header>
           <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель, агента и поиск RAG для чата.</p>
@@ -86,26 +74,22 @@
           <div id="rag-current-chat">
             <span class="scope-badge">Для текущего чата</span>
             <div class="settings-card">
-            <p class="hint">Настройки применяются к следующим ответам.</p>
-            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
-            <p id="rag-chat-help" class="hint">Поиск в опубликованном индексе. Источники сохраняются вместе с ответом.</p>
+            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox"> Использовать RAG в этом чате</label>
             <div id="rag-chat-settings" class="rag-chat-settings hidden">
+
               <div class="rag-chat-options">
                 <label class="rag-toggle"><input id="f-rag_rewrite_enabled" class="control" type="checkbox"> Уточнение запроса (Rewrite)</label>
-                <label class="rag-toggle"><input id="f-rag_filter_enabled" class="control" type="checkbox"> Отбор по релевантности (Filtering)</label>
+                <label class="rag-toggle"><input id="f-rag_filter_enabled" class="control" type="checkbox"> Фильтр cosine (Filtering)</label>
+                <label class="rag-toggle"><input id="f-rag_rerank_enabled" class="control" type="checkbox"> Ранжирование (Reranking)</label>
               </div>
-              <p id="rag-rewrite-help" class="hint hidden">Переформулирование использует модель чата и последние 3 пары вопрос/ответ; исходный вопрос остаётся в запросе ответа.</p>
-              <div id="rag-answer-safeguard" class="rag-answer-safeguard">
-                <label class="field"><span class="field-label">Минимальный cosine для ответа</span><input id="f-rag_similarity_threshold" class="control" type="number" min="-1" max="1" step="0.05" value="0.3" aria-describedby="rag-safeguard-help"></label>
-                <p id="rag-safeguard-help" class="hint">Защита от слабого контекста действует при включённом RAG, даже без Filtering. Этот же порог использует фильтр.</p>
-              </div>
-              <details id="rag-chat-parameters" class="rag-chat-parameters hidden"><summary>Параметры поиска</summary>
+              <div id="rag-chat-parameters" class="rag-chat-parameters hidden">
                 <div class="rag-chat-numbers">
-                  <label class="field"><span class="field-label">Кандидатов до фильтра</span><input id="f-rag_candidates_k" class="control" type="number" min="1" max="100" step="1" value="20"></label>
-                  <label class="field"><span class="field-label">Фрагментов после фильтра</span><input id="f-rag_final_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
+                  <label class="field"><span class="field-label">Количество чанков</span><input id="f-rag_top_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
+                  <label class="field" id="rag-threshold-field"><span class="field-label">Минимальный cosine для ответа</span><input id="f-rag_similarity_threshold" class="control" type="number" min="-1" max="1" step="0.05" value="0.3" aria-describedby="rag-safeguard-help"></label>
                 </div>
-                <p class="hint">Фильтр оставляет фрагменты с cosine не ниже порога и ограничивает их количество. Итоговый лимит не больше числа кандидатов. При выключенном RAG этапы поиска пропускаются.</p>
-              </details>
+              </div>
+              <p id="rag-safeguard-help" class="hint">Порог защиты от слабого контекста действует при включённом RAG, даже без Filtering. Этот же порог использует фильтр.</p>
+              <div id="rag-rerank-fields" class="hidden"><div id="rag-rerank-picker"></div></div>
             </div>
             </div>
           </div>
@@ -124,10 +108,7 @@
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
             <label class="field"><span class="field-label">Подготовка документов</span><select class="control" id="rag-preparation-strategy"><option value="programmatic">Кодом</option><option value="llm">Полностью через LLM</option></select></label>
             <div id="rag-preparation-fields" hidden>
-              <label class="field"><span class="field-label">Сервер LLM</span><select class="control" id="rag-preparation-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
-              <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-preparation-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
-              <label class="field"><span class="field-label">Модель подготовки документов</span><select class="control" id="rag-preparation-model" aria-describedby="rag-preparation-model-status"><option value="openai/gpt-6-luna">openai/gpt-6-luna</option></select></label>
-              <div class="rag-actions"><button id="rag-preparation-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-preparation-model-status" class="hint" role="status"></span></div>
+              <div id="rag-preparation-picker"></div>
               <label class="field"><span class="field-label">Ожидание ответа, с</span><input class="control" id="rag-preparation-timeout-seconds" type="number" min="1" max="3600" value="600"></label>
               <p class="hint">LLM очищает HTML и восстанавливает структуру документа без пересказа.</p>
             </div>
@@ -136,10 +117,7 @@
             <div id="rag-chunks-controls" class="rag-stage-controls" hidden>
             <label class="field"><span class="field-label">Способ разбиения</span><select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
             <div id="rag-semantic-fields" hidden>
-              <label class="field"><span class="field-label">Сервер LLM</span><select class="control" id="rag-semantic-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
-              <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
-              <label class="field"><span class="field-label">Модель для границ чанков</span><select class="control" id="rag-semantic-model" aria-describedby="rag-model-status"><option value="openai/gpt-6-luna">openai/gpt-6-luna</option></select></label>
-              <div class="rag-actions"><button id="rag-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-model-status" class="hint" role="status"></span></div>
+              <div id="rag-semantic-picker"></div>
               <p class="hint">Выберите генеративную модель. LLM выбирает границы исходного текста. Повторное разбиение использует кэш.</p>
             </div>
             <label class="field" for="rag-size"><span id="rag-size-label" class="field-label">Размер чанка, символов</span><input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
@@ -150,9 +128,7 @@
             </div>
             </div>
             <div id="rag-embeddings-controls" class="rag-stage-controls" hidden>
-            <label class="field"><span class="field-label">URL сервера эмбеддингов</span><input class="control" id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
-            <label class="field"><span class="field-label">Модель эмбеддингов</span><select class="control" id="rag-model" aria-describedby="rag-embedding-model-status"><option value="Qwen3-Embedding-0.6B-8bit">Qwen3-Embedding-0.6B-8bit</option></select></label>
-            <div class="rag-actions"><button id="rag-embedding-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-embedding-model-status" class="hint" role="status"></span></div>
+            <div id="rag-embedding-picker"></div>
             <details class="rag-detail"><summary>Параметры эмбеддингов</summary><label class="field"><span class="field-label">Размерность (пусто — от сервера)</span><input class="control" id="rag-dimensions" type="number" min="1"></label><label class="field"><span class="field-label">Ревизия модели</span><input class="control" id="rag-revision" type="text" value="1"></label></details>
             <div class="rag-actions">
             <button id="rag-embed" class="primary-btn" type="button">Создать эмбеддинги</button>
@@ -173,11 +149,9 @@
           <div id="rag-chunk" class="settings-card rag-result"></div>
           </div>
         </section>
-        <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
-          <label class="field">
-            <span class="field-label">Модель</span>
-            <select id="f-model" class="control"></select>
-          </label>
+        <section class="tab-page" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
+          <div id="model-chat-settings" class="settings-group"><span class="scope-badge">Для текущего чата</span>
+          <div class="settings-card"><div id="chat-model-picker"></div>
           <div class="warn hidden" id="model-warn" role="status"></div>
 
           <div class="grid2">
@@ -191,6 +165,7 @@
             </label>
           </div>
 
+          <details class="model-parameters"><summary>Дополнительные параметры генерации</summary>
           <div class="grid3">
             <label class="field">
               <span class="field-label">Top P</span>
@@ -241,6 +216,13 @@
           </label>
 
           <p class="hint">Пустое поле — параметр не отправляется вовсе.</p>
+          </details></div></div>
+          <div id="model-app-settings" class="settings-group" hidden><span class="scope-badge">Для всего приложения</span>
+          <div class="settings-card"><h3>OpenAI-совместимый сервер</h3>
+            <label class="field"><span class="field-label">URL сервера</span><input id="compatible-base-url" type="url" class="control" placeholder="http://127.0.0.1:8005/v1"></label>
+            <p class="hint">Один сервер для всех сценариев. Ключ задаётся на сервере приложения.</p>
+            <p id="model-settings-status" class="hint" role="status"></p>
+          </div></div>
         </section>
 
         <section class="tab-page hidden" id="tab-agent" role="tabpanel" aria-labelledby="tab-btn-agent" tabindex="0">
@@ -275,12 +257,12 @@
 
         <section class="tab-page hidden" id="tab-memory" role="tabpanel" aria-labelledby="tab-btn-memory" tabindex="0">
 
-          <div class="mem-layer">
+          <div class="mem-layer" id="mem-short-layer">
             <h3 class="mem-title">Краткосрочная — реплики</h3><p class="layer-scope">Для текущего чата</p>
             <div class="mem-body" id="mem-short"></div>
           </div>
 
-          <div class="mem-layer">
+          <div class="mem-layer" id="mem-working-layer">
             <h3 class="mem-title">Рабочая — записи о задаче</h3><p class="layer-scope">Для текущего чата</p>
             <div class="mem-body" id="mem-working"></div>
 
@@ -301,7 +283,7 @@
             </div>
           </div>
 
-          <div class="mem-layer">
+          <div class="mem-layer" id="mem-long-layer" hidden>
             <h3 class="mem-title">Долговременная — записи навсегда</h3><p class="layer-scope">Для всех чатов</p>
             <div class="mem-body" id="mem-long"></div>
 
@@ -370,13 +352,14 @@
 
         <section class="tab-page hidden" id="tab-mcp" role="tabpanel" aria-labelledby="tab-btn-mcp" tabindex="0">
           <div class="mem-layer">
-            <h3 class="mem-title">Инструменты MCP</h3>
-            <p class="mem-note">Запустите MCP-сервис в отдельном терминале, затем укажите его Streamable HTTP URL. Отключение закрывает соединение; сервис продолжает работать.</p>
+            <h3 class="mem-title" id="mcp-heading">Инструменты MCP</h3>
+            <p id="mcp-chat-help" class="mem-note" hidden>Напоминания этого чата. Подключения управляются в настройках приложения.</p>
+            <div id="mcp-application-controls" hidden><p class="mem-note">Запустите MCP-сервис в отдельном терминале, затем укажите его Streamable HTTP URL. Отключение закрывает соединение; сервис продолжает работать.</p>
             <form id="mcp-config-form">
               <div id="mcp-config-rows"></div>
               <div class="mcp-config-actions"><button id="mcp-add" type="button" class="mcp-button">Добавить сервер</button><button id="mcp-save" type="submit" class="mem-add">Сохранить URL</button></div>
               <p id="mcp-config-status" class="hint" role="status"></p>
-            </form>
+            </form></div>
             <div class="mem-body" id="mcp-list"></div>
           </div>
         </section>
@@ -388,6 +371,7 @@
   </div>
   <script src="/static/text.js"></script>
   <script src="/static/records.js"></script>
+  <script src="/static/models.js"></script>
   <script src="/static/rag.js"></script>
   <script src="/static/app.js"></script>
 </body>

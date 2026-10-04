@@ -200,7 +200,8 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 PATCHABLE = (
     "label",
     "rag_enabled", "rag_rewrite_enabled", "rag_filter_enabled",
-    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold",
+    "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model",
+    "provider",
     "system",
     "model",
     "stop",
@@ -221,12 +222,12 @@ def _rag_enabled(payload: dict, where: str = "") -> bool:
 
 def _rag_settings(payload: dict, where: str = "") -> dict:
     values = {}
-    for name in ("rag_rewrite_enabled", "rag_filter_enabled"):
-        value = payload.get(name, True)
+    for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_rerank_enabled"):
+        value = payload.get(name, name != "rag_rerank_enabled")
         if type(value) is not bool:
             raise HTTPException(400, detail=f"{where}{name}: boolean true/false")
         values[name] = value
-    for name, default in (("rag_candidates_k", 20), ("rag_final_k", 5)):
+    for name, default in (("rag_top_k", 5),):
         value = payload.get(name, default)
         if type(value) is not int or not 1 <= value <= 100:
             raise HTTPException(400, detail=f"{where}{name}: integer 1..100")
@@ -235,8 +236,11 @@ def _rag_settings(payload: dict, where: str = "") -> dict:
     if type(value) not in (int, float) or not -1 <= value <= 1:
         raise HTTPException(400, detail=f"{where}rag_similarity_threshold: number -1..1")
     values["rag_similarity_threshold"] = float(value)
-    if values["rag_final_k"] > values["rag_candidates_k"]:
-        raise HTTPException(400, detail=f"{where}rag_final_k must be <= rag_candidates_k")
+    values["rag_rerank_provider"] = _choice_field(payload, "rag_rerank_provider", ("openrouter", "compatible"), "openrouter", where)
+    model = payload.get("rag_rerank_model", DEFAULT_GENERATIVE_MODEL)
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(400, detail="rag_rerank_model: nonempty model ID")
+    values["rag_rerank_model"] = model.strip()
     return values
 
 
@@ -547,6 +551,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
         model=_model_field(payload, where),
+        provider=_choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter", where),
         rag_enabled=_rag_enabled(payload, where),
         **_rag_settings(payload, where),
         system=_text_field(payload, "system", where),
@@ -623,8 +628,11 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
         else _parse_spec(item, f"agents[{i}].")
         for i, item in enumerate(raw)
     ]
-    context_lengths = await _context_lengths()
+    context_lengths = await _context_lengths() if any(s.provider == "openrouter" for s in specs) else {}
     agents = REGISTRY.create_many(specs, context_lengths=context_lengths)
+    for agent in agents:
+        if agent.spec.provider != "openrouter":
+            agent.context_length = None
     return {
         "created": len(agents),
         "spawn_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -664,7 +672,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
     rag_enabled = _rag_enabled(payload)
-    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold")}, **payload})
+    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
     # Validate the complete patch before mutating the live configuration.
     validated = {}
     for name, parser in (("model", _model_field), ("label", _label_field),
@@ -675,9 +683,16 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         validated["system"] = _text_field(payload, "system")
     if "response_format" in payload:
         validated["response_format"] = _optional_field(payload, "response_format", (dict,), "объект или null")
+    if "provider" in payload:
+        validated["provider"] = _choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter")
     updated_context_length = agent.context_length
-    if "model" in validated:
-        updated_context_length = (await _context_lengths()).get(validated["model"])
+    if "model" in validated or "provider" in validated:
+        updated_context_length = (await _context_lengths()).get(validated.get("model", agent.spec.model)) if validated.get("provider", agent.spec.provider) == "openrouter" else None
+    if validated.get("provider", agent.spec.provider) == "compatible":
+        effective = {name: sampling.get(name, getattr(agent.spec, name)) if name in payload else getattr(agent.spec, name)
+                     for name in ("top_k", "min_p", "repetition_penalty")}
+        if any(value is not None for value in effective.values()):
+            raise HTTPException(400, "Compatible standard chat API: clear top_k, min_p and repetition_penalty")
     for name, value in validated.items():
         setattr(agent.spec, name, value)
     agent.context_length = updated_context_length
@@ -1132,14 +1147,31 @@ async def stop_task(agent_id: str) -> dict:
 # --- каталог моделей ----------------------------------------------------------
 
 
-@app.get("/api/models")
-async def list_models() -> dict:
-    """Каталог моделей для дропдауна — целиком, без отбора."""
+@app.get("/api/model-settings")
+async def get_model_settings() -> dict:
+    from .model_settings import settings
+    return settings(REGISTRY.store)
+
+
+@app.patch("/api/model-settings")
+async def patch_model_settings(request: Request, payload: dict = Body(...)) -> dict:
+    from .request_security import trusted_rag_request
+    trusted_rag_request(request)
+    if not isinstance(payload, dict) or set(payload) != {"compatible_base_url"}:
+        raise HTTPException(400, "Only compatible_base_url is accepted")
     try:
-        models = await catalog.fetch_models()
-    except Exception as exc:  # каталог недоступен — UI не должен падать
-        raise HTTPException(status_code=502, detail=f"каталог моделей недоступен: {exc}") from exc
-    return {"total": len(models), "models": models}
+        return REGISTRY.store.save_model_settings(payload)
+    except ValueError:
+        raise HTTPException(422, "Model URL must be HTTP(S) without credentials, query or fragment") from None
+
+
+@app.get("/api/models")
+async def list_models(request: Request, provider: str = "openrouter", purpose: str = "generation") -> dict:
+    from .request_security import trusted_rag_request
+    from .rag_models import models
+    from .model_settings import settings
+    trusted_rag_request(request)
+    return await models(provider, settings(REGISTRY.store)["compatible_base_url"], purpose)
 
 
 # --- разговор -----------------------------------------------------------------
@@ -1174,8 +1206,8 @@ def _reserve(agent: Agent) -> None:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _require_key() -> None:
-    if not has_key():
+def _require_key(provider="openrouter") -> None:
+    if provider == "openrouter" and not has_key():
         raise HTTPException(
             status_code=503,
             detail="OPENROUTER_API_KEY не найден: скопируйте .env.example в .env и впишите ключ",
@@ -1189,7 +1221,7 @@ async def send_message(
     """Сообщение агенту. Тело — только текст: ленту диалога хранит агент."""
     agent = _agent(agent_id)
     text = _require_text(payload)
-    _require_key()
+    _require_key(agent.spec.provider)
     _reserve(agent)
     return _stream(lambda: _chat_events(agent, text), request, agent.release)
 
@@ -1203,7 +1235,7 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
     неудачная попытка унесла бы и прошлый ответ, и вопрос.
     """
     agent = _agent(agent_id)
-    _require_key()
+    _require_key(agent.spec.provider)
     _reserve(agent)
     taken = agent.take_last_exchange()
     if taken is None:

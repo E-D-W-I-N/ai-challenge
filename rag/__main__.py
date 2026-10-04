@@ -22,28 +22,28 @@ from .index import Index, Operation, build_index, stage_chunks, stage_embeddings
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=storage_root(), help="Snapshot directory (default data/rag)")
+    from shared_models import DEFAULT_COMPATIBLE_BASE_URL, endpoint, validate_url
+    parser.add_argument("--compatible-base-url", default=DEFAULT_COMPATIBLE_BASE_URL)
     commands = parser.add_subparsers(dest="command", required=True)
     load = commands.add_parser("ingest", help="Explicit URLs/local HTML, never crawl")
     load.add_argument("--url", action="append", default=[])
     load.add_argument("--manifest", type=Path, help='JSON list: {"url":...} or {"path":...,"source":...}; relative paths resolve by manifest')
     load.add_argument("--preparation-strategy", choices=("programmatic", "llm"), default="programmatic")
-    load.add_argument("--preparation-base-url", default=PreparationConfig.base_url)
     load.add_argument("--preparation-model", default=PreparationConfig.model)
-    load.add_argument("--preparation-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
+    load.add_argument("--preparation-provider", choices=("openrouter", "compatible"), default="openrouter")
     load.add_argument("--preparation-timeout", type=float, default=PreparationConfig.timeout_seconds)
     split = commands.add_parser("chunks")
     split.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="fixed")
     split.add_argument("--size", type=int, default=1200)
     split.add_argument("--overlap", type=int, default=180)
-    split.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
     split.add_argument("--semantic-model", default=SemanticConfig.model)
-    split.add_argument("--semantic-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
+    split.add_argument("--semantic-provider", choices=("openrouter", "compatible"), default="openrouter")
     commands.add_parser("save")
     clear_command = commands.add_parser("clear")
     clear_command.add_argument("stage", choices=("chunks", "embeddings", "index"))
     for name in ("index", "compare", "embed"):
         command = commands.add_parser(name)
-        command.add_argument("--base-url", default=EmbeddingConfig.base_url)
+        command.add_argument("--provider", choices=("openrouter", "compatible"), default="compatible")
         command.add_argument("--model", default=EmbeddingConfig.model)
         command.add_argument("--dimensions", type=int)
         command.add_argument("--revision", default="1", help="Change when replacing weights under same model ID")
@@ -52,13 +52,13 @@ def main(argv=None):
             command.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="structural")
             command.add_argument("--size", type=int, default=1200)
             command.add_argument("--overlap", type=int, default=180)
-            command.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
             command.add_argument("--semantic-model", default=SemanticConfig.model)
-            command.add_argument("--semantic-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
+            command.add_argument("--semantic-provider", choices=("openrouter", "compatible"), default="openrouter")
     commands.add_parser("status")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
+        validate_url(args.compatible_base_url)
         if args.command == "ingest":
             inputs = [{"url": url} for url in args.url]
             if args.manifest:
@@ -73,21 +73,21 @@ def main(argv=None):
             if not inputs:
                 raise ValueError("Provide --url or --manifest")
             with Operation(root, "ingest") as operation:
-                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(args.preparation_base_url, args.preparation_model, args.preparation_timeout, auth_mode=args.preparation_auth_mode))
+                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(endpoint(args.preparation_provider, args.compatible_base_url), args.preparation_model, args.preparation_timeout, provider=args.preparation_provider))
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
         elif args.command == "clear":
             with Operation(root, "delete_" + args.stage) as operation:
                 result = clear(root, args.stage, operation)
         elif args.command == "chunks":
-            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model, auth_mode=args.semantic_auth_mode))
+            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(endpoint(args.semantic_provider, args.compatible_base_url), args.semantic_model, provider=args.semantic_provider))
         elif args.command == "save":
             result = save_index(root)
         elif args.command == "status":
             result = Index(root).status()
         else:
-            config = EmbeddingConfig(args.base_url, args.model, args.dimensions, args.revision)
+            config = EmbeddingConfig(endpoint(args.provider, args.compatible_base_url), args.model, args.dimensions, args.revision, provider=args.provider)
             if args.command == "index":
-                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model, auth_mode=args.semantic_auth_mode))
+                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(endpoint(args.semantic_provider, args.compatible_base_url), args.semantic_model, provider=args.semantic_provider))
             elif args.command == "embed":
                 result = stage_embeddings(root, config, args.batch_size)
             else:

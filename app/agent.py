@@ -25,8 +25,9 @@ from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, capture_requests, stream_completion
 from .mcp import MANAGER
-from .rag import (lookup as rag_lookup, rewrite as rag_rewrite, history_pairs, NO_HITS,
-                  ANSWER_PROMPT, CitationError, validate_answer, sufficient_context)
+from .rag import (lookup as rag_lookup, rewrite as rag_rewrite, rerank as rag_rerank,
+                  format_context, history_pairs, NO_HITS, ANSWER_PROMPT, CitationError,
+                  validate_answer, sufficient_context)
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -1571,7 +1572,27 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
-    async def ask(self, user_text: str, *, scheduled: dict | None = None,
+    async def ask(self, user_text: str, **options) -> AsyncIterator[dict]:
+        from shared_models import bind_compatible_url
+        from .model_settings import settings
+        from .config import api_key
+        api_key()
+        frozen_url = settings(self.store)["compatible_base_url"]
+        response = self._ask(user_text, **options)
+        try:
+            while True:
+                # Tokens cannot cross generator yields: consumers may resume in another task.
+                with bind_compatible_url(frozen_url):
+                    try:
+                        event = await anext(response)
+                    except StopAsyncIteration:
+                        break
+                yield event
+        finally:
+            with bind_compatible_url(frozen_url):
+                await response.aclose()
+
+    async def _ask(self, user_text: str, *, scheduled: dict | None = None,
                   can_run=None, request_bodies: list[dict] | None = None,
                   rag_result: dict | None = None) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
@@ -1618,6 +1639,10 @@ class Agent:
                 rag_result.clear()
             preparation_requests = []
             rewrite_result = None
+            rerank_result = None
+            def preparation_usage(extra=None):
+                known = [u for u in ((rewrite_result or {}).get("usage"), (rerank_result or {}).get("usage"), extra) if u]
+                return {**(known[-1] if known else {}), **_summed_usage(known)} if known else None
             try:
                 if spec.rag_enabled:
                     if "messages" in spec.extra_body:
@@ -1630,7 +1655,7 @@ class Agent:
                         if not cancel.is_set() and (can_run is None or await can_run()):
                             with capture_requests() as preparation_requests:
                                 rewrite_result = await rag_rewrite(user_text, used_history, spec.model,
-                                                                   stream_completion, cancel)
+                                                                   stream_completion, cancel, provider=spec.provider)
                             query = rewrite_result["query"]
                     if not cancel.is_set() and (can_run is None or await can_run()):
                         yield {"type": "retrieval", "stage": "search", "query": query}
@@ -1649,9 +1674,25 @@ class Agent:
                             if spec.rag_filter_enabled:
                                 yield {"type": "retrieval", "stage": "filter", "query": query,
                                        "count": len(rag_snapshot["hits"])}
+                            if spec.rag_rerank_enabled and sufficient_context(rag_snapshot, spec.rag_similarity_threshold) and not cancel.is_set() and (can_run is None or await can_run()):
+                                yield {"type": "retrieval", "stage": "rerank", "query": query, "count": len(rag_snapshot["hits"])}
+                                if not cancel.is_set() and (can_run is None or await can_run()):
+                                    with capture_requests() as rerank_requests:
+                                        try:
+                                            rerank_result = await rag_rerank(user_text, rag_snapshot, spec, stream_completion, cancel)
+                                        finally:
+                                            preparation_requests.extend(copy.deepcopy(rerank_requests))
+                                    if not rerank_result.get("cancelled"):
+                                        original_hits = rag_snapshot["hits"]
+                                        rag_snapshot["hits"] = [original_hits[i - 1] for i in rerank_result["source_ids"]]
+                                        rag_snapshot["context"] = format_context(rag_snapshot["hits"])
+                                        rag_snapshot["rerank"] = copy.deepcopy(rerank_result)
+                                        rag_snapshot["timings"]["rerank_seconds"] = rerank_result["duration_seconds"]
+                                        if rag_result is not None:
+                                            rag_result.update(copy.deepcopy(rag_snapshot))
                 if cancel.is_set() or (can_run is not None and not await can_run()):
                     yield {"type": "done", "text": "", "reasoning": "",
-                           "metrics": (rewrite_result or {}).get("usage"),
+                           "metrics": preparation_usage(),
                            "request_bodies": copy.deepcopy(preparation_requests),
                            "answer_index": None, "committed": False, "cancelled": True,
                            "question": user_text, "error": "генерация отменена", "rag": None}
@@ -1698,7 +1739,7 @@ class Agent:
                         yield {"type": "compressing", "strategy": call}
                         if cancel.is_set() or (can_run is not None and not await can_run()):
                             yield {"type": "done", "text": "", "reasoning": "",
-                                   "metrics": (rewrite_result or {}).get("usage"),
+                                   "metrics": preparation_usage(),
                                    "request_bodies": copy.deepcopy(preparation_requests),
                            "answer_index": None, "committed": False, "cancelled": True,
                                    "question": user_text, "error": "генерация отменена", "rag": None}
@@ -1774,7 +1815,10 @@ class Agent:
                 raise
             except Exception as exc:
                 failure = f"{type(exc).__name__}: {exc}"
-                preparation_metrics = getattr(exc, "usage", None) or (rewrite_result or {}).get("usage")
+                preparation_metrics = getattr(exc, "usage", None)
+                known_preparation = [u for u in ((rewrite_result or {}).get("usage"), (rerank_result or {}).get("usage"), preparation_metrics) if u]
+                if known_preparation:
+                    preparation_metrics = {**(preparation_metrics or {}), **_summed_usage(known_preparation)}
                 if request_bodies is not None:
                     request_bodies[:] = copy.deepcopy(preparation_requests)
                 yield {"type": "error", "message": failure, "metrics": preparation_metrics,
@@ -1799,6 +1843,8 @@ class Agent:
             iteration_metrics: list[dict] = []
             if rag_snapshot and (rag_snapshot.get("rewrite") or {}).get("usage"):
                 iteration_metrics.append(rag_snapshot["rewrite"]["usage"])
+            if rag_snapshot and (rag_snapshot.get("rerank") or {}).get("usage"):
+                iteration_metrics.append(rag_snapshot["rerank"]["usage"])
             # Рабочий список сообщений: промпт плюс ход цикла вызовов.
             # В диалоговую историю он не попадает — следующий обмен видит
             # итоговый ответ. Полный work сохраняется в request_bodies.
@@ -2129,8 +2175,9 @@ def spec_as_dict(
         "id": agent_id,
         "label": spec.label,
         "model": spec.model,
+        "provider": spec.provider,
         "rag_enabled": spec.rag_enabled,
-        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold")},
+        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")},
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2179,6 +2226,8 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
     if not known.get("model"):
         return fallback
     known.setdefault("label", fallback.label)
+    known.setdefault("rag_top_k", (config or {}).get("rag_final_k", 5))
+    known["rag_rerank_enabled"] = known.get("rag_rerank_enabled") is True
     known["rag_enabled"] = known.get("rag_enabled") is True
     known["rag_rewrite_enabled"] = known.get("rag_rewrite_enabled") is True
     known["rag_filter_enabled"] = known.get("rag_filter_enabled") is True

@@ -25,7 +25,8 @@ from rag.index import Index, Operation, build_index
 
 @patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": ""})
 def check_rag():
-    assert EmbeddingConfig().model == "Qwen3-Embedding-0.6B-8bit"
+    from shared_models import DEFAULT_EMBEDDING_MODEL
+    assert EmbeddingConfig().model == DEFAULT_EMBEDDING_MODEL
     legacy_config = EmbeddingConfig(model="mlx-community/Qwen3-Embedding-0.6B-8bit")
     assert legacy_config.model == "mlx-community/Qwen3-Embedding-0.6B-8bit"
     assert legacy_config.fingerprint() != EmbeddingConfig().fingerprint()
@@ -103,9 +104,9 @@ def check_rag():
                 raise AssertionError("Frameset accepted as article")
             except ValueError:
                 pass
-            config = EmbeddingConfig(f"http://127.0.0.1:{server.server_port}/v1", "offline-test")
+            config = EmbeddingConfig(f"http://127.0.0.1:{server.server_port}/v1", "offline-test", provider="compatible")
             # CLI's actual HTTP traffic and durable index survive process exit.
-            command = [sys.executable, "-m", "rag", "--root", str(root), "index", "--base-url", config.base_url, "--model", config.model, "--batch-size", "2"]
+            command = [sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", config.base_url, "index", "--provider", "compatible", "--model", config.model, "--batch-size", "2"]
             fake_keys = ("offline-auth-first", "offline-auth-rotated", "offline-auth-rejected")
             mode["key"] = fake_keys[0]
             with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": fake_keys[0]}):
@@ -191,7 +192,7 @@ def check_rag():
                 except ValueError:
                     pass
             mode["value"] = "ok"
-            compare = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "compare", "--base-url", config.base_url, "--model", config.model], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
+            compare = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", config.base_url, "compare", "--provider", "compatible", "--model", config.model], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
             assert compare.returncode == 0, compare.stderr
             comparison = json.loads((root / "comparison.json").read_text())
             assert set(comparison["strategies"]) == {"fixed", "structural"}
