@@ -859,7 +859,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-toggle .control { width: 17px; height: 17px; margin: 0; flex: none; }
 .card-rag { margin: 16px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
 .rag-answer-sources { margin: 8px 0 12px; padding-left: 22px; font-size: 13px; line-height: 1.6; }
-.rag-source-url { font-size: 12px; }
+.rag-source-url { display: block; margin-top: 2px; font-size: 12px; }
 .rag-answer-sources li, #rag-answer-snapshot p, #rag-answer-snapshot summary { overflow-wrap: anywhere; }
 .rag-snapshot-text, .rag-snapshot-context { white-space: pre-wrap; overflow-wrap: anywhere; }
 #rag-answer-snapshot { gap: 12px; }
@@ -869,10 +869,17 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-chat-settings { display: grid; gap: 20px; }
 .rag-chat-options { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .rag-chat-parameters > summary { cursor: pointer; color: var(--muted); }
-.rag-chat-numbers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.rag-chat-numbers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
 .rag-chat-numbers .field-label { overflow-wrap: anywhere; }
 @media (max-width: 1000px) { .rag-chat-numbers { grid-template-columns: 1fr; } }
 
 .failed-request-info { max-height: 220px; overflow: auto; color: var(--muted); }
 .failed-request-info > summary { cursor: pointer; }
 .failed-request-info pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.rag-answer-safeguard { display: grid; gap: 8px; }
+.rag-answer-safeguard > .field { max-width: 280px; }
+.rag-source-card { padding: 10px 12px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 8px; scroll-margin-top: 20px; }
+.rag-source-card:target { border-color: var(--accent); background: var(--accent-soft); }
+.rag-source-quote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; padding-left: 12px; border-left: 2px solid var(--line); }
+.rag-citation-ref { white-space: nowrap; }
