@@ -829,13 +829,18 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 #rag-manifest-label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .rag-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .rag-actions .danger { color: var(--danger); }
-.rag-chunk-usage { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; flex: 1 1 15rem; }
 .rag-result { gap: 12px; }
-.rag-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.rag-item button { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
-.rag-item .muted, .rag-pager { font-size: 12px; }
+#rag-documents, #rag-chunks { gap: 5px; padding: 14px; }
+#rag-documents > h3, #rag-chunks > h3 { margin-bottom: 5px; }
+.rag-list-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; width: 100%; min-width: 0; min-height: 32px; padding: 6px 9px; white-space: normal; text-align: left; line-height: 1.4; }
+.rag-row-title { flex: 1 1 15rem; min-width: 0; overflow-wrap: anywhere; }
+.rag-row-meta, .rag-pager { font-size: 12px; }
+.rag-row-meta { overflow-wrap: anywhere; }
+.rag-list-row:hover { border-color: var(--accent); }
+.rag-list-row.selected { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.rag-list-row.selected .rag-row-title { font-weight: 600; }
+.rag-list-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .rag-pager { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-#rag-chunks > button { align-self: stretch; white-space: normal; text-align: left; overflow-wrap: anywhere; }
 .rag-detail { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-width: 0; }
 .rag-detail summary { padding: 10px 12px; cursor: pointer; overflow-wrap: anywhere; font-size: 13px; color: var(--muted); line-height: 1.5; }
 .rag-detail > label { margin: 0 12px 12px; }

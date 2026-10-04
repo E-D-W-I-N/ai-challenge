@@ -92,7 +92,58 @@ async function main() {
     check("Failure distinct from previous committed index", $("#rag-status").textContent === "Ошибка операции"
       && $("#rag-error").textContent === "embedding failed" && $("#rag-index").textContent.includes("15555"));
   });
-  await scenario("RAG reveals validated stages and keeps only durable current semantic accounting", async () => {
+  await scenario("RAG selection follows IDs, pages and parent changes while rejecting stale children", async () => {
+    const {client, server, $, click} = freshClient({agents: []});
+    const stages = {corpus: {fingerprint: "corpus", urls: []}, chunks: {fingerprint: "chunks"}, embeddings: {embedding_fingerprint: "vectors"}};
+    const status = {state: "ready", stages};
+    const docs = Array.from({length: 25}, (_, i) => ({document_id: "doc-" + i, title: "Same title", words: i + 1, characters: 30}));
+    const chunks = Array.from({length: 25}, (_, i) => ({chunk_id: "chunk-" + i, section: "Same section", start: i, end: i + 1}));
+    server.respond("GET", "/api/rag/status", status);
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: docs});
+    server.respond("GET", "/api/rag/documents?offset=25&limit=25&working=true", {items: [{...docs[0], document_id: "page-two"}]});
+    for (const doc of docs.slice(0, 2)) {
+      server.respond("GET", "/api/rag/documents/" + doc.document_id + "?offset=0&limit=10000", {text: doc.document_id, characters: 30});
+      server.respond("GET", "/api/rag/documents/" + doc.document_id + "/chunks?offset=0&limit=25&working=true", {items: chunks});
+    }
+    server.respond("GET", "/api/rag/documents/doc-0/chunks?offset=25&limit=25&working=true", {items: [{...chunks[0], chunk_id: "other-page"}]});
+    server.respond("GET", "/api/rag/chunks/chunk-0?working=true", {chunk_id: "chunk-0", text: "Selected source"});
+    const rows = (id) => $("#rag-" + id).querySelectorAll(".rag-list-row");
+    const active = (row) => row.attributes["aria-pressed"] === "true" && row.classList.contains("selected");
+    const press = (node) => node.dispatchEvent(new Evt("click"));
+    const page = (id, label) => press($("#rag-" + id).querySelector(".rag-pager").querySelectorAll("button").find((node) => node.textContent === label));
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("No item is selected implicitly", rows("documents").every((row) => row.attributes["aria-pressed"] === "false"));
+    press(rows("documents")[0]); await settle(); press(rows("chunks")[0]); await settle();
+    check("Duplicate titles and sections select only the matching ID", active(rows("documents")[0]) && !active(rows("documents")[1])
+      && active(rows("chunks")[0]) && !active(rows("chunks")[1]));
+    const selectedDetail = $("#rag-chunk").querySelector("details"); selectedDetail.open = true;
+    await settle(1100); click("rag-step-chunks"); await settle();
+    check("Polling and stage navigation preserve mounted selection within one source", active(rows("documents")[0]) && active(rows("chunks")[0])
+      && $("#rag-chunk").querySelector("details") === selectedDetail && selectedDetail.open);
+    page("chunks", "Далее"); await settle();
+    check("Another chunk page never highlights a matching label", rows("chunks").every((row) => !active(row)) && $("#rag-chunk").textContent.includes("Selected source"));
+    page("chunks", "Назад"); await settle();
+    page("documents", "Далее"); await settle();
+    check("Another document page keeps explicit detail without highlighting a duplicate title", rows("documents").every((row) => !active(row)) && active(rows("chunks")[0]));
+    page("documents", "Назад"); await settle();
+    check("Returning to pages restores highlights by ID", active(rows("documents")[0]) && active(rows("chunks")[0]));
+    click("rag-step-embeddings"); await settle();
+    const vector = $("#rag-chunk").querySelectorAll("details").at(-1), lateVector = deferred(), lateText = deferred(), lateDocument = deferred();
+    server.respond("GET", "/api/rag/chunks/chunk-0?vector=true&working=true", () => lateVector.promise);
+    server.respond("GET", "/api/rag/chunks/chunk-1?working=true", () => lateText.promise);
+    server.respond("GET", "/api/rag/documents/doc-1?offset=0&limit=10000", () => lateDocument.promise);
+    vector.open = true; const vectorFetch = vector.ontoggle(); press(rows("chunks")[1]); await settle();
+    press(rows("documents")[1]);
+    check("Changing parent immediately clears old children while new document is loading", active(rows("documents")[1]) && !active(rows("documents")[0])
+      && !$("#rag-chunk").children.length && !$("#rag-chunks").children.length && !$("#rag-document-preview").children.length);
+    lateText.resolve(json({chunk_id: "chunk-1", text: "Stale child"})); lateVector.resolve(json({vector: [9,9,9]})); await vectorFetch; await settle();
+    check("Late text and vector cannot attach under a new parent", !$("#rag-chunk").children.length && !vector.textContent.includes("[9,9,9]"));
+    lateDocument.resolve(json({text: "doc-1", characters: 30})); await settle();
+    check("New parent has no selected child even when chunk labels and IDs repeat", active(rows("documents")[1]) && rows("chunks").every((row) => !active(row)));
+    stages.corpus.fingerprint = "new-corpus"; await settle(1100);
+    check("Generation invalidation clears selection and children", rows("documents").every((row) => !active(row)) && !$("#rag-chunk").children.length && !$("#rag-chunks").children.length);
+  });
+  await scenario("RAG reveals validated stages and keeps actual operation accounting", async () => {
     const {client, server, $, click} = freshClient({agents: []});
     const stages = {corpus: null, chunks: null, embeddings: null};
     const report = {model: "actual-boundaries", calls: 2, usage: {total_tokens: 120}, cost_usd: 0.003};
@@ -103,9 +154,8 @@ async function main() {
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     const gate = (name) => $("#rag-" + name + "-controls");
-    const usage = $("#rag-chunk-usage");
     check("Legacy published index remains inspectable and deletable without enabling save or unavailable stages", gate("chunks").hidden && gate("embeddings").hidden
-      && !gate("save").hidden && !$("#rag-step-save").disabled && $("#rag-save").disabled && !$("#rag-delete-index").hidden && usage.hidden);
+      && !gate("save").hidden && !$("#rag-step-save").disabled && $("#rag-save").disabled && !$("#rag-delete-index").hidden);
     const oldIndex = status.index;
     server.respond("DELETE", "/api/rag/stages/index", () => { status.index = null; return json({cleared: "index"}); });
     click("rag-delete-index"); await settle();
@@ -119,12 +169,12 @@ async function main() {
     check("Selecting chunks shows one stage", !gate("chunks").hidden && gate("documents").hidden && gate("embeddings").hidden && gate("save").hidden);
     stages.chunks = {fingerprint: "semantic-one", strategy: "semantic", report};
     await settle(1100);
-    check("Chunk completion keeps accounting visible in selected chunk stage", !gate("chunks").hidden && gate("embeddings").hidden);
+    check("Chunk completion keeps selected chunk stage", !gate("chunks").hidden && gate("embeddings").hidden);
     click("rag-step-embeddings");
     const draft = $("#rag-model"), parameters = gate("embeddings").querySelector("details");
     draft.value = "draft-to-preserve"; draft.focus(); parameters.open = true;
-    check("Current semantic chunks reveal embeddings and actual durable model/tokens/USD", !gate("embeddings").hidden && gate("save").hidden
-      && !usage.hidden && usage.textContent.includes("actual-boundaries") && usage.textContent.includes("120") && usage.textContent.includes("0.003 USD"));
+    check("Semantic chunks reveal embeddings and accounting stays in actual operation JSON", !gate("embeddings").hidden && gate("save").hidden
+      && same(JSON.parse($("#rag-operation").querySelector("pre").textContent).semantic_report, report));
     stages.embeddings = {embedding_fingerprint: "current-vectors"};
     await settle(1100);
     check("Vectors unlock index without leaving embeddings or remounting draft, focus or details", gate("save").hidden && !$("#rag-step-save").disabled && !gate("embeddings").hidden && draft.value === "draft-to-preserve"
@@ -137,24 +187,15 @@ async function main() {
     check("Index deletion keeps selected index stage and upstream availability", !gate("save").hidden && !$("#rag-step-save").disabled
       && $("#rag-delete-index").hidden && !$("#rag-save").disabled && stages.embeddings.embedding_fingerprint === "current-vectors");
     click("rag-step-chunks");
-    check("Return to chunks hides index and keeps document selector and accounting", !gate("chunks").hidden && $("#rag-index").hidden
-      && !$("#rag-documents").hidden && !$("#rag-chunks").hidden && !usage.hidden);
-    $("#rag-semantic-model").value = "edited-requested-alias";
-    report.cost_usd = 0.000000000001; await settle(1100);
-    check("Small positive actual USD stays nonzero and edited model cannot replace durable model", usage.textContent.includes("0.000000000001 USD") && usage.textContent.includes("actual-boundaries")
-      && !usage.textContent.includes("edited-requested-alias"));
-    delete report.cost_usd; await settle(1100);
-    check("Legacy durable report has unavailable USD while later operation report is ignored", usage.textContent.includes("стоимость: недоступна"));
+    check("Return to chunks hides index and keeps document selector", !gate("chunks").hidden && $("#rag-index").hidden
+      && !$("#rag-documents").hidden && !$("#rag-chunks").hidden);
     stages.chunks = {fingerprint: "fixed-two", strategy: "fixed"}; stages.embeddings = null;
     await settle(1100);
-    check("Fixed chunks hide semantic accounting and invalidated vectors hide save", usage.hidden && usage.textContent === "" && gate("save").hidden);
-    stages.chunks = {fingerprint: "cached-three", strategy: "semantic", report: {model: "cached-model", calls: 0, usage: {total_tokens: 999}}};
-    await settle(1100);
-    check("Cache-only semantic summary bills zero current tokens and USD", usage.textContent.includes("токены: 0") && usage.textContent.includes("стоимость: 0 USD"));
+    check("Invalidated vectors hide save", gate("save").hidden);
     server.respond("DELETE", "/api/rag/stages/chunks", () => { stages.chunks = null; return json({cleared: "chunks"}); });
     click("rag-delete-chunks"); await settle();
-    check("Deletion hides next stages and summary despite stale complete semantic_report", gate("embeddings").hidden && gate("save").hidden && usage.hidden && usage.textContent === ""
-      && draft.value === "draft-to-preserve" && parameters.open);
+    check("Deletion hides next stages while actual operation report remains inspectable", gate("embeddings").hidden && gate("save").hidden
+      && same(JSON.parse($("#rag-operation").querySelector("pre").textContent).semantic_report, report) && draft.value === "draft-to-preserve" && parameters.open);
     click("rag-step-embeddings");
     check("Unavailable future navigation stays disabled", $("#rag-step-embeddings").disabled && !gate("chunks").hidden);
     stages.corpus = null; await settle(1100);
@@ -191,7 +232,10 @@ async function main() {
       && $("#rag-chunk").textContent.includes(savedChunk.text) && !vector.hidden && requests("GET", "/api/rag/chunks/old-chunk?vector=true").length === 0);
     vector.open = true; await vector.ontoggle();
     check("Index exposes actual saved vector", vector.textContent.includes("[1,0,0]"));
-    click("rag-step-embeddings"); await settle(); await select("rag-documents"); await select("rag-chunks");
+    click("rag-step-embeddings"); await settle();
+    check("Source change resets document and child selection before explicit selection", $("#rag-documents").querySelector(".rag-list-row").attributes["aria-pressed"] === "false"
+      && !$("#rag-chunks").children.length && !$("#rag-chunk").children.length);
+    await select("rag-documents"); await select("rag-chunks");
     const lateVector = deferred(); server.respond("GET", "/api/rag/chunks/new-chunk?vector=true&working=true", () => lateVector.promise);
     vector = $("#rag-chunk").querySelectorAll("details").at(-1); vector.open = true; const loading = vector.ontoggle();
     click("rag-step-save"); await settle(); await select("rag-documents"); await select("rag-chunks");
@@ -226,7 +270,7 @@ async function main() {
     const official = deferred(); server.respond("GET", "/api/models", () => official.promise);
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-chunks"); await settle();
     const model = $("#rag-semantic-model"), status = $("#rag-model-status"), endpoint = $("#rag-semantic-base-url"), provider = $("#rag-semantic-auth-mode");
-    check("Persisted model remains selectable during catalogue loading", model.tagName === "SELECT" && model.value === "persisted-alias"
+    check("Persisted semantic mode seeds maximum-size label and keeps model selectable during catalogue loading", $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && model.tagName === "SELECT" && model.value === "persisted-alias"
       && status.textContent.includes("Загрузка") && $("#rag-model-refresh").disabled);
     const cloud = [{id: "cloud-a", prompt_price_per_m: 1.2, completion_price_per_m: 3.4}, {id: "cloud-b"}];
     official.resolve(json({models: cloud})); await settle();
@@ -309,14 +353,14 @@ async function main() {
       && $("#rag-chunk").textContent.includes("Neutral clean document") && $("#rag-chunk").querySelectorAll("details").at(-1).hidden);
     $("#rag-strategy").value = "fixed"; $("#rag-size").value = "512"; $("#rag-overlap").value = "64";
     click("rag-split"); await settle();
-    check("Chunk button sends configured character size and overlap", same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
+    check("Fixed chunk form retains size label and sends configured character size and overlap", $("#rag-size-label").textContent === "Размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
     click("rag-step-chunks");
     $("#rag-strategy").value = "semantic"; $("#rag-strategy").dispatchEvent(new Evt("change"));
     $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1";
     $("#rag-semantic-base-url").dispatchEvent(new Evt("change")); await settle();
     $("#rag-semantic-model").value = "offline-boundaries";
     click("rag-split"); await settle();
-    check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
+    check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
       {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "openrouter", semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
     $("#rag-semantic-auth-mode").value = "omlx"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
     await settle();
