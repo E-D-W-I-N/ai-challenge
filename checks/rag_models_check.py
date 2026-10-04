@@ -47,6 +47,18 @@ def check_rag_models():
                 except HTTPException as error:
                     assert error.status_code == 502 and "secret" not in error.detail
                 else: raise AssertionError("Malformed catalogue accepted")
+            # Exercise real OR catalogue HTTP even when the shared offline fixture is installed.
+            with patch.object(rag_models.catalog, "fetch_models", getattr(rag_models.catalog, "_offline_original_fetch_models", rag_models.catalog.fetch_models)):
+                for reflected in ("neutral-router-secret", "neutral%2drouter%2dsecret", "neutral-compatible-secret"):
+                    state["payload"] = {"data": [{"id": reflected}]}
+                    try: await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                    except HTTPException as error:
+                        assert error.status_code == 502 and "secret" not in error.detail
+                    else: raise AssertionError("OpenRouter reflected a runtime key")
+                    assert calls[-1] == ("https://openrouter.ai/api/v1/embeddings/models", "Bearer neutral-router-secret")
+                state["payload"] = {"data": [{"id": "neutral-vector"}]}
+                safe = await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                assert safe["models"][0]["id"] == "neutral-vector" and safe["models"][0]["prompt_price_per_m"] is None
             state.update(status=401, payload={"error": "neutral-compatible-secret"})
             try: await rag_models.models("compatible", "http://neutral.test/v1")
             except HTTPException as error: assert error.status_code == 502 and "HTTP 401" in error.detail and "secret" not in error.detail

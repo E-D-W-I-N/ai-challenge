@@ -34,6 +34,28 @@ def check_models():
     legacy = agents.spec_from_config({"model": "saved-exact-id", "rag_final_k": 7, "rag_candidates_k": 20}, fallback=generic)
     assert legacy.model == "saved-exact-id" and legacy.rag_top_k == 7 and not legacy.rag_rerank_enabled
 
+    # Status exposes editable canonical selectors while archived identities stay exact.
+    from app import rag_api
+    legacy_stages = {"corpus": {"preparation_config": {"auth_mode": "compatible", "model": "saved-prep"}},
+                     "chunks": {"semantic_config": {"auth_mode": "openrouter", "model": "saved-chunks"}},
+                     "embeddings": {"embedding_config": {"model": "saved-vector", "base_url": "http://old.test/v1"}}}
+    archived = {"index": {"embedding_config": copy.deepcopy(legacy_stages["embeddings"]["embedding_config"]), "embedding_fingerprint": "pinned"}}
+    original = copy.deepcopy(legacy_stages)
+    class StatusIndex:
+        root = Path("/neutral-nonexistent-status")
+        def status(self): return copy.deepcopy(archived)
+    with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=legacy_stages):
+        restored = rag_api.status()
+    assert restored["stages"]["corpus"]["preparation_config"] == {"provider": "compatible", "model": "saved-prep"}
+    assert restored["stages"]["chunks"]["semantic_config"] == {"provider": "openrouter", "model": "saved-chunks"}
+    assert restored["embedding_defaults"]["provider"] == "compatible"
+    assert restored["index"] == archived["index"] and legacy_stages == original
+    restored["embedding_defaults"]["model"] = "editable"
+    assert restored["stages"]["embeddings"]["embedding_config"]["model"] == "saved-vector"
+    invalid = copy.deepcopy(original); invalid["corpus"]["preparation_config"]["auth_mode"] = "unknown"
+    with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=invalid):
+        assert "stage_error" in rag_api.status()
+
     async def collect(response):
         return [event async for event in response]
 

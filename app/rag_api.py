@@ -1,4 +1,5 @@
 """Local durable RAG workflow; paths remain operator configuration only."""
+import copy
 import json
 import sqlite3
 import threading
@@ -20,15 +21,36 @@ from .request_security import trusted_rag_request
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
 
+def editable_config(value, *, embedding=False):
+    """Canonical selector DTO only; published/cache identities stay untouched."""
+    from shared_models import legacy_provider, provider
+    result = copy.deepcopy(value)
+    selected = result.get("provider")
+    if selected is None:
+        selected = "compatible" if embedding else legacy_provider(result.get("auth_mode", "openrouter"))
+    result["provider"] = provider(selected)
+    result.pop("auth_mode", None)
+    return result
+
+
 @router.get("/status")
 def status():
     index = Index()
     result = index.status()
     try:
-        result["stages"] = workflow.stages(index.root)
+        stages = copy.deepcopy(workflow.stages(index.root))
+        for stage, field in (("corpus", "preparation_config"), ("chunks", "semantic_config")):
+            if isinstance(stages.get(stage), dict) and isinstance(stages[stage].get(field), dict):
+                stages[stage][field] = editable_config(stages[stage][field])
+        result["stages"] = stages
     except (OSError, ValueError, KeyError) as error:
         result["stage_error"] = str(error)
-    result["embedding_defaults"] = (result.get("stages", {}).get("embeddings") or result.get("index") or {}).get("embedding_config", EmbeddingConfig().__dict__)
+    defaults = (result.get("stages", {}).get("embeddings") or result.get("index") or {}).get("embedding_config", EmbeddingConfig().__dict__)
+    try:
+        result["embedding_defaults"] = editable_config(defaults, embedding=True)
+    except ValueError as error:
+        result["stage_error"] = str(error)
+        result["embedding_defaults"] = None
     result["manifest_available"] = (index.root / "inputs.json").is_file()
     return result
 
