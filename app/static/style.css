@@ -810,11 +810,11 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .mcp-button:disabled, .mcp-config-actions .mem-add:disabled { opacity: .6; cursor: not-allowed; }
 
 /* RAG uses the same cards, fields and controls as the other settings pages. */
-#tab-rag { min-width: 0; }
-#tab-rag > .settings-card, #rag-ingestion { margin-bottom: 16px; }
+#tab-rag { min-width: 0; gap: 16px; }
 #tab-rag [hidden], #tab-rag .rag-result:empty { display: none; }
 .rag-operation-card { background: var(--bg-soft); gap: 12px; }
 .rag-operation-card p, .rag-result p { margin: 0; line-height: 1.5; }
+.rag-operation-card p, .rag-result p, .rag-result h3 { min-width: 0; overflow-wrap: anywhere; }
 #rag-status { font-weight: 600; font-size: 16px; }
 #rag-error:empty { display: none; }
 .rag-stages { display: flex; flex-wrap: wrap; gap: 8px; }
