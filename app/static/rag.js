@@ -11,7 +11,7 @@ function createRagInspector({ state, $, el, api }) {
   const steps = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Индекс"]];
   const navigation = new Map();
   for (const [id, title] of steps) {
-    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); loadSemanticModels(); });
+    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); loadGenerationModels(); });
     node.className = "mcp-button rag-step"; node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
   }
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
@@ -22,9 +22,7 @@ function createRagInspector({ state, $, el, api }) {
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
     epoch++;
-    const interrupted = modelCatalogues.get(pendingModelSource);
-    if (interrupted) interrupted.retry = true;
-    cancelModelRequest();
+    for (const picker of generationPickers) picker.stop();
     clearTimeout(timer); timer = null;
     controller?.abort(); controller = null;
   }
@@ -143,12 +141,17 @@ function createRagInspector({ state, $, el, api }) {
           const input = $("#rag-" + id);
           if (input && !input.dataset.dirty) {
             const value = stages.chunks.semantic_config[key] ?? "openrouter";
-            if (id === "semantic-model") setSemanticModels([], value);
+            if (id === "semantic-model") semanticPicker.setModels([], value);
             else input.value = value;
           }
         }
       }
       if (!seeded) {
+        const preparation = stages?.corpus?.preparation_config;
+        const strategy = $("#rag-preparation-strategy");
+        if (!strategy.dataset.dirty) strategy.value = stages?.corpus?.preparation_strategy || "programmatic";
+        if (preparation) preparationPicker.restore(preparation);
+        updatePreparationFields();
         if (stages?.chunks) {
           const saved = stages.chunks;
           for (const [id, value] of [["size", saved.size], ["overlap", saved.overlap], ["strategy", saved.strategy === "semantic" ? "semantic" : "fixed"]]) {
@@ -163,12 +166,12 @@ function createRagInspector({ state, $, el, api }) {
           }
         }
         const urls = $("#rag-urls"); if (urls && !urls.dataset.dirty && stages?.corpus) urls.value = stages.corpus.urls.join("\n");
-        previousAuthMode = $("#rag-semantic-auth-mode").value;
+        for (const picker of generationPickers) picker.seed();
         seeded = true;
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
       updateControls();
-      if (initializing) loadSemanticModels();
+      if (initializing) loadGenerationModels();
       await syncPreview();
     } catch (error) { if (error.name !== "AbortError" && token === epoch) showError(error); }
     finally {
@@ -279,11 +282,19 @@ function createRagInspector({ state, $, el, api }) {
     }
     return body;
   }
+  function preparationOptions() {
+    const body = {urls: $("#rag-urls").value.split(/\n/).map(x => x.trim()).filter(Boolean), use_manifest: $("#rag-manifest").checked,
+      preparation_strategy: $("#rag-preparation-strategy").value};
+    if (body.preparation_strategy === "llm") {
+      for (const key of ["auth_mode", "base_url", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
+    }
+    return body;
+  }
   async function start(kind) {
     if (submitting || lastStatus?.operation?.state === "running") return;
     submitting = true; updateControls();
     try {
-      const body = kind === "ingest" ? {urls: $("#rag-urls").value.split(/\n/).map(x => x.trim()).filter(Boolean), use_manifest: $("#rag-manifest").checked}
+      const body = kind === "ingest" ? preparationOptions()
         : kind === "chunks" ? chunkOptions()
         : kind === "embeddings" ? {base_url: $("#rag-base-url").value.trim(), model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -306,77 +317,118 @@ function createRagInspector({ state, $, el, api }) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
   const modelCatalogues = new Map();
-  let modelRequest = 0, modelController = null, pendingModelSource = null;
-  function modelSource() {
-    const mode = $("#rag-semantic-auth-mode").value;
-    const base = $("#rag-semantic-base-url").value.trim().replace(/\/+$/, "");
-    return {mode, base, key: `${mode}:${base}`};
-  }
-  function cancelModelRequest() {
-    modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
-    $("#rag-model-refresh").disabled = false;
-  }
-  function setSemanticModels(models, current) {
-    const select = $("#rag-semantic-model");
-    const options = [{id: "", label: "Выберите модель"}, ...models];
-    if (current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
-    select.replaceChildren();
-    for (const item of options) {
-      const price = item.prompt_price_per_m ? ` · $${item.prompt_price_per_m} / $${item.completion_price_per_m} за 1M` : "";
-      const option = el("option", "", (item.label || item.id) + price); option.value = item.id;
-      option.selected = item.id === current; select.append(option);
+  function createGenerationPicker(prefix, active, buttonPrefix = prefix + "-") {
+    const authMode = $("#rag-" + prefix + "-auth-mode"), endpoint = $("#rag-" + prefix + "-base-url"), model = $("#rag-" + prefix + "-model");
+    const refreshButton = $("#rag-" + buttonPrefix + "model-refresh"), statusNode = $("#rag-" + buttonPrefix + "model-status");
+    let modelRequest = 0, modelController = null, pendingModelSource = null;
+    function modelSource() {
+      const mode = authMode.value;
+      const base = endpoint.value.trim().replace(/\/+$/, "");
+      return {mode, base, key: `${mode}:${base}`};
     }
-    select.value = current || "";
-  }
-  function catalogueMessage(entry, current) {
-    if (entry.error) return entry.error + (current ? " Текущая модель сохранена." : "");
-    if (!entry.models.length) return "Сервер не вернул моделей." + (current ? " Текущая модель сохранена." : "");
-    if (current && !entry.models.some(item => item.id === current)) return "Текущая модель отсутствует в каталоге; выбор сохранён.";
-    return `Доступно моделей: ${entry.models.length}`;
-  }
-  async function loadSemanticModels(force = false) {
-    if (!visible() || selectedStep !== "chunks" || $("#rag-strategy").value !== "semantic") return;
-    const source = modelSource(), select = $("#rag-semantic-model"), status = $("#rag-model-status");
-    const cached = modelCatalogues.get(source.key);
-    if (!force && cached && !cached.retry) {
-      setSemanticModels(cached.models, select.value); status.textContent = catalogueMessage(cached, select.value); return;
+    function cancelModelRequest() {
+      modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
+      refreshButton.disabled = false;
     }
-    if (!force && pendingModelSource === source.key) return;
-    cancelModelRequest();
-    const request = modelRequest; modelController = new AbortController(); pendingModelSource = source.key;
-    const signal = modelController.signal;
-    setSemanticModels(cached?.models || [], select.value);
-    status.textContent = "Загрузка моделей…"; $("#rag-model-refresh").disabled = true;
-    try {
-      const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
-      const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
-        : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}`, {signal});
-      if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
-      const models = data.models || [];
-      if (official) state.models = models;
-      const entry = {models}; modelCatalogues.set(source.key, entry);
-      setSemanticModels(models, select.value); status.textContent = catalogueMessage(entry, select.value);
-    } catch (error) {
-      if (error.name === "AbortError" || request !== modelRequest || source.key !== modelSource().key || !visible()) return;
-      const entry = {models: cached?.models || [], error: "Не удалось загрузить модели. Проверьте URL и обновите список."};
-      modelCatalogues.set(source.key, entry); status.textContent = catalogueMessage(entry, select.value);
-    } finally {
-      if (request === modelRequest) { modelController = null; pendingModelSource = null; $("#rag-model-refresh").disabled = false; }
+    function setModels(models, current) {
+      const select = model;
+      const options = [{id: "", label: "Выберите модель"}, ...models];
+      if (current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
+      select.replaceChildren();
+      for (const item of options) {
+        const price = item.prompt_price_per_m ? ` · $${item.prompt_price_per_m} / $${item.completion_price_per_m} за 1M` : "";
+        const option = el("option", "", (item.label || item.id) + price); option.value = item.id;
+        option.selected = item.id === current; select.append(option);
+      }
+      select.value = current || "";
+    }
+    function catalogueMessage(entry, current) {
+      if (entry.error) return entry.error + (current ? " Текущая модель сохранена." : "");
+      if (!entry.models.length) return "Сервер не вернул моделей." + (current ? " Текущая модель сохранена." : "");
+      if (current && !entry.models.some(item => item.id === current)) return "Текущая модель отсутствует в каталоге; выбор сохранён.";
+      return `Доступно моделей: ${entry.models.length}`;
+    }
+    async function loadModels(force = false) {
+      if (!visible() || !active()) return;
+      const source = modelSource(), select = model, status = statusNode;
+      const cached = modelCatalogues.get(source.key);
+      if (!force && cached && !cached.retry) {
+        setModels(cached.models, select.value); status.textContent = catalogueMessage(cached, select.value); return;
+      }
+      if (!force && pendingModelSource === source.key) return;
+      cancelModelRequest();
+      const request = modelRequest; modelController = new AbortController(); pendingModelSource = source.key;
+      const signal = modelController.signal;
+      setModels(cached?.models || [], select.value);
+      status.textContent = "Загрузка моделей…"; refreshButton.disabled = true;
+      try {
+        const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
+        const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
+          : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}`, {signal});
+        if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
+        const models = data.models || [];
+        if (official) state.models = models;
+        const entry = {models}; modelCatalogues.set(source.key, entry);
+        setModels(models, select.value); status.textContent = catalogueMessage(entry, select.value);
+      } catch (error) {
+        if (error.name === "AbortError" || request !== modelRequest || source.key !== modelSource().key || !visible()) return;
+        const entry = {models: cached?.models || [], error: "Не удалось загрузить модели. Проверьте URL и обновите список."};
+        modelCatalogues.set(source.key, entry); status.textContent = catalogueMessage(entry, select.value);
+      } finally {
+        if (request === modelRequest) { modelController = null; pendingModelSource = null; refreshButton.disabled = false; }
+      }
+    }
+    refreshButton.onclick = () => loadModels(true);
+    const drafts = new Map();
+    let previousAuthMode = "openrouter";
+    authMode.onchange = () => {
+      drafts.set(previousAuthMode, {endpoint: endpoint.value, model: model.value});
+      const draft = drafts.get(authMode.value) || (authMode.value === "omlx"
+        ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
+        : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-4.1-mini"});
+      cancelModelRequest(); endpoint.value = draft.endpoint; setModels([], draft.model); previousAuthMode = authMode.value;
+      for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
+      loadModels();
+    };
+    endpoint.oninput = () => {
+      endpoint.dataset.dirty = "true"; cancelModelRequest(); setModels([], model.value);
+      statusNode.textContent = "URL изменён — обновите список моделей.";
+    };
+    endpoint.onchange = () => loadModels();
+    model.onchange = () => {
+      model.dataset.dirty = "true";
+      const entry = modelCatalogues.get(modelSource().key);
+      if (entry && !modelController) statusNode.textContent = catalogueMessage(entry, model.value);
+    };
+    return {active, load: loadModels, cancel: cancelModelRequest, setModels,
+      seed: () => { previousAuthMode = authMode.value; },
+      restore: (config) => {
+        for (const [input, key] of [[endpoint, "base_url"], [model, "model"], [authMode, "auth_mode"]]) {
+          if (input.dataset.dirty) continue;
+          if (input === model) setModels([], config[key]); else input.value = config[key];
+        }
+      },
+      stop: () => {
+        const interrupted = modelCatalogues.get(pendingModelSource);
+        if (interrupted) interrupted.retry = true;
+        cancelModelRequest();
+      }};
+  }
+  const semanticPicker = createGenerationPicker("semantic", () => selectedStep === "chunks" && $("#rag-strategy").value === "semantic", "");
+  const preparationPicker = createGenerationPicker("preparation", () => selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm");
+  const generationPickers = [semanticPicker, preparationPicker];
+  function loadGenerationModels() {
+    for (const picker of generationPickers) {
+      if (picker.active()) picker.load(); else picker.stop();
     }
   }
-  $("#rag-model-refresh").onclick = () => loadSemanticModels(true);
-  const authMode = $("#rag-semantic-auth-mode");
-  const semanticDrafts = new Map();
-  let previousAuthMode = "openrouter";
-  authMode.onchange = () => {
-    const endpoint = $("#rag-semantic-base-url"), model = $("#rag-semantic-model");
-    semanticDrafts.set(previousAuthMode, {endpoint: endpoint.value, model: model.value});
-    const draft = semanticDrafts.get(authMode.value) || (authMode.value === "omlx"
-      ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
-      : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-4.1-mini"});
-    cancelModelRequest(); endpoint.value = draft.endpoint; setSemanticModels([], draft.model); previousAuthMode = authMode.value;
-    for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
-    loadSemanticModels();
+  function updatePreparationFields() {
+    const llm = $("#rag-preparation-strategy").value === "llm";
+    $("#rag-preparation-fields").hidden = !llm;
+  }
+  $("#rag-preparation-strategy").onchange = () => {
+    $("#rag-preparation-strategy").dataset.dirty = "true";
+    updatePreparationFields(); loadGenerationModels();
   };
   const strategy = $("#rag-strategy");
   if (strategy) strategy.onchange = () => {
@@ -385,26 +437,14 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-semantic-fields").hidden = !semantic;
     $("#rag-size-label").textContent = semantic ? "Максимальный размер чанка, символов" : "Размер чанка, символов";
     $("#rag-size").max = semantic ? "12000" : "100000";
-    if (semantic) loadSemanticModels(); else cancelModelRequest();
+    if (semantic) loadGenerationModels(); else semanticPicker.cancel();
   };
-  for (const id of ["urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
-    const input = $("#rag-" + id); if (input) input.oninput = () => { input.dataset.dirty = "true"; };
+  for (const id of ["preparation-strategy", "preparation-base-url", "preparation-model", "preparation-auth-mode", "urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
+    const input = $("#rag-" + id); if (input && !input.oninput) input.oninput = () => { input.dataset.dirty = "true"; };
   }
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => start(kind);
   }
-  const semanticEndpoint = $("#rag-semantic-base-url");
-  semanticEndpoint.oninput = () => {
-    semanticEndpoint.dataset.dirty = "true"; cancelModelRequest();
-    setSemanticModels([], $("#rag-semantic-model").value);
-    $("#rag-model-status").textContent = "URL изменён — обновите список моделей.";
-  };
-  semanticEndpoint.onchange = () => loadSemanticModels();
-  $("#rag-semantic-model").onchange = () => {
-    const model = $("#rag-semantic-model"); model.dataset.dirty = "true";
-    const entry = modelCatalogues.get(modelSource().key);
-    if (entry && !modelController) $("#rag-model-status").textContent = catalogueMessage(entry, model.value);
-  };
   function snapshotHeader(saved) {
     if (state.section !== "rag") return;
     $("#settings-description").textContent = saved ? "Источники и контекст конкретного ответа" : "Документы, чанки и фактическая индексация";
@@ -432,15 +472,15 @@ function createRagInspector({ state, $, el, api }) {
     if (!historical) return;
     stop(); historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false;
     $("#rag-answer-snapshot").hidden = true; $("#rag-answer-snapshot").replaceChildren();
-    if (visible()) { refresh(); loadSemanticModels(); }
+    if (visible()) { refresh(); loadGenerationModels(); }
   }
   function open() {
     historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
-    stop(); refresh(); loadSemanticModels();
+    stop(); refresh(); loadGenerationModels();
   }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
-    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadSemanticModels(); } });
+    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadGenerationModels(); } });
   }
   return { open, stop, showSnapshot, clearSnapshot };
 }
