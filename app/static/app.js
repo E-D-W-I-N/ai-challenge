@@ -26,12 +26,15 @@ const state = {
   memory: null,        // три слоя памяти — ответ ручки, прочитанный на открытие вкладки
   memoryNote: "",      // почему слоёв не видно: читаем, чат не открыт, ручка ответила ошибкой
   invariants: null,    // инварианты — ответ ручки, прочитанный на открытие вкладки
+  remindersAvailable: false,
   mcp: null,           // серверы MCP — ответ ручки, прочитанный на открытие вкладки
   workspace: "chat",
   settingsScope: "chat",
   scopeSections: {chat: "model", app: "model", history: "rag"},
   navigationRevision: 0,
   agentsRequest: 0,
+  creationRevision: 0,
+  chatCreationError: "",
   sectionFocus: new Map(),
   longMemory: null,
   section: "model",
@@ -76,8 +79,6 @@ const {
   workingStatus,
   loadProfile,
   saveProfile,
-  closeProfileMenu,
-  toggleProfileMenu,
   loadInvariants,
   loadMcp,
   toolsVisible,
@@ -86,7 +87,7 @@ const {
   addFromForm,
   addWorkingFromForm,
   addInvariantFromForm
-} = createRecords({ state, $, el, iconButton, api, json, fmt });
+} = createRecords({ state, $, el, iconButton, api, json, fmt, onMcpChange: refreshSettingsAvailability });
 
 const createSelectors = typeof module !== "undefined" ? require("./models.js") : globalThis.createModelSelectors;
 const modelSelectors = createSelectors({ $, el, api });
@@ -118,13 +119,13 @@ const ICONS = {
   send: "M4 12l16-8-6 16-2.5-6.5z",
   stop: "M7 7h10v10H7z",
   clock: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
-  settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM10 3h4l1 3 3 1 3 3v4l-3 1-1 3-3 3h-4l-1-3-3-1-3-3v-4l3-1 1-3z",
+  settings: "M9.5 2.5h5l.5 3 2 .8 2.5-1.6 2.5 4.3-2.3 1.8v2.4l2.3 1.8-2.5 4.3-2.5-1.6-2 .8-.5 3h-5l-.5-3-2-.8-2.5 1.6L2 15.5l2.3-1.8v-2.4L2 9.5l2.5-4.3L7 6.8l2-.8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+  wrench: "m14 7 3 3 4-4a6 6 0 0 1-8 8L5 22l-3-3 8-8a6 6 0 0 1 8-8z",
   pencil: "M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z",
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
   lines: "M4 6h16M4 10h16M4 14h12M4 18h7",
   branch: "M7 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM7 9v10M17 5a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM17 9v2a4 4 0 0 1-4 4H7",
   user: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2",
-  chevronDown: "m6 9 6 6 6-6",
   memory: "M4 6c0-5 16-5 16 0s-16 5-16 0zM4 6v12c0 5 16 5 16 0V6M4 12c0 5 16 5 16 0",
   shield: "M12 3 3 7v6c0 5 9 9 9 9s9-4 9-9V7zM8 12l3 3 5-6",
   tools: "m14 7 3 3 4-4a6 6 0 0 1-8 8L5 22l-3-3 8-8a6 6 0 0 1 8-8z",
@@ -321,13 +322,7 @@ async function loadAgents(selectId, navigationTicket = state.navigationRevision)
   state.hasKey = data.has_key;
   renderList();
   if (navigationTicket !== state.navigationRevision) return;
-  // Пустой список — это пустой экран, в который нечего написать: список
-  // начинается пустым, и удалить последний чат тоже можно.
-  if (!state.agents.length) {
-    state.current = null;
-    renderList(); syncChatControls(); setBusy(false);
-    return;
-  }
+  if (!state.agents.length) { clearChatSelection(); return; }
   const wanted = selectId || (state.current && state.current.id);
   const exists = state.agents.some((a) => a.id === wanted);
   await openAgent(exists ? wanted : state.agents[0].id, navigationTicket);
@@ -337,8 +332,21 @@ function renderList() {
   const box = $("#agent-list");
   box.innerHTML = "";
   state.agents.forEach((agent) => box.appendChild(listItem(agent)));
-  if (!state.agents.length) box.appendChild(el("p", "list-empty", "Пока нет чатов"));
+  if (!state.agents.length) box.appendChild(el("p", "list-empty", state.chatCreationError
+    ? "Не удалось создать чат: " + state.chatCreationError + ". Повторите кнопкой «Новый чат»." : "Пока нет чатов"));
   renderWorkspaceHead();
+}
+
+function clearChatSelection() {
+  stopStream(); stopChatPolling(); stopMcpPolling();
+  state.current = null; state.memory = null; state.memoryNote = "";
+  state.lastMetrics = null; state.contextPast = false; state.contextStale = false;
+  state.panelDirty = false; state.settingsRevision += 1;
+  ragInspector.clearSnapshot();
+  const empty = el("div", "empty");
+  empty.append(el("h2", "", "Пока нет чатов"), el("p", "", "Создайте чат кнопкой «Новый чат»."));
+  $("#feed").replaceChildren(empty); $("#input").value = "";
+  renderTiles(); renderTaskHead(); renderWorkspaceHead(); syncChatControls(); setBusy(false);
 }
 
 // Пометка ветки: от кого чат отделился и сколько сообщений унёс. Одна
@@ -396,7 +404,7 @@ function listItem(agent) {
     ev.stopPropagation();
     const ticket = ++state.navigationRevision;
     if (state.current?.id !== agent.id && !await openAgent(agent.id, ticket)) return;
-    if (ticket === state.navigationRevision) showSettings(state.scopeSections.chat, true, "chat");
+    if (ticket === state.navigationRevision) { showSettings(state.scopeSections.chat, true, "chat"); loadMcp(true); }
   }, "mini item-settings");
   settings.dataset.agentId = agent.id;
   actions.insertBefore(settings, actions.children[actions.children.length - 1]);
@@ -447,19 +455,33 @@ function askDelete(agent) {
     `«${agent.label}» удалится вместе со всей перепиской. Восстановить её будет неоткуда.`,
     "Удалить",
     async () => {
-      const ticket = state.navigationRevision;
+      const ticket = ++state.navigationRevision, creation = state.creationRevision;
+      let replacementRevision = creation;
       try {
         await api("/api/agents/" + agent.id, { method: "DELETE" });
       } catch (err) {
         hint(String(err.message || err), true);
         return;
       }
-      if (state.current && state.current.id === agent.id) state.current = null;
+      if (state.current?.id === agent.id) clearChatSelection();
       // Чата нет — и промптам его обменов держаться не за что.
       [...state.prompts.keys()]
         .filter((key) => key.startsWith(agent.id + ":"))
         .forEach((key) => state.prompts.delete(key));
-      await loadAgents(undefined, ticket);
+      try {
+        await loadAgents(undefined, ticket);
+        if (!state.agents.length && creation === state.creationRevision) {
+          replacementRevision = ++state.creationRevision;
+          const replacement = await api("/api/agents", json("POST", {}));
+          if (replacementRevision === state.creationRevision) state.chatCreationError = "";
+          await loadAgents(replacement.agents[0].id, ticket);
+          if (ticket === state.navigationRevision) showWorkspace("chat");
+        }
+      } catch (err) {
+        if (replacementRevision !== state.creationRevision) return;
+        state.chatCreationError = String(err.message || err);
+        renderList(); hint(state.chatCreationError, true);
+      }
     }
   );
 }
@@ -468,6 +490,7 @@ function askDelete(agent) {
 
 async function openAgent(agentId, navigationTicket = state.navigationRevision) {
   if (!agentId) return;
+  stopMcpPolling();
   stopChatPolling();
   const epoch = state.chatEpoch;
   stopStream();
@@ -672,6 +695,7 @@ function ragSources(snapshot) {
 async function forkFrom(agent, index) {
   if (state.busy) return;
   const ticket = ++state.navigationRevision;
+  state.creationRevision += 1;
   let created;
   try {
     created = await api("/api/agents/" + agent.id + "/fork", json("POST", { at: index + 1 }));
@@ -1449,6 +1473,19 @@ function renderWorkspaceHead() {
 }
 
 const SCOPE_TABS = {chat: ["model", "agent", "memory", "mcp", "rag"], app: ["model", "memory", "profile", "invariants", "mcp", "rag"], history: ["rag"]};
+function allowedSettingsTabs(scope) {
+  return SCOPE_TABS[scope]?.filter(name => scope !== "chat" || name !== "mcp" || state.remindersAvailable) || [];
+}
+function refreshSettingsAvailability() {
+  if (state.workspace !== "settings" || state.settingsScope !== "chat") return;
+  if (state.section === "mcp" && !state.remindersAvailable) {
+    const focused = $("#tab-mcp").contains(document.activeElement) || document.activeElement === $("#tab-btn-mcp");
+    showSettings("model");
+    if (focused) $("#tab-btn-model").focus();
+    return;
+  }
+  $("#tab-btn-mcp").hidden = !state.remindersAvailable;
+}
 function syncChatControls() {
   const chat = state.settingsScope === "chat", noChat = !state.current;
   $("#settings-no-chat").classList.toggle("hidden", !chat || !noChat);
@@ -1460,6 +1497,7 @@ function syncChatControls() {
   $("#mem-long-layer").hidden = state.settingsScope !== "app";
   $("#mcp-application-controls").hidden = state.settingsScope !== "app";
   $("#mcp-chat-help").hidden = !chat;
+  $("#mcp-heading").hidden = chat;
   ["model", "agent"].forEach(name => $("#tab-" + name).querySelectorAll(".control").forEach(field => {
     if (field.id !== "compatible-base-url") field.disabled = !chat || noChat;
   }));
@@ -1509,10 +1547,13 @@ function openApplicationSettings(which = state.scopeSections.app) {
   scheduleChatPoll();
 }
 function showSettings(which, load = true, scope = state.settingsScope) {
-  if (!SCOPE_TABS[scope]?.includes(which)) return;
+  if (!allowedSettingsTabs(scope).includes(which)) {
+    if (scope === "chat" && which === "mcp") which = "model"; else return;
+  }
   rememberSettingsPosition();
   showWorkspace("settings", false);
-  stopMcpPolling(); ragInspector.stop(); rerankModelPicker.stop(); chatModelPicker.stop();
+  if (scope !== state.settingsScope || state.section === "mcp") stopMcpPolling();
+  ragInspector.stop(); rerankModelPicker.stop(); chatModelPicker.stop();
   if (scope !== "history") ragInspector.clearSnapshot();
   state.settingsScope = scope;
   $("#panel").classList.toggle("history-view", scope === "history");
@@ -1521,18 +1562,19 @@ function showSettings(which, load = true, scope = state.settingsScope) {
   $("#settings-domain").textContent = scope === "app" ? "Настройки приложения" : scope === "chat" ? "Настройки чата" : "Сохранённый ответ";
   $(".settings-nav").hidden = scope === "history";
   document.querySelectorAll(".tab").forEach(tab => {
-    tab.hidden = !SCOPE_TABS[scope].includes(tab.dataset.tab);
+    tab.hidden = !allowedSettingsTabs(scope).includes(tab.dataset.tab);
     const selected = tab.dataset.tab === which;
     tab.classList.toggle("active", selected);
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
-    const label = tab.dataset.tab === "model" && scope === "app" ? "Модели" : tab.dataset.tab === "rag" ? (scope === "chat" ? "Поиск RAG" : "Индекс RAG") : SETTINGS_PAGES[tab.dataset.tab][0];
+    const label = tab.dataset.tab === "mcp" && scope === "chat" ? "Напоминания" : tab.dataset.tab === "model" && scope === "app" ? "Модели" : tab.dataset.tab === "rag" ? (scope === "chat" ? "Поиск RAG" : "Индекс RAG") : SETTINGS_PAGES[tab.dataset.tab][0];
     tab.querySelector(".tab-label").textContent = label;
+    if (tab.dataset.tab === "mcp") tab.querySelector(".tab-icon").replaceChildren(icon(scope === "chat" ? "clock" : "tools"));
   });
   PANEL_TABS.forEach(name => $("#tab-" + name).classList.toggle("hidden", name !== which));
   const [title, description] = SETTINGS_PAGES[which];
-  $("#settings-title").textContent = which === "rag" ? (scope === "chat" ? "Поиск RAG" : scope === "history" ? "Работа RAG — сохранённый ответ" : "Индекс RAG") : which === "model" && scope === "app" ? "Модели" : title;
-  $("#settings-description").textContent = which === "memory" ? (scope === "app" ? "Долговременные сведения для всех чатов" : "История и рабочие записи этого чата") : which === "model" && scope === "app" ? "Подключение к совместимому серверу" : which === "rag" && scope === "chat" ? "Использование контекста в следующих ответах" : which === "mcp" && scope === "chat" ? "Доступные инструменты и напоминания этого чата" : description;
+  $("#settings-title").textContent = which === "mcp" && scope === "chat" ? "Напоминания" : which === "rag" ? (scope === "chat" ? "Поиск RAG" : scope === "history" ? "Работа RAG — сохранённый ответ" : "Индекс RAG") : which === "model" && scope === "app" ? "Модели" : title;
+  $("#settings-description").textContent = which === "memory" ? (scope === "app" ? "Долговременные сведения для всех чатов" : "История и рабочие записи этого чата") : which === "model" && scope === "app" ? "Подключение к совместимому серверу" : which === "rag" && scope === "chat" ? "Использование контекста в следующих ответах" : which === "mcp" && scope === "chat" ? "Состояние и отмена напоминаний этого чата" : description;
   $("#settings-scope").textContent = scope === "app" ? "Для всего приложения" : scope === "history" ? "Для сохранённого ответа" : "Для текущего чата";
   $("#settings-scope").hidden = which === "rag" || which === "model";
   $("#panel-body").scrollTop = state.sectionScroll.get(scope + ":" + which) || 0;
@@ -1659,10 +1701,8 @@ function syncStrategyFields() {
 function syncRagFields() {
   const enabled = $("#f-rag_enabled").checked;
   $("#rag-chat-settings").classList.toggle("hidden", !enabled);
-  $("#rag-rewrite-help").classList.toggle("hidden", !enabled || !$("#f-rag_rewrite_enabled").checked);
   $("#rag-chat-parameters").classList.toggle("hidden", !enabled);
   $("#rag-threshold-field").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
-  $("#rag-filter-help").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
   const rerank = enabled && $("#f-rag_rerank_enabled").checked;
   $("#rag-rerank-fields").classList.toggle("hidden", !rerank);
   if (rerank) rerankModelPicker.load(); else rerankModelPicker.stop();
@@ -1955,13 +1995,20 @@ function confirmBox(title, text, confirmLabel, onYes) {
 
 async function newChat() {
   const ticket = ++state.navigationRevision;
+  state.creationRevision += 1;
   stopStream();
-  const created = await api("/api/agents", json("POST", {}));
-  if (ticket === state.navigationRevision) state.current = null;
-  await loadAgents(created.agents[0].id, ticket);
-  if (ticket !== state.navigationRevision) return;
-  showWorkspace("chat");
-  $("#input").focus();
+  try {
+    const created = await api("/api/agents", json("POST", {}));
+    state.chatCreationError = "";
+    if (ticket === state.navigationRevision) state.current = null;
+    await loadAgents(created.agents[0].id, ticket);
+    if (ticket !== state.navigationRevision) return;
+    showWorkspace("chat"); $("#input").focus();
+  } catch (err) {
+    if (ticket !== state.navigationRevision) return;
+    state.chatCreationError = String(err.message || err);
+    renderList(); hint(state.chatCreationError, true);
+  }
 }
 
 // ─────────────────────────── старт ────────────────────────────
@@ -1971,33 +2018,15 @@ function init() {
   $("#restore-sidebar").appendChild(icon("panelLeft"));
   $("#sidebar-toggle").onclick = () => setCollapsed(true);
   $("#restore-sidebar").onclick = () => setCollapsed(false);
-  $(".avatar").appendChild(icon("user"));
-  $(".profile-chevron").appendChild(icon("chevronDown"));
-  $("#app-settings").insertBefore(icon("settings"), $("#app-settings").firstChild);
-  $("#profile-edit").insertBefore(icon("user"), $("#profile-edit").firstChild);
-  $("#profile-toggle").onclick = toggleProfileMenu;
-  $("#profile-edit").onclick = () => {
-    closeProfileMenu();
-    ++state.navigationRevision; showSettings("profile", false, "app");
-    $("#profile-style").focus();
-  };
-  document.addEventListener("click", (ev) => {
-    if (!$(".profile-control").contains(ev.target)) closeProfileMenu();
-  });
-  document.addEventListener("focusin", (ev) => {
-    if (!$(".profile-control").contains(ev.target)) closeProfileMenu();
-  });
-  $("#app-settings").onclick = () => { closeProfileMenu(); openApplicationSettings(); };
+  $("#app-settings").appendChild(icon("wrench"));
+  $("#app-settings").onclick = () => openApplicationSettings();
   $("#workspace-chat").onclick = () => { ++state.navigationRevision; showWorkspace("chat"); scheduleChatPoll(); };
 
   restoreSidebar();
-  document.addEventListener("keydown", (ev) => {
-    if (document.querySelector(".confirm") || ev.key !== "Escape") return;
-    if (!$("#profile-menu").classList.contains("hidden")) closeProfileMenu(true);
-  });
   document.addEventListener("visibilitychange", () => {
     stopMcpPolling();
     if (toolsVisible()) loadMcp();
+    else if (state.workspace === "settings" && state.settingsScope === "chat") loadMcp(true);
     stopChatPolling();
     if (document.visibilityState !== "hidden") pollCurrentChat();
   });

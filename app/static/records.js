@@ -2,7 +2,7 @@
 (function (root) {
 "use strict";
 
-function createChatRecords({ state, $, el, iconButton, api, json, fmt }) {
+function createChatRecords({ state, $, el, iconButton, api, json, fmt, onMcpChange }) {
 // ────────────────────── вкладка «Память» ──────────────────────
 
 // Три слоя памяти агента — по разделу на каждый, в порядке от короткого
@@ -559,7 +559,6 @@ async function loadProfile() {
       state.profileError = String(err.message || err);
       profileStatus(state.profileError, true);
     }
-    renderProfileSummary();
   })();
   await state.profileLoading;
   state.profileLoading = null;
@@ -585,47 +584,12 @@ async function saveProfile(name) {
       field.value = values[name] || "";
       state.profileDirty.delete(name);
     }
-    renderProfileSummary();
     profileStatus(PROFILE_FIELDS.some((key) => values[key])
       ? "Профиль сохранён: он уезжает системным сообщением в каждый запрос."
       : "Профиль пуст: к запросам не добавляется ничего.");
   } catch (err) {
     state.profileError = String(err.message || err);
     profileStatus(state.profileError, true);
-    renderProfileSummary();
-  }
-}
-
-function renderProfileSummary() {
-  const box = $("#profile-summary");
-  box.innerHTML = "";
-  const filled = state.profile && PROFILE_FIELDS.filter((name) => state.profile[name]);
-  $("#profile-toggle").classList.toggle("configured", Boolean(filled && filled.length));
-  if (state.profileError) box.appendChild(el("p", "hint error", state.profileError));
-  else if (!state.profile) box.appendChild(el("p", "hint", "Читаю профиль…"));
-  else if (!filled.length) box.appendChild(el("p", "hint", "Профиль пока пуст. Задайте стиль, формат или контекст ответа."));
-  if (filled) filled.forEach((name) => {
-    const row = el("div", "profile-summary-field");
-    row.append(el("strong", "", { style: "Стиль", format: "Формат", context: "Контекст" }[name]),
-      el("p", "", state.profile[name]));
-    box.appendChild(row);
-  });
-}
-
-function closeProfileMenu(returnFocus = false) {
-  $("#profile-menu").classList.add("hidden");
-  $("#profile-toggle").setAttribute("aria-expanded", "false");
-  if (returnFocus) $("#profile-toggle").focus();
-}
-
-function toggleProfileMenu() {
-  const open = $("#profile-menu").classList.contains("hidden");
-  $("#profile-menu").classList.toggle("hidden", !open);
-  $("#profile-toggle").setAttribute("aria-expanded", String(open));
-  if (open) {
-    renderProfileSummary();
-    loadProfile();
-    $("#app-settings").focus();
   }
 }
 
@@ -777,6 +741,8 @@ function acceptMcp(answer) {
   if (answer.config && state.mcpConfig && answer.config.revision < state.mcpConfig.revision) return false;
   state.mcp = answer.servers || [];
   state.mcpDisabled = answer.disabled === true;
+  state.remindersAvailable = !state.mcpDisabled && state.mcp.some(reminderServer);
+  onMcpChange?.();
   if (answer.config) state.mcpConfig = answer.config;
   return true;
 }
@@ -832,12 +798,13 @@ async function mutateMcp(path, method, body) {
   stopMcpPolling();
   const epoch = state.mcpEpoch;
   const version = state.mcpDraftVersion || 0;
+  let changed = false;
   state.mcpMutation = true;
   renderMcpConfig(); renderMcp();
   mcpStatus("Ожидание текущих вызовов и обновление подключения…");
   try {
     const answer = await api(path, json(method, body));
-    acceptMcp(answer);
+    acceptMcp(answer); changed = true;
     if (method === "PUT" && version === (state.mcpDraftVersion || 0)) state.mcpDirty = false;
     if (epoch === state.mcpEpoch && toolsVisible()) {
       mcpStatus(method === "PUT" ? "URL сохранены. Подключите нужный сервер." : "Состояние подключения обновлено.");
@@ -846,32 +813,34 @@ async function mutateMcp(path, method, body) {
     if (epoch === state.mcpEpoch && toolsVisible()) mcpStatus(String(err.message || err), true);
   } finally {
     state.mcpMutation = false;
-    if (epoch === state.mcpEpoch && toolsVisible()) { renderMcpConfig(); renderMcp(); }
+    if (epoch === state.mcpEpoch && toolsVisible()) { renderMcpConfig(); renderMcp(); if (changed) loadMcp(); }
     else if (toolsVisible()) loadMcp();
   }
 }
 
-async function loadMcp() {
-  if (!toolsVisible() || state.mcpRequest || state.mcpMutation) return;
+async function loadMcp(discover = false) {
+  const discovery = discover && state.workspace === "settings" && state.settingsScope === "chat" && document.visibilityState !== "hidden";
+  if ((!toolsVisible() && !discovery) || state.mcpRequest || state.mcpMutation) return;
   if (state.mcpTimer !== null) clearTimeout(state.mcpTimer);
   state.mcpTimer = null;
-  const epoch = state.mcpEpoch;
+  const epoch = state.mcpEpoch, scope = state.settingsScope, owner = state.current?.id;
+  const owned = () => epoch === state.mcpEpoch && scope === state.settingsScope && (scope !== "chat" || owner === state.current?.id);
   const controller = new AbortController();
   state.mcpRequest = controller;
   try {
     const headers = state.settingsScope === "chat" && state.current ? { "X-Chat-ID": state.current.id } : {};
     const answer = await api("/api/mcp", { signal: controller.signal, headers });
-    if (epoch !== state.mcpEpoch) return;
+    if (!owned()) return;
     acceptMcp(answer);
     mcpStatus(state.mcpDisabled ? "MCP отключён." : "");
   } catch (err) {
-    if (epoch !== state.mcpEpoch) return;
-    state.mcp = null;
+    if (!owned()) return;
+    state.mcp = null; state.remindersAvailable = false; onMcpChange?.();
     mcpStatus(String(err.message || err), true);
   } finally {
     if (state.mcpRequest === controller) state.mcpRequest = null;
   }
-  if (epoch !== state.mcpEpoch || !toolsVisible()) return;
+  if (!owned() || !toolsVisible()) return;
   renderMcpConfig(); renderMcp();
   // Один отложенный GET после завершения предыдущего: медленная ручка
   // не создаёт параллельных запросов, уход отменяет и таймер, и GET.
@@ -940,6 +909,9 @@ function remindersBlock(data) {
   return box;
 }
 
+function reminderServer(server) {
+  return server.status === "ok" && (Object.hasOwn(server, "reminders") || Object.hasOwn(server, "reminders_error"));
+}
 function renderMcp() {
   const box = $("#mcp-list");
   const expanded = new Set(Array.from(box.querySelectorAll("details")).filter((node) => node.open).map((node) => node.dataset.tool));
@@ -949,7 +921,7 @@ function renderMcp() {
   // подключён» и «не доехало» — разные новости, ровно как у слоёв памяти.
   if (!servers) { box.appendChild(memNote("Не читается: ручка ответила ошибкой.")); return; }
   if (!servers.length) { box.appendChild(memNote("MCP не подключён.")); return; }
-  servers.forEach((server) => {
+  servers.filter(server => state.settingsScope !== "chat" || reminderServer(server)).forEach((server) => {
     const row = el("article", "mcp-server");
     const head = el("header", "mcp-server-head");
     head.append(el("h3", "mcp-server-name", server.name),
@@ -970,8 +942,8 @@ function renderMcp() {
     }
     if (server.error) row.appendChild(el("p", "hint error", server.error));
     if (server.reminders_error) row.appendChild(el("p", "hint error", server.reminders_error));
-    const tools = server.tools || [];
-    if (!tools.length) row.appendChild(memNote("инструментов нет"));
+    const tools = state.settingsScope === "chat" ? [] : server.tools || [];
+    if (!tools.length && state.settingsScope !== "chat") row.appendChild(memNote("инструментов нет"));
     tools.forEach((tool) => {
       const card = el("div", "mcp-tool");
       card.append(el("h4", "mcp-tool-name", tool.name),
@@ -994,7 +966,7 @@ function renderMcp() {
 }
 
 
-return { MEMORY_KINDS, WORKING_KINDS, INVARIANT_KINDS, PROFILE_FIELDS, memoryTabOpen, loadMemory, renderMemory, workingStatus, loadProfile, saveProfile, closeProfileMenu, toggleProfileMenu, loadInvariants, loadMcp, toolsVisible, stopMcpPolling, fillKinds, addFromForm, addWorkingFromForm, addInvariantFromForm };
+return { MEMORY_KINDS, WORKING_KINDS, INVARIANT_KINDS, PROFILE_FIELDS, memoryTabOpen, loadMemory, renderMemory, workingStatus, loadProfile, saveProfile, loadInvariants, loadMcp, toolsVisible, stopMcpPolling, fillKinds, addFromForm, addWorkingFromForm, addInvariantFromForm };
 }
 
 if (typeof module !== "undefined") module.exports = createChatRecords;
