@@ -108,26 +108,23 @@ async function main() {
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag");
-    check("Legacy refinement switches stay off with numeric defaults", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_candidates_k").value === "20" && $("#rag-chat-settings").classList.contains("hidden") && $("#rag-chat-parameters").classList.contains("hidden"));
+    check("Legacy refinement switches stay off with a single Top-K", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_top_k").value === "5" && $("#rag-chat-settings").classList.contains("hidden"));
     $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
-    $("#f-rag_candidates_k").value = "21"; $("#f-rag_final_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
+    $("#f-rag_top_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
     $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
     const patch = requests("PATCH", "/api/agents/ag_1").at(-1).body;
-    check("Refinement controls emit actual boolean and numeric PATCH", patch.rag_rewrite_enabled === true && patch.rag_filter_enabled === true && patch.rag_candidates_k === 21 && patch.rag_final_k === 4 && patch.rag_similarity_threshold === .45 && patch.rag_enabled === false);
+    check("Refinement controls emit one Top-K and independent flags", patch.rag_rewrite_enabled === true && patch.rag_filter_enabled === true && patch.rag_top_k === 4 && patch.rag_similarity_threshold === .45 && patch.rag_enabled === false && !("rag_candidates_k" in patch) && !("rag_final_k" in patch));
     const count = requests("PATCH", "/api/agents/ag_1").length;
-    $("#f-rag_candidates_k").value = "1.5"; $("#f-rag_candidates_k").dispatchEvent(new Evt("change")); await settle();
-    check("Fractional candidate count blocks PATCH and preserves input", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_candidates_k").value === "1.5" && $("#save-status").textContent.includes("целое"));
-    $("#f-rag_candidates_k").value = "21";
-    $("#f-rag_final_k").value = "22"; $("#f-rag_final_k").dispatchEvent(new Evt("change")); await settle();
-    check("Final cap above candidate cap blocks PATCH", requests("PATCH", "/api/agents/ag_1").length === count && $("#save-status").textContent.includes("больше кандидатов"));
-    $("#f-rag_final_k").value = "4";
-    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_candidates_k").value === "30" && $("#f-rag_final_k").value === "7" && !$("#rag-chat-settings").classList.contains("hidden") && !$("#rag-chat-parameters").classList.contains("hidden"));
-    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_candidates_k").value === "21" && $("#f-rag_rewrite_enabled").checked && $("#rag-chat-settings").classList.contains("hidden") && $("#rag-chat-parameters").classList.contains("hidden"));
+    $("#f-rag_top_k").value = "1.5"; $("#f-rag_top_k").dispatchEvent(new Evt("change")); await settle();
+    check("Fractional Top-K blocks PATCH and preserves input", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_top_k").value === "1.5" && $("#save-status").textContent.includes("целое"));
+    $("#f-rag_top_k").value = "4";
+    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_top_k").value === "7" && !$("#rag-chat-settings").classList.contains("hidden") && !$("#rag-chat-parameters").classList.contains("hidden"));
+    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_top_k").value === "4" && $("#f-rag_rewrite_enabled").checked && $("#rag-chat-settings").classList.contains("hidden"));
     click("workspace-chat"); const before = requests("GET", /^\/api\/rag\//).length;
     $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     const snapshot = $("#rag-answer-snapshot");
     check("V2 inspector shows original, rewritten, history and unknown usage", snapshot.querySelector(".rag-snapshot-original-query").textContent === rag.original_query && snapshot.querySelector(".rag-snapshot-query").textContent === rag.query && snapshot.textContent.includes("neutral earlier answer") && snapshot.textContent.includes("Неизвестно"));
-    check("Saved candidate decisions and full context render without current-index reads", snapshot.querySelectorAll(".rag-snapshot-candidate").length === 3 && snapshot.textContent.includes("ниже порога cosine") && snapshot.textContent.includes("лимит фрагментов") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context && requests("GET", /^\/api\/rag\//).length === before);
+    check("Saved candidate decisions and full context render without current-index reads", snapshot.querySelectorAll(".rag-snapshot-candidate").length === 3 && snapshot.textContent.includes("Ниже порога") && snapshot.textContent.includes("Лимит фрагментов") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context && requests("GET", /^\/api\/rag\//).length === before);
   });
   for (const [rewrite, filter] of [[false, false], [true, false], [false, true]]) {
     await scenario("Saved refinement flags " + rewrite + "/" + filter, async () => {
@@ -135,7 +132,7 @@ async function main() {
         config: {rewrite_enabled: rewrite, filter_enabled: filter, candidates_k: 20, final_k: 5, similarity_threshold: .3},
         rewrite: {enabled: rewrite, model: "neutral/rewrite-model", usage: {total_tokens: 11}},
         history_used: [{user: "history question", assistant: "history answer"}], timings: {rewrite_seconds: .5, retrieval_seconds: .2},
-        index: {index_id: "saved-flags"}, candidates: [{chunk_id: "reject", text: "excluded text", decision: "threshold", score: .1}],
+        index: {index_id: "saved-flags"}, candidates: [{chunk_id: "final", text: "final text", decision: "kept", score: .8}, {chunk_id: "reject", text: "excluded text", decision: "threshold", score: .1}],
         hits: [{chunk_id: "final", text: "final text", decision: "kept", score: .8}], context: "exact context"};
       const saved = JSON.stringify(rag);
       const {client, $, click, requests} = freshClient({agents: [{rag_enabled: true, rag_rewrite_enabled: !rewrite, rag_filter_enabled: !filter,
@@ -150,7 +147,7 @@ async function main() {
         && content.includes("rewrite_seconds") === rewrite && !content.includes("Переформулирование выключено"));
       check("Saved filtering controls candidates/threshold visibility " + rewrite + "/" + filter,
         Boolean(node.querySelector(".rag-snapshot-candidate")) === filter && content.includes("similarity_threshold") === filter
-        && content.includes("ниже порога cosine") === filter && (filter || !content.includes("decision")));
+        && content.includes("Ниже порога") === filter && (filter || !content.includes("decision")));
       check("Feature presentation preserves final data and saved capture " + rewrite + "/" + filter,
         node.querySelector(".rag-snapshot-context").textContent === rag.context && content.includes("final text")
         && content.includes("saved-flags") && JSON.stringify(client.state.current.transcript[1].rag) === saved
@@ -319,7 +316,7 @@ async function main() {
     const report = {model: "actual-boundaries", calls: 2, usage: {total_tokens: 120}, cost_usd: 0.003};
     const status = {state: "ready", stages, operation: {kind: "chunks", state: "complete", semantic_report: report},
       index: {index_id: "old-index", words: 10, size_bytes: 100, rows: {documents: 1, chunks: 1}, embedding_config: {model: "old"}}};
-    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1&purpose=embedding", {models: [{id: "draft-to-preserve"}]});
+    server.respond("GET", "/api/models?provider=compatible&purpose=embedding", {models: [{id: "draft-to-preserve"}]});
     server.respond("GET", "/api/rag/status", status);
     server.respond("GET", "/api/rag/documents?offset=0&limit=25", {items: []});
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
@@ -430,57 +427,38 @@ async function main() {
     check("Manual navigation and running operation stay distinct across poll", $("#rag-step-documents").attributes["aria-current"] === "step"
       && $("#rag-step-embeddings").classList.contains("running") && !$("#rag-step-documents").classList.contains("running") && $("#rag-save").disabled);
   });
-  await scenario("RAG embedding catalogue preserves saved choice and rejects late endpoint responses", async () => {
+  await scenario("Shared embedding picker preserves exact ID and catalogue ownership", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
-    const defaults = {base_url: "http://127.0.0.1:8005/v1", model: "mlx-community/Qwen3-Embedding-0.6B-8bit", dimensions: 3, revision: "saved"};
-    const status = {state: "missing", embedding_defaults: defaults, stages: {
+    const original = "namespace/vector-model", route = "/api/models?provider=compatible&purpose=embedding";
+    const status = {state: "missing", embedding_defaults: {provider: "compatible", model: original, dimensions: 3, revision: "saved"}, stages: {
       corpus: {fingerprint: "embedding-corpus", documents: 1, urls: []}, chunks: {fingerprint: "embedding-chunks", chunks: 1}}};
-    server.respond("GET", "/api/rag/status", () => json(status));
+    server.respond("GET", "/api/rag/status", status);
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
-    const cataloguePath = base => `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(base)}&purpose=embedding`;
-    const initial = deferred(); server.respond("GET", cataloguePath(defaults.base_url), () => initial.promise);
+    const initial = deferred(); server.respond("GET", route, () => initial.promise);
     server.respond("POST", "/api/rag/operations/embeddings", {});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
-    const model = $("#rag-model"), endpoint = $("#rag-base-url"), message = $("#rag-embedding-model-status");
-    check("Embedding loading uses a placeholder with no synthetic saved model option", model.tagName === "SELECT" && model.value === ""
-      && model.children.length === 1 && requests("GET", cataloguePath(defaults.base_url)).length === 1);
-    click("rag-embed"); await settle();
-    check("Empty embedding selection never posts", $("#rag-embed").disabled && requests("POST", "/api/rag/operations/embeddings").length === 0);
+    const model = $("#rag-model"), provider = $("#rag-provider"), list = $("#rag-model-catalogue"), message = $("#rag-embedding-model-status");
+    check("Searchable embedding field retains saved ID while loading", model.tagName === "INPUT" && model.attributes.list === list.id && model.value === original && message.textContent.includes("Загрузка"));
     initial.resolve(failure("neutral catalogue error", 502)); await settle();
-    check("Catalogue failure keeps intent private without a phantom option", model.value === "" && model.children.length === 1 && message.textContent.includes("Не удалось"));
-    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "other/Qwen3-Embedding-0.6B-8bit"}]});
-    click("rag-embedding-model-refresh"); await settle();
-    check("Embedding aliases never match another namespace", model.value === "" && model.children.length === 2);
-    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: defaults.model}, {id: "Qwen3-Embedding-0.6B-8bit"}]});
-    click("rag-embedding-model-refresh"); await settle();
-    check("Exact embedding catalogue ID takes priority over namespace alias", model.value === defaults.model && !model.textContent.includes("нет в списке"));
-    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "Qwen3-Embedding-0.6B-8bit"}, {id: "vector-a"}, {id: "vector-b"}]});
-    click("rag-embedding-model-refresh"); await settle();
-    check("Successful oMLX catalogue resolves stored mlx-community prefix to its exact server ID", model.value === "Qwen3-Embedding-0.6B-8bit"
-      && !model.textContent.includes("mlx-community/") && !model.textContent.includes("нет в списке"));
-    server.respond("GET", cataloguePath(defaults.base_url), {models: [{id: "vector-a"}, {id: "vector-b"}]});
-    click("rag-embedding-model-refresh"); await settle();
-    check("Missing embedding ID selects only the placeholder without choosing a different model", model.value === "" && model.children.length === 3
-      && message.textContent.includes("Выберите модель") && $("#rag-embed").disabled);
-    model.value = "vector-a"; model.dispatchEvent(new Evt("change")); model.focus();
-    const refresh = deferred(), beforeRefresh = requests("GET", cataloguePath(defaults.base_url)).length;
-    server.respond("GET", cataloguePath(defaults.base_url), () => refresh.promise);
-    click("rag-embedding-model-refresh"); await settle(); model.value = "vector-b"; model.dispatchEvent(new Evt("change"));
-    refresh.resolve(json({models: [{id: "vector-a"}, {id: "vector-b"}]})); await settle(1100);
-    check("Embedding refresh and status poll preserve selected draft and focus without refetch", model.value === "vector-b" && document.activeElement === model
-      && requests("GET", cataloguePath(defaults.base_url)).length === beforeRefresh + 1);
-    const oldBase = "http://127.0.0.1:9007/v1", newBase = "http://127.0.0.1:9008/v1", late = deferred();
-    server.respond("GET", cataloguePath(oldBase), () => late.promise);
-    endpoint.value = oldBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    check("Changed embedding endpoint clears old catalogue options until its own response", model.value === "" && model.children.length === 1 && $("#rag-embed").disabled);
-    server.respond("GET", cataloguePath(newBase), {models: [{id: "vector-b"}, {id: "new-vector"}]});
-    endpoint.value = newBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    late.resolve(json({models: [{id: "late-vector"}]})); await settle();
-    check("Old embedding endpoint cannot replace newer catalogue or draft", requests("GET", cataloguePath(oldBase))[0].signal.aborted
-      && endpoint.value === newBase && model.value === "vector-b" && !model.textContent.includes("late-vector") && model.textContent.includes("new-vector"));
-    model.value = "new-vector"; model.dispatchEvent(new Evt("change")); click("rag-embed"); await settle();
-    check("Embedding selected server model reaches operation payload", same(requests("POST", "/api/rag/operations/embeddings").at(-1)?.body,
-      {base_url: newBase, model: "new-vector", dimensions: 3, revision: "saved"}));
+    check("Catalogue error preserves exact ID without inventing availability", model.value === original && list.children.length === 0 && message.textContent.includes("Каталог недоступен"));
+    server.respond("GET", route, {models: [{id: "vector-model"}, {id: "other/vector-model"}]}); click("rag-embedding-model-refresh"); await settle();
+    check("Embedding catalogue never rewrites model namespaces", model.value === original && list.children.map(n => n.value).join(",") === "vector-model,other/vector-model");
+    model.value = ""; model.dispatchEvent(new Evt("change")); click("rag-embed"); await settle();
+    check("Empty model blocks embedding operation", $("#rag-embed").disabled && requests("POST", "/api/rag/operations/embeddings").length === 0);
+    model.value = "vector-model"; model.dispatchEvent(new Evt("change")); model.focus();
+    const refresh = deferred(); server.respond("GET", route, () => refresh.promise); click("rag-embedding-model-refresh"); await settle();
+    model.value = "manual/vector"; model.dispatchEvent(new Evt("input")); model.dispatchEvent(new Evt("change"));
+    refresh.resolve(json({models: [{id: "vector-model"}]})); const calls = requests("GET", route).length; await settle(1100);
+    check("Refresh/poll preserve manual ID, focus and mounted input", model.value === "manual/vector" && document.activeElement === model && model === $("#rag-model") && requests("GET", route).length === calls);
+    const late = deferred(); server.respond("GET", route, () => late.promise); click("rag-embedding-model-refresh"); await settle();
+    provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
+    late.resolve(json({models: [{id: "late-wrong-provider"}]})); await settle();
+    check("Provider switch aborts late catalogue and preserves separate drafts", requests("GET", route).at(-1).signal.aborted && !list.children.some(n => n.value === "late-wrong-provider") && model.value === "");
+    server.respond("GET", route, {models: []}); provider.value = "compatible"; provider.dispatchEvent(new Evt("change")); await settle();
+    check("Empty catalogue restores compatible exact-ID draft", model.value === "manual/vector" && list.children.length === 0 && message.textContent.includes("Каталог пуст"));
+    click("rag-embed"); await settle();
+    check("Embedding payload uses shared provider/model with no scenario URL", same(requests("POST", "/api/rag/operations/embeddings").at(-1)?.body,
+      {provider: "compatible", model: "manual/vector", dimensions: 3, revision: "saved"}));
   });
   await scenario("RAG preparation methods have independent generation drafts and operation payloads", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
@@ -492,7 +470,7 @@ async function main() {
     server.respond("POST", "/api/rag/operations/chunks", {});
     client.init(); await settle(); client.state.models = [];
     click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-documents"); await settle();
-    const method = $("#rag-preparation-strategy"), model = $("#rag-preparation-model"), endpoint = $("#rag-preparation-base-url"), provider = $("#rag-preparation-auth-mode");
+    const method = $("#rag-preparation-strategy"), model = $("#rag-preparation-model"), provider = $("#rag-preparation-provider");
     const timeout = $("#rag-preparation-timeout-seconds");
     check("Preparation timeout seeds saved operation report", Number(timeout.value) === 1800);
     timeout.value = "900"; timeout.dispatchEvent(new Evt("input"));
@@ -501,28 +479,28 @@ async function main() {
     check("Document preparation defaults to code and sends no LLM fields", method.value === "programmatic" && $("#rag-preparation-fields").hidden
       && same(requests("POST", "/api/rag/operations/ingest").at(-1)?.body, {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "programmatic"}));
     await settle(1100);
-    const cloud = deferred(); server.respond("GET", "/api/models", () => cloud.promise);
+    const cloud = deferred(); server.respond("GET", "/api/models?provider=openrouter&purpose=generation", () => cloud.promise);
     method.value = "llm"; method.dispatchEvent(new Evt("change")); await settle();
     model.value = "openai/gpt-6-luna"; model.dispatchEvent(new Evt("change")); model.focus();
     cloud.resolve(json({models: [{id: "openai/gpt-6-luna"}, {id: "prep-cloud-draft"}]})); await settle();
     model.value = "prep-cloud-draft"; model.dispatchEvent(new Evt("change"));
-    const calls = requests("GET", "/api/models").length;
+    const calls = requests("GET", "/api/models?provider=openrouter&purpose=generation").length;
     status.operation = {kind: "ingest", state: "complete", preparation_report: {model: "actual-prep-model", calls: 1,
       usage: {prompt_tokens: 321, completion_tokens: 123, total_tokens: 444}, cost_usd: 0.002, config: {timeout_seconds: 600}}};
     const actual = $("#rag-operation").querySelector("details"); actual.open = true;
     await settle(1100);
     check("Preparation poll keeps mounted model/focus/details and actual report", model === $("#rag-preparation-model") && model.value === "prep-cloud-draft"
       && Number(timeout.value) === 900 && document.activeElement === model && actual.open && actual.textContent.includes('"actual-prep-model"') && actual.textContent.includes('"total_tokens": 444')
-      && actual.textContent.includes('"cost_usd": 0.002') && requests("GET", "/api/models").length === calls);
-    const localBase = "http://127.0.0.1:8005/v1", localPath = `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(localBase)}`;
+      && actual.textContent.includes('"cost_usd": 0.002') && requests("GET", "/api/models?provider=openrouter&purpose=generation").length === calls);
+    const localPath = "/api/models?provider=compatible&purpose=generation";
     server.respond("GET", localPath, {models: [{id: "prep-local-draft"}]});
-    provider.value = "omlx"; provider.dispatchEvent(new Evt("change")); await settle();
+    provider.value = "compatible"; provider.dispatchEvent(new Evt("change")); await settle();
     model.value = "prep-local-draft"; model.dispatchEvent(new Evt("change"));
     const local = deferred(); server.respond("GET", localPath, () => local.promise); click("rag-preparation-model-refresh"); await settle();
     click("rag-step-chunks"); await settle();
     local.resolve(json({models: [{id: "late-prep-local"}]})); await settle();
     check("Leaving preparation cancels its catalogue and cannot touch chunk settings", requests("GET", localPath).at(-1).signal.aborted
-      && !model.textContent.includes("late-prep-local") && $("#rag-semantic-auth-mode").value === "openrouter"
+      && !model.textContent.includes("late-prep-local") && $("#rag-semantic-provider").value === "openrouter"
       && $("#rag-semantic-model").value === "openai/gpt-6-luna");
     click("rag-split"); await settle();
     check("Chunk payload excludes preparation settings", same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
@@ -530,83 +508,81 @@ async function main() {
     await settle(1100); server.respond("GET", localPath, {models: [{id: "prep-local-draft"}]});
     click("rag-step-documents"); await settle(); click("rag-ingest"); await settle();
     check("LLM preparation sends only its independent generation settings", same(requests("POST", "/api/rag/operations/ingest").at(-1)?.body,
-      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_timeout_seconds: 900, preparation_auth_mode: "omlx", preparation_base_url: localBase, preparation_model: "prep-local-draft"}));
+      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_timeout_seconds: 900, preparation_provider: "compatible", preparation_model: "prep-local-draft"}));
     provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
-    check("Preparation restores its own provider draft", model.value === "prep-cloud-draft" && endpoint.value === "https://openrouter.ai/api/v1");
+    check("Preparation restores its own provider draft", model.value === "prep-cloud-draft");
     method.value = "programmatic"; method.dispatchEvent(new Evt("change"));
     method.value = "llm"; method.dispatchEvent(new Evt("change")); await settle();
     check("Code/LLM switching preserves preparation draft", model.value === "prep-cloud-draft" && Number(timeout.value) === 900 && !$("#rag-preparation-fields").hidden);
   });
-  await scenario("RAG generation model picker preserves choice and rejects late provider/endpoint catalogs", async () => {
+  await scenario("Global connection saves own drafts and invalidate compatible catalogues", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
-    const stages = {corpus: {fingerprint: "catalog-corpus", documents: 1, urls: []},
+    const initial = deferred(); server.respond("GET", "/api/model-settings", () => initial.promise);
+    const writes = []; const first = deferred(), second = deferred();
+    server.respond("PATCH", "/api/model-settings", request => { writes.push(request.body.compatible_base_url); return writes.length === 1 ? first.promise : writes.length === 2 ? second.promise : json(request.body); });
+    client.init(); await settle(); click("workspace-settings");
+    const input = $("#compatible-base-url"); check("Global server settings editable without selecting a chat", !input.disabled);
+    input.value = "http://127.0.0.1:9001/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
+    input.value = "http://127.0.0.1:9002/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
+    check("Overlapping URL saves are serialized", writes.length === 1);
+    first.resolve(json({compatible_base_url: writes[0]})); await settle();
+    input.value = "http://127.0.0.1:9003/v1"; input.dispatchEvent(new Evt("input"));
+    second.resolve(json({compatible_base_url: "http://127.0.0.1:9002/v1"})); await settle();
+    initial.resolve(json({compatible_base_url: "http://127.0.0.1:8005/v1"})); await settle();
+    check("Late GET and earlier saves cannot overwrite a newer unsaved URL", input.value === "http://127.0.0.1:9003/v1" && input.dataset.dirty === "true");
+    input.dispatchEvent(new Evt("change")); await settle();
+    check("Global URL PATCH contains only nonsecret server address", same(requests("PATCH", "/api/model-settings").at(-1).body, {compatible_base_url: input.value}) && writes.length === 3);
+    server.respond("GET", "/api/rag/status", {state: "missing", stages: {corpus: {fingerprint: "catalog-corpus", documents: 1, urls: []},
       chunks: {fingerprint: "catalog-chunks", chunks: 1, strategy: "semantic", size: 512, overlap: 64,
-        semantic_config: {auth_mode: "openrouter", base_url: "https://openrouter.ai/api/v1", model: "persisted-alias"}}};
-    server.respond("GET", "/api/rag/status", {state: "missing", stages});
+      semantic_config: {provider: "compatible", model: "saved-generative"}}}});
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
-    server.respond("POST", "/api/rag/operations/chunks", {operation_id: "catalog-split"});
-    const official = deferred(); server.respond("GET", "/api/models", () => official.promise);
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-chunks"); await settle();
-    const model = $("#rag-semantic-model"), status = $("#rag-model-status"), endpoint = $("#rag-semantic-base-url"), provider = $("#rag-semantic-auth-mode");
-    check("Persisted semantic mode seeds maximum-size label and keeps model selectable during catalogue loading", $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && model.tagName === "SELECT" && model.value === "persisted-alias"
-      && status.textContent.includes("Загрузка") && $("#rag-model-refresh").disabled);
-    const cloud = [{id: "cloud-a", prompt_price_per_m: 1.2, completion_price_per_m: 3.4}, {id: "cloud-b"}];
-    official.resolve(json({models: cloud})); await settle();
-    check("OpenRouter prices reuse chat catalogue and keep missing persisted ID", client.state.models.length === 2 && model.value === "persisted-alias"
-      && model.textContent.includes("$1.2 / $3.4") && status.textContent.includes("выбор сохранён"));
-    model.value = "cloud-a"; model.dispatchEvent(new Evt("change")); model.focus();
-    check("Choosing a listed model clears the missing-ID hint", status.textContent === "Доступно моделей: 2");
-    const refresh = deferred(); server.respond("GET", "/api/models", () => refresh.promise); click("rag-model-refresh"); await settle();
-    model.value = "cloud-b"; model.dispatchEvent(new Evt("change"));
-    refresh.resolve(json({models: cloud})); await settle(1100);
-    check("Explicit selection made during refresh survives response and polls without catalogue refetch", model.value === "cloud-b" && document.activeElement === model
-      && requests("GET", "/api/models").length === 2 && model === $("#rag-semantic-model"));
-    const localPath = base => `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(base)}`;
-    const slowLocal = deferred(); server.respond("GET", localPath("http://127.0.0.1:8005/v1"), () => slowLocal.promise);
-    provider.value = "omlx"; provider.dispatchEvent(new Evt("change")); await settle();
-    check("New local provider has no copied cloud or embedding selection", model.value === "" && !model.textContent.includes("cloud-b"));
-    const local = "http://127.0.0.1:9001/v1";
-    server.respond("GET", localPath(local), {models: [{id: "neutral-generative"}, {id: "embedding-name-is-not-a-type"}]});
-    endpoint.value = local; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    slowLocal.resolve(json({models: [{id: "wrong-old-server"}]})); await settle();
-    check("Endpoint change ignores late old catalogue without guessing model types", model.textContent.includes("neutral-generative")
-      && model.textContent.includes("embedding-name-is-not-a-type") && !model.textContent.includes("wrong-old-server") && model.value === "");
-    model.value = "neutral-generative"; model.dispatchEvent(new Evt("change")); click("rag-split"); await settle();
-    check("Selected API model is forwarded to actual chunk operation", same(requests("POST", "/api/rag/operations/chunks").at(-1).body,
-      {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "omlx", semantic_base_url: local, semantic_model: "neutral-generative"}));
-    provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
-    check("Returning provider restores explicit draft without another public catalogue request", model.value === "cloud-b"
-      && endpoint.value === "https://openrouter.ai/api/v1" && requests("GET", "/api/models").length === 2);
-    const custom = deferred(), customBase = "http://127.0.0.1:9002/v1";
-    server.respond("GET", `/api/rag/models?auth_mode=openrouter&base_url=${encodeURIComponent(customBase)}`, () => custom.promise);
-    endpoint.value = customBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    provider.value = "omlx"; provider.dispatchEvent(new Evt("change")); await settle(); custom.resolve(json({models: [{id: "wrong-provider"}]})); await settle();
-    check("Custom OpenRouter endpoint is honored and late provider response cannot replace local draft", endpoint.value === local && model.value === "neutral-generative"
-      && !model.textContent.includes("wrong-provider"));
-    const emptyBase = "http://127.0.0.1:9003/v1"; server.respond("GET", localPath(emptyBase), {models: []});
-    endpoint.value = emptyBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    check("Empty catalogue retains selected ID with inline explanation", model.value === "neutral-generative" && status.textContent.includes("не вернул моделей"));
-    server.respond("GET", localPath(emptyBase), () => failure("neutral upstream failure", 502)); click("rag-model-refresh"); await settle();
-    check("Unavailable catalogue preserves fallback choice and offers refresh inline", model.value === "neutral-generative"
-      && status.textContent.includes("Не удалось загрузить") && !$("#rag-model-refresh").disabled);
-    const resumeBase = "http://127.0.0.1:9004/v1", hiddenReply = deferred();
-    server.respond("GET", localPath(resumeBase), () => hiddenReply.promise);
-    endpoint.value = resumeBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
-    document.visibilityState = "hidden"; document.fire(new Evt("visibilitychange")); await settle();
-    const cancelled = requests("GET", localPath(resumeBase))[0].signal.aborted;
-    server.respond("GET", localPath(resumeBase), {models: [{id: "neutral-generative"}, {id: "resumed-model"}]});
-    document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(1100);
-    hiddenReply.resolve(json({models: [{id: "late-hidden-model"}]})); await settle();
-    check("Visibility resume restarts cancelled catalogue once and ignores old response", cancelled && requests("GET", localPath(resumeBase)).length === 2
-      && model.value === "neutral-generative" && model.textContent.includes("resumed-model") && !model.textContent.includes("late-hidden-model")
-      && status.textContent === "Доступно моделей: 2");
-    const warmReply = deferred(); server.respond("GET", localPath(resumeBase), () => warmReply.promise);
-    click("rag-model-refresh"); await settle(); document.visibilityState = "hidden"; document.fire(new Evt("visibilitychange"));
-    server.respond("GET", localPath(resumeBase), {models: [{id: "neutral-generative"}, {id: "refreshed-model"}]});
-    document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(1100);
-    warmReply.resolve(json({models: [{id: "late-warm-model"}]})); await settle();
-    check("Cancelled explicit refresh also resumes once despite existing catalogue cache", requests("GET", localPath(resumeBase)).length === 4
-      && model.value === "neutral-generative" && model.textContent.includes("refreshed-model") && !model.textContent.includes("late-warm-model"));
+    const route = "/api/models?provider=compatible&purpose=generation", late = deferred(); server.respond("GET", route, () => late.promise);
+    click("tab-btn-rag"); await settle(); click("rag-step-chunks"); await settle();
+    const model = $("#rag-semantic-model"); check("Saved semantic picker restores provider/model without stage URL", model.value === "saved-generative" && $("#rag-semantic-provider").value === "compatible" && $("#rag-size-label").textContent.includes("Максимальный"));
+    server.respond("GET", route, {models: [{id: "new-host-model"}]});
+    input.value = "http://127.0.0.1:9004/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
+    late.resolve(json({models: [{id: "late-old-host"}]})); await settle();
+    check("Global URL change cancels old compatible catalogue without losing model", requests("GET", route)[0].signal.aborted && model.value === "saved-generative" && $("#rag-semantic-model-catalogue").children.some(n => n.value === "new-host-model") && !$("#rag-semantic-model-catalogue").children.some(n => n.value === "late-old-host"));
+    const hidden = deferred(); server.respond("GET", route, () => hidden.promise); click("rag-model-refresh"); await settle(); click("rag-step-documents"); await settle();
+    hidden.resolve(json({models: [{id: "late-hidden"}]})); await settle();
+    check("Leaving model stage aborts its request and rejects hidden response", requests("GET", route).at(-1).signal.aborted && !$("#rag-semantic-model-catalogue").children.some(n => n.value === "late-hidden"));
+  });
+  await scenario("Chat and rerank use independent shared selectors and saved ranking report", async () => {
+    const a = {chunk_id: "a", title: "Neutral A", section: "First", score: .8, text: "<b>full text A</b>", decision: "kept"};
+    const b = {chunk_id: "b", title: "Neutral B", section: "Second", score: .6, text: "full text B", decision: "kept"};
+    const rag = {version: 2, query: "neutral", index: {index_id: "saved-reranked"}, config: {rerank_enabled: true, filter_enabled: false, rewrite_enabled: false, top_k: 2},
+      rerank: {enabled: true, provider: "compatible", model: "ranker-only", source_ids: [2,1], usage: {total_tokens: 30}}, candidates: [a,b], hits: [b,a], context: "exact saved ranked context"};
+    const {client, server, $, click, requests, open, send} = freshClient({agents: [{provider: "compatible", model: "chat-only", rag_enabled: true,
+      transcript: [turns[0], {...turns[1], rag}], history_len: 2}, {provider: "openrouter", model: "cloud-only"}]});
+    server.respond("GET", "/api/agents", () => json({has_key: false, agents: server.state.agents, live: 2, max_agents: 1000}));
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream(success));
+    client.init(); await settle(); check("Compatible chat remains available without OpenRouter key", !$("#send").disabled && $("#f-provider").value === "compatible");
+    click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("Top-K stays visible with RAG enabled and filtering off", !$("#rag-chat-parameters").classList.contains("hidden") && $("#rag-threshold-field").classList.contains("hidden") && $("#rag-rerank-fields").classList.contains("hidden"));
+    $("#f-rag_rerank_enabled").checked = true; $("#f-rag_rerank_enabled").dispatchEvent(new Evt("change"));
+    $("#f-rag_rerank_provider").value = "compatible"; $("#f-rag_rerank_provider").dispatchEvent(new Evt("change"));
+    $("#f-rag_rerank_model").value = "ranker-only"; $("#f-rag_rerank_model").dispatchEvent(new Evt("input")); $("#f-rag_rerank_model").dispatchEvent(new Evt("change")); await settle();
+    check("Rerank picker saves own provider/model and preserves chat model", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_rerank_provider === "compatible" && requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_rerank_model === "ranker-only" && $("#f-model").value === "chat-only" && !$("#rag-rerank-fields").classList.contains("hidden"));
+    const saved = JSON.stringify(rag), before = requests("GET", /^\/api\/rag\//).length;
+    $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const snapshot = $("#rag-answer-snapshot"), rows = snapshot.querySelectorAll(".rag-snapshot-candidate");
+    check("Saved rerank report shows original/final ranks and cosine only", rows[0].textContent.includes("1 → 2") && rows[1].textContent.includes("2 → 1") && snapshot.textContent.includes("ranker-only") && !snapshot.textContent.includes("similarity_threshold"));
+    rows[1].querySelector("button").dispatchEvent(new Evt("click"));
+    check("Selecting one candidate shows its complete saved text without index reads", snapshot.querySelectorAll(".rag-snapshot-text").length === 1 && snapshot.querySelector(".rag-snapshot-text").textContent === b.text && requests("GET", /^\/api\/rag\//).length === before && JSON.stringify(client.state.current.transcript[1].rag) === saved);
+    snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle(); click("workspace-chat"); send("neutral request"); await settle();
+    check("Compatible chat posts without an OpenRouter key", requests("POST", "/api/agents/ag_1/messages").length === 1);
+    open(1); await settle(); check("OpenRouter chat still needs its configured key", $("#send").disabled && $("#f-provider").value === "openrouter");
+    open(0); await settle(); check("Chat switch restores independent provider and rerank selection", $("#f-provider").value === "compatible" && $("#f-model").value === "chat-only" && $("#f-rag_rerank_model").value === "ranker-only");
+  });
+  await scenario("Configured rerank without a result does not claim a completed ranking", async () => {
+    const rag = {version: 2, query: "neutral no-hit", index: {index_id: "saved-nohit"},
+      config: {rerank_enabled: true, filter_enabled: true, top_k: 1, similarity_threshold: .3},
+      candidates: [{chunk_id: "below", title: "Neutral below threshold", score: .1, decision: "threshold", text: "full rejected text"}], hits: [], context: ""};
+    const {client, $, requests} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2}]});
+    client.init(); await settle(); const before = requests("GET", /^\/api\/rag\//).length;
+    $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const node = $("#rag-answer-snapshot");
+    check("No-hit report shows rejection and enabled-but-unperformed rerank", node.textContent.includes("Ниже порога") && node.textContent.includes("не выполнялось или не завершилось") && !node.textContent.includes("До → после") && !node.querySelector(".rag-rank") && requests("GET", /^\/api\/rag\//).length === before);
   });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
@@ -621,9 +597,9 @@ async function main() {
     server.respond("POST", "/api/rag/operations/chunks", {operation_id: "split-one"});
     server.respond("POST", "/api/rag/operations/embeddings", {operation_id: "embed-one"});
     server.respond("DELETE", "/api/rag/stages/chunks", {cleared: "chunks"});
-    server.respond("GET", "/api/rag/models?auth_mode=openrouter&base_url=http%3A%2F%2F127.0.0.1%3A9000%2Fv1", {models: [{id: "offline-boundaries"}]});
-    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1", {models: [{id: "local-generative"}]});
-    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1&purpose=embedding", {models: [{id: "offline-model"}]});
+    server.respond("GET", "/api/models?provider=openrouter&purpose=generation", {models: [{id: "offline-boundaries"}]});
+    server.respond("GET", "/api/models?provider=compatible&purpose=generation", {models: [{id: "local-generative"}]});
+    server.respond("GET", "/api/models?provider=compatible&purpose=embedding", {models: [{id: "offline-model"}]});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -635,26 +611,25 @@ async function main() {
     check("Fixed chunk form retains size label and sends configured character size and overlap", $("#rag-size-label").textContent === "Размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
     click("rag-step-chunks");
     $("#rag-strategy").value = "semantic"; $("#rag-strategy").dispatchEvent(new Evt("change"));
-    $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1";
-    $("#rag-semantic-base-url").dispatchEvent(new Evt("change")); await settle();
-    $("#rag-semantic-model").value = "offline-boundaries";
-    click("rag-split"); await settle();
-    check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
-      {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "openrouter", semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
-    $("#rag-semantic-auth-mode").value = "omlx"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
     await settle();
-    check("Local generation has its own editable endpoint and no copied embedding model", $("#rag-semantic-base-url").value === "http://127.0.0.1:8005/v1" && $("#rag-semantic-model").value === "");
+    $("#rag-semantic-model").value = "offline-boundaries"; $("#rag-semantic-model").dispatchEvent(new Evt("change"));
+    click("rag-split"); await settle();
+    check("Semantic choice sends independent provider/model", !$("#rag-semantic-fields").hidden && $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
+      {strategy: "semantic", size: 512, overlap: 64, semantic_provider: "openrouter", semantic_model: "offline-boundaries"}));
+    $("#rag-semantic-provider").value = "compatible"; $("#rag-semantic-provider").dispatchEvent(new Evt("change"));
+    await settle();
+    check("Compatible generation starts with its own model draft", $("#rag-semantic-model").value === "");
     $("#rag-semantic-model").value = "local-generative";
     click("rag-split"); await settle();
-    check("Local semantic stage sends explicit auth and generative model", requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_auth_mode === "omlx" && requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_model === "local-generative");
-    $("#rag-semantic-auth-mode").value = "openrouter"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
-    check("Switching auth restores generative drafts", $("#rag-semantic-model").value === "offline-boundaries" && $("#rag-semantic-base-url").value === "http://127.0.0.1:9000/v1");
+    check("Local semantic stage sends explicit auth and generative model", requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_provider === "compatible" && requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_model === "local-generative");
+    $("#rag-semantic-provider").value = "openrouter"; $("#rag-semantic-provider").dispatchEvent(new Evt("change"));
+    check("Switching provider restores generative drafts", $("#rag-semantic-model").value === "offline-boundaries");
     click("rag-step-embeddings"); await settle();
-    $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
+    $("#rag-model").value = "offline-model";
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();
     check("Embedding button uses mounted fields and never starts save", same(requests("POST", "/api/rag/operations/embeddings")[0]?.body,
-      {base_url: "http://127.0.0.1:8005/v1", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
+      {provider: "compatible", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
     stages.embeddings = {embedding_fingerprint: "vectors-one"};
     const vectorPath = "/api/rag/chunks/chunk?vector=true&working=true";
     server.respond("GET", vectorPath, {vector: [1, 0, 0]});
