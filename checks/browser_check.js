@@ -88,6 +88,60 @@ async function main() {
     open(1); await settle();
     check("Historical selection is cleared when active chat changes", snapshot.hidden && !snapshot.children.length && !$("#rag-workflow").hidden);
   });
+  await scenario("RAG refinement fields and saved candidate decisions", async () => {
+    const rag = {version: 2, original_query: "А что затем?", query: "neutral rewritten query", index: {index_id: "neutral-v2"},
+      config: {rewrite_enabled: true, filter_enabled: true, candidates_k: 20, final_k: 5, similarity_threshold: .3},
+      history_used: [{user: "neutral earlier question", assistant: "neutral earlier answer"}],
+      rewrite: {enabled: true, model: "neutral/model", query: "neutral rewritten query", usage: null, duration_seconds: .4},
+      timings: {rewrite_seconds: .4, retrieval_seconds: .1}, context: "neutral kept context",
+      hits: [{chunk_id: "kept", title: "neutral kept", score: .8, text: "neutral kept context"}],
+      candidates: [{chunk_id: "kept", score: .8, text: "neutral kept context", decision: "kept"},
+        {chunk_id: "below", score: .2, text: "neutral excluded", decision: "threshold"},
+        {chunk_id: "cap", score: .7, text: "neutral cap", decision: "final_cap"}]};
+    const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
+      {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-agent");
+    check("Legacy refinement switches stay off with numeric defaults", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_candidates_k").value === "20");
+    $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
+    $("#f-rag_candidates_k").value = "21"; $("#f-rag_final_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
+    $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
+    const patch = requests("PATCH", "/api/agents/ag_1").at(-1).body;
+    check("Refinement controls emit actual boolean and numeric PATCH", patch.rag_rewrite_enabled === true && patch.rag_filter_enabled === true && patch.rag_candidates_k === 21 && patch.rag_final_k === 4 && patch.rag_similarity_threshold === .45 && patch.rag_enabled === false);
+    const count = requests("PATCH", "/api/agents/ag_1").length;
+    $("#f-rag_candidates_k").value = "1.5"; $("#f-rag_candidates_k").dispatchEvent(new Evt("change")); await settle();
+    check("Fractional candidate count blocks PATCH and preserves input", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_candidates_k").value === "1.5" && $("#save-status").textContent.includes("целое"));
+    $("#f-rag_candidates_k").value = "21";
+    $("#f-rag_final_k").value = "22"; $("#f-rag_final_k").dispatchEvent(new Evt("change")); await settle();
+    check("Final cap above candidate cap blocks PATCH", requests("PATCH", "/api/agents/ag_1").length === count && $("#save-status").textContent.includes("больше кандидатов"));
+    $("#f-rag_final_k").value = "4";
+    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_candidates_k").value === "30" && $("#f-rag_final_k").value === "7");
+    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_candidates_k").value === "21" && $("#f-rag_rewrite_enabled").checked);
+    click("workspace-chat"); const before = requests("GET", /^\/api\/rag\//).length;
+    $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const snapshot = $("#rag-answer-snapshot");
+    check("V2 inspector shows original, rewritten, history and unknown usage", snapshot.querySelector(".rag-snapshot-original-query").textContent === rag.original_query && snapshot.querySelector(".rag-snapshot-query").textContent === rag.query && snapshot.textContent.includes("neutral earlier answer") && snapshot.textContent.includes("Неизвестно"));
+    check("Saved candidate decisions and full context render without current-index reads", snapshot.querySelectorAll(".rag-snapshot-candidate").length === 3 && snapshot.textContent.includes("ниже порога cosine") && snapshot.textContent.includes("лимит фрагментов") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context && requests("GET", /^\/api\/rag\//).length === before);
+  });
+  await scenario("RAG actual stages, deterministic no-hit and failed rewrite diagnostics", async () => {
+    const {client, server, $, send, requests} = freshClient({agents: [{rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true}]});
+    const search = deferred(), filter = deferred(), nohit = deferred(), finish = deferred();
+    const empty = {version: 2, original_query: "neutral", query: "rewritten", hits: [], candidates: [], context: ""};
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream([
+      {event: "retrieval", stage: "rewrite"}, {event: "retrieval", stage: "search"}, {event: "retrieval", stage: "filter"},
+      {...start, generation: false, resolved_messages: []}, {event: "delta", text: "В базе не найдена подходящая информация"}, {event: "done", committed: true, answer_index: 1}
+    ], {beforeRead: async (i) => { if (i === 1) await search.promise; if (i === 2) await filter.promise; if (i === 3) await nohit.promise; if (i === 4) await finish.promise; },
+      finish: () => Object.assign(server.state.agents[0], {transcript: [turns[0], {...turns[1], content: "В базе не найдена подходящая информация", rag: empty}], history_len: 2})}));
+    client.init(); await settle(); send("neutral"); await settle();
+    check("Actual rewrite announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Переформулирование запроса");
+    search.resolve(); await settle(); check("Actual search announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Поиск контекста");
+    filter.resolve(); await settle(); check("Actual filter announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Фильтрация фрагментов");
+    nohit.resolve(); await settle(); check("No-hit start does not announce generation", $("#feed").querySelector(".card-status-text").textContent === "Подходящих фрагментов нет");
+    finish.resolve(); await settle(); check("No-hit answer has empty sources and no fabricated usage", $("#feed").querySelector(".card-rag").textContent.includes("подходящих фрагментов нет") && !$("#feed").querySelector(".card-rag").querySelector("li") && !$("#feed").querySelector(".card-usage"));
+    const payload = {model: "neutral", messages: [{role: "user", content: "neutral rewrite input"}]};
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream([{event: "error", message: "Neutral rewrite invalid", metrics: {prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost_usd: .02}, request_bodies: [payload]}, {event: "done", committed: false, question: "retry", request_bodies: [payload], metrics: {cost_usd: .02}}]));
+    send("retry"); await settle();
+    check("Failed rewrite actual JSON/cost remain in transient diagnostics without a committed answer", $("#composer-hint").querySelector(".failed-request-info").textContent.includes("0.02") && $("#composer-hint").querySelector("pre").textContent === JSON.stringify(payload, null, 2) && client.state.current.history_len === 2 && requests("POST", "/api/agents/ag_1/messages").length === 2);
+  });
   await scenario("RAG retrieval progress, generation and terminal restoration", async () => {
     const {client, server, $, send} = freshClient({agents: [{rag_enabled: true}]});
     const generation = deferred(), token = deferred(), finished = deferred();

@@ -611,7 +611,7 @@ function answerCard(agent, turn, index) {
 
 function ragSources(snapshot) {
   const box = el("div", "card-rag");
-  box.appendChild(el("div", "field-label", "Источники RAG"));
+  box.appendChild(el("div", "field-label", (snapshot.hits || []).length ? "Источники RAG" : "RAG · подходящих фрагментов нет"));
   const list = el("ol", "rag-answer-sources");
   for (const hit of snapshot.hits || []) {
     const item = el("li", "");
@@ -1123,6 +1123,7 @@ async function exchange(path, body, questionText) {
   let reasoning = "";
   let thinking = null;
   let failure = null;
+  let failureDiagnostics = null;
   let status = null;
   let prompt = null;
   let toolBox = null;
@@ -1137,8 +1138,9 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "retrieval":
-            if (!status) { status = cardStatus("Поиск контекста"); card.insertBefore(status, bodyEl); }
-            else status.querySelector(".card-status-text").textContent = "Поиск контекста";
+            const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", filter: "Фильтрация фрагментов"}[e.stage] || "Поиск контекста";
+            if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
+            else status.querySelector(".card-status-text").textContent = retrievalStatus;
             scrollFeed();
             break;
           case "compressing":
@@ -1166,8 +1168,9 @@ async function exchange(path, body, questionText) {
             break;
           case "start":
             // Поиск и служебные вызовы завершены: генерация началась.
-            if (!status) { status = cardStatus("Генерация"); card.insertBefore(status, bodyEl); }
-            else status.querySelector(".card-status-text").textContent = "Генерация";
+            const answerStatus = e.generation === false ? "Подходящих фрагментов нет" : "Генерация";
+            if (!status) { status = cardStatus(answerStatus); card.insertBefore(status, bodyEl); }
+            else status.querySelector(".card-status-text").textContent = answerStatus;
             // Промпт держим у каждого обмена, а не только у того, где есть
             // врезка. У «Всей истории» он и правда повторяет ленту, зато
             // скользящее окно начало **отбрасывает** — и прочитать, что
@@ -1224,6 +1227,7 @@ async function exchange(path, body, questionText) {
             break;
           case "error":
             failure = e.message;
+            if (e.request_bodies?.length) failureDiagnostics = {metrics: e.metrics ?? null, request_bodies: e.request_bodies};
             // Перерисовка здесь не лишняя: метрики упавшего обмена меняют
             // показанное (пометкой «из прошлого обмена», а на частичных
             // числах — и значением), а `done` после ошибки приходит не всегда.
@@ -1235,6 +1239,7 @@ async function exchange(path, body, questionText) {
             if (!committed) {
               terminalQuestion = typeof e.question === "string" ? e.question : null;
               if (e.error) failure = failure || e.error;
+              if (e.request_bodies?.length) failureDiagnostics = {metrics: e.metrics ?? null, request_bodies: e.request_bodies};
             }
             answerIndex = e.answer_index ?? null;
             if (e.text) answer = e.text;
@@ -1284,6 +1289,17 @@ async function exchange(path, body, questionText) {
   // под ключ **прошлого** ответа: кнопка под давней карточкой показала бы
   // чужой запрос, внутри которого лежит сам этот ответ.
   await refreshCurrent(committed ? prompt : null, answerIndex, agent.id, epoch);
+  if (!committed && failureDiagnostics && epoch === state.chatEpoch && state.current?.id === agent.id) {
+    const diagnostics = el("details", "failed-request-info");
+    diagnostics.append(el("summary", "", "Информация о неудачном запросе"));
+    const usage = usageLine({metrics: failureDiagnostics.metrics});
+    if (usage) diagnostics.append(usage);
+    if (failureDiagnostics.metrics?.cost_usd == null) diagnostics.append(el("p", "", "Стоимость вызова неизвестна"));
+    for (const [i, payload] of failureDiagnostics.request_bodies.entries()) {
+      diagnostics.append(el("div", "", `JSON запроса · ${i + 1}`), el("pre", "prompt-json", JSON.stringify(payload, null, 2)));
+    }
+    $("#composer-hint").append(diagnostics);
+  }
   scheduleChatPoll();
 }
 
@@ -1522,6 +1538,10 @@ function fillPanel(agent) {
   });
   fillStrategy(agent.strategy);
   $("#f-rag_enabled").checked = agent.rag_enabled === true;
+  for (const name of ["rag_rewrite_enabled", "rag_filter_enabled"]) $("#f-" + name).checked = agent[name] === true;
+  for (const [name, fallback] of Object.entries({rag_candidates_k: 20, rag_final_k: 5, rag_similarity_threshold: .3})) {
+    $("#f-" + name).value = String(agent[name] ?? fallback);
+  }
   $("#f-system").value = agent.system || "";
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
@@ -1651,8 +1671,16 @@ function readPanel() {
     ),
     strategy: $("#f-strategy").value,
     rag_enabled: $("#f-rag_enabled").checked,
+    rag_rewrite_enabled: $("#f-rag_rewrite_enabled").checked,
+    rag_filter_enabled: $("#f-rag_filter_enabled").checked,
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
+  for (const [name, min, max, integer] of [["rag_candidates_k", 1, 100, true], ["rag_final_k", 1, 100, true], ["rag_similarity_threshold", -1, 1, false]]) {
+    const value = readNumber(name);
+    if (value === null || value < min || value > max || (integer && !Number.isInteger(value))) throw new Error(name + ": " + (integer ? "целое число" : "число") + " от " + min + " до " + max);
+    patch[name] = value;
+  }
+  if (patch.rag_final_k > patch.rag_candidates_k) throw new Error("Фрагментов после фильтра не может быть больше кандидатов");
   return patch;
 }
 
