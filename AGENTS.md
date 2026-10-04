@@ -11,7 +11,7 @@
 проверки маршрутизации, объявленных инструментов и изоляции down-сервера.
 RAG — независимый пакет `rag` внутри проекта, не MCP и не отдельный сервис.
 CLI загружает явные HTML-входы, замораживает корпус и атомарно строит SQLite;
-эмбеддинги предоставляет внешний oMLX по HTTP. Инспектор «Работа RAG» читает
+эмбеддинги предоставляет выбранный OpenRouter или OpenAI-совместимый HTTP-сервер. Инспектор «Работа RAG» читает
 фактическое состояние CLI и документов/чанков/векторов. UI запускает отдельные
 этапы загрузки, разбиения, эмбеддингов и публикации; writer lock общий с CLI.
 Каталог `data/rag` (для standalone CLI также явный `--root`) содержит приватные снимки и отчёты:
@@ -26,7 +26,8 @@ prompt, JSON запросов и assistant.rag; исторический инс�
 request_bodies. Query rewrite и cosine filter независимы: new chats default true, legacy false;
 RAG остаётся OFF. Rewrite — один отдельный constrained вызов модели чата, последние
 3 успешные пары, timeout 60s, strict finish_reason stop/JSON, без retries/fallback.
-Кандидаты 20 → final5, включительный threshold0.3; nohits — детерминированный ответ
+Единый Top-K default5, включительный threshold0.3; необязательный реранкинг
+переставляет все оставшиеся hits одним strict JSON вызовом без retries/fallback; nohits — детерминированный ответ
 без финального LLM. Snapshot v2 хранит original/query/history/config/candidates decisions/
 hits/context/timing/rewrite usage; JSON включает actual rewrite, aggregate без двойного счёта.
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
@@ -43,7 +44,11 @@ Runtime поддерживает только OPENROUTER_API_KEY и RAG_EMBEDDIN
 .env loader принимает только их. Приложение использует data/agents.db, data/rag,
 mcp.json и optional data/rag/inputs.json. Проверки внедряют временные Store/пути
 явно до импорта реестра; прикладные env overrides удалены. Общая генеративная
-модель по умолчанию — openai/gpt-6-luna из независимого rag/defaults.py.
+модель по умолчанию — openai/gpt-6-luna из независимого shared_models (rag/defaults.py реэкспортирует её).
+Общие provider/endpoint/key/payload правила находятся в shared_models. Совместимый
+URL единственный для приложения и замораживается на обмен; ключ остаётся runtime.
+Published embedding identity неизменна: query использует pinned model/revision/dims
+по текущему совместимому URL, смена адреса сама по себе не требует rebuild.
 Прямые зависимости
 (`fastapi`, `uvicorn[standard]`, `httpx`, `mcp`) закреплены в `requirements.txt`.
 
