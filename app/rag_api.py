@@ -47,6 +47,7 @@ class StageRequest(BaseModel):
     preparation_base_url: str = PreparationConfig.base_url
     preparation_model: str = PreparationConfig.model
     preparation_auth_mode: Literal["openrouter", "omlx"] = PreparationConfig.auth_mode
+    preparation_timeout_seconds: float = Field(default=PreparationConfig.timeout_seconds, ge=1, le=3600, strict=True, allow_inf_nan=False)
     strategy: str = "fixed"
     size: int = Field(default=1200, ge=64, le=100000, strict=True)
     overlap: int = Field(default=180, ge=0, strict=True)
@@ -71,7 +72,7 @@ def start(kind: str, body: StageRequest):
         raise HTTPException(422, "Invalid chunk strategy/overlap")
     index = Index()
     try:
-        preparation_config = PreparationConfig(body.preparation_base_url, body.preparation_model, auth_mode=body.preparation_auth_mode)
+        preparation_config = PreparationConfig(body.preparation_base_url, body.preparation_model, body.preparation_timeout_seconds, auth_mode=body.preparation_auth_mode)
         semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model, auth_mode=body.semantic_auth_mode)
         if body.strategy == "semantic" and body.size > 12000:
             raise ValueError("Semantic chunk size must not exceed 12000 characters")

@@ -562,7 +562,11 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   вызывают автоматического платного повтора; любой отказ сохраняет прежний corpus/index.
   Default лимит исходного HTML — 200000 decoded символов (публичный audit 36 HTML:
   максимум 122948 bytes); output JSON вместе с title/sections ограничен 200000 символами,
-  max_tokens=32768. Больший вход явно отклоняется до HTTP, без обрезки; response
+  max_tokens=32768. Nonstream generative запрос ждёт полный output: timeout default600
+  секунд, независимо от semantic timeout; API `preparation_timeout_seconds` и CLI
+  `--preparation-timeout` позволяют выбрать 1–3600 конечных секунд (без bool/NaN/inf).
+  Значение сохраняется в preparation config/report и cache identity.
+  Больший вход явно отклоняется до HTTP, без обрезки; response
   ограничен до разбора JSON, provider length отклоняется. CLI/API используют те же
   defaults; оператор Python может изменить limits в config, они входят cache identity.
   `preparation-cache` приватный: identity = source/raw hash/nonsecret config/prompt,

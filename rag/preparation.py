@@ -17,7 +17,7 @@ from .semantic import SemanticConfig, _call, _decode_response, _contains_credent
 class PreparationConfig:
     base_url: str = SemanticConfig.base_url
     model: str = SemanticConfig.model
-    timeout_seconds: float = 120
+    timeout_seconds: float = 600
     prompt_version: str = "preparation-v1"
     auth_mode: str = "openrouter"
     max_html_characters: int = 200000
@@ -25,7 +25,11 @@ class PreparationConfig:
     max_tokens: int = 32768
 
     def __post_init__(self):
-        SemanticConfig(self.base_url, self.model, self.timeout_seconds, auth_mode=self.auth_mode)
+        # Reuse endpoint/model/auth validation, with an independent preparation timeout.
+        SemanticConfig(self.base_url, self.model, auth_mode=self.auth_mode)
+        if (type(self.timeout_seconds) not in (int, float) or not math.isfinite(self.timeout_seconds)
+                or not 1 <= self.timeout_seconds <= 3600):
+            raise ValueError("Preparation timeout must be between 1 and 3600 seconds")
         if self.prompt_version != "preparation-v1":
             raise ValueError("Unsupported preparation prompt version")
         for field in ("max_html_characters", "max_output_characters", "max_tokens"):

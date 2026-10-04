@@ -30,6 +30,7 @@ def main(argv=None):
     load.add_argument("--preparation-base-url", default=PreparationConfig.base_url)
     load.add_argument("--preparation-model", default=PreparationConfig.model)
     load.add_argument("--preparation-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
+    load.add_argument("--preparation-timeout", type=float, default=PreparationConfig.timeout_seconds)
     split = commands.add_parser("chunks")
     split.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="fixed")
     split.add_argument("--size", type=int, default=1200)
@@ -72,7 +73,7 @@ def main(argv=None):
             if not inputs:
                 raise ValueError("Provide --url or --manifest")
             with Operation(root, "ingest") as operation:
-                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(args.preparation_base_url, args.preparation_model, auth_mode=args.preparation_auth_mode))
+                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(args.preparation_base_url, args.preparation_model, args.preparation_timeout, auth_mode=args.preparation_auth_mode))
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
         elif args.command == "clear":
             with Operation(root, "delete_" + args.stage) as operation:

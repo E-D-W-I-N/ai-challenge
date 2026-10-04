@@ -7,6 +7,8 @@ import sys
 import tempfile
 import time
 import threading
+
+import httpx
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import ingest, load_corpus, corpus_fingerprint, write_json
-from rag.preparation import PreparationConfig
+from rag.preparation import PreparationConfig, Preparer
 from rag.index import Operation, stage_chunks, load_chunks
 from rag.__main__ import main
 
@@ -22,6 +24,36 @@ from rag.__main__ import main
 @patch.dict(os.environ, {"OPENROUTER_API_KEY": " offline-chat-key ", "RAG_EMBEDDING_API_KEY": " offline-local-key ",
                          "RAG_CHUNKING_API_KEY": "unused-old-key", "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
 def check_preparation():
+    assert PreparationConfig().timeout_seconds == 600
+    for invalid in (True, False, 0, -1, 3601, float("nan"), float("inf"), "600"):
+        try:
+            PreparationConfig(timeout_seconds=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Invalid timeout accepted: {invalid}")
+    from app.rag_api import StageRequest
+    for invalid in (True, 0, 3601, float("nan"), float("inf")):
+        try:
+            StageRequest(preparation_timeout_seconds=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid API timeout accepted")
+    # Inspect the actual httpx timeout extensions without waiting or live network.
+    timeouts = []
+    def completion(request):
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+            "title": "Neutral", "blocks": [{"text": "Neutral text", "kind": "paragraph", "section": "Topic"}]})}}]})
+    real_client = httpx.Client
+    def client_factory(*, timeout, trust_env):
+        return real_client(transport=httpx.MockTransport(completion), timeout=timeout, trust_env=False)
+    with tempfile.TemporaryDirectory() as directory, patch("rag.preparation.httpx.Client", client_factory):
+        preparer = Preparer(directory, PreparationConfig(timeout_seconds=3600))
+        preparer.prepare("<p>Neutral text</p>", "neutral://timeout")
+        assert timeouts == [{"connect": 3600, "read": 3600, "write": 3600, "pool": 3600}]
+        assert preparer.report["config"]["timeout_seconds"] == 3600
     calls, mode = [], {"value": "ok", "title": "Temperature measurements", "section": "Measured values", "cost": .005}
     blocks = [{"text": "Measured values", "kind": "heading", "section": "Measured values"},
               {"text": "Sensor A | 12.5 °C\nSensor B | 18 °C", "kind": "table_row", "section": "Measured values"}]
@@ -138,6 +170,12 @@ def check_preparation():
                              "--preparation-base-url", local.base_url, "--preparation-model", local.model,
                              "--preparation-auth-mode", "omlx"]) == 0
             assert len(calls) == before + 2  # metadata call + oMLX; CLI is a cache hit.
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert main(["--root", str(root), "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
+                             "--preparation-base-url", local.base_url, "--preparation-model", local.model,
+                             "--preparation-auth-mode", "omlx", "--preparation-timeout", "1200"]) == 0
+            assert load_corpus(root)["preparation_config"]["timeout_seconds"] == 1200
+            assert len(calls) == before + 3
             # Metadata bounds include sections, even when text itself would fit.
             previous = (root / "corpus.json").read_bytes()
             mode["section"] = "s" * 300
@@ -158,7 +196,8 @@ def check_preparation():
             with patch.dict(os.environ, {"RAG_MANIFEST": str(manifest)}), patch("app.rag_api.Index", lambda: Index(root)):
                 before = len(calls)
                 acknowledgement = start("ingest", StageRequest(use_manifest=True, preparation_strategy="llm",
-                    preparation_base_url=config.base_url, preparation_model="api-neutral", preparation_auth_mode="omlx"))
+                    preparation_base_url=config.base_url, preparation_model="api-neutral", preparation_auth_mode="omlx",
+                    preparation_timeout_seconds=1700))
                 assert acknowledgement["state"] == "running"
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
@@ -169,6 +208,8 @@ def check_preparation():
                 assert status["operation"]["state"] == "complete", status
                 assert len(calls) == before + 1 and calls[-1][1] == "Bearer offline-local-key"
                 assert load_corpus(root)["preparation_strategy"] == "llm"
+                assert load_corpus(root)["preparation_config"]["timeout_seconds"] == 1700
+                assert status["operation"]["preparation_report"]["config"]["timeout_seconds"] == 1700
     finally:
         server.shutdown()
         server.server_close()
