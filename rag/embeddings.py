@@ -10,17 +10,25 @@ from urllib.parse import urlparse
 import httpx
 
 from .documents import digest
+from shared_models import DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_EMBEDDING_MODEL
 
 
 @dataclass(frozen=True)
 class EmbeddingConfig:
-    base_url: str = "http://127.0.0.1:8005/v1"
-    model: str = "Qwen3-Embedding-0.6B-8bit"
+    base_url: str = DEFAULT_COMPATIBLE_BASE_URL
+    model: str = DEFAULT_EMBEDDING_MODEL
     dimensions: int | None = None
     # Change revision when replacing weights behind the same server/model name.
     revision: str = "1"
+    # None is archived compatible identity: do not change its serialized fingerprint.
+    provider: str | None = None
 
     def __post_init__(self):
+        from shared_models import provider, validate_url, endpoint
+        provider(self.provider or "compatible")
+        validate_url(self.base_url)
+        if self.provider == "openrouter":
+            object.__setattr__(self, "base_url", endpoint("openrouter"))
         url = urlparse(self.base_url)
         if url.scheme not in {"http", "https"} or not url.netloc or url.username or url.password:
             raise ValueError("Embedding endpoint must be HTTP(S) without embedded credentials")
@@ -30,7 +38,10 @@ class EmbeddingConfig:
             raise ValueError("Embedding dimensions must be a positive integer")
 
     def fingerprint(self):
-        return digest(json.dumps(asdict(self), sort_keys=True, separators=(",", ":")))
+        identity = asdict(self)
+        if self.provider is None:
+            identity.pop("provider")
+        return digest(json.dumps(identity, sort_keys=True, separators=(",", ":")))
 
 
 def normalize(vector, dimension=None):
@@ -56,7 +67,8 @@ class Embeddings:
             payload["dimensions"] = self.config.dimensions
         def call(client):
             # Runtime credential only: never part of config, cache identity or state.
-            key = os.environ.get("RAG_EMBEDDING_API_KEY", "")
+            from shared_models import key as model_key
+            key = model_key(self.config.provider or "compatible")
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             try:
                 response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload, headers=headers)
@@ -88,5 +100,5 @@ class Embeddings:
             return vectors
         if self.client is not None:
             return call(self.client)
-        with httpx.Client(timeout=120, trust_env=False) as client:
+        with httpx.Client(timeout=120, trust_env=self.config.provider == "openrouter", follow_redirects=False) as client:
             return call(client)

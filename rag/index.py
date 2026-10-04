@@ -322,7 +322,7 @@ class Index:
         """Compatibility list view over the same pinned retrieval result."""
         return self.retrieve(query, top_k, config=config, client=client)["hits"]
 
-    def retrieve(self, query, top_k=5, *, config=None, client=None):
+    def retrieve(self, query, top_k=5, *, config=None, client=None, expected_base_url=None):
         """Identity and full hits come from one read connection across rebuilds."""
         if not 1 <= top_k <= 100:
             raise ValueError("top_k must be between 1 and 100")
@@ -334,10 +334,14 @@ class Index:
             config = config or EmbeddingConfig(**metadata["embedding_config"])
             if config.fingerprint() != metadata["embedding_fingerprint"]:
                 raise ValueError("Query/index embedding configuration mismatch")
+            dispatch_config = config
+            if expected_base_url is not None and (config.provider or "compatible") == "compatible":
+                from dataclasses import replace
+                dispatch_config = replace(config, base_url=expected_base_url)
             corpus = read_json(self.root / "corpus.json")
             if corpus and corpus["fingerprint"] != metadata["corpus_fingerprint"]:
                 raise ValueError("Index is stale; rebuild before retrieval")
-            vector = normalize(Embeddings(config, client).embed([query])[0], metadata["dimension"])
+            vector = normalize(Embeddings(dispatch_config, client).embed([query])[0], metadata["dimension"])
             hits = []
             for row in db.execute("SELECT * FROM chunks"):
                 stored = normalize(json.loads(row["vector"]), metadata["dimension"])

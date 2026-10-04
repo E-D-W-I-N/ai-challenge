@@ -22,7 +22,7 @@ def check_workflow_http():
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             calls.append((self.path, body))
             if self.path == "/v1/chat/completions":
-                assert self.headers.get("Authorization") == "Bearer offline-chunk-key"
+                assert self.headers.get("Authorization") == "Bearer offline-embed-key"
                 units = json.loads(body["messages"][-1]["content"])["units"]
                 ids = [999] if mode["invalid"] else [item["id"] for item in units]
                 result = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"end_unit_ids": ids})}}],
@@ -38,7 +38,7 @@ def check_workflow_http():
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="workflow-http-") as temporary, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "  offline-chunk-key  ", "RAG_CHUNKING_API_KEY": "ignored-old-key", "RAG_EMBEDDING_API_KEY": "offline-embed-key",
+                "OPENROUTER_API_KEY": "  offline-chunk-key  ", "RAG_EMBEDDING_API_KEY": "offline-embed-key",
                 "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}):
             root = Path(temporary)
             source = root / "neutral.html"
@@ -46,14 +46,14 @@ def check_workflow_http():
             ingest([{"path": str(source), "source": "https://example.test/neutral"}], root)
             base = f"http://127.0.0.1:{server.server_port}/v1"
             def cli(*args, success=True):
-                result = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), *args], capture_output=True, text=True,
+                result = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", base, *args], capture_output=True, text=True,
                                         cwd=Path(__file__).resolve().parent.parent)
                 assert result.returncode == (0 if success else 1), result.stderr
                 assert "offline-chunk-key" not in result.stdout + result.stderr and "offline-embed-key" not in result.stdout + result.stderr
                 return json.loads(result.stdout) if success else result.stderr
-            split = ("chunks", "--strategy", "semantic", "--size", "400", "--overlap", "40", "--semantic-base-url", base)
+            split = ("chunks", "--strategy", "semantic", "--size", "400", "--overlap", "40", "--semantic-provider", "compatible")
             with Operation(root, "chunks"):
-                blocked = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), *split], capture_output=True, text=True,
+                blocked = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", base, *split], capture_output=True, text=True,
                                          cwd=Path(__file__).resolve().parent.parent, timeout=5)
                 assert blocked.returncode == 1 and "Another RAG operation" in blocked.stderr and not calls
             first = cli(*split)
@@ -63,7 +63,7 @@ def check_workflow_http():
             cached = cli(*split)
             assert len(calls) == count and cached["report"]["calls"] == 0 and cached["report"]["usage"] == {}
             assert cached["fingerprint"] == first["fingerprint"]
-            cli("embed", "--base-url", base, "--model", "offline-test")
+            cli("embed", "--provider", "compatible", "--model", "offline-test")
             assert not (root / "index.sqlite").exists()
             count = len(calls)
             cli("save")

@@ -384,11 +384,13 @@ def redact(value):
     """Вырезает ключ OpenRouter из всего, что уезжает в базу: в конфиг он
     не попадает по построению, но `extra_body` приходит от клиента, да и
     в реплику его можно вставить, перепутав окно. Репозиторий публичный."""
-    key = api_key()
-    if not key or len(key) < MIN_SECRET_LENGTH:
-        return value
+    api_key()
+    from shared_models import key as model_key
+    keys = [key for key in (model_key("openrouter"), model_key("compatible")) if len(key) >= MIN_SECRET_LENGTH]
     if isinstance(value, str):
-        return value.replace(key, "***")
+        for key in keys:
+            value = value.replace(key, "***")
+        return value
     if isinstance(value, dict):
         return {k: redact(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -1224,6 +1226,19 @@ class Store:
         return {row["field"]: row["content"] for row in rows}
 
     # --- meta: счётчики, общие на всю базу -----------------------------------
+
+    def load_model_settings(self) -> dict:
+        from shared_models import DEFAULT_COMPATIBLE_BASE_URL
+        with self.reading() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='model_settings'").fetchone()
+        return _loads(row["value"], None) if row else {"compatible_base_url": DEFAULT_COMPATIBLE_BASE_URL}
+
+    def save_model_settings(self, value: dict) -> dict:
+        from shared_models import validate_url
+        saved = {"compatible_base_url": validate_url(value["compatible_base_url"])}
+        with self.tx() as conn:
+            conn.execute("INSERT INTO meta(key,value) VALUES ('model_settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_dumps(saved),))
+        return saved
 
     def load_mcp_config(self) -> dict:
         with self.reading() as conn:

@@ -168,23 +168,25 @@ function memoryTabOpen() {
 }
 
 // Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
+let memoryRequest = 0;
 async function loadMemory(force = false) {
-  if (!force && $("#tab-memory").querySelector(".mem-edit-box")) return;
-  const id = state.current && state.current.id;
+  const app = state.settingsScope === "app", scope = state.settingsScope;
+  const container = $(app ? "#mem-long" : "#mem-working");
+  if (container.querySelector(".mem-edit-box")) return;
+  const id = app ? null : state.current?.id, ticket = ++memoryRequest;
+  if (!app && !id) { renderMemory(); return; }
   state.memoryNote = "Читаю память…";
   renderMemory();
+  const owned = () => ticket === memoryRequest && memoryTabOpen() && state.settingsScope === scope && (app || id === state.current?.id);
   try {
-    // Чата ещё нет — общий слой всё равно можно показать: он не про чат.
-    // Первые два раздела в этом случае честно говорят, что показывать нечего.
-    const layers = id
-      ? await api("/api/agents/" + id + "/memory")
-      : { short_term: null, working: null, long_term: await api("/api/memory") };
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = layers;
+    const answer = await api(app ? "/api/memory" : "/api/agents/" + id + "/memory");
+    if (!owned()) return;
+    if (app) state.longMemory = answer;
+    else state.memory = answer;
     state.memoryNote = "";
   } catch (err) {
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = null;
+    if (!owned()) return;
+    if (app) state.longMemory = null; else state.memory = null;
     state.memoryNote = String(err.message || err);
   }
   renderMemory();
@@ -240,9 +242,10 @@ const memNote = (text) => el("p", "mem-note", text);
 const memBlank = () => memNote(state.memoryNote || "Чат ещё не открыт.");
 
 function renderMemory() {
-  renderShortTerm($("#mem-short"));
-  if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
-  if (!$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
+  if (state.settingsScope === "chat") {
+    renderShortTerm($("#mem-short"));
+    if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
+  } else if (state.settingsScope === "app" && !$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
 }
 
 function renderShortTerm(box) {
@@ -305,7 +308,7 @@ function renderWorking(box) {
 
 function renderLongTerm(box) {
   box.innerHTML = "";
-  const long = state.memory && state.memory.long_term;
+  const long = state.longMemory;
   if (!long) { box.appendChild(memBlank()); return; }
   const records = long.records || [];
   if (!records.length) { box.appendChild(memNote("Записей нет.")); return; }
@@ -356,8 +359,10 @@ async function addWorking(kind, content) {
     workingStatus("Чат ещё не открыт: рабочая память живёт в разговоре.", true);
     return false;
   }
+  const ownerId = state.current.id;
   try {
-    const record = await api(workingUrl(), json("POST", { kind, content: text }));
+    const record = await api(workingUrl(undefined, ownerId), json("POST", { kind, content: text }));
+    if (ownerId !== state.current?.id) return false;
     const working = state.memory && state.memory.working;
     if (working) working.records = [...(working.records || []), record];
     renderMemory();
@@ -410,7 +415,7 @@ async function dropWorking(record, ownerId) {
 async function editMemory(record, patch) {
   try {
     const updated = await api("/api/memory/" + record.seq, json("PATCH", patch));
-    const long = state.memory && state.memory.long_term;
+    const long = state.longMemory;
     if (long) {
       long.records = (long.records || [])
         .map((item) => (item.seq === updated.seq ? updated : item));
@@ -438,7 +443,7 @@ async function remember(kind, content) {
   }
   try {
     const record = await api("/api/memory", json("POST", { kind, content: text }));
-    const long = state.memory && state.memory.long_term;
+    const long = state.longMemory;
     if (long) long.records = [...(long.records || []), record];
     renderMemory();
     memoryStatus("Запомнено: " + memoryKindLabel(record.kind) + ".");
@@ -456,7 +461,7 @@ async function forget(record) {
     memoryStatus(String(err.message || err), true);
     return;
   }
-  const long = state.memory && state.memory.long_term;
+  const long = state.longMemory;
   if (long) long.records = (long.records || []).filter((item) => item.seq !== record.seq);
   renderMemory();
   memoryStatus("Запись забыта.");
@@ -620,7 +625,7 @@ function toggleProfileMenu() {
   if (open) {
     renderProfileSummary();
     loadProfile();
-    $("#profile-edit").focus();
+    $("#app-settings").focus();
   }
 }
 
@@ -808,7 +813,7 @@ function renderMcpConfig() {
     const saved = (state.mcpConfig || {}).servers || [];
     (saved.length ? saved : [{ name: "", url: "", enabled: false }]).forEach(mcpDraftRow);
   }
-  $("#mcp-add").onclick = () => { mcpDraftRow(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
+  $("#mcp-add").onclick = () => { if (state.settingsScope !== "app") return; mcpDraftRow(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
   $("#mcp-config-form").onsubmit = (event) => {
     event.preventDefault();
     const rows = Array.from($("#mcp-config-rows").children).map((line) => {
@@ -822,7 +827,7 @@ function renderMcpConfig() {
 }
 
 async function mutateMcp(path, method, body) {
-  if (state.mcpMutation) return;
+  if (state.settingsScope !== "app" || state.mcpMutation) return;
   if (method !== "PUT" && state.mcpDirty) { mcpStatus("Сначала сохраните изменённые URL.", true); return; }
   stopMcpPolling();
   const epoch = state.mcpEpoch;
@@ -854,7 +859,7 @@ async function loadMcp() {
   const controller = new AbortController();
   state.mcpRequest = controller;
   try {
-    const headers = state.current ? { "X-Chat-ID": state.current.id } : {};
+    const headers = state.settingsScope === "chat" && state.current ? { "X-Chat-ID": state.current.id } : {};
     const answer = await api("/api/mcp", { signal: controller.signal, headers });
     if (epoch !== state.mcpEpoch) return;
     acceptMcp(answer);
@@ -891,6 +896,8 @@ function stopMcpPolling() {
 }
 
 function remindersBlock(data) {
+  const ownerId = state.current?.id;
+  const owned = () => state.settingsScope === "chat" && state.current?.id === ownerId;
   const box = el("section", "mem-reminders");
   box.setAttribute("aria-label", "Напоминания");
   box.appendChild(el("h4", "mem-kind", "напоминания — ждёт: " + (data.waiting ?? 0)
@@ -913,14 +920,15 @@ function remindersBlock(data) {
       cancel.type = "button";
       cancel.setAttribute("aria-label", "Снять напоминание №" + item.id);
       cancel.onclick = async () => {
-        const chat = state.current && state.current.id;
-        if (!chat || cancel.disabled) return;
+        const chat = ownerId;
+        if (!chat || !owned() || cancel.disabled) return;
         cancel.disabled = true;
         try {
           await api("/api/agents/" + encodeURIComponent(chat) + "/reminders/"
             + encodeURIComponent(data.server_name) + "/" + item.id + "/cancel", json("POST", {}));
-          await loadMcp();
+          if (owned() && toolsVisible()) await loadMcp();
         } catch (error) {
+          if (!owned()) return;
           cancel.disabled = false;
           mcpStatus(String(error.message || error), true);
         }
@@ -947,7 +955,7 @@ function renderMcp() {
     head.append(el("h3", "mcp-server-name", server.name),
       el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : server.status === "disconnected" ? "Отключён" : "Не отвечает"));
     row.appendChild(head);
-    if (server.url) {
+    if (server.url && state.settingsScope === "app") {
       row.appendChild(el("p", "mem-note", server.url));
       const controls = el("div", "mcp-config-actions");
       const connect = el("button", "mem-add", server.status === "ok" ? "Переподключить" : "Подключить");
@@ -980,7 +988,7 @@ function renderMcp() {
       card.appendChild(schema);
       row.appendChild(card);
     });
-    if (server.reminders) row.appendChild(remindersBlock({ ...server.reminders, server_name: server.name }));
+    if (server.reminders && state.settingsScope === "chat" && state.current) row.appendChild(remindersBlock({ ...server.reminders, server_name: server.name }));
     box.appendChild(row);
   });
 }

@@ -1,93 +1,73 @@
-"""Neutral HTTP fixtures for the generation model picker; never inference."""
+"""Bounded unified provider catalogues over offline HTTP, no model inference."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock, patch
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+import httpx
+from fastapi import HTTPException
 
 
 def check_rag_models():
+    from app import rag_models
     calls = []
-    state = {"status": 200, "payload": {"data": [{"id": "neutral-llm"}, {"id": "embedding-name-is-not-a-type"}, {"id": "neutral-llm"}]}}
-    class Server(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-        def do_GET(self):
-            calls.append((self.path, self.headers.get("Authorization")))
-            self.send_response(state["status"])
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(state["payload"]).encode())
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
-    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-    base = f"http://127.0.0.1:{server.server_port}/v1"
-    try:
-        with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "  neutral-local-key  ", "OPENROUTER_API_KEY": "  neutral-router-key  ",
-                "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "", "no_proxy": ""}):
-            from app.rag_api import router
-            from app import rag_models
-            app = FastAPI(); app.include_router(router)
-            with TestClient(app) as api:
-                params = {"auth_mode": "omlx", "base_url": base + "/"}
-                response = api.get("/api/rag/models", params=params)
-                assert response.status_code == 200, response.text
-                assert response.json() == {"models": [{"id": "embedding-name-is-not-a-type"}, {"id": "neutral-llm"}], "total": 2}
-                assert calls == [("/v1/models", "Bearer neutral-local-key")]
-                embedding_params = {**params, "purpose": "embedding"}
-                assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
-                state["payload"] = {"data": [{"id": "neutral-vector", "model_type": "embedding"}, {"id": "embedding-name-is-still-llm", "model_type": "llm"}]}
-                assert api.get("/api/rag/models", params=embedding_params).json() == {"models": [{"id": "neutral-vector"}], "total": 1}
-                assert api.get("/api/rag/models", params=params).json()["total"] == 2
-                for metadata in (None, "model"):
-                    state["payload"]["data"][1]["model_type"] = metadata
-                    assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
-                state["payload"] = {"data": [{"id": "neutral-vector", "type": "embeddings"}, {"id": "neutral-llm", "type": "llm"}]}
-                assert api.get("/api/rag/models", params=embedding_params).json() == {"models": [{"id": "neutral-vector"}], "total": 1}
-                state["payload"] = {"data": [{"id": "neutral-vector", "model_type": "embedding"},
-                                            {"id": "neutral-vector", "model_type": "llm"}, {"id": "neutral-llm", "model_type": "llm"}]}
-                assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
-                assert api.get("/api/rag/models", params={**params, "purpose": "unknown"}).status_code == 422
-                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": " \t "}):
-                    assert api.get("/api/rag/models", params=params).status_code == 200
-                    assert calls[-1] == ("/v1/models", None)
-                with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}):
-                    assert api.get("/api/rag/models", params={**params, "auth_mode": "openrouter"}).status_code == 200
-                    assert calls[-1] == ("/v1/models", "Bearer neutral-router-key")
-                # Custom OpenRouter follows chat proxy policy, unlike local oMLX.
-                response = api.get("/api/rag/models", params={**params, "auth_mode": "openrouter"})
-                assert response.status_code == 502 and "neutral-router-key" not in response.text
-                models = [{"id": "neutral-router", "prompt_price_per_m": 1.2, "completion_price_per_m": 3.4}]
-                with patch.object(rag_models.catalog, "fetch_models", AsyncMock(return_value=models)) as public:
-                    response = api.get("/api/rag/models", params={"auth_mode": "openrouter", "base_url": "https://openrouter.ai/api/v1/"})
-                    assert response.json() == {"models": models, "total": 1}
-                    public.assert_awaited_once()
+    state = {"status": 200, "payload": {"data": [{"id": "neutral-generation"}, {"id": "name-embedding-is-not-type"}]}}
+    original = httpx.AsyncClient
+    def respond(request):
+        calls.append((str(request.url), request.headers.get("Authorization")))
+        return httpx.Response(state["status"], json=state["payload"])
+    def client(*args, **kwargs):
+        return original(*args, **kwargs, transport=httpx.MockTransport(respond))
+    async def scenarios():
+        with patch.object(rag_models.httpx, "AsyncClient", client), patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": " neutral-compatible-secret ", "OPENROUTER_API_KEY": "neutral-router-secret"}):
+            result = await rag_models.models("compatible", "http://neutral.test/v1", "embedding")
+            assert result["models"] == [{"id": "name-embedding-is-not-type"}, {"id": "neutral-generation"}]
+            assert calls[-1] == ("http://neutral.test/v1/models", "Bearer neutral-compatible-secret")
+            state["payload"] = {"data": [{"id": "neutral-vector", "type": "embedding"}, {"id": "neutral-generation", "type": "llm"}]}
+            assert (await rag_models.models("compatible", "http://neutral.test/v1", "embedding"))["models"] == [{"id": "neutral-vector"}]
+            assert (await rag_models.models("compatible", "http://neutral.test/v1"))["models"] == [{"id": "neutral-generation"}]
+            for invalid in ("file:///neutral", "http://user:secret@neutral.test/v1", "http://neutral.test:99999/v1", "http://neutral.test/v1?secret=x", "http://neutral.test/v1#x", "http://neutral.test/\x00"):
                 before = len(calls)
-                for invalid in ["file:///neutral", "http://user:pass@127.0.0.1/v1", "http://127.0.0.1:999999/v1", base + "?key=neutral", base + "#fragment"]:
-                    assert api.get("/api/rag/models", params={**params, "base_url": invalid}).status_code == 422
+                try: await rag_models.models("compatible", invalid)
+                except HTTPException as error: assert error.status_code == 422
+                else: raise AssertionError("Invalid URL accepted")
                 assert len(calls) == before
-                state.update(status=401, payload={"error": "neutral-local-key " + "x" * 20000})
-                response = api.get("/api/rag/models", params=params)
-                assert response.status_code == 502 and "HTTP 401" in response.text and len(response.text) < 300
-                assert "neutral-local-key" not in response.text
-                state.update(status=200, payload={"data": []})
-                assert api.get("/api/rag/models", params=params).json() == {"models": [], "total": 0}
-                for invalid in [{"bad": []}, {"data": [{"id": "neutral-local-key"}]},
-                                {"data": [{"id": "x" * 513}]}, {"data": [None]}]:
-                    state["payload"] = invalid
-                    response = api.get("/api/rag/models", params=params)
-                    assert response.status_code == 502 and "neutral-local-key" not in response.text and "neutral-unused-key" not in response.text
-                state["payload"] = {"data": [{"id": "x" * (2 * 1024 * 1024)}]}
-                response = api.get("/api/rag/models", params=params)
-                assert response.status_code == 502 and len(response.text) < 300
-        return "runtime auth/proxy/catalog reuse; actual GET IDs and bounded safe failures"
-    finally:
-        server.shutdown(); server.server_close(); thread.join()
-
-
-if __name__ == "__main__":
-    print(check_rag_models())
+            rows = [{"id": "neutral-router", "prompt_price_per_m": 1.2}]
+            with patch.object(rag_models.catalog, "fetch_models", AsyncMock(return_value=rows)) as router:
+                answer = await rag_models.models("openrouter", "http://untrusted-global.test/v1", "embedding")
+                assert answer["base_url"] == "https://openrouter.ai/api/v1" and answer["models"] == rows
+                router.assert_awaited_once_with("embedding")
+            for malformed in ({"bad": []}, {"data": [{"id": "neutral-compatible-secret"}]},
+                              {"data": [{"id": "neutral%2dcompatible%2dsecret"}]},
+                              {"data": [{"id": "x" * 513}]}, {"data": [None]}):
+                state["payload"] = malformed
+                try: await rag_models.models("compatible", "http://neutral.test/v1")
+                except HTTPException as error:
+                    assert error.status_code == 502 and "secret" not in error.detail
+                else: raise AssertionError("Malformed catalogue accepted")
+            # Exercise real OR catalogue HTTP even when the shared offline fixture is installed.
+            with patch.object(rag_models.catalog, "fetch_models", getattr(rag_models.catalog, "_offline_original_fetch_models", rag_models.catalog.fetch_models)):
+                for reflected in ("neutral-router-secret", "neutral%2drouter%2dsecret", "neutral-compatible-secret"):
+                    state["payload"] = {"data": [{"id": reflected}]}
+                    try: await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                    except HTTPException as error:
+                        assert error.status_code == 502 and "secret" not in error.detail
+                    else: raise AssertionError("OpenRouter reflected a runtime key")
+                    assert calls[-1] == ("https://openrouter.ai/api/v1/embeddings/models", "Bearer neutral-router-secret")
+                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "neutral%41secret"}):
+                    state["payload"] = {"data": [{"id": "neutral%41secret"}]}
+                    try: await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                    except HTTPException as error:
+                        assert error.status_code == 502 and "secret" not in error.detail
+                    else: raise AssertionError("Percent-containing runtime key reflected raw")
+                state["payload"] = {"data": [{"id": "neutral-vector"}]}
+                safe = await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                assert safe["models"][0]["id"] == "neutral-vector" and safe["models"][0]["prompt_price_per_m"] is None
+            state.update(status=401, payload={"error": "neutral-compatible-secret"})
+            try: await rag_models.models("compatible", "http://neutral.test/v1")
+            except HTTPException as error: assert error.status_code == 502 and "HTTP 401" in error.detail and "secret" not in error.detail
+            else: raise AssertionError("HTTP failure accepted")
+    asyncio.run(scenarios())
+    return "shared catalogue IDs/types/unknown metadata; canonical OR embedding catalogue; bounded URL/auth failures"

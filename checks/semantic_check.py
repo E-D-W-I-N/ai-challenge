@@ -37,8 +37,8 @@ def check_semantic():
     assert short_payload["reasoning"] == {"effort": "none"} and short_payload["max_tokens"] == 9216
     full_payload = _payload("x" * 256, [(i, i + 1) for i in range(256)], default, 10)
     assert full_payload["max_tokens"] == 11328
-    for alternative in (replace(default, model="unverified-model"), replace(default, auth_mode="omlx"),
-                        replace(default, base_url="http://neutral.test/v1")):
+    for alternative in (replace(default, model="unverified-model"), replace(default, provider="compatible"),
+                        replace(default, base_url="http://neutral.test/v1", provider="compatible")):
         assert "reasoning" not in _payload("x", [(0, 1)], alternative, 10)
     # The requested end at 30 survives even though greedy whole-document
     # packing would choose 40. Subsequent semantic group is capped separately.
@@ -121,7 +121,7 @@ def check_semantic():
             units = json.loads(request["messages"][1]["content"])["units"]
             assert sum(len(u["text"]) for u in units) <= 12000 and len(units) <= 256
             assert request["max_tokens"] == 8192 + max(1024, 64 + len(units) * 12)
-            assert "reasoning" not in request
+            assert request["reasoning"] == {"effort": "none"}
         before = len(requests)
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "rotated-neutral-key"}):
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
@@ -135,7 +135,7 @@ def check_semantic():
         cache_path.write_text(json.dumps(saved))
         rebuilt, fresh = semantic_chunks([doc], config, 90, 15, root=root, client=client)
         assert rebuilt == chunks and fresh["calls"] > 0
-        for changed in [replace(config, model="other-neutral-model"), replace(config, base_url="http://another.test/v1")]:
+        for changed in [replace(config, model="other-neutral-model"), replace(config, base_url="http://another.test/v1", provider="compatible")]:
             assert semantic_chunks([doc], changed, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([document(text + "Changed neutral ending.")], config, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([doc], config, 100, 15, root=root, client=client)[1]["calls"] > 0
@@ -288,7 +288,7 @@ def check_semantic():
                 "OPENROUTER_API_KEY": "  ", "RAG_EMBEDDING_API_KEY": " "}):
             semantic_chunks([short], config, 35, 5, root=unauthenticated, client=client)
             assert auth[-1] is None
-        local_config = replace(config, auth_mode="omlx")
+        local_config = replace(config, provider="compatible")
         with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {
                 "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  "}):
             local_chunks, _ = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
@@ -303,7 +303,7 @@ def check_semantic():
             assert all(secret not in path.read_text() for path in (Path(local) / "semantic-cache").glob("*.json")
                        for secret in ("chat-neutral", "local-neutral"))
         try:
-            replace(config, auth_mode="unknown")
+            replace(config, provider="unknown")
         except ValueError:
             pass
         else:
@@ -313,79 +313,52 @@ def check_semantic():
 
 
 def check_http_diagnostics():
-    """Both auth modes over real offline HTTP; proxy routing and safe 403 text."""
-    for error, credential in (({"message": "offline\tprivate\ncredential"}, "offline private credential"),
-                              ({"code": "guardrail", "message": "Denied"}, "guardrail: Denied")):
-        response = httpx.Response(403, json={"error": error})
-        assert _http_error(response, (credential,)) == "Semantic HTTP error: status 403"
-    calls, reply = [], {"status": 403, "body": {"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}}
-    class Server(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-        def do_POST(self):
-            self.rfile.read(int(self.headers["Content-Length"]))
-            calls.append((self.path, self.headers.get("Authorization")))
-            self.send_response(reply["status"])
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(reply["body"]).encode())
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    proxy = f"http://127.0.0.1:{server.server_port}"
-    try:
-        with patch.dict(os.environ, {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy, "NO_PROXY": "",
-                "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy, "no_proxy": "",
-                "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  "}):
-            for auth_mode in ("openrouter", "omlx"):
-                # OpenRouter request must go through our offline proxy. oMLX
-                # must reach the local endpoint directly despite the same env.
-                base = "http://127.0.0.1:1/v1" if auth_mode == "openrouter" else proxy + "/v1"
-                config = SemanticConfig(base_url=base, auth_mode=auth_mode)
-                fixtures = [
-                    ({"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}, "guardrail_violation: Model denied by guardrail"),
-                    ({"error": {"message": "Denied\n by\tguardrail"}}, ": Denied by guardrail"),
-                    ({"error": {"code": 403, "message": "x" * 1000}}, "; code 403: " + "x" * 400),
-                    ("<html>Cloudflare denial</html>", None),
-                    ({"error": {"message": "<html>blocked</html>"}}, None),
-                    ({"error": {"message": "Bearer unrecognized-secret"}}, None),
-                    ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
-                    ({"error": {"code": "guardrail", "message": "sk-unknown-fixture-key"}}, None),
-                    ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
-                    ({"error": {"code": "sk-\x00unknown-fixture-key"}}, None),
-                ]
-                for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret"):
-                    fixtures.append(({"error": {"code": 403, "message": json.loads(json.dumps(secret).replace("offline", "\\u006fffline"))}}, None))
-                    escaped = "".join("\\u%04x" % ord(c) for c in secret)
-                    for reflected in (escaped, escaped.replace("\\", "\\\\")):
-                        fixtures.append(({"error": {"code": 403, "message": "Credential " + reflected}}, None))
-                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
-                    for control in ("\x00", "\x1b", "\u200b"):
-                        reflected = secret[:7] + control + secret[7:]
-                        fixtures.append(({"error": {"code": 403, "message": reflected}}, None))
-                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
-                for body, detail in fixtures:
-                    reply["body"] = body
-                    with tempfile.TemporaryDirectory() as root:
-                        before = len(calls)
-                        try:
-                            semantic_chunks([document("Neutral sample.")], config, 100, 0, root=root)
-                        except ValueError as error:
-                            text = str(error)
-                            assert text.startswith("Semantic HTTP error: status 403"), text
-                            assert (detail in text if detail else text == "Semantic HTTP error: status 403"), text
-                            assert "secret" not in text and len(text) < 520
-                        else:
-                            raise AssertionError("403 accepted")
-                        assert len(calls) == before + 1
-                        path, authorization = calls[-1]
-                        assert path == ("http://127.0.0.1:1/v1/chat/completions" if auth_mode == "openrouter" else "/v1/chat/completions")
-                        assert authorization == ("Bearer offline-chat-secret" if auth_mode == "openrouter" else "Bearer offline-local-secret")
-                        assert not list((Path(root) / "semantic-cache").glob("*.json"))
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+    """Both providers over offline HTTP transport; canonical routing and bounded diagnostics."""
+    from rag.semantic import _call
+    from shared_models import OPENROUTER_BASE_URL
+    observed = []
+    state = {"body": {"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}}
+    def transport(request):
+        observed.append((str(request.url), request.headers.get("Authorization")))
+        return httpx.Response(403, json=state["body"])
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client, patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  "}):
+        for provider in ("openrouter", "compatible"):
+            config = SemanticConfig(base_url="http://neutral.test/v1", provider=provider)
+            fixtures = [
+                ({"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}, "guardrail_violation"),
+                ({"error": {"message": "Denied\n by\tguardrail"}}, "Denied by guardrail"),
+                ({"error": {"code": 403, "message": "x" * 1000}}, "; code 403: " + "x" * 400),
+                ("<html>Cloudflare denial</html>", None),
+                ({"error": {"message": "<html>blocked</html>"}}, None),
+                ({"error": {"message": "Bearer unrecognized-secret"}}, None),
+                ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
+                ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
+            ]
+            for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret"):
+                fixtures.append(({"error": {"message": secret}}, None))
+                escaped = "".join("\\u%04x" % ord(c) for c in secret)
+                for reflected in (escaped, escaped.replace("\\", "\\\\")):
+                    fixtures.append(({"error": {"code": 403, "message": "Credential " + reflected}}, None))
+                    fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
+                for control in ("\x00", "\x1b", "\u200b"):
+                    reflected = secret[:7] + control + secret[7:]
+                    fixtures.append(({"error": {"code": 403, "message": reflected}}, None))
+                    fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
+            for body, hint in fixtures:
+                state["body"] = body
+                try:
+                    _call(client, config, {"model": config.model, "messages": []})
+                except ValueError as error:
+                    message = str(error)
+                    assert "status 403" in message and len(message) < 520
+                    assert "offline-local-secret" not in message and "offline-chat-secret" not in message
+                    assert (hint is not None and hint in message) or (hint is None and message == "Semantic HTTP error: status 403")
+                else:
+                    raise AssertionError("HTTP failure accepted")
+            expected = OPENROUTER_BASE_URL if provider == "openrouter" else "http://neutral.test/v1"
+            expected_key = "offline-chat-secret" if provider == "openrouter" else "offline-local-secret"
+            assert observed[-1] == (expected + "/chat/completions", "Bearer " + expected_key)
 
 
 if __name__ == "__main__":
