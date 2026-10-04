@@ -876,3 +876,69 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .failed-request-info { max-height: 220px; overflow: auto; color: var(--muted); }
 .failed-request-info > summary { cursor: pointer; }
 .failed-request-info pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Compact desktop settings, with the same picker for every model purpose. */
+.panel { grid-template-columns: 155px minmax(0, 1fr); }
+.settings-nav { padding: 20px 9px; }
+.tabs { gap: 4px; }
+.tab { min-height: 40px; padding: 10px 11px; gap: 9px; font-size: 13px; border-radius: 6px; }
+.tab-icon svg { width: 18px; height: 18px; }
+.panel-body { padding: 24px; }
+.settings-head { margin-bottom: 20px; gap: 12px; }
+.settings-head h2 { font-size: 24px; }
+.settings-head p { font-size: 13px; margin-bottom: 10px; }
+.scope-badge { font-size: 11px; line-height: 1.5; padding: 3px 8px; border-radius: 5px; align-self: flex-start; }
+.tab-page { gap: 12px; }
+.settings-card, .mem-layer { padding: 18px; gap: 14px; }
+.settings-card h3 { font-size: 15px; }
+.field { gap: 5px; }
+.field-label, .rag-toggle { font-size: 13px; }
+.control { min-height: 36px; padding: 7px 10px; font-size: 13px; }
+.control.area { min-height: 90px; }
+.grid2, .grid3 { gap: 14px; }
+.primary-btn { border-radius: 6px; padding: 9px 13px; font-size: 13px; }
+#rag-workflow, #rag-current-chat { gap: 10px; }
+.rag-chat-settings { gap: 12px; }
+.rag-chat-numbers { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 0; }
+.rag-chat-numbers .field { width: 155px; }
+.model-selector { min-width: 0; }
+.model-selector-row { display: grid; grid-template-columns: minmax(170px, 200px) minmax(160px, 1fr) 36px; gap: 10px; align-items: end; }
+.model-refresh { width: 36px; height: 36px; min-width: 36px; padding: 0; font-size: 19px; }
+.model-status { display: block; font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }
+.model-parameters > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.model-parameters[open] { display: flex; flex-direction: column; gap: 14px; }
+.model-parameters[open] > * + * { margin-top: 14px; }
+.rag-ranking-table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: auto; }
+.rag-ranking-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 9px; border-bottom: 1px solid var(--line); }
+.rag-ranking-table td { padding: 8px 9px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.rag-ranking-table tr.selected { background: var(--accent-soft); }
+.rag-ranking-table th:first-child, .rag-rank, .rag-cosine { white-space: nowrap; }
+.rag-fragment-button { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--text); cursor: pointer; padding: 0; font: inherit; }
+.rag-fragment-button:hover { color: var(--accent); }
+.rag-ranking-table .hint { display: block; font-size: 11px; }
+.rag-selected-fragment { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.rag-selected-fragment .rag-snapshot-text { margin: 0; padding: 12px; border-left: 3px solid var(--accent-soft); background: var(--bg-soft); font: inherit; line-height: 1.6; }
+@media (max-width: 1100px) {
+  .panel { grid-template-columns: 150px minmax(0, 1fr); }
+  .panel-body { padding: 20px; }
+  .settings-card, .mem-layer { padding: 16px; }
+  .model-selector-row { grid-template-columns: 200px minmax(130px, 1fr) 36px; }
+}
+@media (max-width: 900px) {
+  .model-selector-row { grid-template-columns: minmax(0, 1fr) 36px; }
+  .model-selector-row > .field:first-child { grid-column: 1 / -1; }
+}
+:root { --sidebar-w: 220px; }
+.rag-help { font-size: 12px; color: var(--muted); }
+.rag-help > summary { cursor: pointer; }
+.rag-help .hint { margin: 8px 0 0; }
+#rag-rerank-fields { min-width: 0; }
+#rag-chat-settings > .rag-help { order: 5; }
+.rag-chat-parameters .rag-help { margin-top: 8px; }
+.sidebar-head { padding: 22px 12px; }
+.brand-name { font-size: 18px; }
+.rag-toggle .control { min-height: 17px; }
+.model-selector-row .model-refresh, .rag-stages .mcp-button { min-height: 36px; }
+.rag-stages .mcp-button { padding: 8px 10px; }
+#rag-answer-snapshot > .rag-detail { border: 0; border-radius: 0; }
+#rag-answer-snapshot > .rag-detail > summary { padding: 4px 0; }

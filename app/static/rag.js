@@ -1,7 +1,7 @@
 "use strict";
 
 // Durable stages and published index share the operator-configured directory.
-function createRagInspector({ state, $, el, api }) {
+function createRagInspector({ state, $, el, api, modelSelectors }) {
   let historical = false;
   let epoch = 0, controller = null, timer = null, indexId = null;
   let previewEpoch = 0, documentRequest = 0, chunkRequest = 0, textRequest = 0;
@@ -136,18 +136,9 @@ function createRagInspector({ state, $, el, api }) {
       lastStatus = data;
       const initializing = !seeded;
       const stages = data.stages;
-      if (!seeded && stages?.chunks?.semantic_config) {
-        for (const [id, key] of [["semantic-base-url", "base_url"], ["semantic-model", "model"], ["semantic-auth-mode", "auth_mode"]]) {
-          const input = $("#rag-" + id);
-          if (input && !input.dataset.dirty) {
-            const value = stages.chunks.semantic_config[key] ?? "openrouter";
-            if (id === "semantic-model") semanticPicker.setModels([], value);
-            else input.value = value;
-          }
-        }
-      }
       if (!seeded) {
         const preparation = stages?.corpus?.preparation_config;
+        if (stages?.chunks?.semantic_config) semanticPicker.restore(stages.chunks.semantic_config);
         const strategy = $("#rag-preparation-strategy");
         if (!strategy.dataset.dirty) strategy.value = stages?.corpus?.preparation_strategy || "programmatic";
         if (preparation) preparationPicker.restore(preparation);
@@ -163,15 +154,12 @@ function createRagInspector({ state, $, el, api }) {
         }
         const defaults = data.embedding_defaults;
         if (defaults) {
-          for (const [id, key] of [["base-url", "base_url"], ["model", "model"], ["dimensions", "dimensions"], ["revision", "revision"]]) {
-            const input = $("#rag-" + id);
-            if (input && !input.dataset.dirty) {
-              if (id === "model") embeddingPicker.setModels([], defaults[key]); else input.value = defaults[key] ?? "";
-            }
+          embeddingPicker.restore({...defaults, provider: defaults.provider || "compatible"});
+          for (const [id, key] of [["dimensions", "dimensions"], ["revision", "revision"]]) {
+            const input = $("#rag-" + id); if (!input.dataset.dirty) input.value = defaults[key] ?? "";
           }
         }
         const urls = $("#rag-urls"); if (urls && !urls.dataset.dirty && stages?.corpus) urls.value = stages.corpus.urls.join("\n");
-        for (const picker of modelPickers) picker.seed();
         seeded = true;
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
@@ -281,8 +269,7 @@ function createRagInspector({ state, $, el, api }) {
   function chunkOptions() {
     const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
     if (body.strategy === "semantic") {
-      body.semantic_auth_mode = $("#rag-semantic-auth-mode").value;
-      body.semantic_base_url = $("#rag-semantic-base-url").value.trim();
+      body.semantic_provider = $("#rag-semantic-provider").value;
       body.semantic_model = $("#rag-semantic-model").value.trim();
     }
     return body;
@@ -292,7 +279,7 @@ function createRagInspector({ state, $, el, api }) {
       preparation_strategy: $("#rag-preparation-strategy").value};
     if (body.preparation_strategy === "llm") {
       body.preparation_timeout_seconds = Number($("#rag-preparation-timeout-seconds").value);
-      for (const key of ["auth_mode", "base_url", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
+      for (const key of ["provider", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
     }
     return body;
   }
@@ -302,8 +289,9 @@ function createRagInspector({ state, $, el, api }) {
     try {
       const body = kind === "ingest" ? preparationOptions()
         : kind === "chunks" ? chunkOptions()
-        : kind === "embeddings" ? {base_url: $("#rag-base-url").value.trim(), model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
-      if (kind === "embeddings" && !body.model) throw new Error("Выберите модель эмбеддингов из списка сервера.");
+        : kind === "embeddings" ? {provider: $("#rag-provider").value, model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
+      const model = kind === "embeddings" ? body.model : body.semantic_model ?? body.preparation_model;
+      if (model !== undefined && !model) throw new Error("Выберите модель или введите её ID.");
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (lastStatus) lastStatus.operation = {...lastStatus.operation, state: "running"};
       $("#rag-error").textContent = "";
@@ -323,128 +311,18 @@ function createRagInspector({ state, $, el, api }) {
   for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"], ["delete-index", "index"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
-  const modelCatalogues = new Map();
-  function createModelPicker(prefix, active, buttonPrefix = prefix + "-", embedding = false) {
-    const authMode = embedding ? {value: "omlx"} : $("#rag-" + prefix + "-auth-mode");
-    const fieldPrefix = prefix ? prefix + "-" : "";
-    const endpoint = $("#rag-" + fieldPrefix + "base-url"), model = $("#rag-" + fieldPrefix + "model");
-    const refreshButton = $("#rag-" + buttonPrefix + "model-refresh"), statusNode = $("#rag-" + buttonPrefix + "model-status");
-    let modelRequest = 0, modelController = null, pendingModelSource = null;
-    let intendedModel = model.value;
-    const desiredModel = () => embedding ? intendedModel : model.value;
-    function modelSource() {
-      const mode = authMode.value;
-      const base = endpoint.value.trim().replace(/\/+$/, "");
-      return {mode, base, key: `${embedding ? "embedding" : "generation"}:${mode}:${base}`};
-    }
-    function cancelModelRequest() {
-      modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
-      refreshButton.disabled = false;
-    }
-    function setModels(models, current, complete = false) {
-      const select = model;
-      if (embedding) {
-        intendedModel = current || "";
-        if (complete && intendedModel.startsWith("mlx-community/") && !models.some(item => item.id === intendedModel)) {
-          const candidates = models.filter(item => item.id === intendedModel.slice("mlx-community/".length));
-          if (candidates.length === 1) intendedModel = candidates[0].id;
-        }
-        current = models.some(item => item.id === intendedModel) ? intendedModel : "";
-      }
-      const options = [{id: "", label: "Выберите модель"}, ...models];
-      if (!embedding && current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
-      select.replaceChildren();
-      for (const item of options) {
-        const price = item.prompt_price_per_m ? ` · $${item.prompt_price_per_m} / $${item.completion_price_per_m} за 1M` : "";
-        const option = el("option", "", (item.label || item.id) + price); option.value = item.id;
-        option.selected = item.id === current; select.append(option);
-      }
-      select.value = current || "";
-      if (embedding && lastStatus) updateControls();
-    }
-    if (embedding) setModels([], intendedModel);
-    function catalogueMessage(entry, current) {
-      if (embedding) {
-        if (entry.error) return entry.error;
-        if (!entry.models.length) return "Сервер не вернул моделей. Выберите другой сервер или обновите список.";
-        if (intendedModel && !current) return "Текущая модель не найдена в каталоге. Выберите модель.";
-        return `Доступно моделей: ${entry.models.length}`;
-      }
-      if (entry.error) return entry.error + (current ? " Текущая модель сохранена." : "");
-      if (!entry.models.length) return "Сервер не вернул моделей." + (current ? " Текущая модель сохранена." : "");
-      if (current && !entry.models.some(item => item.id === current)) return "Текущая модель отсутствует в каталоге; выбор сохранён.";
-      return `Доступно моделей: ${entry.models.length}`;
-    }
-    async function loadModels(force = false) {
-      if (!visible() || !active()) return;
-      const source = modelSource(), select = model, status = statusNode;
-      const cached = modelCatalogues.get(source.key);
-      if (!force && cached && !cached.retry) {
-        setModels(cached.models, desiredModel(), !cached.error); status.textContent = catalogueMessage(cached, select.value); return;
-      }
-      if (!force && pendingModelSource === source.key) return;
-      cancelModelRequest();
-      const request = modelRequest; modelController = new AbortController(); pendingModelSource = source.key;
-      const signal = modelController.signal;
-      setModels(cached?.models || [], desiredModel());
-      status.textContent = "Загрузка моделей…"; refreshButton.disabled = true;
-      try {
-        const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
-        const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
-          : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}${embedding ? "&purpose=embedding" : ""}`, {signal});
-        if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
-        const models = data.models || [];
-        if (official) state.models = models;
-        const entry = {models}; modelCatalogues.set(source.key, entry);
-        setModels(models, desiredModel(), true); status.textContent = catalogueMessage(entry, select.value);
-      } catch (error) {
-        if (error.name === "AbortError" || request !== modelRequest || source.key !== modelSource().key || !visible()) return;
-        const entry = {models: cached?.models || [], error: "Не удалось загрузить модели. Проверьте URL и обновите список."};
-        modelCatalogues.set(source.key, entry); status.textContent = catalogueMessage(entry, select.value);
-      } finally {
-        if (request === modelRequest) { modelController = null; pendingModelSource = null; refreshButton.disabled = false; }
-      }
-    }
-    refreshButton.onclick = () => loadModels(true);
-    const drafts = new Map();
-    let previousAuthMode = "openrouter";
-    authMode.onchange = () => {
-      drafts.set(previousAuthMode, {endpoint: endpoint.value, model: model.value});
-      const draft = drafts.get(authMode.value) || (authMode.value === "omlx"
-        ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
-        : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-6-luna"});
-      cancelModelRequest(); endpoint.value = draft.endpoint; setModels([], draft.model); previousAuthMode = authMode.value;
-      for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
-      loadModels();
-    };
-    endpoint.oninput = () => {
-      endpoint.dataset.dirty = "true"; cancelModelRequest(); setModels([], desiredModel());
-      statusNode.textContent = "URL изменён — обновите список моделей.";
-    };
-    endpoint.onchange = () => loadModels();
-    model.onchange = () => {
-      model.dataset.dirty = "true";
-      if (embedding) { intendedModel = model.value; updateControls(); }
-      const entry = modelCatalogues.get(modelSource().key);
-      if (entry && !modelController) statusNode.textContent = catalogueMessage(entry, model.value);
-    };
-    return {active, load: loadModels, cancel: cancelModelRequest, setModels,
-      seed: () => { previousAuthMode = authMode.value; },
-      restore: (config) => {
-        for (const [input, key] of [[endpoint, "base_url"], [model, "model"], ...(!embedding ? [[authMode, "auth_mode"]] : [])]) {
-          if (input.dataset.dirty) continue;
-          if (input === model) setModels([], config[key]); else input.value = config[key];
-        }
-      },
-      stop: () => {
-        const interrupted = modelCatalogues.get(pendingModelSource);
-        if (interrupted) interrupted.retry = true;
-        cancelModelRequest();
-      }};
-  }
-  const semanticPicker = createModelPicker("semantic", () => selectedStep === "chunks" && $("#rag-strategy").value === "semantic", "");
-  const preparationPicker = createModelPicker("preparation", () => selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm");
-  const embeddingPicker = createModelPicker("", () => selectedStep === "embeddings", "embedding-", true);
+  const semanticPicker = modelSelectors.create({host: $("#rag-semantic-picker"), modelId: "rag-semantic-model", providerId: "rag-semantic-provider",
+    refreshId: "rag-model-refresh", statusId: "rag-model-status", title: "Модель разбиения",
+    active: () => visible() && selectedStep === "chunks" && $("#rag-strategy").value === "semantic"});
+  const preparationPicker = modelSelectors.create({host: $("#rag-preparation-picker"), modelId: "rag-preparation-model", providerId: "rag-preparation-provider",
+    refreshId: "rag-preparation-model-refresh", statusId: "rag-preparation-model-status", title: "Модель подготовки",
+    active: () => visible() && selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm"});
+  const embeddingPicker = modelSelectors.create({host: $("#rag-embedding-picker"), modelId: "rag-model", providerId: "rag-provider",
+    refreshId: "rag-embedding-model-refresh", statusId: "rag-embedding-model-status", title: "Модель эмбеддингов", purpose: "embedding",
+    active: () => visible() && selectedStep === "embeddings", onChange: () => { if (lastStatus) updateControls(); }});
+  semanticPicker.set({provider: "openrouter", model: "openai/gpt-6-luna"});
+  preparationPicker.set({provider: "openrouter", model: "openai/gpt-6-luna"});
+  embeddingPicker.set({provider: "compatible", model: ""});
   const modelPickers = [semanticPicker, preparationPicker, embeddingPicker];
   function loadModelsForStage() {
     for (const picker of modelPickers) {
@@ -468,7 +346,7 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-size").max = semantic ? "12000" : "100000";
     if (semantic) loadModelsForStage(); else semanticPicker.cancel();
   };
-  for (const id of ["preparation-timeout-seconds", "preparation-strategy", "preparation-base-url", "preparation-model", "preparation-auth-mode", "urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
+  for (const id of ["preparation-timeout-seconds", "preparation-strategy", "urls", "dimensions", "revision", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input && !input.oninput) input.oninput = () => { input.dataset.dirty = "true"; };
   }
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {
@@ -499,39 +377,63 @@ function createRagInspector({ state, $, el, api }) {
     const parameters = {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k,
       duration_seconds: snapshot.duration_seconds, retrieval_seconds: snapshot.timings?.retrieval_seconds};
     if (rewriteEnabled) parameters.rewrite_seconds = snapshot.timings?.rewrite_seconds;
-    if (filterEnabled) parameters.filter = {candidates_k: snapshot.config.candidates_k,
-      final_k: snapshot.config.final_k, similarity_threshold: snapshot.config.similarity_threshold};
+    if (filterEnabled) parameters.filter = {top_k: snapshot.config.top_k ?? snapshot.top_k,
+      similarity_threshold: snapshot.config.similarity_threshold};
+    if (filterEnabled && snapshot.config.candidates_k != null) parameters.filter.candidates_k = snapshot.config.candidates_k;
+    if (filterEnabled && snapshot.config.final_k != null) parameters.filter.final_k = snapshot.config.final_k;
     target.replaceChildren(el("h3", "", "Контекст сохранённого ответа"),
       el("p", "hint", "Этот снимок сохранён вместе с ответом и не меняется при перестройке индекса."), back);
+    const query = el("details", "rag-detail"); query.append(el("summary", "", rewriteEnabled ? "Исходный и поисковый запросы" : "Запрос"));
     if (rewriteEnabled) {
-      target.append(el("h3", "", "Исходный запрос"), el("p", "rag-snapshot-original-query", snapshot.original_query ?? snapshot.query ?? ""),
+      query.append(el("h3", "", "Исходный запрос"), el("p", "rag-snapshot-original-query", snapshot.original_query ?? snapshot.query ?? ""),
         el("h3", "", "Запрос для поиска"), el("p", "rag-snapshot-query", snapshot.query || ""));
     } else {
-      target.append(el("h3", "", "Запрос"), el("p", "rag-snapshot-query", snapshot.query ?? snapshot.original_query ?? ""));
+      query.append(el("p", "rag-snapshot-query", snapshot.query ?? snapshot.original_query ?? ""));
     }
-    target.append(detail("Индекс и параметры поиска", parameters));
+    target.append(query);
+    const diagnostics = el("details", "rag-detail"); diagnostics.append(el("summary", "", "Параметры и выполнение поиска"), detail("Индекс и параметры поиска", parameters));
     if (rewriteEnabled) {
-      target.append(detail("Уточнение запроса: модель, токены и стоимость", {...snapshot.rewrite, usage: snapshot.rewrite?.usage ?? "Неизвестно"}),
+      diagnostics.append(detail("Уточнение запроса: модель, токены и стоимость", {...snapshot.rewrite, usage: snapshot.rewrite?.usage ?? "Неизвестно"}),
         detail("История для уточнения запроса", snapshot.history_used || []));
     }
-    if (filterEnabled && snapshot.candidates) {
-      target.append(el("h3", "", "Кандидаты поиска"));
-      const decisions = {kept: "Включён в контекст", threshold: "Исключён: ниже порога cosine", final_cap: "Исключён: лимит фрагментов"};
-      for (const [i, hit] of snapshot.candidates.entries()) {
-        const node = el("details", "rag-detail rag-snapshot-candidate");
-        node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"} · ${decisions[hit.decision] || hit.decision || "—"}`));
-        const {text, ...metadata} = hit;
-        node.append(el("pre", "rag-snapshot-text", text || ""), detail("Метаданные кандидата", metadata)); target.append(node);
+    const rerankEnabled = snapshot.config?.rerank_enabled ?? snapshot.rerank?.enabled ?? false;
+    const rerankPerformed = rerankEnabled && Array.isArray(snapshot.rerank?.source_ids) && snapshot.rerank.source_ids.length > 0;
+    if (rerankEnabled && !rerankPerformed) diagnostics.append(el("p", "hint", "Ранжирование было включено, но не выполнялось или не завершилось."));
+    if (rerankEnabled && snapshot.rerank) diagnostics.append(detail("Ранжирование: модель, токены и стоимость", {...snapshot.rerank,
+      usage: snapshot.rerank?.usage ?? "Неизвестно", duration_seconds: snapshot.timings?.rerank_seconds ?? snapshot.rerank?.duration_seconds}));
+    target.append(diagnostics);
+    const hits = snapshot.hits || [];
+    const candidates = (filterEnabled || rerankEnabled) && snapshot.candidates ? snapshot.candidates : hits;
+    target.append(el("h3", "", rerankPerformed ? "Фрагменты · порядок до и после ранжирования" : "Фрагменты поиска"));
+    if (!candidates.length) target.append(el("p", "hint", "Подходящих фрагментов нет"));
+    else {
+      const table = el("table", "rag-ranking-table"), head = el("thead"), headings = el("tr"), body = el("tbody");
+      for (const label of [...(rerankPerformed ? ["До → после"] : []), "Источник / раздел", "Cosine", "Контекст"]) headings.append(el("th", "", label));
+      head.append(headings); table.append(head, body);
+      const textView = el("div", "rag-selected-fragment");
+      const decisions = {kept: "В контексте", threshold: "Ниже порога", final_cap: "Лимит фрагментов"};
+      function select(hit, row) {
+        for (const node of body.querySelectorAll("tr")) {
+          const selected = node === row; node.classList.toggle("selected", selected);
+          node.querySelector("button").setAttribute("aria-pressed", String(selected));
+        }
+        const {text, decision, ...metadata} = hit;
+        if (filterEnabled && decision !== undefined) metadata.decision = decision;
+        textView.replaceChildren(el("h3", "", hit.section || hit.title || hit.chunk_id),
+          el("pre", "rag-snapshot-text", text || ""), detail("Источник и метаданные фрагмента", metadata));
       }
-    }
-    target.append(el("h3", "", "Фрагменты в контексте"));
-    if (!(snapshot.hits || []).length) target.append(el("p", "hint", "Подходящих фрагментов нет"));
-    for (const [i, hit] of (snapshot.hits || []).entries()) {
-      const node = el("details", "rag-detail rag-snapshot-hit");
-      node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"}`));
-      const {text, decision, ...metadata} = hit;
-      if (filterEnabled && decision !== undefined) metadata.decision = decision;
-      node.append(el("pre", "rag-snapshot-text", text || ""), detail("Метаданные фрагмента", metadata)); target.append(node);
+      for (const [i, hit] of candidates.entries()) {
+        const after = hits.findIndex(item => item.chunk_id === hit.chunk_id);
+        const row = el("tr", (filterEnabled || rerankEnabled ? "rag-snapshot-candidate" : "") + (after >= 0 ? " rag-snapshot-hit" : ""));
+        if (rerankPerformed) row.append(el("td", "rag-rank", `${i + 1} → ${after < 0 ? "—" : after + 1}`));
+        const source = el("td"); const choose = button(hit.title || hit.source || hit.chunk_id, () => select(hit, row));
+        choose.className = "rag-fragment-button"; choose.setAttribute("aria-pressed", "false");
+        source.append(choose, el("span", "hint", hit.section || "")); row.append(source);
+        row.append(el("td", "rag-cosine", Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"));
+        row.append(el("td", "", after >= 0 ? `[${after + 1}]` : (filterEnabled ? decisions[hit.decision] || hit.decision || "—" : "—")));
+        body.append(row); if (i === 0) select(hit, row);
+      }
+      target.append(table, textView);
     }
     const context = el("details", "rag-detail");
     context.append(el("summary", "", "Точный контекст для модели"), el("pre", "rag-snapshot-context", snapshot.context || "")); target.append(context);

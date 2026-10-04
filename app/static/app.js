@@ -82,8 +82,16 @@ const {
   addInvariantFromForm
 } = createRecords({ state, $, el, iconButton, api, json, fmt });
 
+const createSelectors = typeof module !== "undefined" ? require("./models.js") : globalThis.createModelSelectors;
+const modelSelectors = createSelectors({ $, el, api });
+const chatModelPicker = modelSelectors.create({host: $("#chat-model-picker"), modelId: "f-model", providerId: "f-provider",
+  refreshId: "chat-model-refresh", statusId: "chat-model-status", title: "Модель ответа", active: () => !!state.current,
+  onCatalog: models => { state.models = models; renderWarnings(); }});
+const rerankModelPicker = modelSelectors.create({host: $("#rag-rerank-picker"), modelId: "f-rag_rerank_model", providerId: "f-rag_rerank_provider",
+  refreshId: "rag-rerank-model-refresh", statusId: "rag-rerank-model-status", title: "Модель ранжирования",
+  active: () => !!state.current && state.workspace === "settings" && state.section === "rag" && $("#f-rag_enabled").checked && $("#f-rag_rerank_enabled").checked && !$("#rag-current-chat").hidden});
 const createRag = typeof module !== "undefined" ? require("./rag.js") : globalThis.createRagInspector;
-const ragInspector = createRag({ state, $, el, api });
+const ragInspector = createRag({ state, $, el, api, modelSelectors });
 
 // Сколько пикселей от низа ленты ещё считается «читатель внизу».
 const STICK_SLACK = 80;
@@ -924,6 +932,10 @@ function autoGrow(input) {
   input.style.height = Math.min(input.scrollHeight, 168) + "px";
 }
 
+function canCallModel() {
+  return !!state.current && ($("#f-provider").value === "compatible" || state.hasKey);
+}
+
 function setBusy(busy) {
   state.busy = busy;
   const send = $("#send");
@@ -932,12 +944,14 @@ function setBusy(busy) {
   send.classList.toggle("stop", busy);
   send.title = busy ? "Остановить" : "Отправить";
   send.setAttribute("aria-label", send.title);
-  send.disabled = !busy && !state.hasKey;
+  send.disabled = !busy && !canCallModel();
   $("#input").disabled = busy;
   $("#chat-status").textContent = busy ? "Идёт ответ…" : "";
   // Про ключ в интерфейсе не говорим и менять его отсюда нельзя: репозиторий
   // публичный, ключ живёт в .env и остаётся делом того, кто поднял сервер.
-  if (!state.hasKey) hint("Стенд не настроен: нет .env — вызова к модели не будет.", true);
+  const unavailable = "OpenRouter не настроен на сервере приложения.";
+  if (state.current && !canCallModel()) hint(unavailable, true);
+  else if ($("#composer-hint").textContent === unavailable) hint("");
 }
 
 function stopStream() {
@@ -1040,7 +1054,7 @@ async function runCommand(parsed) {
     // Ручка уже прошла — промпт соберётся с правилом **нового** этапа.
     // Молчащий переход человек принимал за «ничего не произошло».
     const ask = parsed.cmd.asks && parsed.cmd.asks(parsed.arg, from);
-    if (ask && state.hasKey) {
+    if (ask && canCallModel()) {
       await exchange("/api/agents/" + id + "/messages", { text: ask }, ask);
     }
   } finally {
@@ -1065,12 +1079,12 @@ async function send() {
   const parsed = parseCommand(text);
   if (parsed) return runCommand(parsed);
 
-  if (!state.hasKey) return;
+  if (!canCallModel()) return;
   await exchange("/api/agents/" + state.current.id + "/messages", { text }, text);
 }
 
 async function regenerate() {
-  if (state.busy || !state.current || !state.hasKey) return;
+  if (state.busy || !state.current || !canCallModel()) return;
   await exchange("/api/agents/" + state.current.id + "/regenerate", null, null);
 }
 
@@ -1138,7 +1152,7 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "retrieval":
-            const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", filter: "Фильтрация фрагментов"}[e.stage] || "Поиск контекста";
+            const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", filter: "Фильтрация фрагментов", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
             if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = retrievalStatus;
             scrollFeed();
@@ -1412,7 +1426,7 @@ function syncChatControls() {
   $("#settings-no-chat").classList.toggle("hidden", !noChat || !["model", "agent", "rag"].includes(state.section));
   $("#save-status").classList.toggle("hidden", noChat || !["model", "agent", "rag"].includes(state.section));
   ["model", "agent"].forEach((name) => {
-    $("#tab-" + name).querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
+    $("#tab-" + name).querySelectorAll(".control").forEach((field) => { field.disabled = noChat && field.id !== "compatible-base-url"; });
   });
   ragInspector.syncChatControls();
 }
@@ -1423,7 +1437,8 @@ function loadVisibleSettings() {
   if (state.section === "profile") loadProfile();
   if (state.section === "invariants") loadInvariants();
   if (state.section === "mcp") loadMcp();
-  if (state.section === "rag") ragInspector.open();
+  if (state.section === "rag") { ragInspector.open(); rerankModelPicker.load(); }
+  if (state.section === "model") { loadModelConnection(); chatModelPicker.load(); }
 }
 
 // Эти переключения меняют видимость уже смонтированных областей. Они не
@@ -1433,6 +1448,7 @@ function showWorkspace(which, load = true) {
   if (state.workspace === "chat") state.feedScroll = $("#feed").scrollTop;
   stopMcpPolling();
   ragInspector.stop();
+  rerankModelPicker.stop();
   state.workspace = which;
   $("#chat-workspace").classList.toggle("hidden", which !== "chat");
   $("#panel").classList.toggle("hidden", which !== "settings");
@@ -1454,6 +1470,7 @@ function showSettings(which, load = true) {
   showWorkspace("settings", false);
   stopMcpPolling();
   ragInspector.stop();
+  rerankModelPicker.stop();
   state.section = which;
   document.querySelectorAll(".tab").forEach((tab) => {
     const selected = tab.dataset.tab === which;
@@ -1466,7 +1483,7 @@ function showSettings(which, load = true) {
   $("#settings-title").textContent = title;
   $("#settings-description").textContent = description;
   $("#settings-scope").textContent = scope;
-  $("#settings-scope").hidden = which === "rag";
+  $("#settings-scope").hidden = which === "rag" || which === "model";
   $("#save-status").classList.toggle("hidden", !["model", "agent", "rag"].includes(which));
   $("#panel-body").scrollTop = state.sectionScroll.get(which) || 0;
   syncChatControls();
@@ -1540,9 +1557,8 @@ function fillPanel(agent) {
   });
   fillStrategy(agent.strategy);
   $("#f-rag_enabled").checked = agent.rag_enabled === true;
-  for (const name of ["rag_rewrite_enabled", "rag_filter_enabled"]) $("#f-" + name).checked = agent[name] === true;
-  syncRagFields();
-  for (const [name, fallback] of Object.entries({rag_candidates_k: 20, rag_final_k: 5, rag_similarity_threshold: .3})) {
+  for (const name of ["rag_rewrite_enabled", "rag_filter_enabled", "rag_rerank_enabled"]) $("#f-" + name).checked = agent[name] === true;
+  for (const [name, fallback] of Object.entries({rag_top_k: agent.rag_final_k ?? 5, rag_similarity_threshold: .3})) {
     $("#f-" + name).value = String(agent[name] ?? fallback);
   }
   $("#f-system").value = agent.system || "";
@@ -1551,9 +1567,11 @@ function fillPanel(agent) {
   fillResponseFormat(agent.response_format);
   // Модель ставим сразу, не дожидаясь каталога: панель — источник правды,
   // и её пустоту нельзя пролить в агента.
-  setModelOptions([{ id: agent.model }], agent.model);
+  chatModelPicker.set({provider: agent.provider, model: agent.model});
+  rerankModelPicker.set({provider: agent.rag_rerank_provider, model: agent.rag_rerank_model || "openai/gpt-6-luna"});
+  syncRagFields();
   state.baseModel = agent.model;
-  fillModels(agent.model).then(renderWarnings);
+  chatModelPicker.load().then(renderWarnings);
   saveStatus("");
 }
 
@@ -1590,7 +1608,12 @@ function syncRagFields() {
   const enabled = $("#f-rag_enabled").checked;
   $("#rag-chat-settings").classList.toggle("hidden", !enabled);
   $("#rag-rewrite-help").classList.toggle("hidden", !enabled || !$("#f-rag_rewrite_enabled").checked);
-  $("#rag-chat-parameters").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
+  $("#rag-chat-parameters").classList.toggle("hidden", !enabled);
+  $("#rag-threshold-field").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
+  $("#rag-filter-help").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
+  const rerank = enabled && $("#f-rag_rerank_enabled").checked;
+  $("#rag-rerank-fields").classList.toggle("hidden", !rerank);
+  if (rerank) rerankModelPicker.load(); else rerankModelPicker.stop();
 }
 
 function fillResponseFormat(value) {
@@ -1616,32 +1639,12 @@ function syncResponseFormat() {
   );
 }
 
-function setModelOptions(models, current) {
-  const select = $("#f-model");
-  select.innerHTML = "";
-  models.forEach((m) => {
-    const price = m.prompt_price_per_m
-      ? "  ·  $" + m.prompt_price_per_m + " / $" + m.completion_price_per_m + " за 1M"
-      : "";
-    const opt = el("option", "", m.id + price);
-    opt.value = m.id;
-    if (m.id === current) opt.selected = true;
-    select.appendChild(opt);
-  });
-}
-
-async function fillModels(current) {
-  if (!state.models.length) {
-    try {
-      state.models = (await api("/api/models")).models || [];
-    } catch (e) {
-      state.models = [];
-    }
-  }
-  const options = state.models.some((m) => m.id === current)
-    ? state.models
-    : [{ id: current }, ...state.models];
-  setModelOptions(options, current);
+async function loadModelConnection() {
+  const input = $("#compatible-base-url"), status = $("#model-settings-status");
+  try {
+    const saved = await modelSelectors.connection();
+    if (!input.dataset.dirty) { input.value = saved.compatible_base_url; status.textContent = ""; }
+  } catch (error) { status.textContent = error.message; }
 }
 
 // Пустое поле значит «не отправлять параметр»: сервер получает null.
@@ -1674,7 +1677,8 @@ function saveStatus(text, isError) {
 function readPanel() {
   const patch = {
     system: $("#f-system").value,
-    model: $("#f-model").value,
+    provider: $("#f-provider").value,
+    model: $("#f-model").value.trim(),
     stop: readStopLines($("#f-stop").value),
     response_format: parseResponseFormat(
       $("#f-response_format_kind").value,
@@ -1684,14 +1688,18 @@ function readPanel() {
     rag_enabled: $("#f-rag_enabled").checked,
     rag_rewrite_enabled: $("#f-rag_rewrite_enabled").checked,
     rag_filter_enabled: $("#f-rag_filter_enabled").checked,
+    rag_rerank_enabled: $("#f-rag_rerank_enabled").checked,
+    rag_rerank_provider: $("#f-rag_rerank_provider").value,
+    rag_rerank_model: $("#f-rag_rerank_model").value.trim(),
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
-  for (const [name, min, max, integer] of [["rag_candidates_k", 1, 100, true], ["rag_final_k", 1, 100, true], ["rag_similarity_threshold", -1, 1, false]]) {
+  for (const [name, min, max, integer] of [["rag_top_k", 1, 100, true], ["rag_similarity_threshold", -1, 1, false]]) {
     const value = readNumber(name);
     if (value === null || value < min || value > max || (integer && !Number.isInteger(value))) throw new Error(name + ": " + (integer ? "целое число" : "число") + " от " + min + " до " + max);
     patch[name] = value;
   }
-  if (patch.rag_final_k > patch.rag_candidates_k) throw new Error("Фрагментов после фильтра не может быть больше кандидатов");
+  if (!patch.model) throw new Error("Выберите модель ответа или введите её ID");
+  if (patch.rag_rerank_enabled && !patch.rag_rerank_model) throw new Error("Выберите модель ранжирования или введите её ID");
   return patch;
 }
 
@@ -1767,7 +1775,7 @@ function applySettings() {
       state.panelDirty = false;
       // Модель сменили — плитка контекста гаснет сразу, а не после следующего
       // ответа: окно у новой модели другое. Правка температуры её не трогает.
-      if (updated.model !== before.model) state.contextStale = true;
+      if (updated.model !== before.model || (updated.provider || "openrouter") !== (before.provider || "openrouter")) state.contextStale = true;
       renderTiles();
       // Сравнивается не панель с панелью, а конфиг агента до и после:
       // сервер по дороге нормализует (пустой список стоп-строк становится
@@ -1945,6 +1953,17 @@ function init() {
   window.addEventListener?.("pagehide", stopChatPolling);
 
   $("#new-chat").onclick = () => newChat();
+  $("#compatible-base-url").oninput = () => { $("#compatible-base-url").dataset.dirty = "true"; $("#model-settings-status").textContent = "Изменения не сохранены"; };
+  let connectionSave = 0;
+  $("#compatible-base-url").onchange = async () => {
+    const input = $("#compatible-base-url"), status = $("#model-settings-status"), draft = input.value, ticket = ++connectionSave;
+    try {
+      const saved = await modelSelectors.saveConnection(draft);
+      if (ticket !== connectionSave || input.value !== draft) return;
+      input.value = saved.compatible_base_url; input.dataset.dirty = ""; status.textContent = "URL сохранён";
+    } catch (error) { if (ticket === connectionSave && input.value === draft) status.textContent = error.message; }
+  };
+  loadModelConnection();
 
   // Настройки применяются по change: у полей ввода это потеря фокуса,
   // у списков — выбор. Отдельной кнопки сохранения нет.
@@ -1963,7 +1982,8 @@ function init() {
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
     // которое уже ни на что не влияет, — значит снова обещать не то.
     if (id === "f-strategy") syncStrategyFields();
-    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled" || id === "f-rag_rewrite_enabled") syncRagFields();
+    if (id === "f-provider") setBusy(state.busy);
+    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled" || id === "f-rag_rewrite_enabled" || id === "f-rag_rerank_enabled") syncRagFields();
     applySettings();
   });
   $("#panel-body").addEventListener("input", (ev) => {
