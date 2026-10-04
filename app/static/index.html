@@ -33,18 +33,7 @@
         <button class="icon-btn" id="restore-sidebar" type="button" aria-label="Показать список чатов" aria-controls="sidebar" aria-expanded="true"></button>
         <h1 id="chat-title">AI Challenge</h1>
         <button id="workspace-chat" class="workspace-return" type="button" aria-controls="chat-workspace" hidden>← Вернуться в чат</button>
-        <div class="profile-control">
-          <button id="profile-toggle" class="profile-toggle" type="button" aria-label="Профиль и настройки приложения" aria-expanded="false" aria-controls="profile-menu">
-            <span class="avatar" aria-hidden="true"></span><span class="profile-chevron" aria-hidden="true"></span>
-          </button>
-          <section class="profile-menu hidden" id="profile-menu" aria-label="Профиль пользователя">
-            <h2>Профиль пользователя</h2>
-            <p class="hint">Как ассистент отвечает вам во всех чатах</p>
-            <div id="profile-summary" role="status"></div>
-            <button id="app-settings" class="profile-menu-action" type="button">Настройки приложения</button>
-            <button id="profile-edit" class="profile-menu-action" type="button">Редактировать профиль</button>
-          </section>
-        </div>
+        <button id="app-settings" class="icon-btn app-settings-button" type="button" aria-label="Настройки приложения" title="Настройки приложения" aria-controls="panel"></button>
       </header>
       <div class="task-head hidden" id="task-head" role="status"></div>
     <section class="chat" id="chat-workspace" role="tabpanel" aria-labelledby="workspace-chat">
@@ -85,12 +74,9 @@
           <div id="rag-current-chat">
             <span class="scope-badge">Для текущего чата</span>
             <div class="settings-card">
-            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
+            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox"> Использовать RAG в этом чате</label>
             <div id="rag-chat-settings" class="rag-chat-settings hidden">
-              <details class="rag-help"><summary>Как используется контекст</summary><p id="rag-chat-help" class="hint">Поиск в опубликованном индексе возвращает до Top-K фрагментов. Тот же набор поступает в ответ. Настройки применяются к следующим ответам.</p>
-                <p id="rag-rewrite-help" class="hint hidden">Уточнение использует модель чата и последние 3 пары вопрос/ответ. Исходный вопрос остаётся в запросе ответа.</p>
-                <p id="rag-filter-help" class="hint hidden">Фильтр может исключить фрагменты ниже порога cosine.</p>
-              </details>
+
               <div class="rag-chat-options">
                 <label class="rag-toggle"><input id="f-rag_rewrite_enabled" class="control" type="checkbox"> Уточнение запроса (Rewrite)</label>
                 <label class="rag-toggle"><input id="f-rag_filter_enabled" class="control" type="checkbox"> Фильтр cosine (Filtering)</label>
@@ -98,7 +84,7 @@
               </div>
               <div id="rag-chat-parameters" class="rag-chat-parameters hidden">
                 <div class="rag-chat-numbers">
-                  <label class="field"><span class="field-label">Top-K · фрагментов</span><input id="f-rag_top_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
+                  <label class="field"><span class="field-label">Количество чанков</span><input id="f-rag_top_k" class="control" type="number" min="1" max="100" step="1" value="5"></label>
                   <label class="field" id="rag-threshold-field"><span class="field-label">Минимальный cosine</span><input id="f-rag_similarity_threshold" class="control" type="number" min="-1" max="1" step="0.05" value="0.3"></label>
                 </div>
               </div>
@@ -365,8 +351,8 @@
 
         <section class="tab-page hidden" id="tab-mcp" role="tabpanel" aria-labelledby="tab-btn-mcp" tabindex="0">
           <div class="mem-layer">
-            <h3 class="mem-title">Инструменты MCP</h3>
-            <p id="mcp-chat-help" class="mem-note" hidden>Доступные инструменты и напоминания этого чата. Подключения управляются в настройках приложения.</p>
+            <h3 class="mem-title" id="mcp-heading">Инструменты MCP</h3>
+            <p id="mcp-chat-help" class="mem-note" hidden>Напоминания этого чата. Подключения управляются в настройках приложения.</p>
             <div id="mcp-application-controls" hidden><p class="mem-note">Запустите MCP-сервис в отдельном терминале, затем укажите его Streamable HTTP URL. Отключение закрывает соединение; сервис продолжает работать.</p>
             <form id="mcp-config-form">
               <div id="mcp-config-rows"></div>

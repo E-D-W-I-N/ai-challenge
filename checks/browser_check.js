@@ -37,7 +37,7 @@ function freshClient(options = {}, classic = false) {
   const $ = (selector) => env.document.querySelector(selector);
   const click = id => {
     if (id === "chat-settings") return $("#agent-list").querySelectorAll(".item-settings").find(row => row.dataset.agentId === client.state.current?.id)?.dispatchEvent(new Evt("click"));
-    if (id === "application-settings") { $("#profile-toggle").dispatchEvent(new Evt("click")); return $("#app-settings").dispatchEvent(new Evt("click")); }
+    if (id === "application-settings") return $("#app-settings").dispatchEvent(new Evt("click"));
     return $("#" + id).dispatchEvent(new Evt("click"));
   };
   const requests = (method, route) => env.server.state.requests.filter((r) =>
@@ -56,6 +56,86 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Reminder capability discovery, disconnect fallback and stale owner", async () => {
+    const {client, server, $, click, open, requests} = freshClient();
+    const connected = {servers: [{name: "arbitrary-neutral", status: "ok", tools: [{name: "neutral__reminders", schema: {}}], reminders: {items: []}}]};
+    server.respond("GET", "/api/mcp", {servers: [{name: "reminders", status: "ok", tools: [{name: "remind"}]}]});
+    client.init(); await settle(); click("chat-settings"); await settle();
+    check("Server name or a scheduling-looking tool cannot invent reminder capability", $("#tab-btn-mcp").hidden);
+    const count = requests("GET", "/api/mcp").length; await settle(2100);
+    check("Capability discovery does not start a global background poll", requests("GET", "/api/mcp").length === count && client.state.mcpTimer === null);
+    server.respond("GET", "/api/mcp", connected); click("chat-settings"); await settle(); click("tab-btn-mcp"); await settle();
+    check("Connected empty reminder list has a visible pane without catalogue", !$("#tab-btn-mcp").hidden && client.state.section === "mcp" && $("#mcp-list").textContent.includes("напоминаний нет") && !$("#mcp-list").querySelector(".mcp-tool"));
+    server.respond("GET", "/api/mcp", {servers: [{...connected.servers[0], reminders: undefined, reminders_error: "neutral list unavailable"}]});
+    document.fire(new Evt("visibilitychange")); await settle();
+    check("Connected protocol list failure preserves reminder pane with actual error", !$("#tab-btn-mcp").hidden && $("#mcp-list").textContent.includes("neutral list unavailable"));
+    server.respond("GET", "/api/mcp", {servers: [{...connected.servers[0], status: "disconnected"}]});
+    $("#tab-btn-mcp").focus(); await settle(2100);
+    check("Disconnect removes active pane and returns keyboard focus to visible model tab", $("#tab-btn-mcp").hidden && client.state.section === "model" && document.activeElement === $("#tab-btn-model") && client.state.mcpTimer === null);
+    $("#tab-btn-memory").dispatchEvent(new Evt("keydown", {key: "ArrowDown"}));
+    check("Keyboard navigation skips unavailable reminders", client.state.section === "rag");
+    const late = deferred(); server.respond("GET", "/api/mcp", () => late.promise); click("chat-settings"); await settle();
+    const old = requests("GET", "/api/mcp").at(-1); click("tab-btn-agent");
+    check("Same-chat tab change preserves entry capability discovery", !old.signal.aborted && requests("GET", "/api/mcp").at(-1) === old);
+    open(1); await settle();
+    late.resolve(json(connected)); await settle();
+    check("Old owner's discovery cannot update capability after chat switch", old.signal.aborted && client.state.current.id === "ag_2" && !client.state.remindersAvailable);
+    server.respond("GET", "/api/mcp", connected); click("chat-settings"); await settle(); click("tab-btn-mcp"); await settle();
+    server.respond("GET", "/api/mcp", () => failure("neutral discovery failed"));
+    document.fire(new Evt("visibilitychange")); await settle();
+    check("Owned failed GET removes unverified availability safely", !client.state.remindersAvailable && $("#tab-btn-mcp").hidden && client.state.section === "model");
+  });
+
+  await scenario("Deleting the last chat creates exactly one replacement; failures keep no ghost", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: [{transcript: turns, history_len: 2}]});
+    client.init(); await settle();
+    const replacement = {...server.state.agents[0], id: "replacement", label: "Replacement", transcript: [], history_len: 0};
+    server.respond("DELETE", "/api/agents/ag_1", () => {server.state.agents = []; return json({deleted: "ag_1"});});
+    server.respond("GET", "/api/agents", () => json({agents: server.state.agents, has_key: true}));
+    server.respond("POST", "/api/agents", () => {server.state.agents = [replacement]; return json({agents: [replacement]});});
+    server.respond("GET", "/api/agents/replacement", replacement);
+    button($("#agent-list"), "Удалить чат").dispatchEvent(new Evt("click")); $(".confirm-row").querySelector(".primary").dispatchEvent(new Evt("click")); await settle();
+    check("Successful last deletion creates one replacement and opens it", requests("POST", "/api/agents").length === 1 && client.state.current.id === "replacement" && !$("#feed").textContent.includes("ответ модели"));
+    server.respond("DELETE", "/api/agents/replacement", () => failure("neutral deletion refused"));
+    button($("#agent-list"), "Удалить чат").dispatchEvent(new Evt("click")); $(".confirm-row").querySelector(".primary").dispatchEvent(new Evt("click")); await settle();
+    check("Failed deletion keeps the current chat and creates nothing", client.state.current.id === "replacement" && requests("POST", "/api/agents").length === 1);
+    client.state.prompts.set("replacement:1", "neutral old prompt"); client.state.lastMetrics = {total_tokens: 50}; client.state.busy = true;
+    server.respond("DELETE", "/api/agents/replacement", () => {server.state.agents = []; return json({deleted: "replacement"});});
+    server.respond("POST", "/api/agents", () => failure("neutral replacement failed"));
+    button($("#agent-list"), "Удалить чат").dispatchEvent(new Evt("click")); $(".confirm-row").querySelector(".primary").dispatchEvent(new Evt("click")); await settle();
+    check("Failed replacement clears deleted transcript, metrics, prompts and busy", !client.state.current && !client.state.lastMetrics && !client.state.busy && !client.state.prompts.has("replacement:1") && !$("#feed").textContent.includes("Replacement"));
+    check("Failed replacement exposes actual error and explicit new-chat retry", $("#agent-list").textContent.includes("neutral replacement failed") && !$("#new-chat").disabled);
+    server.respond("POST", "/api/agents", () => {server.state.agents = [replacement]; return json({agents: [replacement]});});
+    click("new-chat"); await settle();
+    check("Explicit retry creates and selects a chat after replacement failure", client.state.current.id === "replacement" && !client.state.chatCreationError);
+  });
+
+  await scenario("Concurrent confirmed deletions claim a single replacement", async () => {
+    const {client, server, $, requests} = freshClient(); client.init(); await settle();
+    const first = deferred(), second = deferred(), created = deferred();
+    server.respond("DELETE", "/api/agents/ag_1", () => first.promise);
+    server.respond("DELETE", "/api/agents/ag_2", () => second.promise);
+    server.respond("GET", "/api/agents", {agents: [], has_key: true});
+    server.respond("POST", "/api/agents", () => created.promise);
+    const rows = $("#agent-list").querySelectorAll(".item");
+    for (const row of rows) { button(row, "Удалить чат").dispatchEvent(new Evt("click")); $(".confirm-row").querySelector(".primary").dispatchEvent(new Evt("click")); }
+    first.resolve(json({deleted: "ag_1"})); second.resolve(json({deleted: "ag_2"})); await settle();
+    check("Two successful deletion completions issue exactly one automatic creation", requests("POST", "/api/agents").length === 1);
+    created.resolve(failure("neutral cleanup creation failed")); await settle();
+  });
+
+  await scenario("Late last deletion cannot replace a newer user's creation or global navigation", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: [{}]}); client.init(); await settle();
+    const late = deferred(); server.respond("DELETE", "/api/agents/ag_1", () => late.promise);
+    const newer = {...server.state.agents[0], id: "newer", label: "User choice"};
+    server.respond("GET", "/api/agents", () => json({agents: server.state.agents, has_key: true}));
+    server.respond("POST", "/api/agents", () => {server.state.agents = [newer]; return json({agents: [newer]});}); server.respond("GET", "/api/agents/newer", newer);
+    button($("#agent-list"), "Удалить чат").dispatchEvent(new Evt("click")); $(".confirm-row").querySelector(".primary").dispatchEvent(new Evt("click"));
+    click("new-chat"); await settle(); click("application-settings");
+    late.resolve(json({deleted: "ag_1"})); await settle();
+    check("Late delete does not create twice or steal current/global navigation", requests("POST", "/api/agents").length === 1 && client.state.current.id === "newer" && client.state.settingsScope === "app" && client.state.workspace === "settings");
+  });
+
   await scenario("Settings domains, keyboard navigation and mounted drafts", async () => {
     const {client, server, $, click, requests} = freshClient();
     server.respond("GET", "/api/profile", {profile: {style: "neutral style"}});
@@ -65,7 +145,7 @@ async function main() {
     $("#input").value = "composer draft";
     click("chat-settings"); await settle();
     check("Chat gear opens selected-chat model settings", client.state.settingsScope === "chat" && client.state.section === "model" && !$("#model-chat-settings").hidden && $("#model-app-settings").hidden);
-    check("Chat navigation exposes only its five sections", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "agent", "memory", "mcp", "rag"]));
+    check("Chat navigation hides reminders without connected capability", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "agent", "memory", "rag"]));
     $("#f-system").value = "system draft"; $("#f-system").dispatchEvent(new Evt("input"));
     click("tab-btn-memory"); await settle();
     $("#mem-work-content").value = "working draft";
@@ -128,7 +208,7 @@ async function main() {
   await scenario("Global tools hide owned reminders and stale cancellation cannot target another chat", async () => {
     const {client, server, $, click, open, requests} = freshClient();
     server.respond("GET", "/api/mcp", {servers: [{name: "remind", status: "ok", url: "http://127.0.0.1:8018/mcp", tools: [], reminders: {items: [{id: 5, can_cancel: true, text: "neutral owned reminder", fired: 0, state: "ждёт"}]}}], config: {revision: 1, servers: []}});
-    client.init(); await settle(); click("chat-settings"); click("tab-btn-mcp"); await settle();
+    client.init(); await settle(); click("chat-settings"); await settle(); click("tab-btn-mcp"); await settle();
     const cancel = $("#mcp-list").querySelector("button");
     check("Chat tools have owned reminder actions and no server configuration", cancel.textContent === "Снять" && $("#mcp-application-controls").hidden && !$("#mcp-list").querySelector(".mcp-config-actions") && requests("GET", "/api/mcp").at(-1).headers["X-Chat-ID"] === "ag_1");
     open(1); await settle(); cancel.dispatchEvent(new Evt("click")); await settle();
@@ -770,7 +850,7 @@ async function main() {
         reminders: { waiting: 1, fired: 0, items: [base.servers[0].reminders.items[1]] } }] });
       return json({ cancelled: true });
     });
-    client.init(); await settle(30); click("chat-settings"); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("chat-settings"); await settle(); click("tab-btn-mcp"); await settle(10);
     const buttons = $("#mcp-list").querySelectorAll("button").filter((node) => node.textContent === "Снять");
     check("Tools offers cancellation only for owned occurrence while chat is busy", buttons.length === 1);
     buttons[0].dispatchEvent(new Evt("click")); await settle(15);
@@ -1017,8 +1097,8 @@ async function main() {
     server.respond("PATCH", "/api/profile", () => json({ profile: { style: "ясно ***", format: "списком" } }));
     client.init(); await settle(30);
     check("Profile is lazy", requests("GET", "/api/profile").length === 0);
-    click("profile-toggle"); await settle(10); click("profile-edit");
-    check("Profile menu opens shared editor", client.state.section === "profile" && $("#profile-style").value === "кратко" && requests("GET", "/api/profile").length === 1);
+    click("application-settings"); click("tab-btn-profile"); await settle(10);
+    check("Direct settings opens global profile editor", client.state.section === "profile" && $("#profile-style").value === "кратко" && requests("GET", "/api/profile").length === 1);
     $("#profile-style").value = "ясно fixture"; $("#profile-style").dispatchEvent(new Evt("input")); $("#profile-style").dispatchEvent(new Evt("change")); await settle(10);
     check("Profile PATCH sends only touched field and displays API result", same(requests("PATCH", "/api/profile")[0]?.body, { style: "ясно fixture" }) && $("#profile-style").value === "ясно ***" && $("#profile-format").value === "списком" && requests("PATCH", /^\/api\/agents\//).length === 0);
     server.respond("PATCH", "/api/profile", () => failure("профиль занят"));
@@ -1028,8 +1108,8 @@ async function main() {
     server.respond("PATCH", "/api/profile", () => json({ profile: { format: "списком", context: "не терять" } }));
     $("#profile-context").dispatchEvent(new Evt("change")); await settle(10);
     server.respond("GET", "/api/profile", { profile: { format: "списком", context: "не терять" } });
-    open(1); await settle(20); click("profile-toggle"); await settle(10);
-    check("Profile data follows global API across chats", $("#profile-summary").textContent.includes("не терять"));
+    open(1); await settle(20); click("application-settings"); click("tab-btn-profile"); await settle(10);
+    check("Profile data follows global API across chats", $("#profile-context").value === "не терять");
   });
 
   // One shared editor matrix: scope/id/kind discriminate the three real routes.
@@ -1132,21 +1212,20 @@ async function main() {
       { name: "echo", status: "ok", tools: [] },
     ] });
     server.respond("GET", "/api/mcp", response(reminder));
-    client.init(); await settle(30); click("chat-settings"); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("chat-settings"); await settle(); click("tab-btn-mcp"); await settle(10);
     const listing = $("#mcp-list");
     check("Reminder aggregate uses server counts/id/text and recurring occurrences " + classic,
       listing.querySelectorAll(".mem-reminders").length === 1 && listing.textContent.includes("ждёт: 1 · сработало: 1")
       && listing.textContent.includes("№18 — <script>offline reminder</script>") && listing.textContent.includes("раз: 4 · следующее в") && !listing.querySelector("script"));
     check("Read-only reminder page has no form or chat request " + classic,
       !listing.querySelector("input") && !listing.querySelector("button") && requests("POST", /\/messages$/).length === 0);
-    listing.querySelector("details").open = true;
     const fired = { ...reminder, state: "сработало", fired: 1 };
     server.respond("GET", "/api/mcp", response(fired));
     const before = requests("GET", "/api/mcp").length;
     await settle(2100);
-    check("Scheduled 2s GET refreshes fired state and preserves expanded schema " + classic,
+    check("Scheduled 2s GET refreshes fired reminder state " + classic,
       requests("GET", "/api/mcp").length === before + 1 && listing.textContent.includes("ждёт: 0 · сработало: 2")
-      && listing.querySelector("details").open && client.state.mcpTimer !== null);
+      && !listing.querySelector(".mcp-tool") && client.state.mcpTimer !== null);
 
     document.visibilityState = "hidden"; document.fire(new Evt("visibilitychange"));
     const hiddenCount = requests("GET", "/api/mcp").length;
