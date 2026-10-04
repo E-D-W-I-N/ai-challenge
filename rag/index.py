@@ -88,7 +88,8 @@ def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operatio
         # A tombstoned cache may survive interrupted physical cleanup.
         if not available(root, "semantic-cache"):
             import shutil
-            shutil.rmtree(root / "semantic-cache", ignore_errors=True)
+            if (root / "semantic-cache").exists():
+                shutil.rmtree(root / "semantic-cache")
             revive(root, "semantic-cache")
         chunks, report = semantic_chunks(corpus["documents"], semantic_config, size, overlap, root=root, client=client, operation=operation)
     else:

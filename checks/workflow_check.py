@@ -68,6 +68,33 @@ def check_workflow():
             with Operation(root, "delete_chunks") as operation:
                 clear(root, "chunks", operation)
             assert workflow.stages(root)["corpus"] and not workflow.stages(root)["chunks"]
+        # A real valid semantic cache survives denied cleanup physically, but stays invisible.
+        semantic_calls = []
+        def semantic(request):
+            import json
+            semantic_calls.append(request)
+            units = json.loads(json.loads(request.content)["messages"][-1]["content"])["units"]
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+                "content": json.dumps({"end_unit_ids": [item["id"] for item in units]})}}]})
+        with httpx.Client(transport=httpx.MockTransport(semantic)) as client:
+            stage_chunks(root, "semantic", 400, 40, client=client)
+            cache_count = len(semantic_calls)
+            with patch("shutil.rmtree", side_effect=OSError("offline cleanup denied")):
+                try:
+                    with Operation(root, "delete_chunks") as operation:
+                        clear(root, "chunks", operation)
+                    raise AssertionError("Accepted failed physical cleanup")
+                except OSError:
+                    pass
+                try:
+                    stage_chunks(root, "semantic", 400, 40, client=client)
+                    raise AssertionError("Revived deleted semantic cache after failed cleanup")
+                except OSError:
+                    pass
+            assert not available(root, "semantic-cache") and (root / "semantic-cache").exists()
+            assert len(semantic_calls) == cache_count
+            retry = stage_chunks(root, "semantic", 400, 40, client=client)
+            assert available(root, "semantic-cache") and len(semantic_calls) > cache_count and retry["report"]["cached"] == 0
         # Failed initial progress must not retain the writer lock.
         with patch("rag.index.write_json", side_effect=OSError("offline progress denied")):
             try:
@@ -84,6 +111,10 @@ def check_workflow():
             assert release.wait(5)
             return original(*args, **kwargs)
         with patch.dict(os.environ, {"RAG_DIR": str(root), "MCP_DISABLED": "1", "RAG_EMBEDDING_API_KEY": "offline-key"}), TestClient(app) as api:
+            with patch("app.rag_api.threading.Thread", side_effect=RuntimeError("offline start denied")):
+                assert api.post("/api/rag/operations/chunks", json={"size": 400, "overlap": 40}).status_code == 503
+            with Operation(root, "chunks"):
+                pass
             with patch("app.rag_api.stage_chunks", side_effect=paused):
                 response = api.post("/api/rag/operations/chunks", json={"size": 400, "overlap": 40})
                 assert response.status_code == 202 and entered.wait(2)

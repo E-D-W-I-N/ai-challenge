@@ -124,6 +124,24 @@ async function main() {
     click("rag-embed"); await settle();
     check("Embedding button uses mounted fields and never starts save", same(requests("POST", "/api/rag/operations/embeddings")[0]?.body,
       {base_url: "http://127.0.0.1:8005/v1", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
+    stages.embeddings = {embedding_fingerprint: "vectors-one"};
+    const vectorPath = "/api/rag/chunks/chunk?vector=true&working=true";
+    server.respond("GET", vectorPath, {vector: [1, 0, 0]});
+    await settle(1100);
+    const vector = $("#rag-chunk").querySelectorAll("details").at(-1);
+    vector.open = true; await vector.ontoggle();
+    check("Embedding arrival keeps selected chunk and exposes actual vector", !vector.hidden && vector.textContent.includes("[1,0,0]"));
+    const oldVector = deferred(); stages.embeddings = {embedding_fingerprint: "vectors-two"};
+    server.respond("GET", vectorPath, () => oldVector.promise); await settle(1100);
+    stages.embeddings = {embedding_fingerprint: "vectors-three"};
+    server.respond("GET", vectorPath, {vector: [0, 0, 1]}); await settle(1100);
+    oldVector.resolve(json({vector: [0, 1, 0]})); await settle();
+    check("Changed model invalidates old and late vector while preserving selected chunk/details", vector.open && vector.textContent.includes("[0,0,1]")
+      && !vector.textContent.includes("[0,1,0]") && $("#rag-chunk").textContent.includes("Neutral clean document"));
+    server.respond("DELETE", "/api/rag/stages/embeddings", () => { stages.embeddings = null; return json({cleared: "embeddings"}); });
+    click("rag-delete-embeddings"); await settle();
+    check("Deleting embeddings removes mounted numerical vector and preserves chunk selection", vector.hidden && !vector.querySelector("pre")
+      && $("#rag-chunk").textContent.includes("Neutral clean document") && $("#rag-save").disabled);
     click("rag-delete-chunks"); await settle();
     check("Delete chunks uses whitelisted stage endpoint", requests("DELETE", "/api/rag/stages/chunks").length === 1);
   });

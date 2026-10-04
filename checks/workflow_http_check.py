@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rag.documents import ingest
-from rag.index import Index
+from rag.index import Index, Operation
 
 
 def check_workflow_http():
@@ -51,6 +51,10 @@ def check_workflow_http():
                 assert "offline-chunk-key" not in result.stdout + result.stderr and "offline-embed-key" not in result.stdout + result.stderr
                 return json.loads(result.stdout) if success else result.stderr
             split = ("chunks", "--strategy", "semantic", "--size", "400", "--overlap", "40", "--semantic-base-url", base)
+            with Operation(root, "chunks"):
+                blocked = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), *split], capture_output=True, text=True,
+                                         cwd=Path(__file__).resolve().parent.parent, timeout=5)
+                assert blocked.returncode == 1 and "Another RAG operation" in blocked.stderr and not calls
             first = cli(*split)
             assert first["report"]["calls"] > 0 and first["report"]["usage"]["prompt_tokens"] > 0
             assert not (root / "index.sqlite").exists()

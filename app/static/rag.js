@@ -6,6 +6,7 @@ function createRagInspector({ state, $, el, api }) {
   let previewEpoch = 0, documentRequest = 0, chunkRequest = 0, textRequest = 0;
   let documentOffset = 0, chunkOffset = 0, selectedDocument = null, selectedChunk = null;
   const PAGE = 25;
+  let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
   const workingQuery = () => working ? "&working=true" : "";
   const visible = () => state.workspace === "settings" && state.section === "rag" && document.visibilityState !== "hidden";
@@ -73,13 +74,20 @@ function createRagInspector({ state, $, el, api }) {
     let loaded = false;
     vector.ontoggle = async () => {
       if (!vector.open || loaded || !hasVectors) return;
+      const version = vectorVersion, vectorToken = epoch;
       try {
         const saved = await api(`/api/rag/chunks/${encodeURIComponent(item.chunk_id)}?vector=true${workingQuery()}`);
-        if (token !== epoch || preview !== previewEpoch || request !== textRequest || selectedChunk !== item.chunk_id || !visible()) return;
+        if (vectorToken !== epoch || preview !== previewEpoch || request !== textRequest || version !== vectorVersion || !hasVectors || selectedChunk !== item.chunk_id || !visible()) return;
         vector.append(el("pre", "", JSON.stringify(saved.vector))); loaded = true;
       } catch (error) { showError(error); }
     };
     vector.hidden = !hasVectors; target.append(vector);
+    vectorView = { node: vector, invalidate: () => {
+      loaded = false;
+      for (const node of [...vector.querySelectorAll("pre")]) node.remove();
+      vector.hidden = !hasVectors;
+      if (hasVectors && vector.open) vector.ontoggle();
+    }};
   }
   function showError(error) { if (visible()) $("#rag-error").textContent = error.message; }
   async function refresh() {
@@ -119,17 +127,18 @@ function createRagInspector({ state, $, el, api }) {
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
       updateControls();
       const generation = stages?.corpus ? `${stages.corpus.fingerprint}:${stages.chunks?.fingerprint || ""}` : data.index?.index_id;
-      const previousVectors = hasVectors;
+      const nextVectorFingerprint = stages?.corpus ? stages.embeddings?.embedding_fingerprint : data.index?.embedding_fingerprint;
       working = !!stages?.corpus; hasChunks = !working || !!stages?.chunks; hasVectors = !working || !!stages?.embeddings;
       if (generation && (indexId !== generation || !$("#rag-documents").children.length)) {
-        previewEpoch++; indexId = generation; selectedDocument = null; selectedChunk = null;
+        vectorView = null; previewEpoch++; indexId = generation; selectedDocument = null; selectedChunk = null;
         $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
         await documents(0);
       } else if (!generation) {
-        previewEpoch++; indexId = null; $("#rag-documents").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
-      } else if (!previousVectors && hasVectors && selectedChunk) {
-        // Same segmentation gained embeddings; selection remains usable.
-        const vector = $("#rag-chunk").querySelectorAll("details").at(-1); if (vector) vector.hidden = false;
+        vectorView = null; previewEpoch++; indexId = null; $("#rag-documents").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
+      }
+      if (vectorFingerprint !== nextVectorFingerprint) {
+        vectorFingerprint = nextVectorFingerprint; vectorVersion++;
+        vectorView?.invalidate();
       }
     } catch (error) { if (error.name !== "AbortError" && token === epoch) showError(error); }
     finally {
