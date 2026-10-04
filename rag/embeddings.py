@@ -15,7 +15,7 @@ from .documents import digest
 @dataclass(frozen=True)
 class EmbeddingConfig:
     base_url: str = "http://127.0.0.1:8005/v1"
-    model: str = "mlx-community/Qwen3-Embedding-0.6B-8bit"
+    model: str = "Qwen3-Embedding-0.6B-8bit"
     dimensions: int | None = None
     # Change revision when replacing weights behind the same server/model name.
     revision: str = "1"

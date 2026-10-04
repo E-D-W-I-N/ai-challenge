@@ -25,6 +25,10 @@ from rag.index import Index, Operation, build_index
 
 @patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": ""})
 def check_rag():
+    assert EmbeddingConfig().model == "Qwen3-Embedding-0.6B-8bit"
+    legacy_config = EmbeddingConfig(model="mlx-community/Qwen3-Embedding-0.6B-8bit")
+    assert legacy_config.model == "mlx-community/Qwen3-Embedding-0.6B-8bit"
+    assert legacy_config.fingerprint() != EmbeddingConfig().fingerprint()
     calls, authorization, mode = [], [], {"value": "ok", "key": None}
     class Server(BaseHTTPRequestHandler):
         def log_message(self, *args):

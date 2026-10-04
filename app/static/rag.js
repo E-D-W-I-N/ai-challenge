@@ -267,7 +267,7 @@ function createRagInspector({ state, $, el, api }) {
     if (vectorView) vectorView.node.hidden = !hasVectors || !["embeddings", "save"].includes(selectedStep);
     $("#rag-delete-index").hidden = !data.index;
     for (const [id, enabled] of [["ingest", true], ["split", !!stages.corpus], ["embed", !!stages.chunks], ["save", !!stages.embeddings], ["delete-chunks", !!stages.chunks || !!data.index], ["delete-embeddings", !!stages.embeddings || !!data.index], ["delete-index", !!data.index]]) {
-      const node = $("#rag-" + id); if (node) node.disabled = busy || !enabled;
+      const node = $("#rag-" + id); if (node) node.disabled = busy || !enabled || (id === "embed" && !$("#rag-model").value);
     }
     $("#rag-stage-heading").textContent = steps.find(([id]) => id === selectedStep)[1];
     const summary = $("#rag-stage-status");
@@ -303,6 +303,7 @@ function createRagInspector({ state, $, el, api }) {
       const body = kind === "ingest" ? preparationOptions()
         : kind === "chunks" ? chunkOptions()
         : kind === "embeddings" ? {base_url: $("#rag-base-url").value.trim(), model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
+      if (kind === "embeddings" && !body.model) throw new Error("Выберите модель эмбеддингов из списка сервера.");
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (lastStatus) lastStatus.operation = {...lastStatus.operation, state: "running"};
       $("#rag-error").textContent = "";
@@ -329,6 +330,8 @@ function createRagInspector({ state, $, el, api }) {
     const endpoint = $("#rag-" + fieldPrefix + "base-url"), model = $("#rag-" + fieldPrefix + "model");
     const refreshButton = $("#rag-" + buttonPrefix + "model-refresh"), statusNode = $("#rag-" + buttonPrefix + "model-status");
     let modelRequest = 0, modelController = null, pendingModelSource = null;
+    let intendedModel = model.value;
+    const desiredModel = () => embedding ? intendedModel : model.value;
     function modelSource() {
       const mode = authMode.value;
       const base = endpoint.value.trim().replace(/\/+$/, "");
@@ -338,10 +341,18 @@ function createRagInspector({ state, $, el, api }) {
       modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
       refreshButton.disabled = false;
     }
-    function setModels(models, current) {
+    function setModels(models, current, complete = false) {
       const select = model;
+      if (embedding) {
+        intendedModel = current || "";
+        if (complete && intendedModel.startsWith("mlx-community/") && !models.some(item => item.id === intendedModel)) {
+          const candidates = models.filter(item => item.id === intendedModel.slice("mlx-community/".length));
+          if (candidates.length === 1) intendedModel = candidates[0].id;
+        }
+        current = models.some(item => item.id === intendedModel) ? intendedModel : "";
+      }
       const options = [{id: "", label: "Выберите модель"}, ...models];
-      if (current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
+      if (!embedding && current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
       select.replaceChildren();
       for (const item of options) {
         const price = item.prompt_price_per_m ? ` · $${item.prompt_price_per_m} / $${item.completion_price_per_m} за 1M` : "";
@@ -349,8 +360,16 @@ function createRagInspector({ state, $, el, api }) {
         option.selected = item.id === current; select.append(option);
       }
       select.value = current || "";
+      if (embedding && lastStatus) updateControls();
     }
+    if (embedding) setModels([], intendedModel);
     function catalogueMessage(entry, current) {
+      if (embedding) {
+        if (entry.error) return entry.error;
+        if (!entry.models.length) return "Сервер не вернул моделей. Выберите другой сервер или обновите список.";
+        if (intendedModel && !current) return "Текущая модель не найдена в каталоге. Выберите модель.";
+        return `Доступно моделей: ${entry.models.length}`;
+      }
       if (entry.error) return entry.error + (current ? " Текущая модель сохранена." : "");
       if (!entry.models.length) return "Сервер не вернул моделей." + (current ? " Текущая модель сохранена." : "");
       if (current && !entry.models.some(item => item.id === current)) return "Текущая модель отсутствует в каталоге; выбор сохранён.";
@@ -361,13 +380,13 @@ function createRagInspector({ state, $, el, api }) {
       const source = modelSource(), select = model, status = statusNode;
       const cached = modelCatalogues.get(source.key);
       if (!force && cached && !cached.retry) {
-        setModels(cached.models, select.value); status.textContent = catalogueMessage(cached, select.value); return;
+        setModels(cached.models, desiredModel(), !cached.error); status.textContent = catalogueMessage(cached, select.value); return;
       }
       if (!force && pendingModelSource === source.key) return;
       cancelModelRequest();
       const request = modelRequest; modelController = new AbortController(); pendingModelSource = source.key;
       const signal = modelController.signal;
-      setModels(cached?.models || [], select.value);
+      setModels(cached?.models || [], desiredModel());
       status.textContent = "Загрузка моделей…"; refreshButton.disabled = true;
       try {
         const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
@@ -377,7 +396,7 @@ function createRagInspector({ state, $, el, api }) {
         const models = data.models || [];
         if (official) state.models = models;
         const entry = {models}; modelCatalogues.set(source.key, entry);
-        setModels(models, select.value); status.textContent = catalogueMessage(entry, select.value);
+        setModels(models, desiredModel(), true); status.textContent = catalogueMessage(entry, select.value);
       } catch (error) {
         if (error.name === "AbortError" || request !== modelRequest || source.key !== modelSource().key || !visible()) return;
         const entry = {models: cached?.models || [], error: "Не удалось загрузить модели. Проверьте URL и обновите список."};
@@ -399,12 +418,13 @@ function createRagInspector({ state, $, el, api }) {
       loadModels();
     };
     endpoint.oninput = () => {
-      endpoint.dataset.dirty = "true"; cancelModelRequest(); setModels([], model.value);
+      endpoint.dataset.dirty = "true"; cancelModelRequest(); setModels([], desiredModel());
       statusNode.textContent = "URL изменён — обновите список моделей.";
     };
     endpoint.onchange = () => loadModels();
     model.onchange = () => {
       model.dataset.dirty = "true";
+      if (embedding) { intendedModel = model.value; updateControls(); }
       const entry = modelCatalogues.get(modelSource().key);
       if (entry && !modelController) statusNode.textContent = catalogueMessage(entry, model.value);
     };
