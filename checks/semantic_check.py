@@ -241,9 +241,15 @@ def check_http_diagnostics():
                     ("<html>Cloudflare denial</html>", None),
                     ({"error": {"message": "<html>blocked</html>"}}, None),
                     ({"error": {"message": "Bearer unrecognized-secret"}}, None),
+                    ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
+                    ({"error": {"code": "guardrail", "message": "sk-unknown-fixture-key"}}, None),
                 ]
                 for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret", "offline-unused-secret"):
                     fixtures.append(({"error": {"code": 403, "message": json.loads(json.dumps(secret).replace("offline", "\\u006fffline"))}}, None))
+                    escaped = "".join("\\u%04x" % ord(c) for c in secret)
+                    for reflected in (escaped, escaped.replace("\\", "\\\\")):
+                        fixtures.append(({"error": {"code": 403, "message": "Credential " + reflected}}, None))
+                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
                 for body, detail in fixtures:
                     reply["body"] = body
                     with tempfile.TemporaryDirectory() as root:
