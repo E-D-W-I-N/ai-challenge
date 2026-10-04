@@ -451,6 +451,7 @@ select.control {
 .tab-icon svg { width: 22px; height: 22px; }
 .panel-body { min-width: 0; min-height: 0; overflow-y: auto; padding: 30px; scroll-padding: 24px; }
 .settings-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 26px; }
+.settings-head:has(#settings-scope[hidden]) { margin-bottom: 0; }
 .settings-head h2 { font-size: 30px; letter-spacing: -.03em; margin: 0 0 6px; }
 .settings-head p { margin: 0 0 18px; color: var(--muted); font-size: 16px; line-height: 1.5; }
 .settings-head .save-status { margin-top: 10px; max-width: 280px; }
