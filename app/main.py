@@ -199,7 +199,8 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 
 PATCHABLE = (
     "label",
-    "rag_enabled",
+    "rag_enabled", "rag_rewrite_enabled", "rag_filter_enabled",
+    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold",
     "system",
     "model",
     "stop",
@@ -216,6 +217,27 @@ def _rag_enabled(payload: dict, where: str = "") -> bool:
     if type(value) is not bool:
         raise HTTPException(status_code=400, detail=f"{where}rag_enabled: boolean true/false")
     return value
+
+
+def _rag_settings(payload: dict, where: str = "") -> dict:
+    values = {}
+    for name in ("rag_rewrite_enabled", "rag_filter_enabled"):
+        value = payload.get(name, True)
+        if type(value) is not bool:
+            raise HTTPException(400, detail=f"{where}{name}: boolean true/false")
+        values[name] = value
+    for name, default in (("rag_candidates_k", 20), ("rag_final_k", 5)):
+        value = payload.get(name, default)
+        if type(value) is not int or not 1 <= value <= 100:
+            raise HTTPException(400, detail=f"{where}{name}: integer 1..100")
+        values[name] = value
+    value = payload.get("rag_similarity_threshold", 0.3)
+    if type(value) not in (int, float) or not -1 <= value <= 1:
+        raise HTTPException(400, detail=f"{where}rag_similarity_threshold: number -1..1")
+    values["rag_similarity_threshold"] = float(value)
+    if values["rag_final_k"] > values["rag_candidates_k"]:
+        raise HTTPException(400, detail=f"{where}rag_final_k must be <= rag_candidates_k")
+    return values
 
 
 def _optional_field(payload: dict, name: str, types: tuple, hint: str, where: str = ""):
@@ -526,6 +548,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
         label=str(payload.get("label") or _next_chat_label()),
         model=_model_field(payload, where),
         rag_enabled=_rag_enabled(payload, where),
+        **_rag_settings(payload, where),
         system=_text_field(payload, "system", where),
         stop=_stop_field(payload, where),
         response_format=_optional_field(
@@ -641,27 +664,34 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
     rag_enabled = _rag_enabled(payload)
-    if "rag_enabled" in payload:
-        agent.spec.rag_enabled = rag_enabled
-    if "model" in payload:
-        agent.spec.model = _model_field(payload)
-        agent.context_length = (await _context_lengths()).get(agent.spec.model)
-    if "label" in payload:
-        agent.spec.label = _label_field(payload)
+    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold")}, **payload})
+    # Validate the complete patch before mutating the live configuration.
+    validated = {}
+    for name, parser in (("model", _model_field), ("label", _label_field),
+                         ("stop", _stop_field)):
+        if name in payload:
+            validated[name] = parser(payload)
     if "system" in payload:
-        agent.spec.system = _text_field(payload, "system")
-    if "stop" in payload:
-        agent.spec.stop = _stop_field(payload)
+        validated["system"] = _text_field(payload, "system")
     if "response_format" in payload:
-        agent.spec.response_format = _optional_field(
-            payload, "response_format", (dict,), "объект или null"
-        )
+        validated["response_format"] = _optional_field(payload, "response_format", (dict,), "объект или null")
+    updated_context_length = agent.context_length
+    if "model" in validated:
+        updated_context_length = (await _context_lengths()).get(validated["model"])
+    for name, value in validated.items():
+        setattr(agent.spec, name, value)
+    agent.context_length = updated_context_length
     for name in SAMPLING_FIELDS:
         if name in payload:
             setattr(agent.spec, name, sampling[name])
     for name in CONTEXT_FIELDS:
         if name in payload:
             setattr(agent.spec, name, context[name])
+    for name, value in rag_settings.items():
+        if name in payload:
+            setattr(agent.spec, name, value)
+    if "rag_enabled" in payload:
+        agent.spec.rag_enabled = rag_enabled
     # Правка из панели — часть чата: без записи она не пережила бы рестарт,
     # и следующий запрос ушёл бы со старым конфигом.
     agent.save_config()

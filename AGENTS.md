@@ -1,4 +1,4 @@
-# Инструкции для агентов — день 22
+# Инструкции для агентов — день 23
 
 Чат на FastAPI, ванильном JS без сборки и SQLite; MCP подключается,
 показывает инструменты и исполняет вызовы модели в ограниченном цикле.
@@ -18,12 +18,19 @@ CLI загружает явные HTML-входы, замораживает ко
 не читайте пользовательский корпус, не коммитьте его или коллекции вопросов.
 Standalone CLI не импортирует `app.config`/`.env`. В чате `rag_enabled` по
 умолчанию false; при true общий Agent.ask обязательно выполняет retrieval до
-сжатия и генерации, включая отложенные напоминания. Published identity и top5
+сжатия и генерации, включая отложенные напоминания. Published identity и кандидаты
 полных чанков берутся из одного pinned SQLite чтения. Тот же snapshot идёт в
 prompt, JSON запросов и assistant.rag; исторический инспектор не перечитывает
 чанки актуального индекса. Ошибки retrieval дают error/done без silent fallback;
 перегенерация восстанавливает снятый ответ. Fork глубоко копирует rag и
-request_bodies. Query rewrite/filter, проверка цитат и task memory пока отсутствуют.
+request_bodies. Query rewrite и cosine filter независимы: new chats default true, legacy false;
+RAG остаётся OFF. Rewrite — один отдельный constrained вызов модели чата, последние
+3 успешные пары, timeout 60s, strict finish_reason stop/JSON, без retries/fallback.
+Кандидаты 20 → final5, включительный threshold0.3; nohits — детерминированный ответ
+без финального LLM. Snapshot v2 хранит original/query/history/config/candidates decisions/
+hits/context/timing/rewrite usage; JSON включает actual rewrite, aggregate без двойного счёта.
+Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
+сохраняет доступные метрики в error assistant. Проверка цитат и task memory отсутствуют.
 Подготовка документов: programmatic default или полный decoded исходный HTML через
 LLM, независимо от чанкинга; валидируемые title/blocks/sections и bounded input/output,
 без обрезки, silent fallback и платных retries. Private preparation-cache; corpus v2

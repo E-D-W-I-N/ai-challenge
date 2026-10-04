@@ -25,7 +25,7 @@ from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, capture_requests, stream_completion
 from .mcp import MANAGER
-from .rag import lookup as rag_lookup
+from .rag import lookup as rag_lookup, rewrite as rag_rewrite, history_pairs, NO_HITS
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -1616,21 +1616,62 @@ class Agent:
             if rag_result is not None:
                 rag_result.clear()
             preparation_requests = []
+            rewrite_result = None
             try:
                 if spec.rag_enabled:
                     if "messages" in spec.extra_body:
                         raise ValueError("RAG несовместим с extra_body.messages: контекст запроса задаёт приложение")
-                    yield {"type": "retrieval", "stage": "retrieval", "query": user_text}
-                    if not cancel.is_set():
-                        rag_snapshot = copy.deepcopy(await rag_lookup(user_text))
-                        if rag_result is not None:
-                            rag_result.update(copy.deepcopy(rag_snapshot))
+                    query = user_text
+                    used_history = history_pairs(self.history) if spec.rag_rewrite_enabled else []
+                    rewrite_result = None
+                    if spec.rag_rewrite_enabled and not cancel.is_set():
+                        yield {"type": "retrieval", "stage": "rewrite", "query": user_text}
+                        if not cancel.is_set() and (can_run is None or await can_run()):
+                            with capture_requests() as preparation_requests:
+                                rewrite_result = await rag_rewrite(user_text, used_history, spec.model,
+                                                                   stream_completion, cancel)
+                            query = rewrite_result["query"]
+                    if not cancel.is_set() and (can_run is None or await can_run()):
+                        yield {"type": "retrieval", "stage": "search", "query": query}
+                        if not cancel.is_set() and (can_run is None or await can_run()):
+                            rag_snapshot = copy.deepcopy(await rag_lookup(
+                                query, original_query=user_text, history_used=used_history,
+                                spec=spec, rewrite_result=rewrite_result))
+                            if rag_result is not None:
+                                rag_result.update(copy.deepcopy(rag_snapshot))
+                            if spec.rag_filter_enabled:
+                                yield {"type": "retrieval", "stage": "filter", "query": query,
+                                       "count": len(rag_snapshot["hits"])}
                 if cancel.is_set() or (can_run is not None and not await can_run()):
-                    yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                    yield {"type": "done", "text": "", "reasoning": "",
+                           "metrics": (rewrite_result or {}).get("usage"),
+                           "request_bodies": copy.deepcopy(preparation_requests),
                            "answer_index": None, "committed": False, "cancelled": True,
                            "question": user_text, "error": "генерация отменена", "rag": None}
                     return
+                if rag_snapshot is not None and not rag_snapshot["hits"]:
+                    metrics = copy.deepcopy((rag_snapshot.get("rewrite") or {}).get("usage"))
+                    if scheduled:
+                        metrics = {**(metrics or {}), "reminder_execution": scheduled}
+                    yield {"type": "start", "question": user_text, "resolved_messages": [],
+                           "rag": copy.deepcopy(rag_snapshot), "rag_at": None, "generation": False}
+                    if cancel.is_set() or (can_run is not None and not await can_run()):
+                        yield {"type": "done", "committed": False, "cancelled": True,
+                               "metrics": metrics, "request_bodies": copy.deepcopy(preparation_requests),
+                               "question": user_text, "text": "", "rag": copy.deepcopy(rag_snapshot)}
+                        return
+                    yield {"type": "delta", "text": NO_HITS, "metrics": metrics}
+                    allowed = not cancel.is_set() and (can_run is None or await can_run())
+                    committed = self._commit(user_text, NO_HITS, None, "", metrics,
+                                             preparation_requests, rag_snapshot) if allowed else False
+                    yield {"type": "done", "text": NO_HITS, "reasoning": "", "metrics": metrics,
+                           "committed": committed, "cancelled": not allowed,
+                           "question": user_text, "answer_index": len(self.history)-1 if committed else None,
+                           "rag": copy.deepcopy(rag_snapshot), "request_bodies": copy.deepcopy(preparation_requests) if scheduled else None}
+                    return
+                rewrite_requests = preparation_requests
                 with capture_requests() as preparation_requests:
+                    preparation_requests.extend(copy.deepcopy(rewrite_requests))
                     # Служебные вызовы — лениво и **до** сборки промпта: этот же
                     # обмен уедет уже сжатым и уже с обновлённой памятью, и экономия
                     # видна во входных токенах его собственного ответа, а не
@@ -1646,7 +1687,9 @@ class Agent:
                     for call in self.service_plan(spec):
                         yield {"type": "compressing", "strategy": call}
                         if cancel.is_set() or (can_run is not None and not await can_run()):
-                            yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                            yield {"type": "done", "text": "", "reasoning": "",
+                                   "metrics": (rewrite_result or {}).get("usage"),
+                                   "request_bodies": copy.deepcopy(preparation_requests),
                            "answer_index": None, "committed": False, "cancelled": True,
                                    "question": user_text, "error": "генерация отменена", "rag": None}
                             return
@@ -1716,13 +1759,15 @@ class Agent:
                 raise
             except Exception as exc:
                 failure = f"{type(exc).__name__}: {exc}"
+                preparation_metrics = getattr(exc, "usage", None) or (rewrite_result or {}).get("usage")
                 if request_bodies is not None:
                     request_bodies[:] = copy.deepcopy(preparation_requests)
-                yield {"type": "error", "message": failure, "metrics": None}
-                yield {"type": "done", "text": "", "reasoning": "", "metrics": None,
+                yield {"type": "error", "message": failure, "metrics": preparation_metrics,
+                       "request_bodies": copy.deepcopy(preparation_requests)}
+                yield {"type": "done", "text": "", "reasoning": "", "metrics": preparation_metrics,
                            "answer_index": None, "committed": False, "question": user_text,
                        "error": failure, "cancelled": False, "rag": copy.deepcopy(rag_snapshot),
-                       "request_bodies": copy.deepcopy(preparation_requests) if scheduled else None}
+                       "request_bodies": copy.deepcopy(preparation_requests)}
                 return
             finally:
                 if request_bodies is not None:
@@ -1737,6 +1782,8 @@ class Agent:
 
             tool_runs: list[dict] = []
             iteration_metrics: list[dict] = []
+            if rag_snapshot and (rag_snapshot.get("rewrite") or {}).get("usage"):
+                iteration_metrics.append(rag_snapshot["rewrite"]["usage"])
             # Рабочий список сообщений: промпт плюс ход цикла вызовов.
             # В диалоговую историю он не попадает — следующий обмен видит
             # итоговый ответ. Полный work сохраняется в request_bodies.
@@ -1773,6 +1820,8 @@ class Agent:
                             async with contextlib.aclosing(stream):
                                 async for chunk in stream:
                                     kind = chunk["type"]
+                                    if isinstance(chunk.get("metrics"), dict):
+                                        final_metrics = chunk["metrics"]
                                     if kind == "delta":
                                         piece += chunk["text"]
                                         text += chunk["text"]
@@ -1867,6 +1916,11 @@ class Agent:
                 # Клиент ушёл: частичный ответ всё равно записываем — он уже
                 # оплачен, а следующий вопрос должен видеть, чем кончилось.
                 if scheduled is None:
+                    known = list(iteration_metrics)
+                    if isinstance(final_metrics, dict) and (not known or known[-1] is not final_metrics):
+                        known.append(final_metrics)
+                    if known:
+                        final_metrics = {**(final_metrics or {}), **_summed_usage(known)}
                     self._commit(user_text, text, "вызов прерван", reasoning, final_metrics, requests, rag_snapshot)
                 raise
             except Exception as exc:  # noqa: BLE001 — падает обмен, процесс живёт
@@ -1883,8 +1937,10 @@ class Agent:
 
             # Usage складывается по итерациям: вызовы модели после первого
             # оплачены, и сумма, их не считающая, врёт.
-            if len(iteration_metrics) > 1 and isinstance(final_metrics, dict):
-                final_metrics = {**final_metrics, **_summed_usage(iteration_metrics)}
+            if isinstance(final_metrics, dict) and (not iteration_metrics or iteration_metrics[-1] is not final_metrics):
+                iteration_metrics.append(final_metrics)
+            if iteration_metrics:
+                final_metrics = {**(final_metrics or {}), **_summed_usage(iteration_metrics)}
 
             if tool_runs:
                 final_metrics = {**(final_metrics or {}), TOOL_METRIC: tool_runs}
@@ -2022,6 +2078,7 @@ def spec_as_dict(
         "label": spec.label,
         "model": spec.model,
         "rag_enabled": spec.rag_enabled,
+        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold")},
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2071,4 +2128,6 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
         return fallback
     known.setdefault("label", fallback.label)
     known["rag_enabled"] = known.get("rag_enabled") is True
+    known["rag_rewrite_enabled"] = known.get("rag_rewrite_enabled") is True
+    known["rag_filter_enabled"] = known.get("rag_filter_enabled") is True
     return AgentSpec(**known)
