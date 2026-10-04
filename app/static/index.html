@@ -14,7 +14,7 @@
           <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M7 33 20 7l13 26M13 25h14" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 21</span>
+            <span class="brand-sub">чат · день 22</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -83,6 +83,8 @@
           </header>
           <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель и агента.</p>
         <section class="tab-page hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
+          <div id="rag-answer-snapshot" class="settings-card" hidden></div>
+          <div id="rag-workflow">
           <div class="settings-card rag-operation-card">
             <p id="rag-status" role="status"></p><p id="rag-error" class="warn" role="alert"></p>
             <nav id="rag-navigation" class="rag-stages" aria-label="Этапы работы RAG"></nav>
@@ -132,6 +134,7 @@
           <div id="rag-document-preview" class="settings-card rag-result"></div>
           <div id="rag-chunks" class="settings-card rag-result"></div>
           <div id="rag-chunk" class="settings-card rag-result"></div>
+          </div>
         </section>
         <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
           <label class="field">
@@ -206,6 +209,11 @@
         <section class="tab-page hidden" id="tab-agent" role="tabpanel" aria-labelledby="tab-btn-agent" tabindex="0">
 
           <p class="branch-note hidden" id="branch-note" role="note"></p>
+          <div class="settings-card">
+            <h3>Поиск по документам</h3>
+            <label class="rag-toggle"><input id="f-rag_enabled" class="control" type="checkbox" aria-describedby="rag-chat-help"> Использовать RAG в этом чате</label>
+            <p id="rag-chat-help" class="hint">Перед ответом найти 5 фрагментов в опубликованном индексе. Источники сохраняются вместе с ответом.</p>
+          </div>
 
           <div class="settings-card prompt-card"><label class="field">
             <span class="field-label">Системный промпт</span>
