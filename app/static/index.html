@@ -88,16 +88,20 @@
             <div id="rag-operation"></div>
           </div>
           <p>Выполните четыре этапа последовательно. Документы и чанки доступны для просмотра до сохранения индекса.</p>
+          <nav id="rag-navigation" class="rag-navigation" aria-label="Этапы работы RAG"></nav>
           <div id="rag-controls" class="rag-controls">
+            <div id="rag-documents-controls" class="rag-stage-controls">
             <label>URL документов, по одному на строку<textarea class="control" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
             <button id="rag-ingest" class="primary-btn" type="button">Загрузить документы</button>
+            </div>
             <div id="rag-chunks-controls" class="rag-stage-controls" hidden>
             <label>Способ разбиения<select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
             <div id="rag-semantic-fields" hidden>
+              <label>Сервер LLM<select class="control" id="rag-semantic-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
               <label>URL сервера LLM<input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
               <label>Модель для границ чанков<input class="control" id="rag-semantic-model" type="text" value="openai/gpt-4.1-mini"></label>
-              <p class="muted">LLM выбирает границы исходного текста. Повторное разбиение использует кэш. Авторизация: RAG_CHUNKING_API_KEY или OPENROUTER_API_KEY в окружении сервера.</p>
+              <p class="muted">LLM выбирает границы исходного текста. Повторное разбиение использует кэш. OpenRouter использует ключ чата; oMLX — ключ сервера эмбеддингов. Выберите отдельную генеративную модель для разбиения.</p>
             </div>
             <label>Размер чанка, символов<input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
             <details><summary>Параметры разбиения</summary><label>Перекрытие, символов<input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>
@@ -118,12 +122,13 @@
             </div>
             </div>
             <div id="rag-save-controls" class="rag-stage-controls" hidden>
-            <button id="rag-save" class="primary-btn" type="button">Сохранить индекс</button>
+            <div class="rag-actions"><button id="rag-save" class="primary-btn" type="button">Сохранить индекс</button>
+            <button id="rag-delete-index" class="mcp-button danger" type="button" hidden>Удалить индекс</button></div>
             </div>
             <p id="rag-stage-status" role="status"></p>
           </div>
           <div id="rag-index"></div>
-          <div id="rag-documents"></div><div id="rag-chunks"></div><div id="rag-chunk"></div>
+          <div id="rag-ingestion"></div><div id="rag-documents"></div><div id="rag-document-preview"></div><div id="rag-chunks"></div><div id="rag-chunk"></div>
         </section>
         <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
           <label class="field">

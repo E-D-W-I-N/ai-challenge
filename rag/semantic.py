@@ -24,8 +24,11 @@ class SemanticConfig:
     model: str = "openai/gpt-4.1-mini"
     timeout_seconds: float = 60
     prompt_version: str = "boundary-v1"
+    auth_mode: str = "openrouter"
 
     def __post_init__(self):
+        if self.auth_mode not in {"openrouter", "omlx"}:
+            raise ValueError("Semantic auth mode must be openrouter or omlx")
         url = urlparse(self.base_url)
         if (url.scheme not in {"http", "https"} or not url.netloc or url.username or url.password
                 or url.query or url.fragment):
@@ -113,10 +116,10 @@ def _contains_credential(value, credentials):
 
 
 def _call(client, config, payload, trace=None):
-    preferred = os.environ.get("RAG_CHUNKING_API_KEY", "")
-    fallback = os.environ.get("OPENROUTER_API_KEY", "")
-    credentials = tuple(secret for secret in (preferred, fallback) if secret)
-    key = preferred or fallback
+    raw_key = os.environ.get("OPENROUTER_API_KEY" if config.auth_mode == "openrouter" else "RAG_EMBEDDING_API_KEY", "")
+    key = raw_key.strip()
+    runtime_secrets = [os.environ.get(name, "") for name in ("OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY", "RAG_CHUNKING_API_KEY")]
+    credentials = tuple(secret for raw in runtime_secrets if raw.strip() for secret in (raw, raw.strip()))
     if _contains_credential(payload, credentials):
         raise ValueError("Semantic request contains a runtime credential")
     headers = {"Authorization": f"Bearer {key}"} if key else {}

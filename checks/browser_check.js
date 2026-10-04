@@ -104,20 +104,41 @@ async function main() {
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     const gate = (name) => $("#rag-" + name + "-controls");
     const usage = $("#rag-chunk-usage");
-    check("Old published index and complete operation cannot reveal stage forms or stale report", gate("chunks").hidden && gate("embeddings").hidden && gate("save").hidden && usage.hidden);
+    check("Legacy published index remains inspectable and deletable without enabling save or unavailable stages", gate("chunks").hidden && gate("embeddings").hidden
+      && !gate("save").hidden && !$("#rag-step-save").disabled && $("#rag-save").disabled && !$("#rag-delete-index").hidden && usage.hidden);
+    const oldIndex = status.index;
+    server.respond("DELETE", "/api/rag/stages/index", () => { status.index = null; return json({cleared: "index"}); });
+    click("rag-delete-index"); await settle();
+    check("Deleting legacy index returns to documents and locks index navigation", !gate("documents").hidden && gate("save").hidden && $("#rag-step-save").disabled);
+    status.index = oldIndex;
+    click("rag-step-documents");
     stages.corpus = {fingerprint: "current-corpus", documents: 1, urls: []};
     await settle(1100);
-    check("Valid corpus reveals only chunk controls", !gate("chunks").hidden && gate("embeddings").hidden && gate("save").hidden);
+    check("Corpus unlocks chunk navigation without changing selected documents", gate("chunks").hidden && !$("#rag-step-chunks").disabled);
+    click("rag-step-chunks");
+    check("Selecting chunks shows one stage", !gate("chunks").hidden && gate("documents").hidden && gate("embeddings").hidden && gate("save").hidden);
     stages.chunks = {fingerprint: "semantic-one", strategy: "semantic", report};
     await settle(1100);
+    check("Chunk completion keeps accounting visible in selected chunk stage", !gate("chunks").hidden && gate("embeddings").hidden);
+    click("rag-step-embeddings");
     const draft = $("#rag-model"), parameters = gate("embeddings").querySelector("details");
     draft.value = "draft-to-preserve"; draft.focus(); parameters.open = true;
     check("Current semantic chunks reveal embeddings and actual durable model/tokens/USD", !gate("embeddings").hidden && gate("save").hidden
       && !usage.hidden && usage.textContent.includes("actual-boundaries") && usage.textContent.includes("120") && usage.textContent.includes("0.003 USD"));
     stages.embeddings = {embedding_fingerprint: "current-vectors"};
     await settle(1100);
-    check("Vectors reveal save without remounting draft, focus or details", !gate("save").hidden && draft.value === "draft-to-preserve"
+    check("Vectors unlock index without leaving embeddings or remounting draft, focus or details", gate("save").hidden && !$("#rag-step-save").disabled && !gate("embeddings").hidden && draft.value === "draft-to-preserve"
       && document.activeElement === draft && parameters.open && gate("embeddings").querySelector("details") === parameters);
+    click("rag-step-save");
+    check("Index selection shows only save controls and index results", !gate("save").hidden && gate("embeddings").hidden && gate("chunks").hidden
+      && $("#rag-documents").hidden && $("#rag-chunks").hidden && $("#rag-chunk").hidden && !$("#rag-index").hidden && !$("#rag-delete-index").hidden);
+    server.respond("DELETE", "/api/rag/stages/index", () => { status.index = null; return json({cleared: "index"}); });
+    click("rag-delete-index"); await settle();
+    check("Index deletion keeps selected index stage and upstream availability", !gate("save").hidden && !$("#rag-step-save").disabled
+      && $("#rag-delete-index").hidden && !$("#rag-save").disabled && stages.embeddings.embedding_fingerprint === "current-vectors");
+    click("rag-step-chunks");
+    check("Return to chunks hides index and keeps document selector and accounting", !gate("chunks").hidden && $("#rag-index").hidden
+      && !$("#rag-documents").hidden && !$("#rag-chunks").hidden && !usage.hidden);
     $("#rag-semantic-model").value = "edited-requested-alias";
     report.cost_usd = 0.000000000001; await settle(1100);
     check("Small positive actual USD stays nonzero and edited model cannot replace durable model", usage.textContent.includes("0.000000000001 USD") && usage.textContent.includes("actual-boundaries")
@@ -134,8 +155,10 @@ async function main() {
     click("rag-delete-chunks"); await settle();
     check("Deletion hides next stages and summary despite stale complete semantic_report", gate("embeddings").hidden && gate("save").hidden && usage.hidden && usage.textContent === ""
       && draft.value === "draft-to-preserve" && parameters.open);
+    click("rag-step-embeddings");
+    check("Unavailable future navigation stays disabled", $("#rag-step-embeddings").disabled && !gate("chunks").hidden);
     stages.corpus = null; await settle(1100);
-    check("Corpus invalidation hides chunk controls again", gate("chunks").hidden);
+    check("Corpus invalidation returns to documents and keeps future steps locked", gate("chunks").hidden && !gate("documents").hidden && $("#rag-step-chunks").disabled);
   });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
@@ -154,7 +177,7 @@ async function main() {
     check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     $("#rag-chunks").querySelector("button").dispatchEvent(new Evt("click")); await settle();
-    check("Document and chunk preview available before embeddings", $("#rag-chunks").textContent.includes("Neutral clean document")
+    check("Document and chunk preview available before embeddings", $("#rag-document-preview").textContent.includes("Neutral clean document")
       && $("#rag-chunk").textContent.includes("Neutral clean document") && $("#rag-chunk").querySelectorAll("details").at(-1).hidden);
     $("#rag-strategy").value = "fixed"; $("#rag-size").value = "512"; $("#rag-overlap").value = "64";
     click("rag-split"); await settle();
@@ -163,7 +186,14 @@ async function main() {
     $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1"; $("#rag-semantic-model").value = "offline-boundaries";
     click("rag-split"); await settle();
     check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
-      {strategy: "semantic", size: 512, overlap: 64, semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
+      {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "openrouter", semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
+    $("#rag-semantic-auth-mode").value = "omlx"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
+    check("Local generation has its own editable endpoint and no copied embedding model", $("#rag-semantic-base-url").value === "http://127.0.0.1:8005/v1" && $("#rag-semantic-model").value === "");
+    $("#rag-semantic-model").value = "local-generative";
+    click("rag-split"); await settle();
+    check("Local semantic stage sends explicit auth and generative model", requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_auth_mode === "omlx" && requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_model === "local-generative");
+    $("#rag-semantic-auth-mode").value = "openrouter"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
+    check("Switching auth restores generative drafts", $("#rag-semantic-model").value === "offline-boundaries" && $("#rag-semantic-base-url").value === "http://127.0.0.1:9000/v1");
     $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();

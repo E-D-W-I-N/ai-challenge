@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -43,6 +44,7 @@ class StageRequest(BaseModel):
     revision: str = "1"
     semantic_base_url: str = SemanticConfig.base_url
     semantic_model: str = SemanticConfig.model
+    semantic_auth_mode: Literal["openrouter", "omlx"] = SemanticConfig.auth_mode
     batch_size: int = Field(default=16, ge=1, le=256, strict=True)
 
     class Config:
@@ -57,7 +59,7 @@ def start(kind: str, body: StageRequest):
         raise HTTPException(422, "Invalid chunk strategy/overlap")
     index = Index()
     try:
-        semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model)
+        semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model, auth_mode=body.semantic_auth_mode)
         if body.strategy == "semantic" and body.size > 12000:
             raise ValueError("Semantic chunk size must not exceed 12000 characters")
         config = EmbeddingConfig(body.base_url, body.model, body.dimensions, body.revision)
@@ -132,7 +134,7 @@ def chunk(chunk_id: str, vector: bool = False, working: bool = False):
 
 @router.delete("/stages/{kind}")
 def delete_stage(kind: str):
-    if kind not in {"chunks", "embeddings"}:
+    if kind not in {"chunks", "embeddings", "index"}:
         raise HTTPException(404, "Unknown RAG stage")
     try:
         index = Index()

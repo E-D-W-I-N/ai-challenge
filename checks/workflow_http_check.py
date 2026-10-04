@@ -38,7 +38,7 @@ def check_workflow_http():
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="workflow-http-") as temporary, patch.dict(os.environ, {
-                "RAG_CHUNKING_API_KEY": "offline-chunk-key", "RAG_EMBEDDING_API_KEY": "offline-embed-key"}):
+                "OPENROUTER_API_KEY": "  offline-chunk-key  ", "RAG_CHUNKING_API_KEY": "ignored-old-key", "RAG_EMBEDDING_API_KEY": "offline-embed-key"}):
             root = Path(temporary)
             source = root / "neutral.html"
             source.write_text('<article><h1>Neutral</h1><p>' + 'Neutral sample text. ' * 100 + '</p><p>Next neutral topic.</p></article>', encoding="utf-8")
@@ -65,6 +65,14 @@ def check_workflow_http():
             cli("embed", "--base-url", base, "--model", "offline-test")
             assert not (root / "index.sqlite").exists()
             count = len(calls)
+            cli("save")
+            assert len(calls) == count and Index(root).metadata()["strategy"] == "semantic"
+            retained = {name: (root / name).read_bytes() for name in ("corpus.json", "chunks.json", "vectors.json", "embeddings-cache.sqlite")}
+            traces = {path.name: path.read_bytes() for path in (root / "semantic-cache").glob("*.json")}
+            cli("clear", "index")
+            assert Index(root).status()["index"] is None and not (root / "index.sqlite").exists()
+            assert all((root / name).read_bytes() == body for name, body in retained.items())
+            assert traces == {path.name: path.read_bytes() for path in (root / "semantic-cache").glob("*.json")}
             cli("save")
             assert len(calls) == count and Index(root).metadata()["strategy"] == "semantic"
             old_index = (root / "index.sqlite").read_bytes()
