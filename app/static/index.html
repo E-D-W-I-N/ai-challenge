@@ -95,6 +95,14 @@
             <div id="rag-documents-controls" class="rag-stage-controls">
             <label class="field"><span class="field-label">URL документов, по одному на строку</span><textarea class="control area" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
+            <label class="field"><span class="field-label">Подготовка документов</span><select class="control" id="rag-preparation-strategy"><option value="programmatic">Кодом</option><option value="llm">Полностью через LLM</option></select></label>
+            <div id="rag-preparation-fields" hidden>
+              <label class="field"><span class="field-label">Сервер LLM</span><select class="control" id="rag-preparation-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
+              <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-preparation-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
+              <label class="field"><span class="field-label">Модель подготовки документов</span><select class="control" id="rag-preparation-model" aria-describedby="rag-preparation-model-status"><option value="openai/gpt-4.1-mini">openai/gpt-4.1-mini</option></select></label>
+              <div class="rag-actions"><button id="rag-preparation-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-preparation-model-status" class="hint" role="status"></span></div>
+              <p class="hint">LLM очищает HTML и восстанавливает структуру документа без пересказа.</p>
+            </div>
             <button id="rag-ingest" class="primary-btn" type="button">Загрузить документы</button>
             </div>
             <div id="rag-chunks-controls" class="rag-stage-controls" hidden>
