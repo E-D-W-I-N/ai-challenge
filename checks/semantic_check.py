@@ -16,7 +16,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import digest
-from rag.semantic import SemanticConfig, _boundaries, _http_error, semantic_chunks
+from rag.semantic import SemanticConfig, _boundaries, _http_error, _payload, semantic_chunks
 
 
 def document(text):
@@ -28,9 +28,18 @@ def document(text):
             "source": "neutral.html", "title": "Neutral", "blocks": blocks}
 
 
-@patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "", "OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""})
+@patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""})
 def check_semantic():
     units = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 70)]
+    default = SemanticConfig()
+    assert default.model == "openai/gpt-6-luna"
+    short_payload = _payload("x", [(0, 1)], default, 10)
+    assert short_payload["reasoning"] == {"effort": "none"} and short_payload["max_tokens"] == 9216
+    full_payload = _payload("x" * 256, [(i, i + 1) for i in range(256)], default, 10)
+    assert full_payload["max_tokens"] == 11328
+    for alternative in (replace(default, model="unverified-model"), replace(default, auth_mode="omlx"),
+                        replace(default, base_url="http://neutral.test/v1")):
+        assert "reasoning" not in _payload("x", [(0, 1)], alternative, 10)
     # The requested end at 30 survives even though greedy whole-document
     # packing would choose 40. Subsequent semantic group is capped separately.
     spans = _boundaries({"end_unit_ids": [3, 7]}, units, 20)
@@ -98,7 +107,8 @@ def check_semantic():
         for request in requests:
             units = json.loads(request["messages"][1]["content"])["units"]
             assert sum(len(u["text"]) for u in units) <= 12000 and len(units) <= 256
-            assert request["max_tokens"] <= 4096
+            assert request["max_tokens"] == 8192 + max(1024, 64 + len(units) * 12)
+            assert "reasoning" not in request
         before = len(requests)
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "rotated-neutral-key"}):
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
@@ -107,6 +117,7 @@ def check_semantic():
         assert cached["cost_usd"] == 0 and cached["model"] == "actual-neutral-model"
         cache_path = root / cached["trace_files"][0]
         saved = json.loads(cache_path.read_text())
+        assert saved["identity"]["config"]["payload_version"] == "boundary-budget-v2"
         saved["spans"][0][1] += 1
         cache_path.write_text(json.dumps(saved))
         rebuilt, fresh = semantic_chunks([doc], config, 90, 15, root=root, client=client)
@@ -149,14 +160,24 @@ def check_semantic():
         for bad in ("unknown", "duplicate", "missing", "malformed", "truncated", "usage", "null-content", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
             with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
+                from types import SimpleNamespace
+                captured = {}
+                operation = SimpleNamespace(update=lambda **fields: captured.update(fields))
+                before = len(requests)
                 try:
-                    semantic_chunks([short], config, 35, 5, root=rejected, client=client)
+                    semantic_chunks([short], config, 35, 5, root=rejected, client=client, operation=operation)
                 except ValueError as error:
                     assert "credential-injected-secret" not in str(error)
                     if bad in expected_errors:
                         assert expected_errors[bad] in str(error), str(error)
                 else:
                     raise AssertionError(bad)
+                assert len(requests) == before + 1  # Every error ends after one paid attempt.
+                if bad == "truncated":
+                    actual = captured["semantic_report"]
+                    assert actual["calls"] == 1 and actual["model"] == "actual-neutral-model"
+                    assert actual["usage"] == {"prompt_tokens": 51, "completion_tokens": 9, "total_tokens": 60}
+                    assert actual["cost_usd"] == 0.00125
                 artifacts = list((Path(rejected) / "semantic-cache").glob("*.json"))
                 assert not [p for p in artifacts if not p.name.startswith("round-")]
                 assert all("credential-injected-secret" not in p.read_text() for p in artifacts)
@@ -175,18 +196,16 @@ def check_semantic():
         with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "fallback-neutral"}):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
-        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  fallback-neutral  ", "RAG_CHUNKING_API_KEY": "preferred-neutral"}):
+        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  fallback-neutral  "}):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
-            assert "preferred-neutral" not in next((Path(authorized) / "semantic-cache").glob("*.json")).read_text()
         with tempfile.TemporaryDirectory() as unauthenticated, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "  ", "RAG_EMBEDDING_API_KEY": " ", "RAG_CHUNKING_API_KEY": " "}):
+                "OPENROUTER_API_KEY": "  ", "RAG_EMBEDDING_API_KEY": " "}):
             semantic_chunks([short], config, 35, 5, root=unauthenticated, client=client)
             assert auth[-1] is None
         local_config = replace(config, auth_mode="omlx")
         with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  ",
-                "RAG_CHUNKING_API_KEY": "ignored-legacy-neutral"}):
+                "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  "}):
             local_chunks, _ = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
             assert auth[-1] == "Bearer local-neutral"
             before = len(requests)
@@ -197,7 +216,7 @@ def check_semantic():
                 semantic_chunks([short], local_config, 35, 5, root=rotated, client=client)
                 assert auth[-1] == "Bearer rotated-local-neutral"
             assert all(secret not in path.read_text() for path in (Path(local) / "semantic-cache").glob("*.json")
-                       for secret in ("chat-neutral", "local-neutral", "ignored-legacy-neutral"))
+                       for secret in ("chat-neutral", "local-neutral"))
         try:
             replace(config, auth_mode="unknown")
         except ValueError:
@@ -232,8 +251,7 @@ def check_http_diagnostics():
     try:
         with patch.dict(os.environ, {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy, "NO_PROXY": "",
                 "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy, "no_proxy": "",
-                "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  ",
-                "RAG_CHUNKING_API_KEY": "  offline-unused-secret  "}):
+                "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  "}):
             for auth_mode in ("openrouter", "omlx"):
                 # OpenRouter request must go through our offline proxy. oMLX
                 # must reach the local endpoint directly despite the same env.
@@ -251,7 +269,7 @@ def check_http_diagnostics():
                     ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
                     ({"error": {"code": "sk-\x00unknown-fixture-key"}}, None),
                 ]
-                for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret", "offline-unused-secret"):
+                for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret"):
                     fixtures.append(({"error": {"code": 403, "message": json.loads(json.dumps(secret).replace("offline", "\\u006fffline"))}}, None))
                     escaped = "".join("\\u%04x" % ord(c) for c in secret)
                     for reflected in (escaped, escaped.replace("\\", "\\\\")):
