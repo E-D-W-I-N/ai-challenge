@@ -21,20 +21,20 @@ def check_rag_refinement():
     async def drain(stream):
         return [event async for event in stream]
 
-    def candidates(index, query, top_k):
+    def candidates(index, query, top_k, **options):
         queries.append((query, top_k))
         return {"query": query, "top_k": top_k, "index": {"index_id": "pinned-neutral"},
                 "hits": [{"chunk_id": str(i), "source": "fixture:neutral", "text": f"neutral chunk {i}", "score": score}
                          for i, score in enumerate((0.9, 0.6, 0.3, 0.299, -0.2))][:top_k]}
 
     queries = []
-    spec = AgentSpec(label="refined", model="stub/chat", rag_enabled=True, rag_final_k=2)
+    spec = AgentSpec(label="refined", model="stub/chat", rag_enabled=True, rag_top_k=2)
     with patch.object(rag.Index, "retrieve", candidates):
         filtered = rag.retrieve("search", original_query="question", spec=spec)
-        assert queries == [("search", 20)]
-        assert [c["decision"] for c in filtered["candidates"]] == ["kept", "kept", "final_cap", "threshold", "threshold"]
+        assert queries == [("search", 2)]
+        assert [c["decision"] for c in filtered["candidates"]] == ["kept", "kept"]
         assert [h["score"] for h in filtered["hits"]] == [0.9, 0.6]
-        spec.rag_final_k = 5
+        spec.rag_top_k = 5
         inclusive = rag.retrieve("search", spec=spec)
         assert [h["score"] for h in inclusive["hits"]] == [0.9, 0.6, 0.3]
         spec.rag_filter_enabled = False; spec.rag_rewrite_enabled = False
@@ -59,7 +59,7 @@ def check_rag_refinement():
             events = await drain(chat.ask("current question 42"))
         assert events[-1]["committed"] and len(_stub.CALLS) == 2
         assert [e["stage"] for e in events if e["type"] == "retrieval"] == ["rewrite", "search", "filter"]
-        assert queries == [("standalone neutral 42", 20)]
+        assert queries == [("standalone neutral 42", 5)]
         bodies = chat.history[-1].request_bodies; snapshot = chat.history[-1].rag
         assert bodies == [c["payload"] for c in _stub.CALLS]
         first = bodies[0]; last = bodies[-1]
@@ -182,13 +182,13 @@ def check_rag_refinement():
     with TestClient(main.app) as client:
         result = client.post("/api/agents", json={"agent":{"label":"new defaults", "model":"stub/model"}}).json()["agents"][0]
         assert not result["rag_enabled"] and result["rag_rewrite_enabled"] and result["rag_filter_enabled"]
-        assert (result["rag_candidates_k"],result["rag_final_k"],result["rag_similarity_threshold"]) == (20,5,0.3)
+        assert (result["rag_top_k"],result["rag_similarity_threshold"]) == (5,0.3)
         route = f'/api/agents/{result["id"]}'
-        for invalid in ({"rag_rewrite_enabled": None}, {"rag_filter_enabled": 1}, {"rag_candidates_k": True}, {"rag_final_k": 101}, {"rag_similarity_threshold": "0.3"}, {"rag_candidates_k": 4}, {"rag_rewrite_enabled": False, "system": 123}):
+        for invalid in ({"rag_rewrite_enabled": None}, {"rag_filter_enabled": 1}, {"rag_top_k": True}, {"rag_top_k": 101}, {"rag_similarity_threshold": "0.3"}, {"rag_candidates_k": 4}, {"rag_rewrite_enabled": False, "system": 123}):
             before = copy.deepcopy(main.REGISTRY.require(result["id"]).spec)
             assert client.patch(route,json=invalid).status_code == 400
             assert main.REGISTRY.require(result["id"]).spec == before
-        assert client.patch(route, json={"rag_candidates_k": 3, "rag_final_k": 2, "rag_similarity_threshold": -1}).status_code == 200
-        assert client.patch(route, json={"rag_final_k": 4}).status_code == 400
+        assert client.patch(route, json={"rag_top_k": 2, "rag_similarity_threshold": -1}).status_code == 200
+        assert client.patch(route, json={"rag_top_k": 101}).status_code == 400
         client.delete(route)
     return "threshold inclusive/cap reasons; rewrite 3pairs/model/strictstop/cancel/timeout; nohits/reminders; exactJSON/usage/restart/deepcopy/legacy/API"

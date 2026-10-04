@@ -1,4 +1,5 @@
 """Local durable RAG workflow; paths remain operator configuration only."""
+import copy
 import json
 import sqlite3
 import threading
@@ -20,43 +21,56 @@ from .request_security import trusted_rag_request
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
 
+def editable_config(value, *, embedding=False):
+    """Canonical selector DTO only; published/cache identities stay untouched."""
+    from shared_models import legacy_provider, provider
+    result = copy.deepcopy(value)
+    selected = result.get("provider")
+    if selected is None:
+        selected = "compatible" if embedding else legacy_provider(result.get("auth_mode", "openrouter"))
+    result["provider"] = provider(selected)
+    result.pop("auth_mode", None)
+    return result
+
+
 @router.get("/status")
 def status():
     index = Index()
     result = index.status()
     try:
-        result["stages"] = workflow.stages(index.root)
+        stages = copy.deepcopy(workflow.stages(index.root))
+        for stage, field in (("corpus", "preparation_config"), ("chunks", "semantic_config")):
+            if isinstance(stages.get(stage), dict) and isinstance(stages[stage].get(field), dict):
+                stages[stage][field] = editable_config(stages[stage][field])
+        result["stages"] = stages
     except (OSError, ValueError, KeyError) as error:
         result["stage_error"] = str(error)
-    result["embedding_defaults"] = (result.get("stages", {}).get("embeddings") or result.get("index") or {}).get("embedding_config", EmbeddingConfig().__dict__)
+    defaults = (result.get("stages", {}).get("embeddings") or result.get("index") or {}).get("embedding_config", EmbeddingConfig().__dict__)
+    try:
+        result["embedding_defaults"] = editable_config(defaults, embedding=True)
+    except ValueError as error:
+        result["stage_error"] = str(error)
+        result["embedding_defaults"] = None
     result["manifest_available"] = (index.root / "inputs.json").is_file()
     return result
-
-
-@router.get("/models", dependencies=[Depends(trusted_rag_request)])
-async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: str = Query(max_length=2048), purpose: Literal["generation", "embedding"] = "generation"):
-    from .rag_models import models
-    return await models(auth_mode, base_url, purpose)
 
 
 class StageRequest(BaseModel):
     urls: list[str] = Field(default_factory=list, max_length=100)
     use_manifest: bool = False
     preparation_strategy: Literal["programmatic", "llm"] = "programmatic"
-    preparation_base_url: str = PreparationConfig.base_url
     preparation_model: str = PreparationConfig.model
-    preparation_auth_mode: Literal["openrouter", "omlx"] = PreparationConfig.auth_mode
+    preparation_provider: Literal["openrouter", "compatible"] = "openrouter"
     preparation_timeout_seconds: float = Field(default=PreparationConfig.timeout_seconds, ge=1, le=3600, strict=True, allow_inf_nan=False)
     strategy: str = "fixed"
     size: int = Field(default=1200, ge=64, le=100000, strict=True)
     overlap: int = Field(default=180, ge=0, strict=True)
-    base_url: str = EmbeddingConfig.base_url
+    provider: Literal["openrouter", "compatible"] = "compatible"
     model: str = EmbeddingConfig.model
     dimensions: int | None = Field(default=None, gt=0, strict=True)
     revision: str = "1"
-    semantic_base_url: str = SemanticConfig.base_url
     semantic_model: str = SemanticConfig.model
-    semantic_auth_mode: Literal["openrouter", "omlx"] = SemanticConfig.auth_mode
+    semantic_provider: Literal["openrouter", "compatible"] = "openrouter"
     batch_size: int = Field(default=16, ge=1, le=256, strict=True)
 
     class Config:
@@ -71,11 +85,17 @@ def start(kind: str, body: StageRequest):
         raise HTTPException(422, "Invalid chunk strategy/overlap")
     index = Index()
     try:
-        preparation_config = PreparationConfig(body.preparation_base_url, body.preparation_model, body.preparation_timeout_seconds, auth_mode=body.preparation_auth_mode)
-        semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model, auth_mode=body.semantic_auth_mode)
+        from shared_models import endpoint
+        from .model_settings import settings
+        from .registry import REGISTRY
+        from .config import api_key
+        compatible_url = settings(REGISTRY.store)["compatible_base_url"]
+        api_key()
+        preparation_config = PreparationConfig(endpoint(body.preparation_provider, compatible_url), body.preparation_model, body.preparation_timeout_seconds, provider=body.preparation_provider)
+        semantic_config = SemanticConfig(endpoint(body.semantic_provider, compatible_url), body.semantic_model, provider=body.semantic_provider)
         if body.strategy == "semantic" and body.size > 12000:
             raise ValueError("Semantic chunk size must not exceed 12000 characters")
-        config = EmbeddingConfig(body.base_url, body.model, body.dimensions, body.revision)
+        config = EmbeddingConfig(endpoint(body.provider, compatible_url), body.model, body.dimensions, body.revision, provider=body.provider)
         inputs = [{"url": url} for url in body.urls]
         if kind == "ingest":
             from urllib.parse import urlparse

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 import time
 import uuid
 
-from .agent import AgentBusyError
+from .agent import AgentBusyError, _summed_usage
 
 LOG = logging.getLogger(__name__)
 POLL_SECONDS = 0.25
@@ -171,6 +172,17 @@ class ReminderScheduler:
         requests = []
         rag_result = {}
         done = None
+        observed_rounds = []
+        current_usage = None
+        def available_metrics():
+            if (done or {}).get("metrics"):
+                return done["metrics"]
+            usages = [u for u in ((rag_result.get("rewrite") or {}).get("usage"),
+                                 (rag_result.get("rerank") or {}).get("usage")) if u]
+            usages.extend(observed_rounds)
+            if current_usage:
+                usages.append(current_usage)
+            return {**(usages[-1] if usages else {}), **_summed_usage(usages)} if usages else {}
         question = f"[Напоминание №{item['id']}] Срок наступил. Выполни сейчас, без нового планирования: {item['text']}"
 
         async def valid():
@@ -193,6 +205,12 @@ class ReminderScheduler:
                     async for event in events:
                         if event["type"] == "done":
                             done = event
+                        elif event["type"] == "metrics" or (event["type"] == "error" and "request_bodies" not in event):
+                            if event.get("metrics"):
+                                current_usage = copy.deepcopy(event["metrics"])
+                        elif event["type"] == "tool_call" and current_usage:
+                            observed_rounds.append(current_usage)
+                            current_usage = None
                 error = (done or {}).get("error") or ""
                 if not done or not done.get("committed"):
                     error = error or "модель не вернула результат"
@@ -202,7 +220,7 @@ class ReminderScheduler:
                     error = error or "исчерпан лимит цикла инструментов"
                 if error and not (done or {}).get("cancelled") and await valid() and not (done or {}).get("committed"):
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={**((done or {}).get("metrics") or (rag_result.get("rewrite") or {}).get("usage") or {}),
+                                  metrics={**available_metrics(),
                                            "reminder_execution": {"id": item["id"], "server": server.name}},
                                   request_bodies=requests, rag=rag_result or None)
         except asyncio.CancelledError:
@@ -214,7 +232,7 @@ class ReminderScheduler:
             with contextlib.suppress(Exception):
                 if await valid():
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={**((done or {}).get("metrics") or (rag_result.get("rewrite") or {}).get("usage") or {}),
+                                  metrics={**available_metrics(),
                                            "reminder_execution": {"id": item["id"], "server": server.name}},
                                   request_bodies=requests, rag=rag_result or None)
         finally:

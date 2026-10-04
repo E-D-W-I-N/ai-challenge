@@ -2,7 +2,7 @@
 (function (root) {
 "use strict";
 
-function createChatRecords({ state, $, el, iconButton, api, json, fmt }) {
+function createChatRecords({ state, $, el, iconButton, api, json, fmt, onMcpChange }) {
 // ────────────────────── вкладка «Память» ──────────────────────
 
 // Три слоя памяти агента — по разделу на каждый, в порядке от короткого
@@ -168,23 +168,25 @@ function memoryTabOpen() {
 }
 
 // Открытие вкладки — единственное место, откуда слои запрашиваются впервые.
+let memoryRequest = 0;
 async function loadMemory(force = false) {
-  if (!force && $("#tab-memory").querySelector(".mem-edit-box")) return;
-  const id = state.current && state.current.id;
+  const app = state.settingsScope === "app", scope = state.settingsScope;
+  const container = $(app ? "#mem-long" : "#mem-working");
+  if (container.querySelector(".mem-edit-box")) return;
+  const id = app ? null : state.current?.id, ticket = ++memoryRequest;
+  if (!app && !id) { renderMemory(); return; }
   state.memoryNote = "Читаю память…";
   renderMemory();
+  const owned = () => ticket === memoryRequest && memoryTabOpen() && state.settingsScope === scope && (app || id === state.current?.id);
   try {
-    // Чата ещё нет — общий слой всё равно можно показать: он не про чат.
-    // Первые два раздела в этом случае честно говорят, что показывать нечего.
-    const layers = id
-      ? await api("/api/agents/" + id + "/memory")
-      : { short_term: null, working: null, long_term: await api("/api/memory") };
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = layers;
+    const answer = await api(app ? "/api/memory" : "/api/agents/" + id + "/memory");
+    if (!owned()) return;
+    if (app) state.longMemory = answer;
+    else state.memory = answer;
     state.memoryNote = "";
   } catch (err) {
-    if (id !== (state.current && state.current.id)) return;
-    state.memory = null;
+    if (!owned()) return;
+    if (app) state.longMemory = null; else state.memory = null;
     state.memoryNote = String(err.message || err);
   }
   renderMemory();
@@ -240,9 +242,10 @@ const memNote = (text) => el("p", "mem-note", text);
 const memBlank = () => memNote(state.memoryNote || "Чат ещё не открыт.");
 
 function renderMemory() {
-  renderShortTerm($("#mem-short"));
-  if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
-  if (!$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
+  if (state.settingsScope === "chat") {
+    renderShortTerm($("#mem-short"));
+    if (!$("#mem-working").querySelector(".mem-edit-box")) renderWorking($("#mem-working"));
+  } else if (state.settingsScope === "app" && !$("#mem-long").querySelector(".mem-edit-box")) renderLongTerm($("#mem-long"));
 }
 
 function renderShortTerm(box) {
@@ -305,7 +308,7 @@ function renderWorking(box) {
 
 function renderLongTerm(box) {
   box.innerHTML = "";
-  const long = state.memory && state.memory.long_term;
+  const long = state.longMemory;
   if (!long) { box.appendChild(memBlank()); return; }
   const records = long.records || [];
   if (!records.length) { box.appendChild(memNote("Записей нет.")); return; }
@@ -356,8 +359,10 @@ async function addWorking(kind, content) {
     workingStatus("Чат ещё не открыт: рабочая память живёт в разговоре.", true);
     return false;
   }
+  const ownerId = state.current.id;
   try {
-    const record = await api(workingUrl(), json("POST", { kind, content: text }));
+    const record = await api(workingUrl(undefined, ownerId), json("POST", { kind, content: text }));
+    if (ownerId !== state.current?.id) return false;
     const working = state.memory && state.memory.working;
     if (working) working.records = [...(working.records || []), record];
     renderMemory();
@@ -410,7 +415,7 @@ async function dropWorking(record, ownerId) {
 async function editMemory(record, patch) {
   try {
     const updated = await api("/api/memory/" + record.seq, json("PATCH", patch));
-    const long = state.memory && state.memory.long_term;
+    const long = state.longMemory;
     if (long) {
       long.records = (long.records || [])
         .map((item) => (item.seq === updated.seq ? updated : item));
@@ -438,7 +443,7 @@ async function remember(kind, content) {
   }
   try {
     const record = await api("/api/memory", json("POST", { kind, content: text }));
-    const long = state.memory && state.memory.long_term;
+    const long = state.longMemory;
     if (long) long.records = [...(long.records || []), record];
     renderMemory();
     memoryStatus("Запомнено: " + memoryKindLabel(record.kind) + ".");
@@ -456,7 +461,7 @@ async function forget(record) {
     memoryStatus(String(err.message || err), true);
     return;
   }
-  const long = state.memory && state.memory.long_term;
+  const long = state.longMemory;
   if (long) long.records = (long.records || []).filter((item) => item.seq !== record.seq);
   renderMemory();
   memoryStatus("Запись забыта.");
@@ -554,7 +559,6 @@ async function loadProfile() {
       state.profileError = String(err.message || err);
       profileStatus(state.profileError, true);
     }
-    renderProfileSummary();
   })();
   await state.profileLoading;
   state.profileLoading = null;
@@ -580,47 +584,12 @@ async function saveProfile(name) {
       field.value = values[name] || "";
       state.profileDirty.delete(name);
     }
-    renderProfileSummary();
     profileStatus(PROFILE_FIELDS.some((key) => values[key])
       ? "Профиль сохранён: он уезжает системным сообщением в каждый запрос."
       : "Профиль пуст: к запросам не добавляется ничего.");
   } catch (err) {
     state.profileError = String(err.message || err);
     profileStatus(state.profileError, true);
-    renderProfileSummary();
-  }
-}
-
-function renderProfileSummary() {
-  const box = $("#profile-summary");
-  box.innerHTML = "";
-  const filled = state.profile && PROFILE_FIELDS.filter((name) => state.profile[name]);
-  $("#profile-toggle").classList.toggle("configured", Boolean(filled && filled.length));
-  if (state.profileError) box.appendChild(el("p", "hint error", state.profileError));
-  else if (!state.profile) box.appendChild(el("p", "hint", "Читаю профиль…"));
-  else if (!filled.length) box.appendChild(el("p", "hint", "Профиль пока пуст. Задайте стиль, формат или контекст ответа."));
-  if (filled) filled.forEach((name) => {
-    const row = el("div", "profile-summary-field");
-    row.append(el("strong", "", { style: "Стиль", format: "Формат", context: "Контекст" }[name]),
-      el("p", "", state.profile[name]));
-    box.appendChild(row);
-  });
-}
-
-function closeProfileMenu(returnFocus = false) {
-  $("#profile-menu").classList.add("hidden");
-  $("#profile-toggle").setAttribute("aria-expanded", "false");
-  if (returnFocus) $("#profile-toggle").focus();
-}
-
-function toggleProfileMenu() {
-  const open = $("#profile-menu").classList.contains("hidden");
-  $("#profile-menu").classList.toggle("hidden", !open);
-  $("#profile-toggle").setAttribute("aria-expanded", String(open));
-  if (open) {
-    renderProfileSummary();
-    loadProfile();
-    $("#profile-edit").focus();
   }
 }
 
@@ -772,6 +741,8 @@ function acceptMcp(answer) {
   if (answer.config && state.mcpConfig && answer.config.revision < state.mcpConfig.revision) return false;
   state.mcp = answer.servers || [];
   state.mcpDisabled = answer.disabled === true;
+  state.remindersAvailable = !state.mcpDisabled && state.mcp.some(reminderServer);
+  onMcpChange?.();
   if (answer.config) state.mcpConfig = answer.config;
   return true;
 }
@@ -808,7 +779,7 @@ function renderMcpConfig() {
     const saved = (state.mcpConfig || {}).servers || [];
     (saved.length ? saved : [{ name: "", url: "", enabled: false }]).forEach(mcpDraftRow);
   }
-  $("#mcp-add").onclick = () => { mcpDraftRow(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
+  $("#mcp-add").onclick = () => { if (state.settingsScope !== "app") return; mcpDraftRow(); state.mcpDirty = true; state.mcpDraftVersion = (state.mcpDraftVersion || 0) + 1; };
   $("#mcp-config-form").onsubmit = (event) => {
     event.preventDefault();
     const rows = Array.from($("#mcp-config-rows").children).map((line) => {
@@ -822,17 +793,18 @@ function renderMcpConfig() {
 }
 
 async function mutateMcp(path, method, body) {
-  if (state.mcpMutation) return;
+  if (state.settingsScope !== "app" || state.mcpMutation) return;
   if (method !== "PUT" && state.mcpDirty) { mcpStatus("Сначала сохраните изменённые URL.", true); return; }
   stopMcpPolling();
   const epoch = state.mcpEpoch;
   const version = state.mcpDraftVersion || 0;
+  let changed = false;
   state.mcpMutation = true;
   renderMcpConfig(); renderMcp();
   mcpStatus("Ожидание текущих вызовов и обновление подключения…");
   try {
     const answer = await api(path, json(method, body));
-    acceptMcp(answer);
+    acceptMcp(answer); changed = true;
     if (method === "PUT" && version === (state.mcpDraftVersion || 0)) state.mcpDirty = false;
     if (epoch === state.mcpEpoch && toolsVisible()) {
       mcpStatus(method === "PUT" ? "URL сохранены. Подключите нужный сервер." : "Состояние подключения обновлено.");
@@ -841,32 +813,34 @@ async function mutateMcp(path, method, body) {
     if (epoch === state.mcpEpoch && toolsVisible()) mcpStatus(String(err.message || err), true);
   } finally {
     state.mcpMutation = false;
-    if (epoch === state.mcpEpoch && toolsVisible()) { renderMcpConfig(); renderMcp(); }
+    if (epoch === state.mcpEpoch && toolsVisible()) { renderMcpConfig(); renderMcp(); if (changed) loadMcp(); }
     else if (toolsVisible()) loadMcp();
   }
 }
 
-async function loadMcp() {
-  if (!toolsVisible() || state.mcpRequest || state.mcpMutation) return;
+async function loadMcp(discover = false) {
+  const discovery = discover && state.workspace === "settings" && state.settingsScope === "chat" && document.visibilityState !== "hidden";
+  if ((!toolsVisible() && !discovery) || state.mcpRequest || state.mcpMutation) return;
   if (state.mcpTimer !== null) clearTimeout(state.mcpTimer);
   state.mcpTimer = null;
-  const epoch = state.mcpEpoch;
+  const epoch = state.mcpEpoch, scope = state.settingsScope, owner = state.current?.id;
+  const owned = () => epoch === state.mcpEpoch && scope === state.settingsScope && (scope !== "chat" || owner === state.current?.id);
   const controller = new AbortController();
   state.mcpRequest = controller;
   try {
-    const headers = state.current ? { "X-Chat-ID": state.current.id } : {};
+    const headers = state.settingsScope === "chat" && state.current ? { "X-Chat-ID": state.current.id } : {};
     const answer = await api("/api/mcp", { signal: controller.signal, headers });
-    if (epoch !== state.mcpEpoch) return;
+    if (!owned()) return;
     acceptMcp(answer);
     mcpStatus(state.mcpDisabled ? "MCP отключён." : "");
   } catch (err) {
-    if (epoch !== state.mcpEpoch) return;
-    state.mcp = null;
+    if (!owned()) return;
+    state.mcp = null; state.remindersAvailable = false; onMcpChange?.();
     mcpStatus(String(err.message || err), true);
   } finally {
     if (state.mcpRequest === controller) state.mcpRequest = null;
   }
-  if (epoch !== state.mcpEpoch || !toolsVisible()) return;
+  if (!owned() || !toolsVisible()) return;
   renderMcpConfig(); renderMcp();
   // Один отложенный GET после завершения предыдущего: медленная ручка
   // не создаёт параллельных запросов, уход отменяет и таймер, и GET.
@@ -891,6 +865,8 @@ function stopMcpPolling() {
 }
 
 function remindersBlock(data) {
+  const ownerId = state.current?.id;
+  const owned = () => state.settingsScope === "chat" && state.current?.id === ownerId;
   const box = el("section", "mem-reminders");
   box.setAttribute("aria-label", "Напоминания");
   box.appendChild(el("h4", "mem-kind", "напоминания — ждёт: " + (data.waiting ?? 0)
@@ -913,14 +889,15 @@ function remindersBlock(data) {
       cancel.type = "button";
       cancel.setAttribute("aria-label", "Снять напоминание №" + item.id);
       cancel.onclick = async () => {
-        const chat = state.current && state.current.id;
-        if (!chat || cancel.disabled) return;
+        const chat = ownerId;
+        if (!chat || !owned() || cancel.disabled) return;
         cancel.disabled = true;
         try {
           await api("/api/agents/" + encodeURIComponent(chat) + "/reminders/"
             + encodeURIComponent(data.server_name) + "/" + item.id + "/cancel", json("POST", {}));
-          await loadMcp();
+          if (owned() && toolsVisible()) await loadMcp();
         } catch (error) {
+          if (!owned()) return;
           cancel.disabled = false;
           mcpStatus(String(error.message || error), true);
         }
@@ -932,6 +909,9 @@ function remindersBlock(data) {
   return box;
 }
 
+function reminderServer(server) {
+  return server.status === "ok" && (Object.hasOwn(server, "reminders") || Object.hasOwn(server, "reminders_error"));
+}
 function renderMcp() {
   const box = $("#mcp-list");
   const expanded = new Set(Array.from(box.querySelectorAll("details")).filter((node) => node.open).map((node) => node.dataset.tool));
@@ -941,13 +921,13 @@ function renderMcp() {
   // подключён» и «не доехало» — разные новости, ровно как у слоёв памяти.
   if (!servers) { box.appendChild(memNote("Не читается: ручка ответила ошибкой.")); return; }
   if (!servers.length) { box.appendChild(memNote("MCP не подключён.")); return; }
-  servers.forEach((server) => {
+  servers.filter(server => state.settingsScope !== "chat" || reminderServer(server)).forEach((server) => {
     const row = el("article", "mcp-server");
     const head = el("header", "mcp-server-head");
     head.append(el("h3", "mcp-server-name", server.name),
       el("span", "mcp-server-status" + (server.status === "ok" ? " ok" : " down"), server.status === "ok" ? "Подключён" : server.status === "disconnected" ? "Отключён" : "Не отвечает"));
     row.appendChild(head);
-    if (server.url) {
+    if (server.url && state.settingsScope === "app") {
       row.appendChild(el("p", "mem-note", server.url));
       const controls = el("div", "mcp-config-actions");
       const connect = el("button", "mem-add", server.status === "ok" ? "Переподключить" : "Подключить");
@@ -962,8 +942,8 @@ function renderMcp() {
     }
     if (server.error) row.appendChild(el("p", "hint error", server.error));
     if (server.reminders_error) row.appendChild(el("p", "hint error", server.reminders_error));
-    const tools = server.tools || [];
-    if (!tools.length) row.appendChild(memNote("инструментов нет"));
+    const tools = state.settingsScope === "chat" ? [] : server.tools || [];
+    if (!tools.length && state.settingsScope !== "chat") row.appendChild(memNote("инструментов нет"));
     tools.forEach((tool) => {
       const card = el("div", "mcp-tool");
       card.append(el("h4", "mcp-tool-name", tool.name),
@@ -980,13 +960,13 @@ function renderMcp() {
       card.appendChild(schema);
       row.appendChild(card);
     });
-    if (server.reminders) row.appendChild(remindersBlock({ ...server.reminders, server_name: server.name }));
+    if (server.reminders && state.settingsScope === "chat" && state.current) row.appendChild(remindersBlock({ ...server.reminders, server_name: server.name }));
     box.appendChild(row);
   });
 }
 
 
-return { MEMORY_KINDS, WORKING_KINDS, INVARIANT_KINDS, PROFILE_FIELDS, memoryTabOpen, loadMemory, renderMemory, workingStatus, loadProfile, saveProfile, closeProfileMenu, toggleProfileMenu, loadInvariants, loadMcp, toolsVisible, stopMcpPolling, fillKinds, addFromForm, addWorkingFromForm, addInvariantFromForm };
+return { MEMORY_KINDS, WORKING_KINDS, INVARIANT_KINDS, PROFILE_FIELDS, memoryTabOpen, loadMemory, renderMemory, workingStatus, loadProfile, saveProfile, loadInvariants, loadMcp, toolsVisible, stopMcpPolling, fillKinds, addFromForm, addWorkingFromForm, addInvariantFromForm };
 }
 
 if (typeof module !== "undefined") module.exports = createChatRecords;

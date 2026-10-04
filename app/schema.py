@@ -16,6 +16,8 @@ class AgentSpec:
     model: str
     """id модели OpenRouter, например "meta-llama/llama-3.1-8b-instruct"."""
 
+    provider: str = "openrouter"
+
     system: str = ""
     """Системный промпт. Дом у него ровно один — это поле."""
 
@@ -67,8 +69,10 @@ class AgentSpec:
     рядом с вашим, а названный тем же `id` — победит."""
     rag_rewrite_enabled: bool = True
     rag_filter_enabled: bool = True
-    rag_candidates_k: int = 20
-    rag_final_k: int = 5
+    rag_top_k: int = 5
+    rag_rerank_enabled: bool = False
+    rag_rerank_provider: str = "openrouter"
+    rag_rerank_model: str = "openai/gpt-6-luna"
     rag_similarity_threshold: float = 0.3
     rag_enabled: bool = False
     """Mandatory published-index retrieval for this chat; legacy chats default OFF."""

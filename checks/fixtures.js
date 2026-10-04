@@ -53,13 +53,15 @@ function buildServer(options = {}) {
   const respond = (method, path, answer) => routes.set(method + " " + path, answer);
   async function fetchStub(path, init = {}) {
     const request = { method: (init.method || "GET").toUpperCase(), path,
-      body: init.body ? JSON.parse(init.body) : null, signal: init.signal };
+      body: init.body ? JSON.parse(init.body) : null, signal: init.signal, headers: {...(init.headers || {})} };
     state.requests.push(request);
     const key = request.method + " " + path;
     if (routes.has(key)) {
       const answer = routes.get(key);
       return typeof answer === "function" ? answer(request) : json(answer);
     }
+    if (path === "/api/model-settings" && request.method === "GET") return json({compatible_base_url: "http://127.0.0.1:8005/v1"});
+    if (path === "/api/model-settings" && request.method === "PATCH") return json(request.body);
     if (path.startsWith("/api/models") && request.method === "GET") return json({ models: [
       { id: "первая/модель", supported_parameters: ["temperature", "top_p", "stop", "response_format"] },
       { id: "вторая/модель", supported_parameters: [] },

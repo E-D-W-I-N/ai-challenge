@@ -66,8 +66,11 @@ def check_security():
             return httpx.Response(200, json={"data": [{"id": "neutral-generation"}]})
         def client_with_fixture(*args, **kwargs):
             return original_client(*args, **kwargs, transport=httpx.MockTransport(catalogue))
+        from app import main
         app = FastAPI(); app.include_router(rag_api.router)
-        params = {"auth_mode": "openrouter", "base_url": "https://neutral-upstream.test/v1"}
+        app.add_api_route("/api/models", main.list_models, methods=["GET"])
+        main.REGISTRY.store.save_model_settings({"compatible_base_url": "https://neutral-upstream.test/v1"})
+        params = {"provider": "compatible"}
         denied = [
             {"Origin": "https://unrelated.test", "Sec-Fetch-Site": "cross-site"},
             {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
@@ -81,7 +84,7 @@ def check_security():
         with patch.object(rag_models.httpx, "AsyncClient", client_with_fixture), patch.object(rag_models.config, "api_key", return_value=keys[0]) as key_reader, \
                 patch.object(rag_api, "Index") as index, patch.object(rag_api, "Operation") as operation, TestClient(app) as api:
             for headers in denied:
-                response = api.get("/api/rag/models", params=params, headers=headers)
+                response = api.get("/api/models", params=params, headers=headers)
                 assert response.status_code == 403 and all(key not in response.text for key in keys)
                 assert api.post("/api/rag/operations/chunks", json={"strategy": "semantic"}, headers=headers).status_code == 403
                 assert api.post("/api/rag/operations/embeddings", content="{}", headers={**dict(headers), "Content-Type": "text/plain"}).status_code == 403
@@ -89,9 +92,9 @@ def check_security():
             assert outbound == [] and key_reader.call_count == 0 and index.call_count == 0 and operation.call_count == 0
             for headers in [{}, {"Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Site": "none"},
                             {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"}, {"Origin": "HTTP://TESTSERVER:80"}]:
-                response = api.get("/api/rag/models", params=params, headers=headers)
+                response = api.get("/api/models", params=params, headers=headers)
                 assert response.status_code == 200 and response.json()["models"] == [{"id": "neutral-generation"}]
-            assert len(outbound) == 5 and key_reader.call_count == 5 and all(auth == "Bearer " + keys[0] for _, auth in outbound)
+            assert len(outbound) == 5 and key_reader.call_count == 5 and all(auth == "Bearer " + keys[1] for _, auth in outbound)
             # Trusted requests still reach the original route, without launching work
             # for an unknown operation/delete kind.
             assert api.post("/api/rag/operations/unknown", json={}, headers={"Origin": "http://testserver"}).status_code == 404
@@ -100,7 +103,7 @@ def check_security():
                                    ("https://localhost", "https://LOCALHOST:443", "localhost"),
                                    ("http://testserver", "http://[::1]:8000", "[::1]:8000")]:
             with patch.object(rag_models.httpx, "AsyncClient", client_with_fixture), TestClient(app, base_url=base) as api:
-                assert api.get("/api/rag/models", params=params, headers={"Host": host, "Origin": origin, "Sec-Fetch-Site": "same-origin"}).status_code == 200
+                assert api.get("/api/models", params=params, headers={"Host": host, "Origin": origin, "Sec-Fetch-Site": "same-origin"}).status_code == 200
     return "chat status/category errors omit raw/encoded secrets; RAG origin guard precedes keys and effects"
 
 
