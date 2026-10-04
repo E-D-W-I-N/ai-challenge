@@ -5461,6 +5461,12 @@ def check_rag_chat():
     return check_rag_chat()
 
 
+@check("RAG refinement: rewrite/filter lifecycle")
+def check_rag_refinement():
+    from checks.rag_refinement_check import check_rag_refinement
+    return check_rag_refinement()
+
+
 @check("RAG: actual semantic HTTP/CLI and save boundary")
 def check_rag_workflow_http():
     from checks.workflow_http_check import check_workflow_http
