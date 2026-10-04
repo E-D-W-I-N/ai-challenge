@@ -35,7 +35,11 @@ function freshClient(options = {}, classic = false) {
     client = require(path.join(STATIC, "app.js"));
   }
   const $ = (selector) => env.document.querySelector(selector);
-  const click = (id) => $("#" + id).dispatchEvent(new Evt("click"));
+  const click = id => {
+    if (id === "chat-settings") return $("#agent-list").querySelectorAll(".item-settings").find(row => row.dataset.agentId === client.state.current?.id)?.dispatchEvent(new Evt("click"));
+    if (id === "application-settings") { $("#profile-toggle").dispatchEvent(new Evt("click")); return $("#app-settings").dispatchEvent(new Evt("click")); }
+    return $("#" + id).dispatchEvent(new Evt("click"));
+  };
   const requests = (method, route) => env.server.state.requests.filter((r) =>
     r.method === method && (typeof route === "string" ? r.path === route : route.test(r.path)));
   const send = (text) => { $("#input").value = text; $("#composer").requestSubmit(); };
@@ -52,6 +56,87 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Settings domains, keyboard navigation and mounted drafts", async () => {
+    const {client, server, $, click, requests} = freshClient();
+    server.respond("GET", "/api/profile", {profile: {style: "neutral style"}});
+    server.respond("GET", "/api/memory", {records: [{seq: 1, kind: "knowledge", content: "global record"}]});
+    server.respond("GET", "/api/agents/ag_1/memory", {short_term: {messages: 0}, working: {records: []}, long_term: {records: []}});
+    client.init(); await settle();
+    $("#input").value = "composer draft";
+    click("chat-settings"); await settle();
+    check("Chat gear opens selected-chat model settings", client.state.settingsScope === "chat" && client.state.section === "model" && !$("#model-chat-settings").hidden && $("#model-app-settings").hidden);
+    check("Chat navigation exposes only its five sections", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "agent", "memory", "mcp", "rag"]));
+    $("#f-system").value = "system draft"; $("#f-system").dispatchEvent(new Evt("input"));
+    click("tab-btn-memory"); await settle();
+    $("#mem-work-content").value = "working draft";
+    check("Chat memory hides global form and reads only aggregate chat memory", !$("#mem-working-layer").hidden && !$("#mem-short-layer").hidden && $("#mem-long-layer").hidden && requests("GET", "/api/memory").length === 0);
+    click("application-settings"); await settle();
+    check("Avatar opens global model connection without chat form", client.state.settingsScope === "app" && !$("#model-app-settings").hidden && $("#model-chat-settings").hidden);
+    check("Application navigation exposes only its six sections", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "memory", "profile", "invariants", "mcp", "rag"]));
+    const before = requests("PATCH", "/api/agents/ag_1").length;
+    $("#f-system").dispatchEvent(new Evt("change")); await settle();
+    check("Hidden chat controls cannot PATCH from application settings", requests("PATCH", "/api/agents/ag_1").length === before);
+    $("#tab-btn-model").dispatchEvent(new Evt("keydown", {key: "ArrowDown"})); await settle();
+    check("Application keyboard skips hidden agent tab", client.state.section === "memory");
+    check("Application memory uses global endpoint and hides personal forms", !$("#mem-long-layer").hidden && $("#mem-working-layer").hidden && $("#mem-short-layer").hidden && requests("GET", "/api/memory").length === 1 && $("#mem-long").textContent.includes("global record"));
+    $("#mem-content").value = "global draft";
+    const getCount = requests("GET", "/api/agents/ag_1").length;
+    click("chat-settings"); await settle();
+    check("Same-chat gear preserves drafts without reopening chat", requests("GET", "/api/agents/ag_1").length === getCount && $("#f-system").value === "system draft" && $("#mem-work-content").value === "working draft" && $("#mem-content").value === "global draft");
+    click("tab-btn-rag"); await settle();
+    check("Chat search never polls the index or shows pipeline", requests("GET", /^\/api\/rag\//).length === 0 && $("#rag-workflow").hidden && !$("#rag-current-chat").hidden);
+    click("application-settings"); click("tab-btn-rag"); await settle();
+    check("Application index hides chat usage and fetches status", !$("#rag-workflow").hidden && $("#rag-current-chat").hidden && requests("GET", "/api/rag/status").length === 1);
+    click("workspace-chat");
+    check("Explicit return preserves composer and mounted forms", client.state.workspace === "chat" && $("#input").value === "composer draft" && $("#workspace-chat").hidden);
+  });
+
+  await scenario("No-chat application settings and late navigation ownership", async () => {
+    const empty = freshClient({agents: []});
+    empty.server.respond("GET", "/api/memory", {records: []});
+    empty.client.init(); await settle(); empty.click("application-settings"); empty.click("tab-btn-memory"); await settle();
+    check("No-chat globals do not create or PATCH a chat", !empty.client.state.current && empty.requests("POST", "/api/agents").length === 0 && empty.requests("GET", "/api/memory").length === 1 && empty.requests("PATCH", /^\/api\/agents\//).length === 0);
+    empty.click("tab-btn-mcp"); await settle();
+    check("No-chat MCP global GET has no chat header", !empty.requests("GET", "/api/mcp").at(-1).headers?.["X-Chat-ID"] && !empty.$("#mcp-application-controls").hidden);
+    window.dispatchEvent(new Evt("pagehide"));
+    const {client, server, $, click, requests} = freshClient(); client.init(); await settle();
+    const late = deferred(); server.respond("GET", "/api/agents/ag_2", () => late.promise);
+    $("#agent-list").querySelectorAll(".item-settings")[1].dispatchEvent(new Evt("click")); await settle();
+    click("application-settings");
+    late.resolve(json(server.state.agents[1])); await settle();
+    check("Late gear response cannot steal avatar navigation or current chat", client.state.settingsScope === "app" && client.state.current.id === "ag_1");
+    server.respond("GET", "/api/agents/ag_2", server.state.agents[1]);
+    $("#agent-list").querySelectorAll(".item-settings")[1].dispatchEvent(new Evt("click")); await settle();
+    check("Row gear opens precisely its chat and settings", client.state.current.id === "ag_2" && client.state.settingsScope === "chat" && client.state.workspace === "settings");
+    const created = deferred(); server.respond("POST", "/api/agents", () => created.promise);
+    click("new-chat"); click("application-settings");
+    created.resolve(json({agents: [{...server.state.agents[0], id: "created"}]})); await settle();
+    check("Late creation cannot replace newer global navigation", client.state.settingsScope === "app" && client.state.workspace === "settings" && client.state.current.id === "ag_2");
+  });
+
+  await scenario("An old empty agent list cannot replace a newer created chat", async () => {
+    const {client, server, $, click} = freshClient();
+    const initial = deferred(); server.respond("GET", "/api/agents", () => initial.promise);
+    client.init(); await settle();
+    server.respond("GET", "/api/agents", {agents: server.state.agents, has_key: true});
+    server.respond("POST", "/api/agents", {agents: [server.state.agents[0]]});
+    click("new-chat"); await settle();
+    initial.resolve(json({agents: [], has_key: true})); await settle();
+    check("Newer list and selected chat survive a delayed initial empty response", client.state.current.id === "ag_1" && $("#agent-list").querySelectorAll(".item").length === 2);
+  });
+
+  await scenario("Global tools hide owned reminders and stale cancellation cannot target another chat", async () => {
+    const {client, server, $, click, open, requests} = freshClient();
+    server.respond("GET", "/api/mcp", {servers: [{name: "remind", status: "ok", url: "http://127.0.0.1:8018/mcp", tools: [], reminders: {items: [{id: 5, can_cancel: true, text: "neutral owned reminder", fired: 0, state: "ждёт"}]}}], config: {revision: 1, servers: []}});
+    client.init(); await settle(); click("chat-settings"); click("tab-btn-mcp"); await settle();
+    const cancel = $("#mcp-list").querySelector("button");
+    check("Chat tools have owned reminder actions and no server configuration", cancel.textContent === "Снять" && $("#mcp-application-controls").hidden && !$("#mcp-list").querySelector(".mcp-config-actions") && requests("GET", "/api/mcp").at(-1).headers["X-Chat-ID"] === "ag_1");
+    open(1); await settle(); cancel.dispatchEvent(new Evt("click")); await settle();
+    check("Detached reminder button cannot cancel under another chat", requests("POST", /\/reminders\//).length === 0);
+    click("application-settings"); click("tab-btn-mcp"); await settle();
+    check("Global tools show connections without reminder or chat headers", !$("#mcp-application-controls").hidden && !$("#mcp-list").querySelector(".mem-reminders") && !!$("#mcp-list").querySelector(".mcp-config-actions") && !requests("GET", "/api/mcp").at(-1).headers["X-Chat-ID"]);
+  });
+
   await scenario("Per-chat RAG setting and immutable answer snapshot", async () => {
     const rag = {version: 1, query: "neutral original question", top_k: 5,
       index: {index_id: "saved-old-index", strategy: "semantic", dimension: 3}, duration_seconds: .2,
@@ -62,17 +147,17 @@ async function main() {
     client.init(); await settle();
     check("Legacy RAG defaults OFF", !$("#f-rag_enabled").checked);
     check("Chat RAG controls belong to the mounted RAG page", $("#tab-rag").querySelector("#f-rag_enabled") === $("#f-rag_enabled") && !$("#tab-agent").querySelector("#f-rag_enabled"));
-    click("workspace-settings"); click("tab-btn-rag");
+    click("chat-settings"); click("tab-btn-rag");
     $("#f-rag_enabled").checked = true; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
     check("Checkbox saves boolean per-chat config", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_enabled === true && client.state.current.rag_enabled === true);
-    open(1); await settle(); check("Other chat loads own enabled setting", $("#f-rag_enabled").checked);
+    open(1); await settle(); click("chat-settings"); check("Other chat loads own enabled setting", $("#f-rag_enabled").checked);
     $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
-    open(0); await settle(); check("Chat switching restores persisted RAG choice", $("#f-rag_enabled").checked);
+    open(0); await settle(); click("chat-settings"); click("tab-btn-rag"); check("Chat switching restores persisted RAG choice", $("#f-rag_enabled").checked);
     click("workspace-chat");
     const sourceBox = $("#feed").querySelector(".card-rag");
     check("Answer sources render as inert text", sourceBox.textContent.includes("<script>neutral source</script>") && !sourceBox.querySelector("a"));
     const late = deferred(); server.respond("GET", "/api/rag/status", () => late.promise);
-    click("workspace-settings"); click("tab-btn-rag"); await settle();
+    click("chat-settings"); click("tab-btn-rag"); await settle();
     const lateSettings = deferred(); server.respond("PATCH", "/api/agents/ag_1", () => lateSettings.promise);
     $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
     click("workspace-chat");
@@ -90,10 +175,10 @@ async function main() {
     check("Historical inspection hides chat editing and its save status", $("#rag-current-chat").hidden && $("#f-rag_enabled").disabled && $("#save-status").classList.contains("hidden") && !$("#settings-scope").hidden);
     server.respond("GET", "/api/rag/status", {state: "missing"});
     snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle();
-    check("Current workflow stays mounted and restores chat editing after historical inspection", snapshot.hidden && !$("#rag-workflow").hidden && $("#rag-status").textContent === "Индекс отсутствует" && !$("#rag-current-chat").hidden && !$("#f-rag_enabled").disabled && !$("#save-status").classList.contains("hidden"));
+    check("History returns to application index without chat controls", client.state.settingsScope === "app" && snapshot.hidden && !$("#rag-workflow").hidden && $("#rag-status").textContent === "Индекс отсутствует" && $("#rag-current-chat").hidden && $("#f-rag_enabled").disabled && $("#save-status").classList.contains("hidden"));
     click("workspace-chat"); $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click"));
     open(1); await settle();
-    check("Historical selection is cleared and chat editing restored when active chat changes", snapshot.hidden && !snapshot.children.length && !$("#rag-workflow").hidden && !$("#rag-current-chat").hidden && !$("#f-rag_enabled").disabled);
+    check("Selecting a chat clears history and returns to conversation", snapshot.hidden && !snapshot.children.length && client.state.workspace === "chat" && client.state.current.id === "ag_2");
   });
   await scenario("RAG refinement fields and saved candidate decisions", async () => {
     const rag = {version: 2, original_query: "А что затем?", query: "neutral rewritten query", index: {index_id: "neutral-v2"},
@@ -107,7 +192,7 @@ async function main() {
         {chunk_id: "cap", score: .7, text: "neutral cap", decision: "final_cap"}]};
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag");
+    client.init(); await settle(); click("chat-settings"); click("tab-btn-rag");
     check("Legacy refinement switches stay off with a single Top-K", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_top_k").value === "5" && $("#rag-chat-settings").classList.contains("hidden"));
     $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
     $("#f-rag_top_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
@@ -153,6 +238,7 @@ async function main() {
         && content.includes("saved-flags") && JSON.stringify(client.state.current.transcript[1].rag) === saved
         && requests("GET", /^\/api\/rag\//).length === before);
       node.querySelector("button").dispatchEvent(new Evt("click")); await settle();
+      click("chat-settings"); click("tab-btn-rag");
       $("#f-rag_filter_enabled").checked = filter;
       $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
       $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -231,7 +317,7 @@ async function main() {
     server.respond("GET", "/api/rag/documents/doc/chunks?offset=0&limit=25", { items: [chunk] });
     server.respond("GET", "/api/rag/chunks/chunk", chunk);
     server.respond("GET", "/api/rag/chunks/chunk?vector=true", { ...chunk, vector: [0.2, 0.4, 0.8] });
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     check("No selected chat hides and disables per-chat RAG without disabling workflow", $("#rag-current-chat").hidden && $("#f-rag_enabled").disabled && !$("#rag-workflow").hidden);
     check("No chat/key needed for saved index and actual CLI counts", $("#rag-status").textContent === "Индекс готов"
       && $("#rag-index").textContent.includes("15555") && $("#rag-operation").textContent.includes("1.25"));
@@ -278,7 +364,7 @@ async function main() {
     const active = (row) => row.attributes["aria-pressed"] === "true" && row.classList.contains("selected");
     const press = (node) => node.dispatchEvent(new Evt("click"));
     const page = (id, label) => press($("#rag-" + id).querySelector(".rag-pager").querySelectorAll("button").find((node) => node.textContent === label));
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     check("No item is selected implicitly", rows("documents").every((row) => row.attributes["aria-pressed"] === "false"));
     press(rows("documents")[0]); await settle(); press(rows("chunks")[0]); await settle();
     check("Duplicate titles and sections select only the matching ID", active(rows("documents")[0]) && !active(rows("documents")[1])
@@ -320,7 +406,7 @@ async function main() {
     server.respond("GET", "/api/rag/status", status);
     server.respond("GET", "/api/rag/documents?offset=0&limit=25", {items: []});
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     const gate = (name) => $("#rag-" + name + "-controls");
     check("Legacy published index remains inspectable and deletable without enabling save or unavailable stages", gate("chunks").hidden && gate("embeddings").hidden
       && !gate("save").hidden && !$("#rag-step-save").disabled && $("#rag-save").disabled && !$("#rag-delete-index").hidden);
@@ -388,7 +474,7 @@ async function main() {
     server.respond("GET", "/api/rag/chunks/old-chunk", savedChunk);
     server.respond("GET", "/api/rag/chunks/new-chunk?working=true", workingChunk);
     server.respond("GET", "/api/rag/chunks/old-chunk?vector=true", {vector: [1, 0, 0]});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     check("Single mounted status navigation works without an operation", $("#rag-navigation").parentElement.classList.contains("rag-operation-card")
       && $("#rag-navigation").querySelectorAll("button").length === 4 && $("#rag-operation").hidden && $("#rag-step-save").attributes["aria-current"] === "step");
     check("Stale index uses saved documents despite current corpus", $("#rag-documents").textContent.includes(savedDoc.title)
@@ -436,7 +522,7 @@ async function main() {
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
     const initial = deferred(); server.respond("GET", route, () => initial.promise);
     server.respond("POST", "/api/rag/operations/embeddings", {});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     const model = $("#rag-model"), provider = $("#rag-provider"), list = $("#rag-model-catalogue"), message = $("#rag-embedding-model-status");
     check("Searchable embedding field retains saved ID while loading", model.tagName === "INPUT" && model.attributes.list === list.id && model.value === original && message.textContent.includes("Загрузка"));
     initial.resolve(failure("neutral catalogue error", 502)); await settle();
@@ -469,7 +555,7 @@ async function main() {
     server.respond("POST", "/api/rag/operations/ingest", {});
     server.respond("POST", "/api/rag/operations/chunks", {});
     client.init(); await settle(); client.state.models = [];
-    click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-documents"); await settle();
+    click("application-settings"); click("tab-btn-rag"); await settle(); click("rag-step-documents"); await settle();
     const method = $("#rag-preparation-strategy"), model = $("#rag-preparation-model"), provider = $("#rag-preparation-provider");
     const timeout = $("#rag-preparation-timeout-seconds");
     check("Preparation timeout seeds saved operation report", Number(timeout.value) === 1800);
@@ -520,7 +606,7 @@ async function main() {
     const initial = deferred(); server.respond("GET", "/api/model-settings", () => initial.promise);
     const writes = []; const first = deferred(), second = deferred();
     server.respond("PATCH", "/api/model-settings", request => { writes.push(request.body.compatible_base_url); return writes.length === 1 ? first.promise : writes.length === 2 ? second.promise : json(request.body); });
-    client.init(); await settle(); click("workspace-settings");
+    client.init(); await settle(); click("application-settings");
     const input = $("#compatible-base-url"); check("Global server settings editable without selecting a chat", !input.disabled);
     input.value = "http://127.0.0.1:9001/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
     input.value = "http://127.0.0.1:9002/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
@@ -557,7 +643,7 @@ async function main() {
     server.respond("GET", "/api/agents", () => json({has_key: false, agents: server.state.agents, live: 2, max_agents: 1000}));
     server.respond("POST", "/api/agents/ag_1/messages", () => stream(success));
     client.init(); await settle(); check("Compatible chat remains available without OpenRouter key", !$("#send").disabled && $("#f-provider").value === "compatible");
-    click("workspace-settings"); click("tab-btn-rag"); await settle();
+    click("chat-settings"); click("tab-btn-rag"); await settle();
     check("Top-K stays visible with RAG enabled and filtering off", !$("#rag-chat-parameters").classList.contains("hidden") && $("#rag-threshold-field").classList.contains("hidden") && $("#rag-rerank-fields").classList.contains("hidden"));
     $("#f-rag_rerank_enabled").checked = true; $("#f-rag_rerank_enabled").dispatchEvent(new Evt("change"));
     $("#f-rag_rerank_provider").value = "compatible"; $("#f-rag_rerank_provider").dispatchEvent(new Evt("change"));
@@ -600,7 +686,7 @@ async function main() {
     server.respond("GET", "/api/models?provider=openrouter&purpose=generation", {models: [{id: "offline-boundaries"}]});
     server.respond("GET", "/api/models?provider=compatible&purpose=generation", {models: [{id: "local-generative"}]});
     server.respond("GET", "/api/models?provider=compatible&purpose=embedding", {models: [{id: "offline-model"}]});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    client.init(); await settle(); click("application-settings"); click("tab-btn-rag"); await settle();
     check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     $("#rag-chunks").querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -684,7 +770,7 @@ async function main() {
         reminders: { waiting: 1, fired: 0, items: [base.servers[0].reminders.items[1]] } }] });
       return json({ cancelled: true });
     });
-    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("chat-settings"); click("tab-btn-mcp"); await settle(10);
     const buttons = $("#mcp-list").querySelectorAll("button").filter((node) => node.textContent === "Снять");
     check("Tools offers cancellation only for owned occurrence while chat is busy", buttons.length === 1);
     buttons[0].dispatchEvent(new Evt("click")); await settle(15);
@@ -834,7 +920,7 @@ async function main() {
       finish: () => Object.assign(server.state.agents[0], { transcript: turns, history_len: 2 }) }));
     client.init(); await settle(30);
     const feed = $("#feed"); $("#input").value = "draft";
-    click("workspace-settings"); click("workspace-chat");
+    click("chat-settings"); click("workspace-chat");
     check("Workspace preserves mounted feed, selection and draft", $("#feed") === feed && client.state.current.id === "ag_1" && $("#input").value === "draft");
     click("sidebar-toggle");
     check("Desktop sidebar records collapsed state", $("#app").classList.contains("no-sidebar"));
@@ -850,7 +936,7 @@ async function main() {
     check("Confirmation restores focus without deleting", !$(".confirm") && document.activeElement === trash && requests("DELETE", /./).length === 0);
     send("вопрос"); await settle(35);
     const controller = client.state.abort;
-    click("workspace-settings");
+    click("chat-settings");
     check("Workspace switch keeps stream active", client.state.busy && !controller.signal.aborted);
     await settle(100); click("workspace-chat");
     check("Stream finishes in original workspace", !client.state.busy && $("#feed").textContent.includes("ответ модели"));
@@ -937,7 +1023,7 @@ async function main() {
     check("Profile PATCH sends only touched field and displays API result", same(requests("PATCH", "/api/profile")[0]?.body, { style: "ясно fixture" }) && $("#profile-style").value === "ясно ***" && $("#profile-format").value === "списком" && requests("PATCH", /^\/api\/agents\//).length === 0);
     server.respond("PATCH", "/api/profile", () => failure("профиль занят"));
     $("#profile-context").value = "не терять"; $("#profile-context").dispatchEvent(new Evt("input")); $("#profile-context").dispatchEvent(new Evt("change")); await settle(10);
-    click("workspace-chat"); click("workspace-settings"); await settle(10);
+    click("workspace-chat"); click("application-settings"); await settle(10);
     check("Profile failure survives reread without losing dirty text", $("#profile-context").value === "не терять" && $("#profile-status").textContent.includes("занят"));
     server.respond("PATCH", "/api/profile", () => json({ profile: { format: "списком", context: "не терять" } }));
     $("#profile-context").dispatchEvent(new Evt("change")); await settle(10);
@@ -957,11 +1043,12 @@ async function main() {
     const { client, server, $, click, requests } = freshClient();
     const memory = { short_term: { messages: 0, summaries: [] }, working: { records: isWorking ? [record] : [] }, long_term: { records: isWorking ? [] : [record] } };
     server.respond("GET", "/api/agents/ag_1/memory", memory);
+    server.respond("GET", "/api/memory", memory.long_term);
     server.respond("GET", "/api/invariants", { records: [record], total: 1 });
     server.respond("PATCH", base + "/37", () => json(changed));
     server.respond("POST", base, () => json({ ...changed, seq: 84 }));
     server.respond("DELETE", base + "/37", () => json({ deleted: 37 }));
-    client.init(); await settle(30); click(isInvariant ? "tab-btn-invariants" : "tab-btn-memory"); await settle(10);
+    client.init(); await settle(30); click(isWorking ? "chat-settings" : "application-settings"); click(isInvariant ? "tab-btn-invariants" : "tab-btn-memory"); await settle(10);
     $(container).querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
     const editor = $(container).querySelector(".mem-edit");
     const select = $(container).querySelector(".mem-edit-kind");
@@ -970,7 +1057,7 @@ async function main() {
     if (kind === "long") {
       server.respond("PATCH", base + "/37", () => failure("память занята"));
       editor.dispatchEvent(new Evt("keydown", { key: "Enter" })); await settle(10);
-      click("workspace-chat"); click("workspace-settings"); await settle(10);
+      click("workspace-chat"); click("application-settings"); await settle(10);
       check("Record failure keeps the mounted editor and draft", $(container).querySelector(".mem-edit") === editor && editor.value === "saved fixture" && $("#mem-status").textContent.includes("занята"));
       server.respond("PATCH", base + "/37", () => json(changed));
     }
@@ -1005,7 +1092,7 @@ async function main() {
     const { client, server, $, click, open, requests } = freshClient();
     server.respond("GET", "/api/agents/ag_1/memory", { short_term: { messages: 0, summaries: [] }, working: { records: [{ seq: 9, kind: "question", content: "first chat", at: 1 }] }, long_term: { records: [] } });
     server.respond("GET", "/api/agents/ag_2/memory", { short_term: { messages: 0, summaries: [] }, working: { records: [] }, long_term: { records: [] } });
-    client.init(); await settle(30); click("tab-btn-memory"); await settle(10);
+    client.init(); await settle(30); click("chat-settings"); click("tab-btn-memory"); await settle(10);
     $("#mem-working").querySelectorAll(".mini")[0].dispatchEvent(new Evt("click"));
     const editor = $("#mem-working").querySelector(".mem-edit"); editor.value = "stale draft";
     open(1); await settle(20); editor.dispatchEvent(new Evt("keydown", { key: "Enter" })); await settle(10);
@@ -1020,16 +1107,16 @@ async function main() {
     const { client, server, $, click, requests } = freshClient();
     const servers = [{ name: "local", status: "ok", tools: [{ name: "local__echo", description: "echo fixture", schema: { type: "object", properties: { text: { type: "string" } } } }] }, { name: "down", status: "down", error: "fixture unavailable", tools: [] }];
     server.respond("GET", "/api/mcp", { servers });
-    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("application-settings"); click("tab-btn-mcp"); await settle(10);
     check("MCP renders callable name, schema and down reason", $("#mcp-list").textContent.includes("local__echo") && $("#mcp-list").textContent.includes('"type": "string"') && $("#mcp-list").textContent.includes("fixture unavailable"));
     const pending = deferred(); server.respond("GET", "/api/mcp", () => pending.promise);
-    click("workspace-chat"); click("workspace-settings");
+    click("workspace-chat"); click("application-settings");
     const controller = client.state.mcpRequest; click("workspace-chat");
     pending.resolve(json({ servers: [{ name: "LATE SERVER", status: "ok", tools: [] }] })); await settle(10);
     check("Leaving MCP aborts and ignores late response", controller.signal.aborted && !$("#mcp-list").textContent.includes("LATE SERVER"));
     server.respond("GET", "/api/mcp", { servers });
     const before = requests("GET", "/api/mcp").length;
-    document.visibilityState = "hidden"; click("workspace-settings"); await settle(10);
+    document.visibilityState = "hidden"; click("application-settings"); await settle(10);
     check("Hidden document does not poll MCP", requests("GET", "/api/mcp").length === before);
     document.visibilityState = "visible"; document.fire(new Evt("visibilitychange")); await settle(10);
     check("Visible MCP reopens with one GET", requests("GET", "/api/mcp").length === before + 1);
@@ -1045,7 +1132,7 @@ async function main() {
       { name: "echo", status: "ok", tools: [] },
     ] });
     server.respond("GET", "/api/mcp", response(reminder));
-    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("chat-settings"); click("tab-btn-mcp"); await settle(10);
     const listing = $("#mcp-list");
     check("Reminder aggregate uses server counts/id/text and recurring occurrences " + classic,
       listing.querySelectorAll(".mem-reminders").length === 1 && listing.textContent.includes("ждёт: 1 · сработало: 1")
@@ -1074,7 +1161,7 @@ async function main() {
     click("tab-btn-mcp"); await settle(10);
     const controller = client.state.mcpRequest;
     click("workspace-chat");
-    server.respond("GET", "/api/mcp", response(fired)); click("workspace-settings"); await settle(10);
+    server.respond("GET", "/api/mcp", response(fired)); click("chat-settings"); await settle(10);
     // The aborted request resolves after the new entry has already rendered.
     pending.resolve(json({ servers: [{ name: "LATE SERVER", tools: [] }] })); await settle(10);
     check("Workspace exit aborts GET and rejects old epoch after reentry " + classic,
@@ -1108,12 +1195,12 @@ async function main() {
     const rows = [{ name: "custom", url: "http://127.0.0.1:8016/mcp", enabled: false }];
     const saved = { servers: [{ ...rows[0], status: "disconnected", tools: [] }], config: { revision: 1, servers: rows } };
     server.respond("GET", "/api/mcp", empty);
-    client.init(); await settle(30); click("tab-btn-mcp"); await settle(10);
+    client.init(); await settle(30); click("application-settings"); click("tab-btn-mcp"); await settle(10);
     const name = $(".mcp-name"), url = $(".mcp-url");
     name.value = "custom"; name.dispatchEvent(new Evt("input"));
     url.value = rows[0].url; url.dispatchEvent(new Evt("input"));
     const late = deferred(); server.respond("GET", "/api/mcp", () => late.promise);
-    click("workspace-chat"); click("workspace-settings");
+    click("workspace-chat"); click("application-settings");
     const oldController = client.state.mcpRequest;
     const saving = deferred(); server.respond("PUT", "/api/mcp/config", () => saving.promise);
     $("#mcp-config-form").requestSubmit(); $("#mcp-config-form").requestSubmit();
