@@ -450,6 +450,7 @@ async function openAgent(agentId) {
     return loadAgents();
   }
   if (epoch !== state.chatEpoch) return;
+  ragInspector.clearSnapshot();
   state.current = agent;
   state.settingsRevision += 1;
   // Рабочий редактор принадлежит прежнему чату; глобальные редакторы
@@ -599,11 +600,32 @@ function answerCard(agent, turn, index) {
   const tools = toolLine(turn);
   if (tools) card.appendChild(tools);
 
+  if (turn.rag) card.appendChild(ragSources(turn.rag));
+
   const usage = usageLine(turn);
   if (usage) card.appendChild(usage);
 
   if (turn.error) card.appendChild(el("div", "card-error", turn.error));
   return card;
+}
+
+function ragSources(snapshot) {
+  const box = el("div", "card-rag");
+  box.appendChild(el("div", "field-label", "Источники RAG"));
+  const list = el("ol", "rag-answer-sources");
+  for (const hit of snapshot.hits || []) {
+    const item = el("li", "");
+    item.appendChild(el("span", "", hit.title || hit.source || hit.chunk_id));
+    if (hit.section) item.appendChild(el("span", "muted", " · " + hit.section));
+    if (hit.source) item.appendChild(el("div", "muted rag-source-url", hit.source));
+    list.appendChild(item);
+  }
+  box.appendChild(list);
+  const inspect = el("button", "mcp-button", "Контекст и фрагменты ответа");
+  inspect.type = "button";
+  inspect.onclick = () => { showSettings("rag", false); ragInspector.showSnapshot(snapshot); $("#panel-body").scrollTop = 0; };
+  box.appendChild(inspect);
+  return box;
 }
 
 // Ветка отсюда: новый чат уносит разговор по эту карточку включительно
@@ -818,6 +840,7 @@ function promptRole(msg, index, prompt) {
   if (index === prompt.workingAt) return SERVICE_CALLS.facts.role;
   // Состояние задачи — третьей врезкой, тем же порядком, что в промпте.
   if (index === prompt.taskAt) return "состояние задачи";
+  if (index === prompt.ragAt) return "контекст RAG";
   // Врезки стратегии может не быть вовсе — окно и «Вся история» не вставляют
   // ничего, и `summary_at` приходит пустым; память не едет, когда её нет или
   // выключатель чата в «выключено». Сравнение строгое именно поэтому:
@@ -1105,6 +1128,7 @@ async function exchange(path, body, questionText) {
   let toolBox = null;
   let committed = false;
   let answerIndex = null;
+  let terminalQuestion = null;
 
   try {
     await streamPost(
@@ -1112,6 +1136,11 @@ async function exchange(path, body, questionText) {
       body,
       (e) => {
         switch (e.event) {
+          case "retrieval":
+            if (!status) { status = cardStatus("Поиск контекста"); card.insertBefore(status, bodyEl); }
+            else status.querySelector(".card-status-text").textContent = "Поиск контекста";
+            scrollFeed();
+            break;
           case "compressing":
             // Служебный вызов — отдельное обращение к модели ДО ответа:
             // пауза уже идёт, и карточка обязана сказать, из-за чего она
@@ -1136,9 +1165,9 @@ async function exchange(path, body, questionText) {
             }
             break;
           case "start":
-            // Промпт собран — значит служебный вызов позади и дальше пойдёт
-            // ответ: строке состояния больше нечего показывать.
-            if (status) { status.remove(); status = null; }
+            // Поиск и служебные вызовы завершены: генерация началась.
+            if (!status) { status = cardStatus("Генерация"); card.insertBefore(status, bodyEl); }
+            else status.querySelector(".card-status-text").textContent = "Генерация";
             // Промпт держим у каждого обмена, а не только у того, где есть
             // врезка. У «Всей истории» он и правда повторяет ленту, зато
             // скользящее окно начало **отбрасывает** — и прочитать, что
@@ -1148,13 +1177,14 @@ async function exchange(path, body, questionText) {
             if (e.resolved_messages) {
               prompt = {
                 messages: e.resolved_messages,
-                // Слотов четыре: обе памяти, состояние задачи и врезка
-                // стратегии. Все называет сервер, все бывают пустыми
+                // Слоты памяти, задачи, стратегии и RAG называет сервер;
+                // каждый бывает пустым
                 // и в одном промпте встречаются вместе.
                 memoryAt: e.memory_at,
                 workingAt: e.working_at,
                 taskAt: e.task_at,
                 summaryAt: e.summary_at,
+                ragAt: e.rag_at,
                 strategy: e.strategy,
               };
             }
@@ -1170,6 +1200,7 @@ async function exchange(path, body, questionText) {
             scrollFeed();
             break;
           case "delta":
+            if (status) { status.remove(); status = null; }
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
             if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
@@ -1201,6 +1232,10 @@ async function exchange(path, body, questionText) {
           case "done":
             // Записался ли обмен в историю — знает агент, и говорит прямо.
             committed = e.committed === true;
+            if (!committed) {
+              terminalQuestion = typeof e.question === "string" ? e.question : null;
+              if (e.error) failure = failure || e.error;
+            }
             answerIndex = e.answer_index ?? null;
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
@@ -1216,6 +1251,7 @@ async function exchange(path, body, questionText) {
     if (err.name !== "AbortError") failure = String(err.message || err);
   }
 
+  if (status) status.remove();
   card.classList.remove("busy");
   state.abort = null;
   setBusy(false);
@@ -1233,6 +1269,10 @@ async function exchange(path, body, questionText) {
       const input = $("#input");
       if (!input.value) { input.value = questionText; autoGrow(input); }
     }
+  }
+
+  if (!committed && terminalQuestion !== null && !$("#input").value) {
+    $("#input").value = terminalQuestion; autoGrow($("#input"));
   }
 
   // Лента и список слева перерисовываются по серверу: на экране должно быть
@@ -1481,6 +1521,7 @@ function fillPanel(agent) {
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
   fillStrategy(agent.strategy);
+  $("#f-rag_enabled").checked = agent.rag_enabled === true;
   $("#f-system").value = agent.system || "";
   // Стоп-строки — по одной в строке: список строк, а не JSON руками.
   $("#f-stop").value = (agent.stop || []).join("\n");
@@ -1609,6 +1650,7 @@ function readPanel() {
       $("#f-response_format").value
     ),
     strategy: $("#f-strategy").value,
+    rag_enabled: $("#f-rag_enabled").checked,
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
   return patch;
