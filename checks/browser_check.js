@@ -61,7 +61,8 @@ async function main() {
     const {client, server, $, click, open, requests} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2}, {rag_enabled: true}]});
     client.init(); await settle();
     check("Legacy RAG defaults OFF", !$("#f-rag_enabled").checked);
-    click("workspace-settings"); click("tab-btn-agent");
+    check("Chat RAG controls belong to the mounted RAG page", $("#tab-rag").querySelector("#f-rag_enabled") === $("#f-rag_enabled") && !$("#tab-agent").querySelector("#f-rag_enabled"));
+    click("workspace-settings"); click("tab-btn-rag");
     $("#f-rag_enabled").checked = true; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
     check("Checkbox saves boolean per-chat config", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_enabled === true && client.state.current.rag_enabled === true);
     open(1); await settle(); check("Other chat loads own enabled setting", $("#f-rag_enabled").checked);
@@ -80,6 +81,7 @@ async function main() {
       && snapshot.textContent.includes("saved-old-index") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context
       && snapshot.querySelector(".rag-snapshot-text").textContent === rag.hits[0].text
       && requests("GET", /^\/api\/rag\//).length === before);
+    check("Legacy snapshot has one query and no refinement details", !snapshot.querySelector(".rag-snapshot-original-query") && snapshot.querySelector(".rag-snapshot-query").textContent === rag.query && !snapshot.textContent.includes("Переформулирование") && !snapshot.querySelector(".rag-snapshot-candidate"));
     check("Late current-index response cannot overwrite historical snapshot", !snapshot.textContent.includes("new-index") && snapshot.textContent.includes("0.9234"));
     server.respond("GET", "/api/rag/status", {state: "missing"});
     snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -100,7 +102,7 @@ async function main() {
         {chunk_id: "cap", score: .7, text: "neutral cap", decision: "final_cap"}]};
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
-    client.init(); await settle(); click("workspace-settings"); click("tab-btn-agent");
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag");
     check("Legacy refinement switches stay off with numeric defaults", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_candidates_k").value === "20" && $("#rag-chat-settings").classList.contains("hidden") && $("#rag-chat-parameters").classList.contains("hidden"));
     $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
     $("#f-rag_candidates_k").value = "21"; $("#f-rag_final_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
@@ -122,6 +124,40 @@ async function main() {
     check("V2 inspector shows original, rewritten, history and unknown usage", snapshot.querySelector(".rag-snapshot-original-query").textContent === rag.original_query && snapshot.querySelector(".rag-snapshot-query").textContent === rag.query && snapshot.textContent.includes("neutral earlier answer") && snapshot.textContent.includes("Неизвестно"));
     check("Saved candidate decisions and full context render without current-index reads", snapshot.querySelectorAll(".rag-snapshot-candidate").length === 3 && snapshot.textContent.includes("ниже порога cosine") && snapshot.textContent.includes("лимит фрагментов") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context && requests("GET", /^\/api\/rag\//).length === before);
   });
+  for (const [rewrite, filter] of [[false, false], [true, false], [false, true]]) {
+    await scenario("Saved refinement flags " + rewrite + "/" + filter, async () => {
+      const rag = {version: 2, original_query: "original neutral", query: "search neutral",
+        config: {rewrite_enabled: rewrite, filter_enabled: filter, candidates_k: 20, final_k: 5, similarity_threshold: .3},
+        rewrite: {enabled: rewrite, model: "neutral/rewrite-model", usage: {total_tokens: 11}},
+        history_used: [{user: "history question", assistant: "history answer"}], timings: {rewrite_seconds: .5, retrieval_seconds: .2},
+        index: {index_id: "saved-flags"}, candidates: [{chunk_id: "reject", text: "excluded text", decision: "threshold", score: .1}],
+        hits: [{chunk_id: "final", text: "final text", decision: "kept", score: .8}], context: "exact context"};
+      const saved = JSON.stringify(rag);
+      const {client, $, click, requests} = freshClient({agents: [{rag_enabled: true, rag_rewrite_enabled: !rewrite, rag_filter_enabled: !filter,
+        transcript: [turns[0], {...turns[1], rag}], history_len: 2}]});
+      client.init(); await settle();
+      const before = requests("GET", /^\/api\/rag\//).length;
+      $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+      const node = $("#rag-answer-snapshot"), content = node.textContent;
+      check("Saved rewrite controls query/history/model visibility " + rewrite + "/" + filter,
+        Boolean(node.querySelector(".rag-snapshot-original-query")) === rewrite
+        && content.includes("neutral/rewrite-model") === rewrite && content.includes("history answer") === rewrite
+        && content.includes("rewrite_seconds") === rewrite && !content.includes("Переформулирование выключено"));
+      check("Saved filtering controls candidates/threshold visibility " + rewrite + "/" + filter,
+        Boolean(node.querySelector(".rag-snapshot-candidate")) === filter && content.includes("similarity_threshold") === filter
+        && content.includes("ниже порога cosine") === filter && (filter || !content.includes("decision")));
+      check("Feature presentation preserves final data and saved capture " + rewrite + "/" + filter,
+        node.querySelector(".rag-snapshot-context").textContent === rag.context && content.includes("final text")
+        && content.includes("saved-flags") && JSON.stringify(client.state.current.transcript[1].rag) === saved
+        && requests("GET", /^\/api\/rag\//).length === before);
+      $("#f-rag_filter_enabled").checked = filter;
+      $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
+      check("Changing current settings saves next-answer config without changing inspected snapshot " + rewrite + "/" + filter,
+        requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_filter_enabled === filter
+        && node.textContent === content && JSON.stringify(client.state.current.transcript[1].rag) === saved
+        && !$("#save-status").classList.contains("hidden"));
+    });
+  }
   await scenario("RAG actual stages, deterministic no-hit and failed rewrite diagnostics", async () => {
     const {client, server, $, send, requests} = freshClient({agents: [{rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true}]});
     const search = deferred(), filter = deferred(), nohit = deferred(), finish = deferred();
@@ -192,6 +228,7 @@ async function main() {
     server.respond("GET", "/api/rag/chunks/chunk", chunk);
     server.respond("GET", "/api/rag/chunks/chunk?vector=true", { ...chunk, vector: [0.2, 0.4, 0.8] });
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("No selected chat hides and disables per-chat RAG without disabling workflow", $("#rag-current-chat").hidden && $("#f-rag_enabled").disabled && !$("#rag-workflow").hidden);
     check("No chat/key needed for saved index and actual CLI counts", $("#rag-status").textContent === "Индекс готов"
       && $("#rag-index").textContent.includes("15555") && $("#rag-operation").textContent.includes("1.25"));
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();

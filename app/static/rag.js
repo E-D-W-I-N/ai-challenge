@@ -484,18 +484,28 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-workflow").hidden = true;
     const target = $("#rag-answer-snapshot"); target.hidden = false;
     const back = button("К текущему индексу", open);
+    // Presentation follows the immutable answer flags, never the current chat controls.
+    const rewriteEnabled = snapshot.config?.rewrite_enabled ?? snapshot.rewrite?.enabled ?? false;
+    const filterEnabled = snapshot.config?.filter_enabled === true;
+    const parameters = {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k,
+      duration_seconds: snapshot.duration_seconds, retrieval_seconds: snapshot.timings?.retrieval_seconds};
+    if (rewriteEnabled) parameters.rewrite_seconds = snapshot.timings?.rewrite_seconds;
+    if (filterEnabled) parameters.filter = {candidates_k: snapshot.config.candidates_k,
+      final_k: snapshot.config.final_k, similarity_threshold: snapshot.config.similarity_threshold};
     target.replaceChildren(el("h3", "", "Контекст сохранённого ответа"),
-      el("p", "hint", "Этот снимок сохранён вместе с ответом и не меняется при перестройке индекса."), back,
-      el("h3", "", "Исходный запрос"), el("p", "rag-snapshot-original-query", snapshot.original_query ?? snapshot.query ?? ""),
-      el("h3", "", "Запрос для поиска"), el("p", "rag-snapshot-query", snapshot.query || ""),
-      detail("Индекс и параметры поиска", {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k, config: snapshot.config, duration_seconds: snapshot.duration_seconds, timings: snapshot.timings}));
-    if (snapshot.rewrite) {
-      const rewrite = snapshot.rewrite;
-      target.append(el("p", "hint", rewrite.enabled ? "Переформулирование включено" : "Переформулирование выключено"),
-        detail("Переформулирование: модель, токены и стоимость", {...rewrite, usage: rewrite.usage ?? "Неизвестно"}),
-        detail("История для переформулирования", snapshot.history_used || []));
+      el("p", "hint", "Этот снимок сохранён вместе с ответом и не меняется при перестройке индекса."), back);
+    if (rewriteEnabled) {
+      target.append(el("h3", "", "Исходный запрос"), el("p", "rag-snapshot-original-query", snapshot.original_query ?? snapshot.query ?? ""),
+        el("h3", "", "Запрос для поиска"), el("p", "rag-snapshot-query", snapshot.query || ""));
+    } else {
+      target.append(el("h3", "", "Запрос"), el("p", "rag-snapshot-query", snapshot.query ?? snapshot.original_query ?? ""));
     }
-    if (snapshot.candidates) {
+    target.append(detail("Индекс и параметры поиска", parameters));
+    if (rewriteEnabled) {
+      target.append(detail("Уточнение запроса: модель, токены и стоимость", {...snapshot.rewrite, usage: snapshot.rewrite?.usage ?? "Неизвестно"}),
+        detail("История для уточнения запроса", snapshot.history_used || []));
+    }
+    if (filterEnabled && snapshot.candidates) {
       target.append(el("h3", "", "Кандидаты поиска"));
       const decisions = {kept: "Включён в контекст", threshold: "Исключён: ниже порога cosine", final_cap: "Исключён: лимит фрагментов"};
       for (const [i, hit] of snapshot.candidates.entries()) {
@@ -510,7 +520,8 @@ function createRagInspector({ state, $, el, api }) {
     for (const [i, hit] of (snapshot.hits || []).entries()) {
       const node = el("details", "rag-detail rag-snapshot-hit");
       node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"}`));
-      const {text, ...metadata} = hit;
+      const {text, decision, ...metadata} = hit;
+      if (filterEnabled && decision !== undefined) metadata.decision = decision;
       node.append(el("pre", "rag-snapshot-text", text || ""), detail("Метаданные фрагмента", metadata)); target.append(node);
     }
     const context = el("details", "rag-detail");
