@@ -10,7 +10,7 @@ function createRagInspector({ state, $, el, api }) {
   const steps = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Индекс"]];
   const navigation = new Map();
   for (const [id, title] of steps) {
-    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); });
+    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); loadSemanticModels(); });
     node.className = "mcp-button rag-step"; node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
   }
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
@@ -21,6 +21,9 @@ function createRagInspector({ state, $, el, api }) {
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
     epoch++;
+    const interrupted = modelCatalogues.get(pendingModelSource);
+    if (interrupted) interrupted.retry = true;
+    cancelModelRequest();
     clearTimeout(timer); timer = null;
     controller?.abort(); controller = null;
   }
@@ -109,10 +112,16 @@ function createRagInspector({ state, $, el, api }) {
       renderOperation(data.operation);
       renderIndex(data.index, data.ingestion);
       lastStatus = data;
+      const initializing = !seeded;
       const stages = data.stages;
       if (!seeded && stages?.chunks?.semantic_config) {
         for (const [id, key] of [["semantic-base-url", "base_url"], ["semantic-model", "model"], ["semantic-auth-mode", "auth_mode"]]) {
-          const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = stages.chunks.semantic_config[key] ?? "openrouter";
+          const input = $("#rag-" + id);
+          if (input && !input.dataset.dirty) {
+            const value = stages.chunks.semantic_config[key] ?? "openrouter";
+            if (id === "semantic-model") setSemanticModels([], value);
+            else input.value = value;
+          }
         }
       }
       if (!seeded) {
@@ -135,6 +144,7 @@ function createRagInspector({ state, $, el, api }) {
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
       updateControls();
+      if (initializing) loadSemanticModels();
       await syncPreview();
     } catch (error) { if (error.name !== "AbortError" && token === epoch) showError(error); }
     finally {
@@ -268,7 +278,7 @@ function createRagInspector({ state, $, el, api }) {
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (lastStatus) lastStatus.operation = {...lastStatus.operation, state: "running"};
       $("#rag-error").textContent = "";
-      stop(); refresh();
+      open();
     } catch (error) { showError(error); }
     finally { submitting = false; updateControls(); }
   }
@@ -277,13 +287,73 @@ function createRagInspector({ state, $, el, api }) {
     submitting = true; updateControls();
     try {
       await api(`/api/rag/stages/${kind}`, {method: "DELETE"});
-      stop(); refresh();
+      open();
     } catch (error) { showError(error); }
     finally { submitting = false; updateControls(); }
   }
   for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"], ["delete-index", "index"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
+  const modelCatalogues = new Map();
+  let modelRequest = 0, modelController = null, pendingModelSource = null;
+  function modelSource() {
+    const mode = $("#rag-semantic-auth-mode").value;
+    const base = $("#rag-semantic-base-url").value.trim().replace(/\/+$/, "");
+    return {mode, base, key: `${mode}:${base}`};
+  }
+  function cancelModelRequest() {
+    modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
+    $("#rag-model-refresh").disabled = false;
+  }
+  function setSemanticModels(models, current) {
+    const select = $("#rag-semantic-model");
+    const options = [{id: "", label: "Выберите модель"}, ...models];
+    if (current && !models.some(item => item.id === current)) options.splice(1, 0, {id: current, label: current + " · нет в списке"});
+    select.replaceChildren();
+    for (const item of options) {
+      const price = item.prompt_price_per_m ? ` · $${item.prompt_price_per_m} / $${item.completion_price_per_m} за 1M` : "";
+      const option = el("option", "", (item.label || item.id) + price); option.value = item.id;
+      option.selected = item.id === current; select.append(option);
+    }
+    select.value = current || "";
+  }
+  function catalogueMessage(entry, current) {
+    if (entry.error) return entry.error + (current ? " Текущая модель сохранена." : "");
+    if (!entry.models.length) return "Сервер не вернул моделей." + (current ? " Текущая модель сохранена." : "");
+    if (current && !entry.models.some(item => item.id === current)) return "Текущая модель отсутствует в каталоге; выбор сохранён.";
+    return `Доступно моделей: ${entry.models.length}`;
+  }
+  async function loadSemanticModels(force = false) {
+    if (!visible() || selectedStep !== "chunks" || $("#rag-strategy").value !== "semantic") return;
+    const source = modelSource(), select = $("#rag-semantic-model"), status = $("#rag-model-status");
+    const cached = modelCatalogues.get(source.key);
+    if (!force && cached && !cached.retry) {
+      setSemanticModels(cached.models, select.value); status.textContent = catalogueMessage(cached, select.value); return;
+    }
+    if (!force && pendingModelSource === source.key) return;
+    cancelModelRequest();
+    const request = modelRequest; modelController = new AbortController(); pendingModelSource = source.key;
+    const signal = modelController.signal;
+    setSemanticModels(cached?.models || [], select.value);
+    status.textContent = "Загрузка моделей…"; $("#rag-model-refresh").disabled = true;
+    try {
+      const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
+      const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
+        : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}`, {signal});
+      if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
+      const models = data.models || [];
+      if (official) state.models = models;
+      const entry = {models}; modelCatalogues.set(source.key, entry);
+      setSemanticModels(models, select.value); status.textContent = catalogueMessage(entry, select.value);
+    } catch (error) {
+      if (error.name === "AbortError" || request !== modelRequest || source.key !== modelSource().key || !visible()) return;
+      const entry = {models: cached?.models || [], error: "Не удалось загрузить модели. Проверьте URL и обновите список."};
+      modelCatalogues.set(source.key, entry); status.textContent = catalogueMessage(entry, select.value);
+    } finally {
+      if (request === modelRequest) { modelController = null; pendingModelSource = null; $("#rag-model-refresh").disabled = false; }
+    }
+  }
+  $("#rag-model-refresh").onclick = () => loadSemanticModels(true);
   const authMode = $("#rag-semantic-auth-mode");
   const semanticDrafts = new Map();
   let previousAuthMode = "openrouter";
@@ -293,8 +363,9 @@ function createRagInspector({ state, $, el, api }) {
     const draft = semanticDrafts.get(authMode.value) || (authMode.value === "omlx"
       ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
       : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-4.1-mini"});
-    endpoint.value = draft.endpoint; model.value = draft.model; previousAuthMode = authMode.value;
+    cancelModelRequest(); endpoint.value = draft.endpoint; setSemanticModels([], draft.model); previousAuthMode = authMode.value;
     for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
+    loadSemanticModels();
   };
   const strategy = $("#rag-strategy");
   if (strategy) strategy.onchange = () => {
@@ -302,6 +373,7 @@ function createRagInspector({ state, $, el, api }) {
     const semantic = strategy.value === "semantic";
     $("#rag-semantic-fields").hidden = !semantic;
     $("#rag-size").max = semantic ? "12000" : "100000";
+    if (semantic) loadSemanticModels(); else cancelModelRequest();
   };
   for (const id of ["urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input) input.oninput = () => { input.dataset.dirty = "true"; };
@@ -309,10 +381,22 @@ function createRagInspector({ state, $, el, api }) {
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => start(kind);
   }
-  function open() { stop(); refresh(); }
+  const semanticEndpoint = $("#rag-semantic-base-url");
+  semanticEndpoint.oninput = () => {
+    semanticEndpoint.dataset.dirty = "true"; cancelModelRequest();
+    setSemanticModels([], $("#rag-semantic-model").value);
+    $("#rag-model-status").textContent = "URL изменён — обновите список моделей.";
+  };
+  semanticEndpoint.onchange = () => loadSemanticModels();
+  $("#rag-semantic-model").onchange = () => {
+    const model = $("#rag-semantic-model"); model.dataset.dirty = "true";
+    const entry = modelCatalogues.get(modelSource().key);
+    if (entry && !modelController) $("#rag-model-status").textContent = catalogueMessage(entry, model.value);
+  };
+  function open() { stop(); refresh(); loadSemanticModels(); }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
-    document.addEventListener("visibilitychange", () => { stop(); if (visible()) refresh(); });
+    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadSemanticModels(); } });
   }
   return { open, stop };
 }
