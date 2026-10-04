@@ -510,6 +510,23 @@ function createRagInspector({ state, $, el, api }) {
       target.append(el("h3", "", "Запрос"), el("p", "rag-snapshot-query", snapshot.query ?? snapshot.original_query ?? ""));
     }
     target.append(detail("Индекс и параметры поиска", parameters));
+    if (snapshot.answer_policy?.weak_context_enabled === true) {
+      target.append(detail("Защита от слабого контекста", snapshot.answer_policy));
+    }
+    if (snapshot.answer) {
+      const status = {verified: "Цитаты проверены", insufficient: "Недостаточно информации", receipt: "Подтверждение напоминания: цитаты не требуются"};
+      target.append(el("h3", "", status[snapshot.answer.status] || "Состояние проверки цитат"));
+      if (snapshot.answer.reason) {
+        const reasons = {low_similarity: "Ни один фрагмент не достиг порога cosine.", model: "Модель не нашла в источниках достаточно данных для ответа."};
+        target.append(el("p", "hint", reasons[snapshot.answer.reason] || snapshot.answer.reason));
+      }
+      for (const citation of snapshot.answer.status === "verified" ? snapshot.answer.citations || [] : []) {
+        const node = el("details", "rag-detail rag-snapshot-citation");
+        node.append(el("summary", "", `[${citation.source_id}] ${citation.title || citation.source || citation.chunk_id}`),
+          el("blockquote", "rag-source-quote", citation.quote), detail("Источник цитаты", citation));
+        target.append(node);
+      }
+    }
     if (rewriteEnabled) {
       target.append(detail("Уточнение запроса: модель, токены и стоимость", {...snapshot.rewrite, usage: snapshot.rewrite?.usage ?? "Неизвестно"}),
         detail("История для уточнения запроса", snapshot.history_used || []));

@@ -31,6 +31,14 @@ def check_rag_chat():
     async def drain(stream):
         return [event async for event in stream]
 
+    def grounded(messages, index):
+        context = next((m["content"] for m in messages if m.get("content", "").startswith("RAG:")), None)
+        if context is None:
+            return "Neutral final answer"
+        hit = json.loads(context[context.index("\n") + 1:])[0]
+        return json.dumps({"answer": "Neutral final answer [1]",
+                           "citations": [{"source_id": 1, "quote": hit["text"]}]})
+
     calls = []
     def transport(request):
         body = json.loads(request.content)
@@ -78,7 +86,7 @@ def check_rag_chat():
                 return real_retrieve(index, query, *args, client=embedding, **kwargs)
             with patch("rag.index.storage_root", lambda: root), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key}), \
                  patch.object(Index, "retrieve", offline_retrieve), \
-                 patch.object(agents, "stream_completion", _stub.make()):
+                 patch.object(agents, "stream_completion", _stub.make(grounded)):
                 store = Store(str(root / "chat.db")).init()
                 agent = agents.Agent(AgentSpec(label="RAG", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False), store=store)
                 _stub.reset(); count = len(calls)
@@ -88,7 +96,8 @@ def check_rag_chat():
                 assert events[0]["type"] == "retrieval" and events[-1]["committed"]
                 assert len(calls) == count + 1 and calls[-1]["input"] == ["neutral question"]
                 assert start["rag_at"] == len(start["resolved_messages"]) - 2
-                assert snapshot == start["rag"] == events[-1]["rag"]
+                assert {k: v for k, v in snapshot.items() if k != "answer"} == start["rag"]
+                assert snapshot == events[-1]["rag"]
                 assert snapshot["context"] == _stub.CALLS[0]["payload"]["messages"][start["rag_at"]]["content"]
                 assert answer.request_bodies[0] == _stub.CALLS[0]["payload"]
                 assert fake_key not in json.dumps(snapshot) and len(snapshot["hits"]) == 5
@@ -162,7 +171,7 @@ def check_rag_chat():
             async def lookup(query, **options):
                 ready.set(); await release.wait(); return snapshot
             agent = agents.Agent(AgentSpec(label="cancel", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
-            with patch.object(agents, "rag_lookup", lookup), patch.object(agents, "stream_completion", _stub.make()):
+            with patch.object(agents, "rag_lookup", lookup), patch.object(agents, "stream_completion", _stub.make(grounded)):
                 _stub.reset(); task = asyncio.create_task(drain(agent.ask("cancel query")))
                 await ready.wait(); agent.cancel(); agent.spec.rag_enabled = False; release.set()
                 result = await task
@@ -217,10 +226,10 @@ def check_rag_chat():
         def provider(request):
             body = json.loads(request.content); received.append(body)
             if len(received) == 1:
-                delta = {"tool_calls": [{"index": 0, "id": "ping-one", "type": "function",
+                delta = {"content": "Unverified intermediate draft", "tool_calls": [{"index": 0, "id": "ping-one", "type": "function",
                     "function": {"name": "ping", "arguments": '{"text":"neutral"}'}}]}
             else:
-                delta = {"content": "Neutral final answer"}
+                delta = {"content": grounded(body["messages"], 0)}
             frames = [{"choices": [{"delta": delta}]}, {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
             return httpx.Response(200, text="".join("data: " + json.dumps(frame) + "\n\n" for frame in frames) + "data: [DONE]\n\n")
         with service("services.echo", temp) as (process, url):
@@ -241,6 +250,7 @@ def check_rag_chat():
                             chat = agents.Agent(AgentSpec(label="tools", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False))
                             result = await drain(chat.ask("tool question"))
                             assert result[-1]["committed"] and len(received) == 2
+                            assert [e["text"] for e in result if e["type"] == "delta"] == ["Neutral final answer [1]"]
                             assert chat.history[-1].request_bodies == received and chat.history[-1].rag == snapshot
                             assert any(e["type"] == "tool_call" and e["result"] == "pong neutral" for e in result)
                             assert all(any(m.get("content") == snapshot["context"] for m in body["messages"]) for body in received)
@@ -285,7 +295,8 @@ def check_rag_chat():
                 result = await drain(chat.ask("scheduled", scheduled={"id": 1, "server": "neutral"},
                                               request_bodies=request_sink, rag_result=rag_sink))
             assert result[-1]["committed"] is False and result[-1]["request_bodies"] == request_sink
-            assert request_sink[0]["messages"][0]["content"] == "completed service" and rag_sink == snapshot
+            assert request_sink[0]["messages"][0]["content"] == "completed service"
+            assert rag_sink == {k: v for k, v in snapshot.items() if k != "answer"}
             assert not chat.history
         asyncio.run(preparation_failure())
 

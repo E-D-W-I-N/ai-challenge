@@ -52,6 +52,60 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Verified citations use saved ranks, inert quotes and safe local references", async () => {
+    const rag = {version: 2, query: "neutral question", config: {rewrite_enabled: false, filter_enabled: false},
+      answer_policy: {weak_context_enabled: true, similarity_threshold: .4},
+      hits: [{chunk_id: "first", text: "unreferenced fragment"}, {chunk_id: "second", text: "<b>exact neutral quote</b>"},
+        {chunk_id: "third", text: "neutral third quote"}], context: "exact pinned context",
+      answer: {status: "verified", citations: [
+        {source_id: 2, chunk_id: "second", source: "javascript:alert(1)", title: "<script>neutral title</script>", section: "section", quote: "<b>exact neutral quote</b>"},
+        {source_id: 3, chunk_id: "third", source: "https://example.test/source", title: "Third source", quote: "neutral third quote"}]}};
+    const {client, $, requests} = freshClient({agents: [{rag_enabled: true, rag_filter_enabled: false,
+      transcript: [turns[0], {...turns[1], content: "Supported **answer** [2] and [3]. Code `[2]`.\n\n```\n[3]\n```", rag}], history_len: 2}]});
+    client.init(); await settle();
+    const card = $("#feed").querySelector(".card"), sources = card.querySelectorAll(".rag-source-card");
+    check("Only cited saved ranks become cards, with exact inert quote text", sources.length === 2
+      && sources[0].id === "rag-source-1-2" && sources[1].id === "rag-source-1-3"
+      && sources[0].attributes.value === "2" && sources[0].querySelector("blockquote").textContent === "<b>exact neutral quote</b>"
+      && !sources[0].querySelector("script") && !sources[0].querySelector("a")
+      && sources[1].querySelector("a").attributes.href === "https://example.test/source");
+    const rendered = card.querySelector(".card-body").innerHTML;
+    check("Inline references link matching cards while preserving code", (rendered.match(/class="rag-citation-ref"/g) || []).length === 2
+      && rendered.includes('href="#rag-source-1-2"') && rendered.includes('href="#rag-source-1-3"')
+      && rendered.includes("<strong>answer</strong>") && rendered.includes("<code>[2]</code>")
+      && rendered.includes("<pre><code>[3]</code></pre>"));
+    check("Citation markup cannot leak into URL attributes or unverified text", !client.renderMarkdown("[2]", {}).includes("rag-citation-ref")
+      && !client.renderMarkdown("[url](https://example.test/[2])", {2: "rag-source-1-2"}).includes("rag-citation-ref")
+      && !client.renderMarkdown("[label][2] [2]: ref https://example.test/[2] \\[2]", {2: "rag-source-1-2"}).includes("rag-citation-ref")
+      && !client.renderMarkdown("[2]", {2: 'rag-source-x" onclick="bad'}).includes("rag-citation-ref"));
+    const raw = button(card, "Показать сырой текст"); raw.dispatchEvent(new Evt("click")); raw.dispatchEvent(new Evt("click"));
+    check("Returning from raw view restores verified references", card.querySelector(".card-body").innerHTML === rendered);
+    const before = requests("GET", /^\/api\/rag\//).length;
+    card.querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const historical = $("#rag-answer-snapshot");
+    check("Saved validation and shared safeguard inspect independently of filter toggle", historical.querySelectorAll(".rag-snapshot-citation").length === 2
+      && historical.textContent.includes("Цитаты проверены") && historical.textContent.includes("similarity_threshold")
+      && !historical.querySelector(".rag-snapshot-candidate") && requests("GET", /^\/api\/rag\//).length === before
+      && $("#rag-current-chat").hidden && $("#save-status").classList.contains("hidden"));
+  });
+  await scenario("Shared safeguard stays visible without filtering; refusals and receipts have no citations", async () => {
+    const {client, $, click, requests} = freshClient({agents: [{rag_enabled: true, rag_filter_enabled: false,
+      transcript: [turns[0], {...turns[1], rag: {hits: [{title: "uncited neutral fragment"}], answer: {status: "insufficient", citations: []}}},
+        {...turns[1], rag: {hits: [{title: "receipt fragment"}], answer: {status: "receipt", citations: []}}}], history_len: 3}]});
+    client.init(); await settle();
+    check("Refusals and receipts render no fabricated source cards", !$("#feed").querySelector(".rag-source-card")
+      && !$("#feed").querySelector(".rag-answer-sources") && $("#feed").textContent.includes("недостаточно информации")
+      && $("#feed").textContent.includes("напоминание запланировано"));
+    click("workspace-settings"); click("tab-btn-rag"); await settle();
+    check("Shared threshold is outside filter-specific K controls and RAG ON reveals it", !$("#rag-chat-settings").classList.contains("hidden")
+      && $("#rag-chat-parameters").classList.contains("hidden") && !$("#rag-chat-parameters").querySelector("#f-rag_similarity_threshold")
+      && $("#rag-answer-safeguard").querySelector("#f-rag_similarity_threshold") === $("#f-rag_similarity_threshold"));
+    $("#f-rag_similarity_threshold").value = ".55"; $("#f-rag_similarity_threshold").dispatchEvent(new Evt("change")); await settle();
+    check("Visible shared threshold saves with Filtering OFF", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_similarity_threshold === .55
+      && requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_filter_enabled === false);
+    $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
+    check("RAG OFF hides safeguard while preserving its value", $("#rag-chat-settings").classList.contains("hidden") && Number($("#f-rag_similarity_threshold").value) === .55);
+  });
   await scenario("Per-chat RAG setting and immutable answer snapshot", async () => {
     const rag = {version: 1, query: "neutral original question", top_k: 5,
       index: {index_id: "saved-old-index", strategy: "semantic", dimension: 3}, duration_seconds: .2,

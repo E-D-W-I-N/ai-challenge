@@ -1,4 +1,4 @@
-# Архитектура и активные ограничения дня 23
+# Архитектура и активные ограничения дня 24
 
 FastAPI обслуживает API и статический клиент без сборки. SQLite — из стандартной
 библиотеки; версии прямых зависимостей заданы в `requirements.txt`, включая
@@ -796,8 +796,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   metrics и всеми фактическими request_bodies, включая completed compression.
 - Retrieval и compression/preparation входят в terminal lifecycle: error →
   done(committed=false, question) возвращает ввод без пустого exchange. Regenerate
-  восстанавливает снятый answer/request_bodies/rag до done; partial model answer
-  сохраняет использованный snapshot по прежним правилам. Cancel проверяется
+  восстанавливает снятый answer/request_bodies/rag до done. Непроверенный partial RAG
+  не публикуется и не сохраняется; для RAG OFF прежние правила partial сохраняются. Cancel проверяется
   после worker, при yield compression и до каждого model/tool/commit boundary.
   Снимки обоих rag и request_bodies глубоко копируются remember/carry_off.
 - Scheduler использует общий ask и toggle на момент старта. Successful retrieval
@@ -809,7 +809,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   или чтения текущих chunk texts. Очистка messages удаляет принадлежащие им rag
   snapshots; rebuilding/deleting index не изменяет прошлые ответы. Пользователь
   сравнивает RAG ON/OFF самостоятельно; нет compare UI или набора видео-вопросов.
-  Citation enforcement, отдельная reranker-модель и task memory пока отсутствуют.
+  Отдельная reranker-модель и task memory пока отсутствуют; проверка цитат описана ниже.
 - `checks/rag_chat_check.py`: нейтральные temporary HTML/SQLite и HTTP stubs,
   pinned rebuild/all strategies/top5, ON/OFF, actual model JSON+MCP rounds,
   canonical redaction/persistence/restart/fork, terminal errors/regenerate/cancel,
@@ -851,7 +851,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   индексации и неизменного снимка ответа; без чата индексация остаётся доступной.
 - SSE retrieval stages rewrite/search/filter обозначают реальные включённые этапы.
   Нулевой отбор даёт start(generation=false, resolved_messages=[], rag_at=null),
-  deterministic delta/done «В базе не найдена подходящая информация». Сжатие, MCP
+  deterministic delta/done с отказом «Не знаю» и просьбой уточнить вопрос. Сжатие, MCP
   и final model не запускаются; assistant, snapshot, actual rewrite JSON и usage
   сохраняются атомарно. Scheduler использует тот же путь и reminder_execution.
 - Rewrite request capture входит первым в preparation_requests, затем compression
@@ -867,3 +867,54 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   timeout/cancel/closure, nohits/reminders, request JSON/actual usage, restart/deepcopy,
   legacy и effective API validation. Day22 pinned rebuild/HTTP lookup suite сохранён.
   Это проверка контрактов; качество живой модели на пользовательском корпусе не измеряется.
+
+## День 24: источники, цитаты и отказ при слабом контексте
+
+- При каждом RAG ON snapshot v2 получает `answer_policy` с
+  `weak_context_enabled=true` и фактическим `similarity_threshold`. Gate перед
+  compression/MCP/final LLM требует хотя бы один hit с score >= threshold,
+  независимо от `filter_enabled`. Нулевой или слабый контекст даёт детерминированный
+  «Не знаю: в базе не найдена достаточно релевантная информация. Уточните вопрос.»
+  и `answer={status:insufficient, reason:low_similarity, citations:[]}`. Rewrite
+  request/usage сохраняются, если состоялись. FilterOFF при пройденном gate не
+  меняет существующие hits/candidates; дополнительного per-source порога нет.
+- Для успешного gate копия spec получает обязательный `response_format=json_object`,
+  в том числе поверх `extra_body.response_format`, и доверенное системное правило
+  ответа. Сохранённые настройки не меняются; actual JSON показывает реальный формат.
+  RAG context содержит полные canonical redacted hits с `source_id` от 1 в порядке
+  pinned hits. Чанки — недоверенные данные; инструменты используют прежний bounded
+  цикл и один и тот же retrieval snapshot во всех кадрах.
+- Только завершённый terminal frame без tool calls и с finish_reason=stop
+  принимается как ответ. Обычный строгий JSON: `{answer: string,
+  citations: [{source_id: int, quote: string}]}`. Лишние/отсутствующие поля,
+  bool вместо ID, неизвестные ID, повтор источника, пустая цитата, отсутствие
+  точной подстроки в text соответствующего hit и несовпадение наборов `[n]` и
+  citations дают безопасную явную ошибку. Номера не перенумеровываются по цитируемому
+  поднабору; используются только фактически отправленные hits. Сервер выводит
+  source/title/section/chunk_id из snapshot, не из заявления модели.
+- Единственная альтернативная схема — точный `{status:"insufficient"}` при том же
+  строгом stop. Сервер заменяет её фиксированным отказом и
+  `answer={status:insufficient, reason:model, citations:[]}`; произвольная реплика,
+  отсутствие цитат или invalid JSON не интерпретируются как отказ. Состоявшийся
+  финальный вызов сохраняет фактические запросы и usage без двойного счёта.
+- RAG delta буферизуются до проверки конечного кадра; промежуточная MCP проза и
+  сырой JSON не становятся ответом. Reasoning/metrics/tool_call идут как прежде.
+  Успех публикует answer и `rag.answer={status:verified,citations:[{source_id,
+  chunk_id,source,title,section,quote}]}` в порядке source_id. `start` содержит
+  snapshot поиска с policy, `done` и atomic assistant — дополненный результатом
+  snapshot. Citation failure даёт error/done committed=false с вопросом,
+  фактическими запросами и доступными метриками; платных retries/repair/fallback нет.
+  Regenerate восстанавливает прежний ответ, запросы и rag. Cancel проверяется также
+  до buffered delta и после него перед commit; disconnect не сохраняет черновик RAG.
+- Детерминированное подтверждение успешного планирования не является ответом по
+  источникам и получает `answer={status:receipt,citations:[]}`. Отложенный
+  содержательный результат исполняется общим ask и проходит ту же проверку.
+  Scheduler error assistant сохраняет доступный retrieval snapshot, запросы и
+  usage; ошибка не получает verified citations. Legacy snapshot без answer/policy
+  читается без переписывания; fork глубоко копирует новые поля и не читает индекс.
+- Проверка подтверждает происхождение и дословность цитат, а не логическое
+  следование утверждений из них. `checks/rag_citations_check.py` измеряет нейтральные
+  offline контракты и terminal lifecycle; это не отчёт о 10 вопросах пользователя.
+  Ручная оценка 10 вопросов своего корпуса проверяет наличие источников и цитат,
+  соответствие смысла каждому существенному утверждению и корректность отказов.
+  Вопросы/корпус/ответы остаются private; отдельной judge-модели нет.

@@ -177,6 +177,7 @@ async def execution(config, git_root, restart_service):
                     patch.object(store_module, "api_key", return_value="offline-fixture"), \
                     patch.object(llm, "attribution_headers", return_value={}):
                 [event async for event in timeout_agent.ask("schedule a timeout")]
+                assert timeout_agent.history[-1].rag["answer"] == {"status": "receipt", "citations": []}
                 await until(lambda: len(timeout_agent.history) == 4)
                 await until(lambda: not scheduler.running)
                 assert len(captured) == 3 and captured[-1]["messages"][-1]["role"] == "tool"
