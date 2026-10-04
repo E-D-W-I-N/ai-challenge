@@ -1,4 +1,4 @@
-# Карта клиента дня 21
+# Карта клиента дня 22
 
 FastAPI отдаёт HTML, CSS и четыре обычных локальных скрипта; сборки нет.
 `index.html` загружает `text.js` → `records.js` → `rag.js` → `app.js`.
@@ -7,7 +7,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 |---|---|
 | `app/static/text.js` | Чистые Markdown/экранирование, формат чисел, stop/JSON, сравнение значений, предупреждения параметров. В браузере `ChatText`, под Node объект CommonJS. |
 | `app/static/records.js` | `createChatRecords({state, $, el, iconButton, api, json, fmt})`: память, общий editor, профиль и меню, инварианты, ленивый MCP. State один, передаётся из app.js; запросов при создании фабрики нет. |
-| `app/static/rag.js` | `createRagInspector`: durable stages UI/CLI, pages документов/чанков до публикации, lazy vector; без зависимости от чата/ключа. |
+| `app/static/rag.js` | `createRagInspector`: durable stages UI/CLI, pages документов/чанков до публикации, lazy vector; исторический снимок ответа без чтения текущего индекса. |
 | `app/static/app.js` | State и DOM/API-помощники, список чатов/ветки, лента/поток/промпт/метрики, команды задачи, настройки, sidebar/подтверждения и init. Фабрика возвращает только функции/карты, нужные этой оболочке. |
 | `app/static/style.css`, `index.html` | Светлая гибкая оболочка для ноутбука: sidebar, общая шапка, семь страниц, нижние метрики. Компактные формы без отдельного phone/drawer режима. |
 
@@ -36,6 +36,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оркестрация | app/mcp.py, agent.py; checks/run_checks.py | Порядок двух серверов/ids/SSE/metrics, полный live payload против API, initialize-down isolation | MCP; Оркестрация нескольких серверов |
+| RAG в чате | app.js: fillPanel, readPanel, exchange, ragSources; rag.js: showSnapshot | Boolean per-chat PATCH/default/reload/switch; реальные retrieval/start события; terminal error/input restore; saved turn.rag без live reads/late GET под Node | Промпт, контекст и метрики; RAG: документы, индекс и инспектор; Клиент |
 | Работа RAG | rag.js; app/rag_api.py; rag | UI stage payloads и CLI counts; staged documents/chunks, lazy vector, mounted details/drafts/focus и late GET под Node; offline HTTP/cache/fingerprints/deletion/atomic save в Python | RAG: документы, индекс и инспектор |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
@@ -135,3 +136,19 @@ OpenRouter показывает общий каталог чата с ценам
 выбор отмечен синим и сохраняется при poll и возврате на ту же страницу списка.
 Одинаковые заголовки различаются по ID. При смене документа старый чанк и вектор
 сразу скрываются; смена источника или поколения сбрасывает выбор.
+
+## Ручной просмотр ответа с RAG
+
+На neutral offline-фикстуре откройте «Агент», включите checkbox текущего чата,
+смените чат и вернитесь: выбор сохраняется только в своём конфиге. Отправьте
+вопрос и проверьте «Поиск контекста» → «Генерация» на событиях сервера. При
+отказе поиска вопрос возвращается в ввод, обмен не добавляется; не должно
+оставаться занятого состояния. Для regenerate прежний ответ восстанавливается.
+
+У сохранённого ответа просмотрите список источников и откройте «Контекст и
+фрагменты ответа». На 1100/1440 px длинные source/title и точный контекст
+доступны на полной ширине; данные показываются как текст. Затем измените или
+удалите текущий индекс: исторический снимок этого ответа остаётся прежним.
+В Network открытие снимка не запрашивает status/documents/chunks/vector.
+Проверьте поздний ответ current-index GET и возврат «К текущему индексу»:
+снимок не заменяется, формы индексации остаются смонтированными с черновиками.

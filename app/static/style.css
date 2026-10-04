@@ -846,3 +846,17 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-detail > label { margin: 0 12px 12px; }
 .rag-detail pre, .rag-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: 12px; background: var(--code-bg); font-size: 12px; line-height: 1.6; border-radius: 7px; }
 .rag-detail pre { border-top: 1px solid var(--line); border-radius: 0 0 7px 7px; }
+
+/* Answer-owned retrieval snapshot uses the existing full-width settings page. */
+#rag-workflow { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+#rag-workflow[hidden] { display: none; }
+.rag-toggle { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.rag-toggle .control { width: 17px; height: 17px; margin: 0; flex: none; }
+.card-rag { margin: 16px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.rag-answer-sources { margin: 8px 0 12px; padding-left: 22px; font-size: 13px; line-height: 1.6; }
+.rag-source-url { font-size: 12px; }
+.rag-answer-sources li, #rag-answer-snapshot p, #rag-answer-snapshot summary { overflow-wrap: anywhere; }
+.rag-snapshot-text, .rag-snapshot-context { white-space: pre-wrap; overflow-wrap: anywhere; }
+#rag-answer-snapshot { gap: 12px; }
+#rag-answer-snapshot > p { margin: 0; line-height: 1.5; }
+#rag-answer-snapshot > button { align-self: start; }

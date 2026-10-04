@@ -1,4 +1,4 @@
-"""Ядро проверок дня 20 — без сети, без ключа, без живых вызовов к LLM.
+"""Ядро проверок дня 22 — без сети, без ключа, без живых вызовов к LLM.
 
     .venv/bin/python checks/run_checks.py
 
@@ -4029,6 +4029,8 @@ def check_config_survives_by_construction():
         kind = str(f.type)
         if f.name == "model":
             probes[f.name] = "проверка/модель"
+        elif kind == "bool":
+            probes[f.name] = True
         elif "list[str]" in kind:
             probes[f.name] = [f"СТОП-{f.name}"]
         elif "str" in kind:
@@ -5451,6 +5453,12 @@ def check_git_exchange():
 def check_pipeline_http():
     from checks.pipeline_url import check_pipeline_http
     return check_pipeline_http()
+
+
+@check("RAG chat: pinned retrieval, immutable answer snapshot and terminal lifecycle")
+def check_rag_chat():
+    from checks.rag_chat_check import check_rag_chat
+    return check_rag_chat()
 
 
 @check("RAG: actual semantic HTTP/CLI and save boundary")

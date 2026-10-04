@@ -40,6 +40,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label", default="CLI", help="имя агента в реестре")
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--rag", action="store_true", help="mandatory published-index retrieval for a new chat")
     parser.add_argument(
         "--session",
         default=None,
@@ -72,6 +73,7 @@ def build_agent(args: argparse.Namespace) -> Agent:
     spec = AgentSpec(
         label=args.label,
         model=args.model,
+        rag_enabled=getattr(args, "rag", False),
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         system=args.system,
@@ -85,7 +87,10 @@ async def ask(agent: Agent, text: str, out=sys.stdout) -> str:
     error: str | None = None
     async for event in agent.ask(text):
         kind = event["type"]
-        if kind == "delta":
+        if kind == "retrieval":
+            out.write("[поиск контекста RAG]\n")
+            out.flush()
+        elif kind == "delta":
             answer += event["text"]
             out.write(event["text"])
             out.flush()

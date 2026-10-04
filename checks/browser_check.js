@@ -52,6 +52,78 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Per-chat RAG setting and immutable answer snapshot", async () => {
+    const rag = {version: 1, query: "neutral original question", top_k: 5,
+      index: {index_id: "saved-old-index", strategy: "semantic", dimension: 3}, duration_seconds: .2,
+      hits: [{chunk_id: "old-chunk", document_id: "old-doc", title: "<script>neutral source</script>",
+        source: "javascript:alert(1)", section: "Historic section", start: 0, end: 19, text: "<b>old exact text</b>", score: .9234}],
+      context: "[neutral context]\n<b>old exact text</b>"};
+    const {client, server, $, click, open, requests} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2}, {rag_enabled: true}]});
+    client.init(); await settle();
+    check("Legacy RAG defaults OFF", !$("#f-rag_enabled").checked);
+    click("workspace-settings"); click("tab-btn-agent");
+    $("#f-rag_enabled").checked = true; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
+    check("Checkbox saves boolean per-chat config", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_enabled === true && client.state.current.rag_enabled === true);
+    open(1); await settle(); check("Other chat loads own enabled setting", $("#f-rag_enabled").checked);
+    $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
+    open(0); await settle(); check("Chat switching restores persisted RAG choice", $("#f-rag_enabled").checked);
+    click("workspace-chat");
+    const sourceBox = $("#feed").querySelector(".card-rag");
+    check("Answer sources render as inert text", sourceBox.textContent.includes("<script>neutral source</script>") && !sourceBox.querySelector("a"));
+    const late = deferred(); server.respond("GET", "/api/rag/status", () => late.promise);
+    click("workspace-settings"); click("tab-btn-rag"); await settle(); click("workspace-chat");
+    const before = requests("GET", /^\/api\/rag\//).length;
+    sourceBox.querySelector("button").dispatchEvent(new Evt("click"));
+    late.resolve(json({state: "ready", index: {index_id: "new-index", rows: {documents: 0, chunks: 0}}})); await settle();
+    const snapshot = $("#rag-answer-snapshot");
+    check("Historical inspector uses saved identity/context without live reads", !snapshot.hidden && $("#rag-workflow").hidden
+      && snapshot.textContent.includes("saved-old-index") && snapshot.querySelector(".rag-snapshot-context").textContent === rag.context
+      && snapshot.querySelector(".rag-snapshot-text").textContent === rag.hits[0].text
+      && requests("GET", /^\/api\/rag\//).length === before);
+    check("Late current-index response cannot overwrite historical snapshot", !snapshot.textContent.includes("new-index") && snapshot.textContent.includes("0.9234"));
+    server.respond("GET", "/api/rag/status", {state: "missing"});
+    snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    check("Current workflow stays mounted and reachable after historical inspection", snapshot.hidden && !$("#rag-workflow").hidden && $("#rag-status").textContent === "Индекс отсутствует");
+    click("workspace-chat"); $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click"));
+    open(1); await settle();
+    check("Historical selection is cleared when active chat changes", snapshot.hidden && !snapshot.children.length && !$("#rag-workflow").hidden);
+  });
+  await scenario("RAG retrieval progress, generation and terminal restoration", async () => {
+    const {client, server, $, send} = freshClient({agents: [{rag_enabled: true}]});
+    const generation = deferred(), token = deferred(), finished = deferred();
+    const savedRag = {version: 1, query: "neutral question", index: {index_id: "saved-neutral"}, top_k: 5, hits: [], context: "neutral saved context"};
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream([
+      {event: "retrieval", stage: "retrieval", query: "neutral question"}, {...start, rag_at: 0},
+      {event: "delta", text: "neutral answer"}, {event: "done", committed: true, answer_index: 1}], {
+      beforeRead: async (index) => { if (index === 1) await generation.promise; if (index === 2) await token.promise; },
+      finish: () => { Object.assign(server.state.agents[0], {transcript: [turns[0], {...turns[1], rag: savedRag}], history_len: 2}); finished.resolve(); }
+    }));
+    client.init(); await settle(); send("neutral question"); await settle();
+    check("Real retrieval event announces search before generation", $("#feed").querySelector(".card-status-text")?.textContent === "Поиск контекста");
+    generation.resolve(); await settle();
+    check("Start event changes progress to generation", $("#feed").querySelector(".card-status-text")?.textContent === "Генерация");
+    token.resolve(); await finished.promise; await settle();
+    check("Terminal exchange removes progress", !$("#feed").querySelector(".card-status"));
+    const card = $("#feed").querySelector(".card"); button(card, "Информация о запросе").dispatchEvent(new Evt("click"));
+    check("RAG prompt slot zero is preserved", card.querySelector(".prompt-role").textContent === "контекст RAG");
+    server.respond("POST", "/api/agents/ag_1/regenerate", () => stream([
+      {event: "retrieval", stage: "retrieval"}, {event: "error", message: "Neutral retrieval unavailable"},
+      {event: "done", committed: false, restored: true, question: "neutral question"}]));
+    button(card, "Перегенерировать").dispatchEvent(new Evt("click")); await settle();
+    check("Failed regenerate restores previous answer snapshot", same(client.state.current.transcript[1].rag, savedRag)
+      && $("#feed").querySelector(".card-rag") && !client.state.busy);
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream([
+      {event: "retrieval", stage: "retrieval"}, {event: "error", message: "Neutral index missing"},
+      {event: "done", committed: false, question: "retry neutral question"}]));
+    send("retry neutral question"); await settle();
+    check("Retrieval failure restores input without false answer or stuck busy", $("#input").value === "retry neutral question"
+      && !client.state.busy && $("#feed").querySelectorAll(".card").length === 1 && client.state.current.history_len === 2);
+    server.respond("POST", "/api/agents/ag_1/messages", () => stream([
+      {event: "retrieval", stage: "retrieval"},
+      {event: "done", committed: false, cancelled: true, question: "cancelled neutral question", error: "Neutral cancellation"}]));
+    send("cancelled neutral question"); await settle();
+    check("Uncommitted cancellation restores terminal question without error event", $("#input").value === "cancelled neutral question" && !client.state.busy && client.state.current.history_len === 2);
+  });
   await scenario("RAG inspector reads saved state without chat/key, paginates and reveals actual vector", async () => {
     const info = { index_id: "saved-1", words: 15555, size_bytes: 8192, rows: { documents: 1, chunks: 1 },
       version: 1, strategy: "structural", dimension: 3, embedding_config: { model: "offline-test" } };

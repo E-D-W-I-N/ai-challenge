@@ -195,6 +195,7 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 
 PATCHABLE = (
     "label",
+    "rag_enabled",
     "system",
     "model",
     "stop",
@@ -204,6 +205,13 @@ PATCHABLE = (
 )
 """Что панель справа вправе менять у живого чата: всё, что в ней видно,
 и ничего сверх. Имя меняют из списка слева тем же полем `label`."""
+
+
+def _rag_enabled(payload: dict, where: str = "") -> bool:
+    value = payload.get("rag_enabled", False)
+    if type(value) is not bool:
+        raise HTTPException(status_code=400, detail=f"{where}rag_enabled: boolean true/false")
+    return value
 
 
 def _optional_field(payload: dict, name: str, types: tuple, hint: str, where: str = ""):
@@ -513,6 +521,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
         model=_model_field(payload, where),
+        rag_enabled=_rag_enabled(payload, where),
         system=_text_field(payload, "system", where),
         stop=_stop_field(payload, where),
         response_format=_optional_field(
@@ -627,6 +636,9 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     # со следующего сообщения.
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
+    rag_enabled = _rag_enabled(payload)
+    if "rag_enabled" in payload:
+        agent.spec.rag_enabled = rag_enabled
     if "model" in payload:
         agent.spec.model = _model_field(payload)
         agent.context_length = (await _context_lengths()).get(agent.spec.model)

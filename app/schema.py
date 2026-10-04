@@ -65,6 +65,8 @@ class AgentSpec:
     поверх тела; `provider.require_parameters` уже стоит в app/llm.py, там же
     `plugins` мержатся по `id`: выключенный `context-compression` уцелеет
     рядом с вашим, а названный тем же `id` — победит."""
+    rag_enabled: bool = False
+    """Mandatory published-index retrieval for this chat; legacy chats default OFF."""
 
 
 STRATEGIES = ("full", "window", "summary")

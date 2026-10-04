@@ -319,11 +319,18 @@ class Index:
             return result
 
     def search(self, query, top_k=5, *, config=None, client=None):
-        """One read connection pins a complete index across concurrent rebuilds."""
+        """Compatibility list view over the same pinned retrieval result."""
+        return self.retrieve(query, top_k, config=config, client=client)["hits"]
+
+    def retrieve(self, query, top_k=5, *, config=None, client=None):
+        """Identity and full hits come from one read connection across rebuilds."""
         if not 1 <= top_k <= 100:
             raise ValueError("top_k must be between 1 and 100")
         with closing(self.connect()) as db:
             metadata = self.metadata(db)
+            if any(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] != metadata[table]
+                   for table in ("documents", "chunks")):
+                raise ValueError("Index row counts differ from committed metadata")
             config = config or EmbeddingConfig(**metadata["embedding_config"])
             if config.fingerprint() != metadata["embedding_fingerprint"]:
                 raise ValueError("Query/index embedding configuration mismatch")
@@ -339,4 +346,8 @@ class Index:
                 hit["chunk_id"] = hit.pop("id")
                 hit["score"] = sum(a * b for a, b in zip(vector, stored))
                 hits.append(hit)
-            return sorted(hits, key=lambda h: (-h["score"], h["chunk_id"]))[:top_k]
+            identity = {key: metadata[key] for key in (
+                "index_id", "corpus_fingerprint", "embedding_fingerprint", "embedding_config", "dimension", "strategy"
+            )}
+            return {"query": query, "top_k": top_k, "index": identity,
+                    "hits": sorted(hits, key=lambda h: (-h["score"], h["chunk_id"]))[:top_k]}

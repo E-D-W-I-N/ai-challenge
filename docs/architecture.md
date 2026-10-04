@@ -529,7 +529,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   Он не импортирует `app.config`, не читает `.env`, не использует MCP или
   провайдер генерации. `python -m rag` принимает операторские пути, приложение
   читает только свой `RAG_DIR` (по умолчанию `data/rag`). HTTP API пути не принимает.
-  В день 21 обмен чата ещё не использует RAG; его история и цикл MCP прежние.
+  В день 22 при `spec.rag_enabled` общий Agent.ask использует published retrieval;
+  история и цикл MCP прежние, независимый CLI не импортирует приложение.
 - Ingest берёт только перечисленные HTTP(S) URL или локальные HTML из manifest.
   Не обнаруживает ссылки, не следует frameset, не скачивает сайт целиком,
   не применяет OCR/PDF. Декодирование: BOM, HTML charset, HTTP charset,
@@ -688,3 +689,62 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   interrupted/stale и bounded API. Настоящий JS инспектора под Node проверяет
   saved state, выбор/раскрытие вектора, ошибку с прежним индексом и late GET.
   Это offline контракт, не измерение качества поиска на архиве или живой модели.
+
+
+## RAG в чате: запрос и сохранённый snapshot
+
+- `AgentSpec.rag_enabled` — строгий boolean, default false и для legacy config.
+  Настройка принадлежит чату, сохраняется в sessions.config, копируется в ветку.
+  Create/PATCH не принимают строки, числа или null вместо bool. Снимок spec
+  снимается один раз на начало обмена; правка в полёте действует со следующего.
+- При OFF Agent.ask не читает индекс/корпус и не вызывает embedding HTTP. При ON
+  retrieval обязателен до сжатия и генерации, не является MCP инструментом и
+  не выбирается моделью. Исходный вопрос эмбеддится один раз за обмен; все MCP
+  кадры используют уже построенный work с тем же RAG-контекстом.
+- `rag.Index.retrieve` открывает один read connection: index metadata, embedding
+  config/fingerprint и top5 full-text hits принадлежат одному поколению SQLite.
+  Параллельный atomic rebuild не заменяет его identity или чанки. Начальная
+  stale-проверка обязательна; начатый snapshot закреплён, следующий обмен читает
+  актуальную публикацию. Fixed/structural/semantic strategy не ограничивает поиск.
+  Query embedding использует published endpoint/model/dimensions/revision;
+  mismatch, missing/deleted/stale/corrupt index и HTTP/векторная ошибка явны.
+  При ON `extra_body.messages` отклоняется до retrieval/compression/LLM через
+  error/done: оно заменило бы собранный RAG-контекст и исказило snapshot.
+  При OFF прежняя семантика extra_body сохраняется.
+- `app/rag.py` выполняет синхронный HTTP/SQLite lookup в worker thread без Store
+  транзакции и блокировки event loop. Worker возвращает только данные; после
+  возврата Agent проверяет cancel/can_run до compression/LLM. Сам HTTP worker
+  может завершиться после отмены, но не запускает модель и не пишет историю.
+- Canonical versioned snapshot `Turn.rag`: query, top_k=5, index_id и corpus/
+  embedding identity/config/dimension/strategy, hits с полными text/metadata/
+  offsets/hash/score, точный context и реальная retrieval duration. Runtime
+  credentials/headers не включаются. App redaction применяется до форматирования
+  context: prompt, captured JSON и inspector показывают одну representation.
+  Врезка — user data перед исходным вопросом, помечена как недоверенные источники,
+  не команды. Полные top5 не обрезаются скрыто; model context error остаётся явным.
+- SSE `retrieval` (query/stage) показывает фактическую подготовку; `start` несёт
+  rag и zero-based `rag_at` в resolved_messages (null при OFF), затем генерацию.
+  Done несёт тот же snapshot. Turn.rag nullable для OFF/legacy; messages.rag
+  мигрируется без удаления старых сообщений и пишется атомарно с assistant,
+  metrics и всеми фактическими request_bodies, включая completed compression.
+- Retrieval и compression/preparation входят в terminal lifecycle: error →
+  done(committed=false, question) возвращает ввод без пустого exchange. Regenerate
+  восстанавливает снятый answer/request_bodies/rag до done; partial model answer
+  сохраняет использованный snapshot по прежним правилам. Cancel проверяется
+  после worker, при yield compression и до каждого model/tool/commit boundary.
+  Снимки обоих rag и request_bodies глубоко копируются remember/carry_off.
+- Scheduler использует общий ask и toggle на момент старта. Successful retrieval
+  snapshot и request capture доступны его static failure commit при допустимом
+  исходном чате; failed lookup не выдумывает snapshot. Cancellation/can_run не
+  допускают публикации результата отменённой/недействительной задачи. Receipt
+  планирования и delayed execution остаются отдельными фактическими событиями.
+- Исторический ответ/инспектор читают committed snapshot, без повторного search
+  или чтения текущих chunk texts. Очистка messages удаляет принадлежащие им rag
+  snapshots; rebuilding/deleting index не изменяет прошлые ответы. Пользователь
+  сравнивает RAG ON/OFF самостоятельно; нет compare UI или набора видео-вопросов.
+  Query rewrite, filtering/reranking, citation enforcement и task memory вне дня22.
+- `checks/rag_chat_check.py`: нейтральные temporary HTML/SQLite и HTTP stubs,
+  pinned rebuild/all strategies/top5, ON/OFF, actual model JSON+MCP rounds,
+  canonical redaction/persistence/restart/fork, terminal errors/regenerate/cancel,
+  per-chat bool и legacy migration. Offline contracts не измеряют качество
+  retrieval на пользовательском архиве; corpus/questions/reports остаются private.

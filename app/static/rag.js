@@ -2,6 +2,7 @@
 
 // Durable stages and published index share the operator-configured directory.
 function createRagInspector({ state, $, el, api }) {
+  let historical = false;
   let epoch = 0, controller = null, timer = null, indexId = null;
   let previewEpoch = 0, documentRequest = 0, chunkRequest = 0, textRequest = 0;
   let documentOffset = 0, chunkOffset = 0, selectedDocument = null, selectedChunk = null;
@@ -16,7 +17,7 @@ function createRagInspector({ state, $, el, api }) {
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
   const workingQuery = () => working ? "&working=true" : "";
-  const visible = () => state.workspace === "settings" && state.section === "rag" && document.visibilityState !== "hidden";
+  const visible = () => !historical && state.workspace === "settings" && state.section === "rag" && document.visibilityState !== "hidden";
   const labels = { missing: "Индекс отсутствует", stale: "Корпус изменён — перестройте индекс", running: "Операция выполняется",
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
@@ -404,12 +405,44 @@ function createRagInspector({ state, $, el, api }) {
     const entry = modelCatalogues.get(modelSource().key);
     if (entry && !modelController) $("#rag-model-status").textContent = catalogueMessage(entry, model.value);
   };
-  function open() { stop(); refresh(); loadSemanticModels(); }
+  function snapshotHeader(saved) {
+    if (state.section !== "rag") return;
+    $("#settings-description").textContent = saved ? "Источники и контекст конкретного ответа" : "Документы, чанки и фактическая индексация";
+    $("#settings-scope").textContent = saved ? "Для сохранённого ответа" : "Для всего приложения";
+  }
+  function showSnapshot(snapshot) {
+    stop(); historical = true; snapshotHeader(true);
+    $("#rag-workflow").hidden = true;
+    const target = $("#rag-answer-snapshot"); target.hidden = false;
+    const back = button("К текущему индексу", open);
+    target.replaceChildren(el("h3", "", "Контекст сохранённого ответа"),
+      el("p", "hint", "Этот снимок использован при генерации ответа и не меняется при перестройке индекса."), back,
+      el("h3", "", "Запрос"), el("p", "rag-snapshot-query", snapshot.query || ""),
+      detail("Индекс и параметры поиска", {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k, duration_seconds: snapshot.duration_seconds}));
+    for (const [i, hit] of (snapshot.hits || []).entries()) {
+      const node = el("details", "rag-detail rag-snapshot-hit");
+      node.append(el("summary", "", `${i + 1}. ${hit.title || hit.source || hit.chunk_id} · cosine ${Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"}`));
+      const {text, ...metadata} = hit;
+      node.append(el("pre", "rag-snapshot-text", text || ""), detail("Метаданные фрагмента", metadata)); target.append(node);
+    }
+    const context = el("details", "rag-detail");
+    context.append(el("summary", "", "Точный контекст для модели"), el("pre", "rag-snapshot-context", snapshot.context || "")); target.append(context);
+  }
+  function clearSnapshot() {
+    if (!historical) return;
+    stop(); historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false;
+    $("#rag-answer-snapshot").hidden = true; $("#rag-answer-snapshot").replaceChildren();
+    if (visible()) { refresh(); loadSemanticModels(); }
+  }
+  function open() {
+    historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
+    stop(); refresh(); loadSemanticModels();
+  }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
     document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadSemanticModels(); } });
   }
-  return { open, stop };
+  return { open, stop, showSnapshot, clearSnapshot };
 }
 if (typeof module !== "undefined") module.exports = createRagInspector;
 else globalThis.createRagInspector = createRagInspector;
