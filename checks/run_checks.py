@@ -4767,10 +4767,11 @@ def check_remind_cancel():
     отказ, а не молчание и не «снято»."""
     import tempfile
 
-    from app.mcp_servers import remind as srv
+    from services.reminders import server as srv
 
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
         with patch.object(srv, "DATABASE", Path(tmp) / "r.db"):
+            assert srv.db_path() == Path(tmp) / "r.db"
             srv.remind("раз", 3600)
             srv.remind("два", 3600)
             gone = srv.cancel(1)
@@ -4791,10 +4792,11 @@ def check_remind_aggregate():
     который не считает, здесь красный."""
     import tempfile
 
-    from app.mcp_servers import remind as srv
+    from services.reminders import server as srv
 
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
         with patch.object(srv, "DATABASE", Path(tmp) / "r.db"):
+            assert srv.db_path() == Path(tmp) / "r.db"
             srv.remind("долгое", 3600)
             srv.remind("уже", 0)
             srv.remind("период", 0, every=3600)
