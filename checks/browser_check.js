@@ -104,7 +104,14 @@ async function main() {
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     const gate = (name) => $("#rag-" + name + "-controls");
     const usage = $("#rag-chunk-usage");
-    check("Old published index and complete operation cannot reveal stage forms or stale report", gate("chunks").hidden && gate("embeddings").hidden && gate("save").hidden && usage.hidden);
+    check("Legacy published index remains inspectable and deletable without enabling save or unavailable stages", gate("chunks").hidden && gate("embeddings").hidden
+      && !gate("save").hidden && !$("#rag-step-save").disabled && $("#rag-save").disabled && !$("#rag-delete-index").hidden && usage.hidden);
+    const oldIndex = status.index;
+    server.respond("DELETE", "/api/rag/stages/index", () => { status.index = null; return json({cleared: "index"}); });
+    click("rag-delete-index"); await settle();
+    check("Deleting legacy index returns to documents and locks index navigation", !gate("documents").hidden && gate("save").hidden && $("#rag-step-save").disabled);
+    status.index = oldIndex;
+    click("rag-step-documents");
     stages.corpus = {fingerprint: "current-corpus", documents: 1, urls: []};
     await settle(1100);
     check("Corpus unlocks chunk navigation without changing selected documents", gate("chunks").hidden && !$("#rag-step-chunks").disabled);

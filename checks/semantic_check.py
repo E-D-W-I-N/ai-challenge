@@ -146,6 +146,10 @@ def check_semantic():
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
             assert "preferred-neutral" not in next((Path(authorized) / "semantic-cache").glob("*.json")).read_text()
+        with tempfile.TemporaryDirectory() as unauthenticated, patch.dict(os.environ, {
+                "OPENROUTER_API_KEY": "  ", "RAG_EMBEDDING_API_KEY": " ", "RAG_CHUNKING_API_KEY": " "}):
+            semantic_chunks([short], config, 35, 5, root=unauthenticated, client=client)
+            assert auth[-1] is None
         local_config = replace(config, auth_mode="omlx")
         with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {
                 "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  ",

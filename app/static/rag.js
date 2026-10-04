@@ -195,7 +195,7 @@ function createRagInspector({ state, $, el, api }) {
   function updateControls() {
     const data = lastStatus || {}, stages = data.stages || {};
     const busy = submitting || data.operation?.state === "running";
-    const available = {documents: true, chunks: !!stages.corpus, embeddings: !!stages.chunks, save: !!stages.embeddings};
+    const available = {documents: true, chunks: !!stages.corpus, embeddings: !!stages.chunks, save: !!stages.embeddings || !!data.index};
     if (!selectedStep) selectedStep = available.save ? "save" : available.embeddings ? "embeddings" : available.chunks ? "chunks" : "documents";
     if (!available[selectedStep]) {
       const position = steps.findIndex(([id]) => id === selectedStep);

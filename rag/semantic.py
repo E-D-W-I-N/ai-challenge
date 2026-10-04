@@ -119,7 +119,7 @@ def _call(client, config, payload, trace=None):
     raw_key = os.environ.get("OPENROUTER_API_KEY" if config.auth_mode == "openrouter" else "RAG_EMBEDDING_API_KEY", "")
     key = raw_key.strip()
     runtime_secrets = [os.environ.get(name, "") for name in ("OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY", "RAG_CHUNKING_API_KEY")]
-    credentials = tuple(secret for raw in runtime_secrets for secret in (raw, raw.strip()) if secret)
+    credentials = tuple(secret for raw in runtime_secrets if raw.strip() for secret in (raw, raw.strip()))
     if _contains_credential(payload, credentials):
         raise ValueError("Semantic request contains a runtime credential")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
