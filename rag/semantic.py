@@ -141,15 +141,22 @@ def _http_error(response, credentials):
     # Escaped strings may contain reconstructable credentials even after the
     # outer JSON was decoded. Fail closed rather than displaying nested escapes.
     unsafe = r"[<>\\]|\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]+"
-    if any(isinstance(value, str) and re.search(unsafe, value, re.IGNORECASE) for value in (code, detail)):
+    if any(isinstance(value, str) and (re.search(unsafe, value, re.IGNORECASE)
+            or any(not c.isprintable() and c not in "\r\n\t" for c in value)) for value in (code, detail)):
         return message
+    if isinstance(detail, str):
+        detail = " ".join(detail.split())
+        if _contains_credential(detail, credentials) or re.search(unsafe, detail, re.IGNORECASE):
+            return message
+    prefix = message
     if (type(code) is int and abs(code) <= 999999999) or (isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code)):
         message += f"; code {code}"
     if isinstance(detail, str):
-        detail = " ".join("".join(c for c in detail if c.isprintable() or c.isspace()).split())
         if detail:
             message += ": " + detail[:400]
-    return message
+    # Validate the actual rendered string too: normalization, concatenation and
+    # bounding must never produce an unchecked reconstructable runtime key.
+    return prefix if _contains_credential(message, credentials) else message
 
 
 def _call(client, config, payload, trace=None):

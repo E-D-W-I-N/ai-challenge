@@ -16,7 +16,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import digest
-from rag.semantic import SemanticConfig, _boundaries, semantic_chunks
+from rag.semantic import SemanticConfig, _boundaries, _http_error, semantic_chunks
 
 
 def document(text):
@@ -210,6 +210,10 @@ def check_semantic():
 
 def check_http_diagnostics():
     """Both auth modes over real offline HTTP; proxy routing and safe 403 text."""
+    for error, credential in (({"message": "offline\tprivate\ncredential"}, "offline private credential"),
+                              ({"code": "guardrail", "message": "Denied"}, "guardrail: Denied")):
+        response = httpx.Response(403, json={"error": error})
+        assert _http_error(response, (credential,)) == "Semantic HTTP error: status 403"
     calls, reply = [], {"status": 403, "body": {"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}}
     class Server(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -237,18 +241,25 @@ def check_http_diagnostics():
                 config = SemanticConfig(base_url=base, auth_mode=auth_mode)
                 fixtures = [
                     ({"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}, "guardrail_violation: Model denied by guardrail"),
+                    ({"error": {"message": "Denied\n by\tguardrail"}}, ": Denied by guardrail"),
                     ({"error": {"code": 403, "message": "x" * 1000}}, "; code 403: " + "x" * 400),
                     ("<html>Cloudflare denial</html>", None),
                     ({"error": {"message": "<html>blocked</html>"}}, None),
                     ({"error": {"message": "Bearer unrecognized-secret"}}, None),
                     ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
                     ({"error": {"code": "guardrail", "message": "sk-unknown-fixture-key"}}, None),
+                    ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
+                    ({"error": {"code": "sk-\x00unknown-fixture-key"}}, None),
                 ]
                 for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret", "offline-unused-secret"):
                     fixtures.append(({"error": {"code": 403, "message": json.loads(json.dumps(secret).replace("offline", "\\u006fffline"))}}, None))
                     escaped = "".join("\\u%04x" % ord(c) for c in secret)
                     for reflected in (escaped, escaped.replace("\\", "\\\\")):
                         fixtures.append(({"error": {"code": 403, "message": "Credential " + reflected}}, None))
+                        fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
+                    for control in ("\x00", "\x1b", "\u200b"):
+                        reflected = secret[:7] + control + secret[7:]
+                        fixtures.append(({"error": {"code": 403, "message": reflected}}, None))
                         fixtures.append(({"error": {"code": reflected, "message": "Denied"}}, None))
                 for body, detail in fixtures:
                     reply["body"] = body
