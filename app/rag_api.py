@@ -14,6 +14,7 @@ from rag.artifacts import clear
 from rag.documents import ingest
 from rag.embeddings import EmbeddingConfig
 from rag.semantic import SemanticConfig
+from rag.preparation import PreparationConfig
 from rag.index import Index, Operation, stage_chunks, stage_embeddings, save_index
 from .request_security import trusted_rag_request
 
@@ -42,6 +43,11 @@ async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: st
 class StageRequest(BaseModel):
     urls: list[str] = Field(default_factory=list, max_length=100)
     use_manifest: bool = False
+    preparation_strategy: Literal["programmatic", "llm"] = "programmatic"
+    preparation_base_url: str = PreparationConfig.base_url
+    preparation_model: str = PreparationConfig.model
+    preparation_auth_mode: Literal["openrouter", "omlx"] = PreparationConfig.auth_mode
+    preparation_timeout_seconds: float = Field(default=PreparationConfig.timeout_seconds, ge=1, le=3600, strict=True, allow_inf_nan=False)
     strategy: str = "fixed"
     size: int = Field(default=1200, ge=64, le=100000, strict=True)
     overlap: int = Field(default=180, ge=0, strict=True)
@@ -66,6 +72,7 @@ def start(kind: str, body: StageRequest):
         raise HTTPException(422, "Invalid chunk strategy/overlap")
     index = Index()
     try:
+        preparation_config = PreparationConfig(body.preparation_base_url, body.preparation_model, body.preparation_timeout_seconds, auth_mode=body.preparation_auth_mode)
         semantic_config = SemanticConfig(body.semantic_base_url, body.semantic_model, auth_mode=body.semantic_auth_mode)
         if body.strategy == "semantic" and body.size > 12000:
             raise ValueError("Semantic chunk size must not exceed 12000 characters")
@@ -94,7 +101,7 @@ def start(kind: str, body: StageRequest):
     def run():
         try:
             if kind == "ingest":
-                report = ingest(inputs, index.root, operation=operation)
+                report = ingest(inputs, index.root, operation=operation, preparation_strategy=body.preparation_strategy, preparation_config=preparation_config)
                 operation.update(documents=report["documents"], words=report["words"], state="complete")
             elif kind == "chunks":
                 stage_chunks(index.root, body.strategy, body.size, body.overlap, operation=operation, semantic_config=semantic_config)

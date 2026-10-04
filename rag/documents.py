@@ -224,8 +224,14 @@ def normalize_html(data: bytes, source: str, content_type="") -> dict:
             "words": len(text.split()), "blocks": blocks}
 
 
-def ingest(inputs: list[dict], root: Path, *, client=None, operation=None) -> dict:
+def ingest(inputs: list[dict], root: Path, *, client=None, operation=None, preparation_strategy="programmatic", preparation_config=None, preparation_client=None) -> dict:
     """Inputs: {url} or {path, source?}; report errors without replacing corpus."""
+    if preparation_strategy not in {"programmatic", "llm"}:
+        raise ValueError("Preparation strategy must be programmatic or llm")
+    preparer = None
+    if preparation_strategy == "llm":
+        from .preparation import PreparationConfig, Preparer
+        preparer = Preparer(root, preparation_config or PreparationConfig(), operation, preparation_client)
     documents, errors, seen = [], [], set()
     with httpx.Client(timeout=30, follow_redirects=True) if client is None else _borrow(client) as http:
         for entry in inputs:
@@ -249,29 +255,39 @@ def ingest(inputs: list[dict], root: Path, *, client=None, operation=None) -> di
                     data, content_type = response.content, response.headers.get("content-type", "")
                     if content_type and not any(x in content_type.lower() for x in ("html", "text/", "octet-stream")):
                         raise ValueError("Input must be HTML/text, not PDF or binary")
-                documents.append(normalize_html(data, source, content_type))
+                documents.append(preparer.prepare(decode_html(data, content_type), source) if preparer else normalize_html(data, source, content_type))
             except (OSError, ValueError, LookupError, httpx.HTTPError) as error:
                 errors.append({"source": source, "error": str(error)})
             if operation is not None:
                 operation.update(stage="documents", documents=len(documents), words=sum(d["words"] for d in documents), failed=len(errors), inputs_done=len(seen), inputs_total=len(inputs))
     report = {"documents": len(documents), "words": sum(d["words"] for d in documents), "errors": errors,
               "approx_pages": sum(d["words"] for d in documents) / 500, "at": now()}
+    report["preparation_strategy"] = preparation_strategy
+    if preparer:
+        preparer.publish()
+        report["preparation"] = preparer.report
     write_json(root / "ingest-report.json", report)
     if errors or not documents:
         raise ValueError(f"Ingestion failed: {len(errors)} failed inputs; see ingest-report.json")
-    fingerprint = digest(json.dumps([(d["source"], d["content_hash"]) for d in documents], separators=(",", ":")))
-    write_json(root / "corpus.json", {"version": 1, "fingerprint": fingerprint, "documents": documents})
+    fingerprint = corpus_fingerprint(documents, 2)
+    write_json(root / "corpus.json", {"version": 2, "fingerprint": fingerprint, "preparation_strategy": preparation_strategy, "preparation_config": preparer.report["config"] if preparer else None, "documents": documents})
     return report
+
+
+def corpus_fingerprint(documents, version):
+    identity = [(d["source"], d["content_hash"]) if version == 1 else
+                (d["source"], d["content_hash"], d["title"], d["blocks"]) for d in documents]
+    return digest(json.dumps(identity, separators=(",", ":"), sort_keys=version != 1))
 
 
 def load_corpus(root: Path) -> dict:
     corpus = json.loads((root / "corpus.json").read_text(encoding="utf-8"))
-    if corpus.get("version") != 1 or not corpus.get("documents"):
+    if corpus.get("version") not in {1, 2} or not corpus.get("documents"):
         raise ValueError("Unsupported or empty corpus")
     for document in corpus["documents"]:
         if digest(document["text"]) != document["content_hash"]:
             raise ValueError("Corpus content hash mismatch")
-    expected = digest(json.dumps([(d["source"], d["content_hash"]) for d in corpus["documents"]], separators=(",", ":")))
+    expected = corpus_fingerprint(corpus["documents"], corpus["version"])
     if expected != corpus["fingerprint"]:
         raise ValueError("Corpus fingerprint mismatch")
     return corpus

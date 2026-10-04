@@ -15,6 +15,7 @@ from .artifacts import clear
 from .documents import ingest, load_corpus, write_json
 from .embeddings import EmbeddingConfig
 from .semantic import SemanticConfig
+from .preparation import PreparationConfig
 from .index import Index, Operation, build_index, stage_chunks, stage_embeddings, save_index, storage_root
 
 
@@ -25,6 +26,11 @@ def main(argv=None):
     load = commands.add_parser("ingest", help="Explicit URLs/local HTML, never crawl")
     load.add_argument("--url", action="append", default=[])
     load.add_argument("--manifest", type=Path, help='JSON list: {"url":...} or {"path":...,"source":...}; relative paths resolve by manifest')
+    load.add_argument("--preparation-strategy", choices=("programmatic", "llm"), default="programmatic")
+    load.add_argument("--preparation-base-url", default=PreparationConfig.base_url)
+    load.add_argument("--preparation-model", default=PreparationConfig.model)
+    load.add_argument("--preparation-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
+    load.add_argument("--preparation-timeout", type=float, default=PreparationConfig.timeout_seconds)
     split = commands.add_parser("chunks")
     split.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="fixed")
     split.add_argument("--size", type=int, default=1200)
@@ -67,7 +73,7 @@ def main(argv=None):
             if not inputs:
                 raise ValueError("Provide --url or --manifest")
             with Operation(root, "ingest") as operation:
-                result = ingest(inputs, root, operation=operation)
+                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(args.preparation_base_url, args.preparation_model, args.preparation_timeout, auth_mode=args.preparation_auth_mode))
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
         elif args.command == "clear":
             with Operation(root, "delete_" + args.stage) as operation:

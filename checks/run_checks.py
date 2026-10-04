@@ -5479,6 +5479,12 @@ def check_security_boundaries():
     return check_security()
 
 
+@check("RAG: full raw HTML preparation, cache, atomic failures and API/CLI")
+def check_rag_preparation():
+    from checks.preparation_check import check_preparation
+    return check_preparation()
+
+
 @check("RAG: semantic exact source boundaries and cache validation")
 def check_rag_semantic():
     from checks.semantic_check import check_semantic

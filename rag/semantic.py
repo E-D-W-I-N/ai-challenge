@@ -122,9 +122,9 @@ def _contains_credential(value, credentials):
     return False
 
 
-def _http_error(response, credentials):
+def _http_error(response, credentials, label="Semantic"):
     """Expose only bounded structured provider diagnostics, never raw bodies."""
-    message = f"Semantic HTTP error: status {response.status_code}"
+    message = f"{label} HTTP error: status {response.status_code}"
     if len(response.content) > 65536:
         return message
     try:
@@ -159,27 +159,36 @@ def _http_error(response, credentials):
     return prefix if _contains_credential(message, credentials) else message
 
 
-def _call(client, config, payload, trace=None):
+def _runtime_credentials():
+    runtime_secrets = [os.environ.get(name, "") for name in
+                       ("OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY", "RAG_CHUNKING_API_KEY")]
+    return tuple(secret for raw in runtime_secrets if raw.strip() for secret in (raw, raw.strip()))
+
+
+def _call(client, config, payload, trace=None, *, label="Semantic", before_send=None, response_limit=None):
     raw_key = os.environ.get("OPENROUTER_API_KEY" if config.auth_mode == "openrouter" else "RAG_EMBEDDING_API_KEY", "")
     key = raw_key.strip()
-    runtime_secrets = [os.environ.get(name, "") for name in ("OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY", "RAG_CHUNKING_API_KEY")]
-    credentials = tuple(secret for raw in runtime_secrets if raw.strip() for secret in (raw, raw.strip()))
+    credentials = _runtime_credentials()
     if _contains_credential(payload, credentials):
-        raise ValueError("Semantic request contains a runtime credential")
+        raise ValueError(f"{label} request contains a runtime credential")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
+    if before_send:
+        before_send()
     try:
         response = client.post(config.base_url.rstrip("/") + "/chat/completions", json=payload, headers=headers)
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
-        raise ValueError(_http_error(error.response, credentials)) from None
+        raise ValueError(_http_error(error.response, credentials, label)) from None
     except (httpx.HTTPError, UnicodeError):
-        raise ValueError("Semantic HTTP request failed") from None
+        raise ValueError(f"{label} HTTP request failed") from None
+    if response_limit is not None and len(response.content) > response_limit:
+        raise ValueError(f"{label} response exceeds the configured output limit")
     try:
         body = response.json()
     except (ValueError, UnicodeError):
-        raise ValueError("Semantic response is invalid JSON") from None
+        raise ValueError(f"{label} response is invalid JSON") from None
     if _contains_credential(body, credentials):
-        raise ValueError("Semantic response contains a runtime credential")
+        raise ValueError(f"{label} response contains a runtime credential")
     # Content is itself JSON: escaped string values must not bypass the guard.
     if isinstance(body, dict):
         for choice in body.get("choices", []) if isinstance(body.get("choices"), list) else []:
@@ -191,41 +200,41 @@ def _call(client, config, payload, trace=None):
                     except (ValueError, TypeError):
                         continue
                     if _contains_credential(decoded_content, credentials):
-                        raise ValueError("Semantic response contains a runtime credential")
+                        raise ValueError(f"{label} response contains a runtime credential")
     if trace is not None:
         trace(body)
-    decoded = _decode_response(body)
+    decoded = _decode_response(body, label=label)
     # Preserve the actual request and response, with no request headers.
     return decoded, body
 
 
-def _decode_response(body):
+def _decode_response(body, *, label="Semantic"):
     if not isinstance(body, dict):
-        raise ValueError("Semantic response must be a JSON object")
+        raise ValueError(f"{label} response must be a JSON object")
     choices = body.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise ValueError("Semantic response must contain exactly one completion choice")
+        raise ValueError(f"{label} response must contain exactly one completion choice")
     reason = choices[0].get("finish_reason")
     if reason == "length":
-        raise ValueError("Semantic completion reached its token limit before finishing")
+        raise ValueError(f"{label} completion reached its token limit before finishing")
     if reason == "content_filter":
-        raise ValueError("Semantic completion was blocked by a content filter")
+        raise ValueError(f"{label} completion was blocked by a content filter")
     if reason != "stop":
-        raise ValueError("Semantic completion did not finish with stop")
+        raise ValueError(f"{label} completion did not finish with stop")
     message = choices[0].get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str):
-        raise ValueError("Semantic completion must contain JSON text")
+        raise ValueError(f"{label} completion must contain JSON text")
     try:
         decoded = json.loads(content)
     except (ValueError, TypeError):
-        raise ValueError("Semantic completion content is invalid JSON; expected end_unit_ids") from None
+        raise ValueError(f"{label} completion content is invalid JSON; expected JSON object") from None
     usage = body.get("usage", {})
     if not isinstance(usage, dict):
-        raise ValueError("Semantic response has invalid usage accounting")
+        raise ValueError(f"{label} response has invalid usage accounting")
     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
         if field in usage and (type(usage[field]) is not int or usage[field] < 0):
-            raise ValueError("Semantic response has invalid usage accounting")
+            raise ValueError(f"{label} response has invalid usage accounting")
     return decoded
 
 
