@@ -25,7 +25,8 @@ from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, capture_requests, stream_completion
 from .mcp import MANAGER
-from .rag import lookup as rag_lookup, rewrite as rag_rewrite, history_pairs, NO_HITS
+from .rag import (lookup as rag_lookup, rewrite as rag_rewrite, history_pairs, NO_HITS,
+                  ANSWER_PROMPT, CitationError, validate_answer, sufficient_context)
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -1637,6 +1638,12 @@ class Agent:
                             rag_snapshot = copy.deepcopy(await rag_lookup(
                                 query, original_query=user_text, history_used=used_history,
                                 spec=spec, rewrite_result=rewrite_result))
+                            rag_snapshot["answer_policy"] = {
+                                "weak_context_enabled": True,
+                                "similarity_threshold": spec.rag_similarity_threshold,
+                            }
+                            # A supplied lookup result is retrieval data, never an old answer proof.
+                            rag_snapshot.pop("answer", None)
                             if rag_result is not None:
                                 rag_result.update(copy.deepcopy(rag_snapshot))
                             if spec.rag_filter_enabled:
@@ -1649,7 +1656,10 @@ class Agent:
                            "answer_index": None, "committed": False, "cancelled": True,
                            "question": user_text, "error": "генерация отменена", "rag": None}
                     return
-                if rag_snapshot is not None and not rag_snapshot["hits"]:
+                if rag_snapshot is not None and not sufficient_context(rag_snapshot, spec.rag_similarity_threshold):
+                    rag_snapshot["answer"] = {"status": "insufficient", "reason": "low_similarity", "citations": []}
+                    if rag_result is not None:
+                        rag_result.update(copy.deepcopy(rag_snapshot))
                     metrics = copy.deepcopy((rag_snapshot.get("rewrite") or {}).get("usage"))
                     if scheduled:
                         metrics = {**(metrics or {}), "reminder_execution": scheduled}
@@ -1717,6 +1727,11 @@ class Agent:
                     # развели бы промпт с номерами так же, как профиль.
                     invariants = self.invariant_items()
 
+                    if rag_snapshot is not None:
+                        # The protocol belongs to this exchange, never saved chat settings.
+                        spec.system = "\n\n".join(filter(None, (spec.system, ANSWER_PROMPT)))
+                        spec.response_format = {"type": "json_object"}
+                        spec.extra_body["response_format"] = {"type": "json_object"}
                     prompt = self.build_prompt(
                         user_text,
                         spec=spec,
@@ -1790,6 +1805,9 @@ class Agent:
             work = list(prompt)
             rounds = 0
             scheduled_receipt = None
+            final_frame_complete = False
+            calls = None
+            piece = ""
 
             try:
                 async with MANAGER.lease():
@@ -1810,6 +1828,7 @@ class Agent:
                                 cancelled = True
                                 break
                             piece = ""
+                            final_frame_complete = False
                             calls: list[dict] | None = None
                             stream = stream_completion(
                                 spec,
@@ -1825,7 +1844,8 @@ class Agent:
                                     if kind == "delta":
                                         piece += chunk["text"]
                                         text += chunk["text"]
-                                        yield chunk
+                                        if rag_snapshot is None:
+                                            yield chunk
                                     elif kind == "reasoning":
                                         reasoning += chunk["text"]
                                         yield chunk
@@ -1842,6 +1862,7 @@ class Agent:
                                         if tools:
                                             calls = chunk["calls"]
                                     elif kind == "done":
+                                        final_frame_complete = True
                                         piece = chunk["text"]
                                         reasoning = chunk.get("reasoning") or reasoning
                                         final_metrics = chunk["metrics"]
@@ -1913,9 +1934,8 @@ class Agent:
                 failure = str(exc)
                 yield {"type": "error", "message": failure, "metrics": None}
             except asyncio.CancelledError:
-                # Клиент ушёл: частичный ответ всё равно записываем — он уже
-                # оплачен, а следующий вопрос должен видеть, чем кончилось.
-                if scheduled is None:
+                # OFF preserves paid partial answers; RAG must not persist unchecked JSON.
+                if scheduled is None and rag_snapshot is None:
                     known = list(iteration_metrics)
                     if isinstance(final_metrics, dict) and (not known or known[-1] is not final_metrics):
                         known.append(final_metrics)
@@ -1963,6 +1983,33 @@ class Agent:
             if cut and isinstance(final_metrics, dict):
                 final_metrics = {**final_metrics, CUT_METRIC[spec.strategy]: cut}
 
+            citation_failure = False
+            if rag_snapshot is not None:
+                # Intermediate MCP prose and incomplete JSON are never knowledge answers.
+                receipt_text = text
+                text = ""
+                if scheduled_receipt:
+                    text = receipt_text
+                    rag_snapshot["answer"] = {"status": "receipt", "citations": []}
+                elif failure is None and not cancelled:
+                    try:
+                        if not final_frame_complete or calls:
+                            raise CitationError("Ошибка проверки RAG-цитат: окончательный ответ не завершён")
+                        text, rag_snapshot["answer"] = validate_answer(piece, rag_snapshot, final_metrics)
+                    except CitationError as exc:
+                        failure = str(exc)
+                        citation_failure = True
+                        yield {"type": "error", "message": failure, "metrics": final_metrics,
+                               "request_bodies": copy.deepcopy(requests)}
+                if rag_result is not None:
+                    rag_result.update(copy.deepcopy(rag_snapshot))
+                if cancel.is_set() or (can_run is not None and not await can_run()):
+                    cancelled = True
+                    failure = "генерация отменена"
+                    text = ""
+                if text:
+                    yield {"type": "delta", "text": text}
+
             # Сторож: запрещённые слова ищутся в **готовом** ответе — слово,
             # разорванное между кусками потока, по кускам не нашлось бы.
             # До записи — значит отметка уедет в базу той же транзакцией, что
@@ -1980,7 +2027,12 @@ class Agent:
             if hits:
                 final_metrics = {**(final_metrics or {}), BANNED_METRIC: hits}
 
-            allowed = can_run is None or await can_run()
+            if rag_snapshot is not None and cancel.is_set():
+                cancelled = True
+                failure = "генерация отменена"
+            allowed = (can_run is None or await can_run()) and not citation_failure
+            if rag_snapshot is not None and (failure is not None or cancelled):
+                allowed = False
             committed = self._commit(user_text, text, failure, reasoning, final_metrics, requests, rag_snapshot) if allowed else False
 
             done: dict = {
@@ -1992,7 +2044,7 @@ class Agent:
                 "error": failure,
                 "committed": committed,
                 "answer_index": len(self.history) - 1 if committed else None,
-                "request_bodies": requests if scheduled else None,
+                "request_bodies": requests if scheduled or (rag_snapshot is not None and not committed) else None,
                 "rag": copy.deepcopy(rag_snapshot),
             }
             if not committed:

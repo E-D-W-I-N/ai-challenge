@@ -5467,6 +5467,12 @@ def check_rag_refinement():
     return check_rag_refinement()
 
 
+@check("RAG citations: provenance, exact quotes and weak-context refusal")
+def check_rag_citations():
+    from checks.rag_citations_check import check_rag_citations
+    return check_rag_citations()
+
+
 @check("RAG: actual semantic HTTP/CLI and save boundary")
 def check_rag_workflow_http():
     from checks.workflow_http_check import check_workflow_http

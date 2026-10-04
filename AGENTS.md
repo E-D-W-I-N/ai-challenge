@@ -1,4 +1,4 @@
-# Инструкции для агентов — день 23
+# Инструкции для агентов — день 24
 
 Чат на FastAPI, ванильном JS без сборки и SQLite; MCP подключается,
 показывает инструменты и исполняет вызовы модели в ограниченном цикле.
@@ -30,7 +30,17 @@ RAG остаётся OFF. Rewrite — один отдельный constrained в
 без финального LLM. Snapshot v2 хранит original/query/history/config/candidates decisions/
 hits/context/timing/rewrite usage; JSON включает actual rewrite, aggregate без двойного счёта.
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
-сохраняет доступные метрики в error assistant. Проверка цитат и task memory отсутствуют.
+сохраняет доступные метрики в error assistant. При RAG ON финальный JSON answer/citations
+проверяется до публикации: ссылки [n] — позиции pinned hits; source/section/chunk_id
+берутся только оттуда, quote — точная подстрока canonical redacted text. Ошибка —
+no-commit/restore без retry; непроверенный partial RAG не сохраняется при отмене.
+Порог слабого контекста действует всегда при ON: отсутствие hits либо max(score)<threshold
+даёт детерминированное «Не знаю» с уточнением без final LLM. FilterOFF не меняет отбор,
+если gate пройден. Явный strict JSON {status:insufficient} модели даёт тот же отказ с
+paid usage. Snapshot v2 дополнен answer_policy и answer(status/citations/reason);
+история и ветки не перечитывают индекс. Receipt планирования — отдельное исключение,
+содержательный результат напоминания проверяется. Дословность не доказывает смысл;
+10 вопросов и оценка качества остаются приватной ручной работой. Task memory отсутствует.
 Подготовка документов: programmatic default или полный decoded исходный HTML через
 LLM, независимо от чанкинга; валидируемые title/blocks/sections и bounded input/output,
 без обрезки, silent fallback и платных retries. Private preparation-cache; corpus v2

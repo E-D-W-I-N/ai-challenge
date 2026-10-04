@@ -24,7 +24,7 @@ def check_rag_refinement():
     def candidates(index, query, top_k):
         queries.append((query, top_k))
         return {"query": query, "top_k": top_k, "index": {"index_id": "pinned-neutral"},
-                "hits": [{"chunk_id": str(i), "text": f"neutral chunk {i}", "score": score}
+                "hits": [{"chunk_id": str(i), "source": "fixture:neutral", "text": f"neutral chunk {i}", "score": score}
                          for i, score in enumerate((0.9, 0.6, 0.3, 0.299, -0.2))][:top_k]}
 
     queries = []
@@ -52,7 +52,8 @@ def check_rag_refinement():
         chat.remember("user", "failed question"); chat.remember("assistant", "failed answer", error="failed")
         before = len(chat.history)
         def reply(messages, index):
-            return '{"query":"standalone neutral 42"}' if index == 0 else "final neutral answer"
+            return '{"query":"standalone neutral 42"}' if index == 0 else json.dumps({
+                "answer": "final neutral answer [1]", "citations": [{"source_id": 1, "quote": "neutral chunk 0"}]})
         _stub.reset(); queries.clear()
         with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(reply)):
             events = await drain(chat.ask("current question 42"))
@@ -129,8 +130,9 @@ def check_rag_refinement():
         assert chat.history[-1].metrics["reminder_execution"]["id"] == 9
         assert chat.history[-1].request_bodies == [_stub.CALLS[0]["payload"]]
 
-        # Disconnect during final generation commits partial answer and known paid rewrite once.
+        # Disconnect during final generation cannot commit an unverified partial RAG answer.
         _stub.reset()
+        depth = len(chat.history)
         async def partial(session, **kwargs):
             if session.label == "RAG query rewrite":
                 async for event in _stub.make('{"query":"x"}')(session, **kwargs): yield event
@@ -142,8 +144,7 @@ def check_rag_refinement():
             try: await drain(chat.ask("disconnect"))
             except asyncio.CancelledError: pass
             else: raise AssertionError("disconnect must propagate")
-        assert chat.history[-1].content == "partial" and chat.history[-1].metrics["total_tokens"] == 107
-        assert chat.history[-1].metrics["cost_usd"] == 0.100123
+        assert len(chat.history) == depth
 
         # Timeout closes the stream and never runs retrieval; cancel is terminal too.
         for cancel_now in (False, True):
