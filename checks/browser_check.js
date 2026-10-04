@@ -6,7 +6,7 @@ const vm = require("vm");
 const { TextDecoder, TextEncoder } = require("util");
 const { boot, settle, Evt } = require("./dom.js");
 const { json, failure, deferred, stream, start, success, turns, planning, execution } = require("./fixtures.js");
-const STATIC = process.env.CHECK_STATIC_DIR || path.join(__dirname, "..", "app", "static");
+const STATIC = process.argv[2] || path.join(__dirname, "..", "app", "static");
 const HTML = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
 const failures = [];
 let passed = 0;
@@ -132,7 +132,7 @@ async function main() {
     const doc = { document_id: "doc", title: "<script>archive</script>", words: 15555, characters: 50000 };
     const chunk = { chunk_id: "chunk", document_id: "doc", section: "Раздел", start: 120, end: 170, text: "Реальный текст" };
     const { client, server, $, click, requests } = freshClient({ agents: [] });
-    server.respond("GET", "/api/rag/status", { state: "ready", index: info, operation });
+    server.respond("GET", "/api/rag/status", { state: "ready", index: info, operation, embedding_defaults: {model: "edited-before-poll", base_url: "http://127.0.0.1:8005/v1"} });
     server.respond("GET", "/api/rag/documents?offset=0&limit=25", { items: [doc] });
     server.respond("GET", "/api/rag/documents/doc/chunks?offset=0&limit=25", { items: [chunk] });
     server.respond("GET", "/api/rag/chunks/chunk", chunk);
@@ -221,6 +221,7 @@ async function main() {
     const report = {model: "actual-boundaries", calls: 2, usage: {total_tokens: 120}, cost_usd: 0.003};
     const status = {state: "ready", stages, operation: {kind: "chunks", state: "complete", semantic_report: report},
       index: {index_id: "old-index", words: 10, size_bytes: 100, rows: {documents: 1, chunks: 1}, embedding_config: {model: "old"}}};
+    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1&purpose=embedding", {models: [{id: "draft-to-preserve"}]});
     server.respond("GET", "/api/rag/status", status);
     server.respond("GET", "/api/rag/documents?offset=0&limit=25", {items: []});
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
@@ -242,7 +243,7 @@ async function main() {
     stages.chunks = {fingerprint: "semantic-one", strategy: "semantic", report};
     await settle(1100);
     check("Chunk completion keeps selected chunk stage", !gate("chunks").hidden && gate("embeddings").hidden);
-    click("rag-step-embeddings");
+    click("rag-step-embeddings"); await settle();
     const draft = $("#rag-model"), parameters = gate("embeddings").querySelector("details");
     draft.value = "draft-to-preserve"; draft.focus(); parameters.open = true;
     check("Semantic chunks reveal embeddings and accounting stays in actual operation JSON", !gate("embeddings").hidden && gate("save").hidden
@@ -331,6 +332,40 @@ async function main() {
     check("Manual navigation and running operation stay distinct across poll", $("#rag-step-documents").attributes["aria-current"] === "step"
       && $("#rag-step-embeddings").classList.contains("running") && !$("#rag-step-documents").classList.contains("running") && $("#rag-save").disabled);
   });
+  await scenario("RAG embedding catalogue preserves saved choice and rejects late endpoint responses", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: []});
+    const defaults = {base_url: "http://127.0.0.1:8005/v1", model: "saved-vector-id", dimensions: 3, revision: "saved"};
+    const status = {state: "missing", embedding_defaults: defaults, stages: {
+      corpus: {fingerprint: "embedding-corpus", documents: 1, urls: []}, chunks: {fingerprint: "embedding-chunks", chunks: 1}}};
+    server.respond("GET", "/api/rag/status", () => json(status));
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
+    const cataloguePath = base => `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(base)}&purpose=embedding`;
+    const initial = deferred(); server.respond("GET", cataloguePath(defaults.base_url), () => initial.promise);
+    server.respond("POST", "/api/rag/operations/embeddings", {});
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
+    const model = $("#rag-model"), endpoint = $("#rag-base-url"), message = $("#rag-embedding-model-status");
+    check("Embedding saved ID stays selectable while its own catalogue loads", model.tagName === "SELECT" && model.value === "saved-vector-id"
+      && requests("GET", cataloguePath(defaults.base_url)).length === 1);
+    initial.resolve(json({models: [{id: "vector-a"}, {id: "vector-b"}]})); await settle();
+    check("Unavailable saved embedding ID remains as explicit catalogue option", model.value === "saved-vector-id" && message.textContent.includes("выбор сохранён"));
+    model.value = "vector-a"; model.dispatchEvent(new Evt("change")); model.focus();
+    const refresh = deferred(); server.respond("GET", cataloguePath(defaults.base_url), () => refresh.promise);
+    click("rag-embedding-model-refresh"); await settle(); model.value = "vector-b"; model.dispatchEvent(new Evt("change"));
+    refresh.resolve(json({models: [{id: "vector-a"}, {id: "vector-b"}]})); await settle(1100);
+    check("Embedding refresh and status poll preserve selected draft and focus without refetch", model.value === "vector-b" && document.activeElement === model
+      && requests("GET", cataloguePath(defaults.base_url)).length === 2);
+    const oldBase = "http://127.0.0.1:9007/v1", newBase = "http://127.0.0.1:9008/v1", late = deferred();
+    server.respond("GET", cataloguePath(oldBase), () => late.promise);
+    endpoint.value = oldBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    server.respond("GET", cataloguePath(newBase), {models: [{id: "vector-b"}, {id: "new-vector"}]});
+    endpoint.value = newBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    late.resolve(json({models: [{id: "late-vector"}]})); await settle();
+    check("Old embedding endpoint cannot replace newer catalogue or draft", requests("GET", cataloguePath(oldBase))[0].signal.aborted
+      && endpoint.value === newBase && model.value === "vector-b" && !model.textContent.includes("late-vector") && model.textContent.includes("new-vector"));
+    model.value = "new-vector"; model.dispatchEvent(new Evt("change")); click("rag-embed"); await settle();
+    check("Embedding selected server model reaches operation payload", same(requests("POST", "/api/rag/operations/embeddings").at(-1)?.body,
+      {base_url: newBase, model: "new-vector", dimensions: 3, revision: "saved"}));
+  });
   await scenario("RAG preparation methods have independent generation drafts and operation payloads", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
     const status = {state: "missing", operation: {kind: "ingest", state: "complete", preparation_report: {config: {timeout_seconds: 1800}}}, stages: {corpus: {fingerprint: "prep-fixture", documents: 1, urls: []},
@@ -352,8 +387,8 @@ async function main() {
     await settle(1100);
     const cloud = deferred(); server.respond("GET", "/api/models", () => cloud.promise);
     method.value = "llm"; method.dispatchEvent(new Evt("change")); await settle();
-    model.value = "openai/gpt-4.1-mini"; model.dispatchEvent(new Evt("change")); model.focus();
-    cloud.resolve(json({models: [{id: "openai/gpt-4.1-mini"}, {id: "prep-cloud-draft"}]})); await settle();
+    model.value = "openai/gpt-6-luna"; model.dispatchEvent(new Evt("change")); model.focus();
+    cloud.resolve(json({models: [{id: "openai/gpt-6-luna"}, {id: "prep-cloud-draft"}]})); await settle();
     model.value = "prep-cloud-draft"; model.dispatchEvent(new Evt("change"));
     const calls = requests("GET", "/api/models").length;
     status.operation = {kind: "ingest", state: "complete", preparation_report: {model: "actual-prep-model", calls: 1,
@@ -372,7 +407,7 @@ async function main() {
     local.resolve(json({models: [{id: "late-prep-local"}]})); await settle();
     check("Leaving preparation cancels its catalogue and cannot touch chunk settings", requests("GET", localPath).at(-1).signal.aborted
       && !model.textContent.includes("late-prep-local") && $("#rag-semantic-auth-mode").value === "openrouter"
-      && $("#rag-semantic-model").value === "openai/gpt-4.1-mini");
+      && $("#rag-semantic-model").value === "openai/gpt-6-luna");
     click("rag-split"); await settle();
     check("Chunk payload excludes preparation settings", same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
       {strategy: "fixed", size: 1200, overlap: 180}));
@@ -472,6 +507,7 @@ async function main() {
     server.respond("DELETE", "/api/rag/stages/chunks", {cleared: "chunks"});
     server.respond("GET", "/api/rag/models?auth_mode=openrouter&base_url=http%3A%2F%2F127.0.0.1%3A9000%2Fv1", {models: [{id: "offline-boundaries"}]});
     server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1", {models: [{id: "local-generative"}]});
+    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1&purpose=embedding", {models: [{id: "offline-model"}]});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -497,7 +533,7 @@ async function main() {
     check("Local semantic stage sends explicit auth and generative model", requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_auth_mode === "omlx" && requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_model === "local-generative");
     $("#rag-semantic-auth-mode").value = "openrouter"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
     check("Switching auth restores generative drafts", $("#rag-semantic-model").value === "offline-boundaries" && $("#rag-semantic-base-url").value === "http://127.0.0.1:9000/v1");
-    click("rag-step-embeddings");
+    click("rag-step-embeddings"); await settle();
     $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();

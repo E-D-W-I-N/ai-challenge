@@ -858,7 +858,7 @@ async function loadMcp() {
     const answer = await api("/api/mcp", { signal: controller.signal, headers });
     if (epoch !== state.mcpEpoch) return;
     acceptMcp(answer);
-    mcpStatus(state.mcpDisabled ? "MCP выключен через MCP_DISABLED=1." : "");
+    mcpStatus(state.mcpDisabled ? "MCP отключён." : "");
   } catch (err) {
     if (epoch !== state.mcpEpoch) return;
     state.mcp = null;

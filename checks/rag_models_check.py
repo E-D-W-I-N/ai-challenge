@@ -27,7 +27,7 @@ def check_rag_models():
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     base = f"http://127.0.0.1:{server.server_port}/v1"
     try:
-        with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "  neutral-local-key  ", "OPENROUTER_API_KEY": "  neutral-router-key  ", "RAG_CHUNKING_API_KEY": "  neutral-unused-key  ",
+        with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "  neutral-local-key  ", "OPENROUTER_API_KEY": "  neutral-router-key  ",
                 "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "", "no_proxy": ""}):
             from app.rag_api import router
             from app import rag_models
@@ -38,6 +38,20 @@ def check_rag_models():
                 assert response.status_code == 200, response.text
                 assert response.json() == {"models": [{"id": "embedding-name-is-not-a-type"}, {"id": "neutral-llm"}], "total": 2}
                 assert calls == [("/v1/models", "Bearer neutral-local-key")]
+                embedding_params = {**params, "purpose": "embedding"}
+                assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
+                state["payload"] = {"data": [{"id": "neutral-vector", "model_type": "embedding"}, {"id": "embedding-name-is-still-llm", "model_type": "llm"}]}
+                assert api.get("/api/rag/models", params=embedding_params).json() == {"models": [{"id": "neutral-vector"}], "total": 1}
+                assert api.get("/api/rag/models", params=params).json()["total"] == 2
+                for metadata in (None, "model"):
+                    state["payload"]["data"][1]["model_type"] = metadata
+                    assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
+                state["payload"] = {"data": [{"id": "neutral-vector", "type": "embeddings"}, {"id": "neutral-llm", "type": "llm"}]}
+                assert api.get("/api/rag/models", params=embedding_params).json() == {"models": [{"id": "neutral-vector"}], "total": 1}
+                state["payload"] = {"data": [{"id": "neutral-vector", "model_type": "embedding"},
+                                            {"id": "neutral-vector", "model_type": "llm"}, {"id": "neutral-llm", "model_type": "llm"}]}
+                assert api.get("/api/rag/models", params=embedding_params).json()["total"] == 2
+                assert api.get("/api/rag/models", params={**params, "purpose": "unknown"}).status_code == 422
                 with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": " \t "}):
                     assert api.get("/api/rag/models", params=params).status_code == 200
                     assert calls[-1] == ("/v1/models", None)
@@ -62,8 +76,8 @@ def check_rag_models():
                 assert "neutral-local-key" not in response.text
                 state.update(status=200, payload={"data": []})
                 assert api.get("/api/rag/models", params=params).json() == {"models": [], "total": 0}
-                for invalid in [{"bad": []}, {"data": [{"id": "neutral-local-key"}]}, {"data": [{"id": "  neutral-unused-key  "}]},
-                                {"data": [{"id": "neutral-unused-key"}]}, {"data": [{"id": "x" * 513}]}, {"data": [None]}]:
+                for invalid in [{"bad": []}, {"data": [{"id": "neutral-local-key"}]},
+                                {"data": [{"id": "x" * 513}]}, {"data": [None]}]:
                     state["payload"] = invalid
                     response = api.get("/api/rag/models", params=params)
                     assert response.status_code == 502 and "neutral-local-key" not in response.text and "neutral-unused-key" not in response.text

@@ -21,7 +21,7 @@ from .index import Index, Operation, build_index, stage_chunks, stage_embeddings
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=storage_root(), help="Same directory as app RAG_DIR (default data/rag)")
+    parser.add_argument("--root", type=Path, default=storage_root(), help="Snapshot directory (default data/rag)")
     commands = parser.add_subparsers(dest="command", required=True)
     load = commands.add_parser("ingest", help="Explicit URLs/local HTML, never crawl")
     load.add_argument("--url", action="append", default=[])

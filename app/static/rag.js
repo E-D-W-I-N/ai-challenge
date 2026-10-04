@@ -11,7 +11,7 @@ function createRagInspector({ state, $, el, api }) {
   const steps = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Индекс"]];
   const navigation = new Map();
   for (const [id, title] of steps) {
-    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); loadGenerationModels(); });
+    const node = button(title, () => { if (node.disabled) return; selectedStep = id; updateControls(); syncPreview().catch(showError); loadModelsForStage(); });
     node.className = "mcp-button rag-step"; node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
   }
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
@@ -22,7 +22,7 @@ function createRagInspector({ state, $, el, api }) {
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
     epoch++;
-    for (const picker of generationPickers) picker.stop();
+    for (const picker of modelPickers) picker.stop();
     clearTimeout(timer); timer = null;
     controller?.abort(); controller = null;
   }
@@ -164,16 +164,19 @@ function createRagInspector({ state, $, el, api }) {
         const defaults = data.embedding_defaults;
         if (defaults) {
           for (const [id, key] of [["base-url", "base_url"], ["model", "model"], ["dimensions", "dimensions"], ["revision", "revision"]]) {
-            const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = defaults[key] ?? "";
+            const input = $("#rag-" + id);
+            if (input && !input.dataset.dirty) {
+              if (id === "model") embeddingPicker.setModels([], defaults[key]); else input.value = defaults[key] ?? "";
+            }
           }
         }
         const urls = $("#rag-urls"); if (urls && !urls.dataset.dirty && stages?.corpus) urls.value = stages.corpus.urls.join("\n");
-        for (const picker of generationPickers) picker.seed();
+        for (const picker of modelPickers) picker.seed();
         seeded = true;
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
       updateControls();
-      if (initializing) loadGenerationModels();
+      if (initializing) loadModelsForStage();
       await syncPreview();
     } catch (error) { if (error.name !== "AbortError" && token === epoch) showError(error); }
     finally {
@@ -320,14 +323,16 @@ function createRagInspector({ state, $, el, api }) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
   const modelCatalogues = new Map();
-  function createGenerationPicker(prefix, active, buttonPrefix = prefix + "-") {
-    const authMode = $("#rag-" + prefix + "-auth-mode"), endpoint = $("#rag-" + prefix + "-base-url"), model = $("#rag-" + prefix + "-model");
+  function createModelPicker(prefix, active, buttonPrefix = prefix + "-", embedding = false) {
+    const authMode = embedding ? {value: "omlx"} : $("#rag-" + prefix + "-auth-mode");
+    const fieldPrefix = prefix ? prefix + "-" : "";
+    const endpoint = $("#rag-" + fieldPrefix + "base-url"), model = $("#rag-" + fieldPrefix + "model");
     const refreshButton = $("#rag-" + buttonPrefix + "model-refresh"), statusNode = $("#rag-" + buttonPrefix + "model-status");
     let modelRequest = 0, modelController = null, pendingModelSource = null;
     function modelSource() {
       const mode = authMode.value;
       const base = endpoint.value.trim().replace(/\/+$/, "");
-      return {mode, base, key: `${mode}:${base}`};
+      return {mode, base, key: `${embedding ? "embedding" : "generation"}:${mode}:${base}`};
     }
     function cancelModelRequest() {
       modelRequest++; modelController?.abort(); modelController = null; pendingModelSource = null;
@@ -367,7 +372,7 @@ function createRagInspector({ state, $, el, api }) {
       try {
         const official = source.mode === "openrouter" && source.base === "https://openrouter.ai/api/v1";
         const data = official && state.models.length && !force && !cached?.retry ? {models: state.models}
-          : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}`, {signal});
+          : await api(official ? "/api/models" : `/api/rag/models?auth_mode=${source.mode}&base_url=${encodeURIComponent(source.base)}${embedding ? "&purpose=embedding" : ""}`, {signal});
         if (request !== modelRequest || source.key !== modelSource().key || !visible()) return;
         const models = data.models || [];
         if (official) state.models = models;
@@ -388,7 +393,7 @@ function createRagInspector({ state, $, el, api }) {
       drafts.set(previousAuthMode, {endpoint: endpoint.value, model: model.value});
       const draft = drafts.get(authMode.value) || (authMode.value === "omlx"
         ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
-        : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-4.1-mini"});
+        : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-6-luna"});
       cancelModelRequest(); endpoint.value = draft.endpoint; setModels([], draft.model); previousAuthMode = authMode.value;
       for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
       loadModels();
@@ -406,7 +411,7 @@ function createRagInspector({ state, $, el, api }) {
     return {active, load: loadModels, cancel: cancelModelRequest, setModels,
       seed: () => { previousAuthMode = authMode.value; },
       restore: (config) => {
-        for (const [input, key] of [[endpoint, "base_url"], [model, "model"], [authMode, "auth_mode"]]) {
+        for (const [input, key] of [[endpoint, "base_url"], [model, "model"], ...(!embedding ? [[authMode, "auth_mode"]] : [])]) {
           if (input.dataset.dirty) continue;
           if (input === model) setModels([], config[key]); else input.value = config[key];
         }
@@ -417,11 +422,12 @@ function createRagInspector({ state, $, el, api }) {
         cancelModelRequest();
       }};
   }
-  const semanticPicker = createGenerationPicker("semantic", () => selectedStep === "chunks" && $("#rag-strategy").value === "semantic", "");
-  const preparationPicker = createGenerationPicker("preparation", () => selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm");
-  const generationPickers = [semanticPicker, preparationPicker];
-  function loadGenerationModels() {
-    for (const picker of generationPickers) {
+  const semanticPicker = createModelPicker("semantic", () => selectedStep === "chunks" && $("#rag-strategy").value === "semantic", "");
+  const preparationPicker = createModelPicker("preparation", () => selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm");
+  const embeddingPicker = createModelPicker("", () => selectedStep === "embeddings", "embedding-", true);
+  const modelPickers = [semanticPicker, preparationPicker, embeddingPicker];
+  function loadModelsForStage() {
+    for (const picker of modelPickers) {
       if (picker.active()) picker.load(); else picker.stop();
     }
   }
@@ -431,7 +437,7 @@ function createRagInspector({ state, $, el, api }) {
   }
   $("#rag-preparation-strategy").onchange = () => {
     $("#rag-preparation-strategy").dataset.dirty = "true";
-    updatePreparationFields(); loadGenerationModels();
+    updatePreparationFields(); loadModelsForStage();
   };
   const strategy = $("#rag-strategy");
   if (strategy) strategy.onchange = () => {
@@ -440,7 +446,7 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-semantic-fields").hidden = !semantic;
     $("#rag-size-label").textContent = semantic ? "Максимальный размер чанка, символов" : "Размер чанка, символов";
     $("#rag-size").max = semantic ? "12000" : "100000";
-    if (semantic) loadGenerationModels(); else semanticPicker.cancel();
+    if (semantic) loadModelsForStage(); else semanticPicker.cancel();
   };
   for (const id of ["preparation-timeout-seconds", "preparation-strategy", "preparation-base-url", "preparation-model", "preparation-auth-mode", "urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input && !input.oninput) input.oninput = () => { input.dataset.dirty = "true"; };
@@ -475,15 +481,15 @@ function createRagInspector({ state, $, el, api }) {
     if (!historical) return;
     stop(); historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false;
     $("#rag-answer-snapshot").hidden = true; $("#rag-answer-snapshot").replaceChildren();
-    if (visible()) { refresh(); loadGenerationModels(); }
+    if (visible()) { refresh(); loadModelsForStage(); }
   }
   function open() {
     historical = false; snapshotHeader(false); $("#rag-workflow").hidden = false; $("#rag-answer-snapshot").hidden = true;
-    stop(); refresh(); loadGenerationModels();
+    stop(); refresh(); loadModelsForStage();
   }
   if (typeof window !== "undefined") {
     window.addEventListener("pagehide", stop);
-    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadGenerationModels(); } });
+    document.addEventListener("visibilitychange", () => { stop(); if (visible()) { refresh(); loadModelsForStage(); } });
   }
   return { open, stop, showSnapshot, clearSnapshot };
 }

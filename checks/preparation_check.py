@@ -16,15 +16,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import ingest, load_corpus, corpus_fingerprint, write_json
-from rag.preparation import PreparationConfig, Preparer
+from rag.preparation import PreparationConfig, Preparer, _payload
 from rag.index import Operation, stage_chunks, load_chunks
 from rag.__main__ import main
 
 
 @patch.dict(os.environ, {"OPENROUTER_API_KEY": " offline-chat-key ", "RAG_EMBEDDING_API_KEY": " offline-local-key ",
-                         "RAG_CHUNKING_API_KEY": "unused-old-key", "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
+                         "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
 def check_preparation():
     assert PreparationConfig().timeout_seconds == 600
+    default = PreparationConfig()
+    assert default.model == "openai/gpt-6-luna"
+    assert _payload("<p>Neutral</p>", default)["reasoning"] == {"effort": "none"}
+    assert default.payload_version == "preparation-reasoning-v2"
+    for alternate in (replace(default, model="unverified"), replace(default, auth_mode="omlx"), replace(default, base_url="http://neutral.test/v1")):
+        assert "reasoning" not in _payload("<p>Neutral</p>", alternate)
     for invalid in (True, False, 0, -1, 3601, float("nan"), float("inf"), "600"):
         try:
             PreparationConfig(timeout_seconds=invalid)
