@@ -158,12 +158,14 @@ async def execution(config, git_root, restart_service):
             return httpx.Response(200, text="data: " + json.dumps(frame) + "\n\n"
                 + "data: " + json.dumps(ending) + "\n\n" + "data: [DONE]\n\n")
 
-        timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider", rag_enabled=True))
+        timeout_agent = registry.create(AgentSpec(label="timeout JSON", model="offline/any-provider", rag_enabled=True,
+                                                   rag_rewrite_enabled=False, rag_filter_enabled=False))
         retrieval_queries = []
-        async def timeout_lookup(query):
+        async def timeout_lookup(query, **options):
             retrieval_queries.append(query)
             return {"version": 1, "query": query, "top_k": 5,
-                    "index": {"index_id": "neutral-scheduled-index"}, "hits": [],
+                    "index": {"index_id": "neutral-scheduled-index"},
+                    "hits": [{"chunk_id": "neutral", "text": "Neutral scheduled source data", "score": 1.0}],
                     "context": "Neutral scheduled source data", "duration_seconds": 0}
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(timeout_provider)) as offline_client:
