@@ -24,6 +24,10 @@ prompt, JSON запросов и assistant.rag; исторический инс�
 чанки актуального индекса. Ошибки retrieval дают error/done без silent fallback;
 перегенерация восстанавливает снятый ответ. Fork глубоко копирует rag и
 request_bodies. Query rewrite/filter, проверка цитат и task memory пока отсутствуют.
+Подготовка документов: programmatic default или полный decoded исходный HTML через
+LLM, независимо от чанкинга; валидируемые title/blocks/sections и bounded input/output,
+без обрезки, silent fallback и платных retries. Private preparation-cache; corpus v2
+fingerprint учитывает метаданные, legacy v1 читается без миграции.
 Semantic разбиение использует отдельный generative HTTP endpoint и runtime auth,
 выбирает IDs границ исходных units; fixed и structural остаются детерминированными.
 Кэш/trace private; проверяем только offline fixtures, без живых LLM вызовов.

@@ -11,6 +11,8 @@ def stages(root):
         return result
     result["corpus"] = {"fingerprint": corpus["fingerprint"], "documents": len(corpus["documents"]),
                         "words": sum(d["words"] for d in corpus["documents"]),
+                        "preparation_strategy": corpus.get("preparation_strategy", "programmatic"),
+                        "preparation_config": corpus.get("preparation_config"),
                         "urls": [d["source"] for d in corpus["documents"] if d["source"].startswith(("http://", "https://"))]}
     try:
         _, chunks = load_chunks(root)

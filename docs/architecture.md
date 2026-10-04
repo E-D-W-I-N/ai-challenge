@@ -526,8 +526,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 ## RAG: документы, индекс и инспектор
 
 - `rag` — независимый пакет Python в этом репозитории, вызываемый приложением.
-  Он не импортирует `app.config`, не читает `.env`, не использует MCP или
-  провайдер генерации. `python -m rag` принимает операторские пути, приложение
+  Он не импортирует `app.config`, не читает `.env`, не использует MCP;
+  отдельная generative HTTP-граница обслуживает LLM подготовку и semantic разбиение. `python -m rag` принимает операторские пути, приложение
   читает только свой `RAG_DIR` (по умолчанию `data/rag`). HTTP API пути не принимает.
   В день 22 при `spec.rag_enabled` общий Agent.ask использует published retrieval;
   история и цикл MCP прежние, независимый CLI не импортирует приложение.
@@ -547,6 +547,33 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   выравнивается в строку. Списки и строки технических таблиц
   остаются связанными блоками; layout-таблицы обходятся рекурсивно. Это эвристика,
   оператор просматривает нормализованный текст, особенно страницы без main.
+- Подготовка документов независима от стратегии чанкинга: `programmatic` (default)
+  сохраняет прежнюю эвристическую очистку; `llm` отправляет decoded исходный HTML,
+  без предварительной normalize_html, в отдельный generative `/chat/completions`.
+  `PreparationConfig` выбирает endpoint/model/auth_mode независимо от semantic config.
+  Prompt требует полный текст без суммаризации, с фактами, числами, списками и таблицами;
+  модель возвращает JSON title и ordered blocks (text/kind/section). Заголовок и разделы
+  должны быть содержательными и непустыми; при отсутствии исходного heading модель
+  формулирует краткое название темы. Python валидирует схему и вычисляет точные
+  полуоткрытые offsets, words и hash, сохраняя совместимость всех последующих этапов.
+  Автоматически доказать полноту фактов модельного результата невозможно: оператор
+  просматривает подготовленный документ. Invalid JSON/schema, unfinished/length,
+  credential reflection и HTTP ошибки не заменяются программной очисткой и не
+  вызывают автоматического платного повтора; любой отказ сохраняет прежний corpus/index.
+  Default лимит исходного HTML — 200000 decoded символов (публичный audit 36 HTML:
+  максимум 122948 bytes); output JSON вместе с title/sections ограничен 200000 символами,
+  max_tokens=32768. Больший вход явно отклоняется до HTTP, без обрезки; response
+  ограничен до разбора JSON, provider length отклоняется. CLI/API используют те же
+  defaults; оператор Python может изменить limits в config, они входят cache identity.
+  `preparation-cache` приватный: identity = source/raw hash/nonsecret config/prompt,
+  checked request/response без headers. Повторный input/config читает валидированный
+  кэш без вызова; ротация runtime ключа не меняет identity. Transport/auth/proxy и
+  безопасные ошибки общие с semantic. preparation_report показывает только текущие
+  actual HTTP attempts, модель response, usage, actual cost_usd (null при missing cost;
+  cache-only — 0), computed/cached и duration; report не входит corpus fingerprint.
+  Corpus v2 fingerprint включает source/text hash/title/blocks, поэтому metadata-only
+  изменения инвалидируют chunks/vectors и делают индекс stale. Legacy v1 читается
+  по прежнему fingerprint без destructive migration.
 - Fixed: по умолчанию 1200 символов / 180 перекрытия; размер 64–100000,
   перекрытие 0 ≤ overlap < size, оба входят в fingerprint и chunk_id. Structural по умолчанию: заголовки,
   абзацы, пункты и строки таблиц пакуются внутри раздела до 1200 символов;
