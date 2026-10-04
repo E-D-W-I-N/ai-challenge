@@ -182,16 +182,28 @@ def use_temp_db(path: str | None = None) -> str:
     бы в рабочую базу сервера.
 
     Без аргумента каждый процесс получает **свежий** каталог, даже если
-    AGENT_DB_PATH унаследован от родителя: иначе `spawn_100.py` в подпроцессе
+    окружение унаследовано от родителя: иначе `spawn_100.py` в подпроцессе
     писал бы сотню чатов в базу проверок. Явный путь нужен проверке
     перезапуска — там два процесса обязаны видеть один файл.
     """
     import os
     import tempfile
 
+    requested_path = path
     if path is None:
         path = os.path.join(tempfile.mkdtemp(prefix="checks-db-"), "agents.db")
-    os.environ["AGENT_DB_PATH"] = path
+    # Config import performs no I/O; prevent fixture key reads from the user's .env.
+    import app.config as config
+    config._load_dotenv = lambda: None
+    import app.store as store
+    if store._STORE is None:
+        store._STORE = store.Store(path).init()
+    elif str(store._STORE.path) != str(path):
+        # Repeated install_offline in one process must retain the registry's store.
+        if requested_path is not None:
+            raise ValueError("Explicit database injection must happen before registry import")
+        return str(store._STORE.path)
+
     return path
 
 
@@ -206,6 +218,9 @@ def install_offline(db_path: str | None = None) -> None:
 
     import app.catalog as catalog
     import app.main as main
+    import app.mcp as mcp
+    from pathlib import Path
+    mcp.DEFAULT_CONFIG_PATH = Path(main.REGISTRY.store.path).parent / "fixture-no-mcp.json"
 
     async def no_catalog():
         return []

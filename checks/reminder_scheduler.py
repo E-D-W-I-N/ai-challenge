@@ -75,7 +75,7 @@ async def execution(config, git_root, restart_service):
     store = Store(Path(git_root) / "app.db").init()
     registry = AgentRegistry(store=store)
     manager = mcp.McpManager()
-    with patch.dict(os.environ, {"MCP_CONFIG_PATH": str(config), "MCP_DISABLED": "0"}), \
+    with patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(config)), \
             patch.object(mcp, "ROOT", Path(git_root)), patch.object(agent_module, "MANAGER", manager):
         await manager.start()
         assert all(s.status == "ok" for s in manager.servers), [s.error for s in manager.servers]
@@ -371,7 +371,7 @@ def clear_acceptance(config, directory):
                 await session.initialize()
                 return await session.call_tool(tool, args)
 
-    with patch.dict(os.environ, {"MCP_CONFIG_PATH": str(scoped_config), "MCP_DISABLED": "0"}), \
+    with patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(scoped_config)), \
             patch.object(mcp, "ROOT", directory), patch.object(mcp, "MANAGER", manager), \
             patch.object(agent_module, "MANAGER", manager), patch.object(main, "REGISTRY", registry):
         with TestClient(app) as client:
@@ -466,7 +466,7 @@ def lifespan_acceptance(config, directory):
     _stub.reset()
     _stub.install(reply=lambda ms, i: "" if i == 0 else "Автоматический итог в исходном чате",
                   tool_calls=lambda ms, i: [call("remind", {"text": "automatic result", "in_seconds": .35})] if i == 0 else None)
-    with patch.dict(os.environ, {"MCP_CONFIG_PATH": str(config), "MCP_DISABLED": "0"}), \
+    with patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(config)), \
             patch.object(mcp, "ROOT", directory), patch.object(mcp, "MANAGER", manager), \
             patch.object(agent_module, "MANAGER", manager), patch.object(main, "REGISTRY", registry):
         with TestClient(app) as client:
@@ -576,8 +576,7 @@ def main():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ}
-        env.update(REMIND_DB_PATH=str(directory / "remote.db"), REMIND_PORT=str(port))
-        process = subprocess.Popen([sys.executable, "-m", "services.reminders.server"], cwd=ROOT,
+        process = subprocess.Popen([sys.executable, "-m", "services.reminders.server", "--db", str(directory / "remote.db"), "--port", str(port)], cwd=ROOT,
                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         def ready_for(target, target_port):
             end = time.monotonic() + 5
@@ -595,7 +594,7 @@ def main():
         def restart_service():
             nonlocal process
             process.terminate(); process.wait(timeout=5)
-            process = subprocess.Popen([sys.executable, "-m", "services.reminders.server"], cwd=ROOT,
+            process = subprocess.Popen([sys.executable, "-m", "services.reminders.server", "--db", str(directory / "remote.db"), "--port", str(port)], cwd=ROOT,
                                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             ready()
         git_process = None

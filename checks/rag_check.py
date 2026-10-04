@@ -223,7 +223,7 @@ def check_rag():
             from app.main import app
             from fastapi.testclient import TestClient
             write_json(root / "progress.json", {"state": "ready"})
-            with patch.dict(os.environ, {"RAG_DIR": str(root), "MCP_DISABLED": "1", "OPENROUTER_API_KEY": ""}), TestClient(app) as api:
+            with patch("rag.index.storage_root", lambda: root), patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), TestClient(app) as api:
                 status = api.get("/api/rag/status").json()
                 assert all(key not in json.dumps(status) for key in fake_keys)
                 assert status["index"]["rows"]["chunks"] == refreshed["chunks"]

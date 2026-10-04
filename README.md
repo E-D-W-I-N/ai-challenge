@@ -84,6 +84,14 @@ make check-browser   # только клиентские проверки под
 Он не создаёт и не перезаписывает `.env`. Все последующие Python-команды
 выполняются через `.venv/bin/python`; ошибки команд дают ненулевой exit code.
 
+Приложение читает из окружения и `.env` только `OPENROUTER_API_KEY` и
+`RAG_EMBEDDING_API_KEY`. Модель генерации по умолчанию в чате, CLI и RAG —
+`openai/gpt-6-luna`; сохраняемые настройки чатов продолжают определять их модель.
+База чатов — `data/agents.db`, корпус/индекс — `data/rag`, начальный MCP конфиг —
+`mcp.json`. Другие прикладные env настройки не поддерживаются; адреса, модели
+и параметры задаются в существующих формах или явных CLI аргументах сервисов.
+Стандартные PATH/HOME/LANG и HTTP proxy окружение сохраняют своё назначение.
+
 Для ручного диалога создайте `.env` из `.env.example`, только если его ещё
 нет, и задайте `OPENROUTER_API_KEY` локально. Ключ не нужен offline-проверкам.
 Секреты не выводите и не коммитьте; используйте только точечный `git add`,
@@ -126,14 +134,14 @@ interrupted/stale, bounded API и настоящий клиент под Node с
 добавьте объект с полем `url`; для локальной копии можно задать `source`.
 Можно повторять `--url` вместо manifest. CLI не импортирует конфигурацию чата
 и не читает `.env`.
-Оператор задаёт один и тот же каталог CLI и приложению; умолчание `data/rag`:
+Приложение использует фиксированный каталог `data/rag`; CLI использует его по умолчанию,
+а `--root` позволяет оператору работать с отдельным каталогом:
 
 Примеры ниже используют oMLX на порту 8005, как начальное поле UI;
 укажите фактический адрес и ID модели своего сервера.
 
 ```sh
-export RAG_DIR="$PWD/data/rag"
-.venv/bin/python -m rag ingest --manifest "$RAG_DIR/inputs.json"
+.venv/bin/python -m rag ingest --manifest data/rag/inputs.json
 .venv/bin/python -m rag index --base-url http://127.0.0.1:8005/v1 \
   --model mlx-community/Qwen3-Embedding-0.6B-8bit --batch-size 16
 .venv/bin/python -m rag status
@@ -183,7 +191,7 @@ Ingest сохраняет frozen corpus.json и ingest-report.json с ошибк
 ```sh
 .venv/bin/python -m rag chunks --strategy fixed --size 1200 --overlap 180
 .venv/bin/python -m rag chunks --strategy semantic --size 1200 --overlap 180 \
-  --semantic-base-url https://openrouter.ai/api/v1 --semantic-model openai/gpt-4.1-mini
+  --semantic-base-url https://openrouter.ai/api/v1 --semantic-model openai/gpt-6-luna
 .venv/bin/python -m rag embed --base-url http://127.0.0.1:8005/v1 --model YOUR_MODEL
 .venv/bin/python -m rag save
 .venv/bin/python -m rag clear index  # сохраняет все предыдущие этапы и кэши
@@ -202,7 +210,7 @@ Ingest сохраняет frozen corpus.json и ingest-report.json с ошибк
 interrupted/error названы явно, предыдущий индекс при отказе виден отдельно.
 UI запускает отдельные этапы «Загрузить документы» → «Разбить на чанки» →
 «Создать эмбеддинги» → «Сохранить индекс». Укажите явные URL; локальный HTML
-доступен только из операторского `RAG_MANIFEST`, без ввода путей в HTTP.
+доступен только из фиксированного manifest `data/rag/inputs.json`, без ввода путей в HTTP.
 На этапе «Документы» выберите подготовку «Кодом» (по умолчанию) или
 «Полностью через LLM»: генеративная модель получает HTML, очищает его и
 восстанавливает структуру без пересказа. Для LLM доступны OpenRouter/oMLX,
@@ -216,7 +224,7 @@ UI запускает отдельные этапы «Загрузить док�
 «Максимальный размер чанка»: модель выбирает смысловые границы, код ограничивает
 размер групп и добавляет заданное перекрытие. В UI доступны «По размеру» и
 «Семантическое · LLM». Для semantic по умолчанию OpenRouter /
-`openai/gpt-4.1-mini`; endpoint редактируется, модель выбирается из каталога
+`openai/gpt-6-luna`; endpoint редактируется, модель выбирается из каталога
 сервера; auth берётся из
 `OPENROUTER_API_KEY` процесса (тот же ключ, что в чате). Для локальной
 генеративной модели выберите oMLX в UI или передайте CLI

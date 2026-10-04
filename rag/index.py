@@ -22,7 +22,7 @@ VERSION = 1
 
 def storage_root() -> Path:
     # Intentionally never import app.config / dotenv.
-    return Path(os.environ.get("RAG_DIR", "data/rag")).resolve()
+    return (Path(__file__).resolve().parent.parent / "data" / "rag").resolve()
 
 
 def read_json(path, default=None):

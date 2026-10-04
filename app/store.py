@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -42,7 +41,7 @@ from pathlib import Path
 from .config import ROOT, api_key
 
 DEFAULT_DB_PATH = ROOT / "data" / "agents.db"
-"""Куда пишется база, если AGENT_DB_PATH не задан. Каталог в .gitignore вместе
+"""Фиксированный путь базы приложения. Каталог в .gitignore вместе
 с `*.db`, `*.db-wal` и `*.db-shm`: в базе лежат тексты диалогов."""
 
 MEMORY = ":memory:"
@@ -292,13 +291,9 @@ _CLAIM_ATTEMPTS = 50
 вторая берёт свободный номер. Полсотни — запас, а не рабочий режим."""
 
 
-def db_path() -> Path | str:
-    """Путь к базе. Через переменную окружения — иначе проверки писали бы
-    в рабочий файл."""
-    raw = os.environ.get("AGENT_DB_PATH", "").strip()
-    if not raw:
-        return DEFAULT_DB_PATH
-    return MEMORY if raw == MEMORY else Path(raw)
+def db_path() -> Path:
+    """Fixed application database; tests inject an explicit Store before registry import."""
+    return DEFAULT_DB_PATH
 
 
 def _dumps(value) -> str:
@@ -1316,7 +1311,7 @@ _STORE_LOCK = threading.Lock()
 
 
 def shared_store() -> Store:
-    """Хранилище процесса. Открывается один раз, по пути из AGENT_DB_PATH."""
+    """Хранилище процесса. Открывается один раз в data/agents.db."""
     global _STORE
     with _STORE_LOCK:
         if _STORE is None:

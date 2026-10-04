@@ -49,7 +49,9 @@ from .store import StoreBusyError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model="openai/gpt-4o-mini")
+from rag.defaults import DEFAULT_GENERATIVE_MODEL
+
+NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model=DEFAULT_GENERATIVE_MODEL)
 """Что получает кнопка «Новый чат»: пусто всё, кроме модели — без неё запрос
 некуда отправить. Промпт задаёт пользователь. Имя выдаёт `_next_chat_label`."""
 
@@ -76,8 +78,10 @@ def _next_branch_label() -> str:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    from .config import _load_dotenv
+    _load_dotenv()
     # MCP — до yield: к первому запросу список инструментов уже на руках.
-    # Пустой менеджер (нет конфига, MCP_DISABLED=1) неотличим от дня 15.
+    # Пустой менеджер (нет конфига) неотличим от дня 15.
     await mcp.MANAGER.start(REGISTRY.store)
     scheduler = ReminderScheduler(mcp.MANAGER, REGISTRY)
     _app.state.reminder_scheduler = scheduler
@@ -1249,7 +1253,7 @@ async def list_mcp(request: Request) -> dict:
     """Подключённые MCP-серверы: имя, статус и инструменты с описанием
     и схемой. У сервера с инструментом `reminders` — и свежий список
     напоминаний полем `reminders` (дёргается вызовом, только если сервер
-    жив). Пустой список — нет настроенных серверов; при MCP_DISABLED=1
+    жив). Пустой список — нет настроенных серверов; при пустой конфигурации
     сохранённые URL остаются видимыми, но отключёнными."""
     manager = mcp.MANAGER
     # A delayed model exchange owns the manager lease. Read its stable

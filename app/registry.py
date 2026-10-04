@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import Iterable
 
@@ -26,17 +25,9 @@ from .schema import AgentSpec
 from .store import Store, shared_store
 
 DEFAULT_MAX_AGENTS = 1000
-"""Потолок живых, если AGENT_MAX_LIVE не задан. С запасом больше ста: спавн
+"""Фиксированный потолок живых агентов. С запасом больше ста: спавн
 сотни не должен вытеснить чат, в котором прямо сейчас говорят."""
 
-
-def _max_agents() -> int:
-    raw = os.environ.get("AGENT_MAX_LIVE", "").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return DEFAULT_MAX_AGENTS
-    return max(1, value)
 
 
 class UnknownAgentError(KeyError):
@@ -46,7 +37,7 @@ class UnknownAgentError(KeyError):
 class AgentRegistry:
     def __init__(self, max_agents: int | None = None, store: Store | None = None) -> None:
         self._agents: dict[str, Agent] = {}
-        self.max_agents = max_agents if max_agents is not None else _max_agents()
+        self.max_agents = max_agents if max_agents is not None else DEFAULT_MAX_AGENTS
         self.evicted = 0
         """Сколько чатов выгружено из памяти за жизнь процесса. Именно
         выгружено, а не удалено: в базе они остались."""
@@ -242,7 +233,9 @@ class AgentRegistry:
                 self.evicted += 1
 
 
-_UNKNOWN_MODEL = "openai/gpt-4o-mini"
+from rag.defaults import DEFAULT_GENERATIVE_MODEL
+
+_UNKNOWN_MODEL = DEFAULT_GENERATIVE_MODEL
 """Чем заменить модель, если в сохранённом конфиге её нет: показать такой чат
 в списке всё равно надо — в нём лежит переписка."""
 

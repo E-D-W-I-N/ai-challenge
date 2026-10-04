@@ -14,7 +14,7 @@ CLI загружает явные HTML-входы, замораживает ко
 эмбеддинги предоставляет внешний oMLX по HTTP. Инспектор «Работа RAG» читает
 фактическое состояние CLI и документов/чанков/векторов. UI запускает отдельные
 этапы загрузки, разбиения, эмбеддингов и публикации; writer lock общий с CLI.
-Каталог `data/rag` (или операторский `RAG_DIR`) содержит приватные снимки и отчёты:
+Каталог `data/rag` (для standalone CLI также явный `--root`) содержит приватные снимки и отчёты:
 не читайте пользовательский корпус, не коммитьте его или коллекции вопросов.
 Standalone CLI не импортирует `app.config`/`.env`. В чате `rag_enabled` по
 умолчанию false; при true общий Agent.ask обязательно выполняет retrieval до
@@ -32,6 +32,11 @@ Semantic разбиение использует отдельный generative H
 выбирает IDs границ исходных units; fixed и structural остаются детерминированными.
 Кэш/trace private; проверяем только offline fixtures, без живых LLM вызовов.
 Offline HTTP-эмбеддинги проверяются на нейтральном временном HTML, без инференса.
+Runtime поддерживает только OPENROUTER_API_KEY и RAG_EMBEDDING_API_KEY;
+.env loader принимает только их. Приложение использует data/agents.db, data/rag,
+mcp.json и optional data/rag/inputs.json. Проверки внедряют временные Store/пути
+явно до импорта реестра; прикладные env overrides удалены. Общая генеративная
+модель по умолчанию — openai/gpt-6-luna из независимого rag/defaults.py.
 Прямые зависимости
 (`fastapi`, `uvicorn[standard]`, `httpx`, `mcp`) закреплены в `requirements.txt`.
 

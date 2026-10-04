@@ -34,5 +34,5 @@ python3.11 -m venv /private/tmp/pipeline-mcp-venv
 
 Цепочку ведёт модель через обычные tool responses; сервис не передаёт результаты
 между инструментами сам. Старый `app.mcp_servers.pipeline` — тонкий совместимый
-alias для stdio-проверок с временным ROOT и `PIPELINE_FILES_DIR`; обычный HTTP
+alias для stdio-проверок с временным ROOT и `OUTPUT`; обычный HTTP
 запуск использует только явные пути оператора.

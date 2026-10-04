@@ -1,6 +1,5 @@
 """Local durable RAG workflow; paths remain operator configuration only."""
 import json
-import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -30,14 +29,14 @@ def status():
     except (OSError, ValueError, KeyError) as error:
         result["stage_error"] = str(error)
     result["embedding_defaults"] = (result.get("stages", {}).get("embeddings") or result.get("index") or {}).get("embedding_config", EmbeddingConfig().__dict__)
-    result["manifest_available"] = bool(os.environ.get("RAG_MANIFEST"))
+    result["manifest_available"] = (index.root / "inputs.json").is_file()
     return result
 
 
 @router.get("/models", dependencies=[Depends(trusted_rag_request)])
-async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: str = Query(max_length=2048)):
+async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: str = Query(max_length=2048), purpose: Literal["generation", "embedding"] = "generation"):
     from .rag_models import models
-    return await models(auth_mode, base_url)
+    return await models(auth_mode, base_url, purpose)
 
 
 class StageRequest(BaseModel):
@@ -83,10 +82,9 @@ def start(kind: str, body: StageRequest):
             if any(urlparse(url).scheme not in {"http", "https"} or not urlparse(url).netloc or urlparse(url).username or urlparse(url).password for url in body.urls):
                 raise ValueError("Provide explicit HTTP(S) URLs without credentials")
             if body.use_manifest:
-                configured = os.environ.get("RAG_MANIFEST")
-                if not configured:
-                    raise ValueError("Operator manifest is not configured")
-                manifest = Path(configured).resolve()
+                manifest = index.root / "inputs.json"
+                if not manifest.is_file():
+                    raise ValueError("Operator manifest data/rag/inputs.json is not available")
                 entries = json.loads(manifest.read_text(encoding="utf-8"))
                 if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
                     raise ValueError("Invalid operator manifest")

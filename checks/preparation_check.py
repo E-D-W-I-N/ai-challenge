@@ -193,7 +193,8 @@ def check_preparation():
                                 preparation_model=config.model, preparation_auth_mode="omlx")
             assert body.preparation_strategy == "llm" and body.strategy == "fixed"
             # Dispatch the actual API worker with an operator-owned neutral manifest.
-            with patch.dict(os.environ, {"RAG_MANIFEST": str(manifest)}), patch("app.rag_api.Index", lambda: Index(root)):
+            write_json(root / "inputs.json", inputs)
+            with patch("app.rag_api.Index", lambda: Index(root)):
                 before = len(calls)
                 acknowledgement = start("ingest", StageRequest(use_manifest=True, preparation_strategy="llm",
                     preparation_base_url=config.base_url, preparation_model="api-neutral", preparation_auth_mode="omlx",

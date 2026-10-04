@@ -32,7 +32,7 @@ _stub.install_offline()
 # MCP в наборе выключен по умолчанию: проверки Дней 6–15 обязаны пройти
 # в точности как были, без процесса на каждый TestClient. Проверки MCP
 # включают его сами, с фикстурным конфигом (`_mcp_env`).
-os.environ.setdefault("MCP_DISABLED", "1")
+
 
 import app.agent as agent_module  # noqa: E402
 import app.main as main  # noqa: E402
@@ -3561,7 +3561,7 @@ def check_tool_calls_transport():
 
     # --- незнакомый тип события обмен переживает ------------------------------
     #
-    # Реестр пуст (MCP_DISABLED=1) — значит инструменты не объявлены,
+    # Реестр пуст (пустая конфигурация) — значит инструменты не объявлены,
     # и событие `tool_calls` агент исполнять не вправе: он переживает его
     # молча, обмен идёт одним обращением и записывается. Заглушка отдаёт
     # событие той же формы, что настоящий транспорт.
@@ -3706,7 +3706,7 @@ def check_tool_call_loop():
 
 @check("tools объявляются только при непустом реестре: пустой — неотличим от дня 15")
 def check_tools_only_with_registry():
-    """Реестр пуст (MCP_DISABLED=1): тело запроса ключа `tools` не имеет
+    """Реестр пуст (пустая конфигурация): тело запроса ключа `tools` не имеет
     вовсе — ни с пустым списком, ни с чужим. Слать всегда значило бы назвать
     модели инструменты, которых у нас нет."""
     _stub.install(reply="ок")
@@ -3892,7 +3892,7 @@ def check_tool_history_stays_pairwise():
                 second = client.post(f"/api/agents/{chat}/messages", json={"text": "два"})
                 assert second.status_code == 200, second.text
 
-    conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
+    conn = sqlite3.connect(REGISTRY.store.path)
     rows = conn.execute(
         "SELECT seq, role FROM messages WHERE session_id = ? ORDER BY seq", (chat,)
     ).fetchall()
@@ -4465,16 +4465,15 @@ def check_every_write_path_redacts():
 # --- день 16: MCP — соединение и список инструментов -------------------------
 #
 # Проверки поднимают настоящий subprocess через тот же McpManager, что носит
-# приложение, с фикстурным MCP_CONFIG_PATH. Заглушки вместо сервера здесь не
+# приложение, с явно внедрённым фикстурным конфигом. Заглушки вместо сервера здесь не
 # бывает: соединение проверяется соединением.
 
 
+@contextlib.contextmanager
 def _mcp_env(config_path: str, **extra):
-    """Окружение проверки MCP: фикстурный конфиг и включённый менеджер —
-    набор по умолчанию держит MCP_DISABLED=1."""
-    return patch.dict(
-        os.environ, {"MCP_CONFIG_PATH": config_path, "MCP_DISABLED": "0", **extra}
-    )
+    """Explicit fixture config, with optional runtime auth keys."""
+    with patch.object(mcp_module, "DEFAULT_CONFIG_PATH", Path(config_path)), patch.dict(os.environ, extra):
+        yield
 
 
 def _mcp_config(tmp: str, servers: dict) -> str:
@@ -4669,7 +4668,7 @@ def check_mcp_stop_two_servers_lifo():
 @check("MCP: без конфига менеджер пуст, и ручка отдаёт пустой список")
 def check_mcp_empty_without_config():
     """Нет файла — ни процессов, ни инструментов, ни ошибки: приложение
-    работает в точности как в день 15. То же и с MCP_DISABLED=1."""
+    работает в точности как в день 15. Явное отключение fixture менеджера также безопасно."""
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="check-mcp-") as tmp:
@@ -4681,8 +4680,8 @@ def check_mcp_empty_without_config():
                 await manager.start()
                 assert manager.servers == [] and manager.tools == {}
                 await manager.stop()
-            with _mcp_env(missing, MCP_DISABLED="1"):
-                manager = McpManager()
+            with _mcp_env(missing):
+                manager = McpManager(disabled=True)
                 await manager.start()
                 assert manager.servers == [] and manager.tools == {}
 
@@ -4711,9 +4710,9 @@ def _remind_fixture_config(tmp: str, extra: dict | None = None) -> str:
     for package in ("app", "checks", "services"):
         (directory / package).symlink_to(Path(ROOT) / package, target_is_directory=True)
     (directory / "_isolated_remind.py").write_text(
-        "import os\n"
-        + "os.environ['REMIND_DB_PATH'] = " + repr(str(directory / "reminders.db")) + "\n"
-        + "from app.mcp_servers.remind import server\nserver.run()\n",
+        "from pathlib import Path\nfrom services.reminders import server as srv\n"
+        + "srv.DATABASE = Path(" + repr(str(directory / "reminders.db")) + ")\n"
+        + "srv.server.run()\n",
         encoding="utf-8",
     )
     return _mcp_config(tmp, {"remind": {"module": "_isolated_remind", "timeout_s": 10}, **(extra or {})})
@@ -4734,7 +4733,7 @@ def check_remind_one_shot_fires():
         assert srv.finish_reminder(rid, "a", path=path, now=111)
         item = srv.list_reminders(path=path, now=300)["items"][0]
         assert item["fired"] == 1 and item["state"] == "сработало", item
-        with patch.dict(os.environ, {"REMIND_DB_PATH": str(path)}):
+        with patch.object(srv, "DATABASE", path):
             assert srv.remind("   ", 5).startswith("пустой текст")
             assert "прошлом" in srv.remind("текст", -1)
             assert "больше нуля" in srv.remind("текст", 5, every=0)
@@ -4771,7 +4770,7 @@ def check_remind_cancel():
     from app.mcp_servers import remind as srv
 
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
-        with patch.dict(os.environ, {"REMIND_DB_PATH": os.path.join(tmp, "r.db")}):
+        with patch.object(srv, "DATABASE", Path(tmp) / "r.db"):
             srv.remind("раз", 3600)
             srv.remind("два", 3600)
             gone = srv.cancel(1)
@@ -4795,7 +4794,7 @@ def check_remind_aggregate():
     from app.mcp_servers import remind as srv
 
     with tempfile.TemporaryDirectory(prefix="check-remind-") as tmp:
-        with patch.dict(os.environ, {"REMIND_DB_PATH": os.path.join(tmp, "r.db")}):
+        with patch.object(srv, "DATABASE", Path(tmp) / "r.db"):
             srv.remind("долгое", 3600)
             srv.remind("уже", 0)
             srv.remind("период", 0, every=3600)
@@ -4942,7 +4941,7 @@ def check_remind_end_to_end():
     # Заведённое видно через ручку, а история осталась попарной.
     ours = [i for i in listing["items"] if i["text"] == marker]
     assert len(ours) == 1 and ours[0]["state"] == "ждёт" and ours[0]["fired"] == 0, ours
-    conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
+    conn = sqlite3.connect(REGISTRY.store.path)
     roles = conn.execute(
         "SELECT role FROM messages WHERE session_id = ? ORDER BY seq", (chat,)
     ).fetchall()
@@ -4974,9 +4973,8 @@ def _pipeline_fixture(tmp: str, extra: dict | None = None) -> tuple[Path, str]:
     for package in ("app", "checks", "services"):
         (directory / package).symlink_to(Path(ROOT) / package, target_is_directory=True)
     (directory / "_isolated_pipeline.py").write_text(
-        "import os\nfrom pathlib import Path\n"
-        + "os.environ['PIPELINE_FILES_DIR'] = " + repr(str(directory / "output")) + "\n"
-        + "from app.mcp_servers import pipeline as srv\n"
+        "from pathlib import Path\nfrom app.mcp_servers import pipeline as srv\n"
+        + "srv.OUTPUT = Path(" + repr(str(directory / "output")) + ")\n"
         + "srv.ROOT = Path(" + repr(str(repo)) + ")\n"
         + "srv.server.run()\n",
         encoding="utf-8",
@@ -5067,7 +5065,7 @@ def check_pipeline_summarize_reference():
     return "независимый эталон: dedup/order/4 группы/unparsed/лимит 2/отказы"
 
 
-@check("save_file: пишет в каталог из PIPELINE_FILES_DIR, содержимое побайтово")
+@check("save_file: пишет в каталог явного OUTPUT, содержимое побайтово")
 def check_pipeline_save_file_writes():
     """Каталог приходит из env (проверка уводит его во временный), ответ
     называет путь записанного, а байты на диске — в точности те, что просили."""
@@ -5078,7 +5076,7 @@ def check_pipeline_save_file_writes():
 
     content = "раз\r\nдва ⚙\n"
     with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
-        with patch.dict(os.environ, {"PIPELINE_FILES_DIR": tmp}):
+        with patch.object(srv, "OUTPUT", Path(tmp)):
             answer = srv.save_file("итог.txt", content)
         written = (Path(tmp) / "итог.txt").read_bytes()
     assert written == content.encode("utf-8"), written
@@ -5095,7 +5093,7 @@ def check_pipeline_save_file_name():
     from app.mcp_servers import pipeline as srv
 
     with tempfile.TemporaryDirectory(prefix="check-pipeline-") as tmp:
-        with patch.dict(os.environ, {"PIPELINE_FILES_DIR": str(Path(tmp) / "output")}):
+        with patch.object(srv, "OUTPUT", Path(tmp) / "output"):
             for bad in ("../escape.txt", "sub/dir.txt", "a\\b.txt", "..", "  ", "", " name", "name ", "a..b"):
                 answer = srv.save_file(bad, "x")
                 assert answer.startswith("отказано:"), (bad, answer)
@@ -5255,7 +5253,7 @@ def check_pipeline_chain():
     runs = answer_turn["metrics"]["tool_calls"]
     assert [r["name"] for r in runs] == plan, runs
     assert all(r["ok"] and r["server"] == "pipeline" for r in runs), runs
-    conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
+    conn = sqlite3.connect(REGISTRY.store.path)
     roles = conn.execute("SELECT role FROM messages WHERE session_id=? ORDER BY seq", (chat,)).fetchall()
     conn.close()
     assert roles == [("user",), ("assistant",)], roles
@@ -5347,7 +5345,7 @@ def check_orch_two_servers_routing():
     runs = answer_turn["metrics"]["tool_calls"]
     assert [(r["name"], r["server"]) for r in runs] == [("git_log", "git"), ("ping", "echo")], runs
     assert all(r["ok"] for r in runs), runs
-    conn = sqlite3.connect(os.environ["AGENT_DB_PATH"])
+    conn = sqlite3.connect(REGISTRY.store.path)
     persisted = conn.execute("SELECT role FROM messages WHERE session_id=? ORDER BY seq", (chat,)).fetchall()
     conn.close()
     assert persisted == [("user",), ("assistant",)], persisted
@@ -5477,6 +5475,12 @@ def check_rag_model_catalogue():
 def check_security_boundaries():
     from checks.security_check import check_security
     return check_security()
+
+
+@check("runtime: fixed defaults, explicit isolation and two-key dotenv")
+def check_runtime_configuration():
+    from checks.runtime_check import check_runtime
+    return check_runtime()
 
 
 @check("RAG: full raw HTML preparation, cache, atomic failures and API/CLI")

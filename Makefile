@@ -1,4 +1,4 @@
-PYTHON ?= python3.11
+PYTHON = python3.11
 
 .DEFAULT_GOAL := help
 .PHONY: help setup run check check-browser
