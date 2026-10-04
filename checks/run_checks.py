@@ -5459,6 +5459,12 @@ def check_rag_workflow_http():
     return check_workflow_http()
 
 
+@check("RAG: generation model catalogue HTTP/auth and safe failures")
+def check_rag_model_catalogue():
+    from checks.rag_models_check import check_rag_models
+    return check_rag_models()
+
+
 @check("RAG: semantic exact source boundaries and cache validation")
 def check_rag_semantic():
     from checks.semantic_check import check_semantic

@@ -215,6 +215,58 @@ async function main() {
     check("Manual navigation and running operation stay distinct across poll", $("#rag-step-documents").attributes["aria-current"] === "step"
       && $("#rag-step-embeddings").classList.contains("running") && !$("#rag-step-documents").classList.contains("running") && $("#rag-save").disabled);
   });
+  await scenario("RAG generation model picker preserves choice and rejects late provider/endpoint catalogs", async () => {
+    const {client, server, $, click, requests} = freshClient({agents: []});
+    const stages = {corpus: {fingerprint: "catalog-corpus", documents: 1, urls: []},
+      chunks: {fingerprint: "catalog-chunks", chunks: 1, strategy: "semantic", size: 512, overlap: 64,
+        semantic_config: {auth_mode: "openrouter", base_url: "https://openrouter.ai/api/v1", model: "persisted-alias"}}};
+    server.respond("GET", "/api/rag/status", {state: "missing", stages});
+    server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
+    server.respond("POST", "/api/rag/operations/chunks", {operation_id: "catalog-split"});
+    const official = deferred(); server.respond("GET", "/api/models", () => official.promise);
+    client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-chunks"); await settle();
+    const model = $("#rag-semantic-model"), status = $("#rag-model-status"), endpoint = $("#rag-semantic-base-url"), provider = $("#rag-semantic-auth-mode");
+    check("Persisted model remains selectable during catalogue loading", model.tagName === "SELECT" && model.value === "persisted-alias"
+      && status.textContent.includes("Загрузка") && $("#rag-model-refresh").disabled);
+    const cloud = [{id: "cloud-a", prompt_price_per_m: 1.2, completion_price_per_m: 3.4}, {id: "cloud-b"}];
+    official.resolve(json({models: cloud})); await settle();
+    check("OpenRouter prices reuse chat catalogue and keep missing persisted ID", client.state.models.length === 2 && model.value === "persisted-alias"
+      && model.textContent.includes("$1.2 / $3.4") && status.textContent.includes("выбор сохранён"));
+    model.value = "cloud-a"; model.dispatchEvent(new Evt("change")); model.focus();
+    const refresh = deferred(); server.respond("GET", "/api/models", () => refresh.promise); click("rag-model-refresh"); await settle();
+    model.value = "cloud-b"; model.dispatchEvent(new Evt("change"));
+    refresh.resolve(json({models: cloud})); await settle(1100);
+    check("Explicit selection made during refresh survives response and polls without catalogue refetch", model.value === "cloud-b" && document.activeElement === model
+      && requests("GET", "/api/models").length === 2 && model === $("#rag-semantic-model"));
+    const localPath = base => `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(base)}`;
+    const slowLocal = deferred(); server.respond("GET", localPath("http://127.0.0.1:8005/v1"), () => slowLocal.promise);
+    provider.value = "omlx"; provider.dispatchEvent(new Evt("change")); await settle();
+    check("New local provider has no copied cloud or embedding selection", model.value === "" && !model.textContent.includes("cloud-b"));
+    const local = "http://127.0.0.1:9001/v1";
+    server.respond("GET", localPath(local), {models: [{id: "neutral-generative"}, {id: "embedding-name-is-not-a-type"}]});
+    endpoint.value = local; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    slowLocal.resolve(json({models: [{id: "wrong-old-server"}]})); await settle();
+    check("Endpoint change ignores late old catalogue without guessing model types", model.textContent.includes("neutral-generative")
+      && model.textContent.includes("embedding-name-is-not-a-type") && !model.textContent.includes("wrong-old-server") && model.value === "");
+    model.value = "neutral-generative"; model.dispatchEvent(new Evt("change")); click("rag-split"); await settle();
+    check("Selected API model is forwarded to actual chunk operation", same(requests("POST", "/api/rag/operations/chunks").at(-1).body,
+      {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "omlx", semantic_base_url: local, semantic_model: "neutral-generative"}));
+    provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
+    check("Returning provider restores explicit draft without another public catalogue request", model.value === "cloud-b"
+      && endpoint.value === "https://openrouter.ai/api/v1" && requests("GET", "/api/models").length === 2);
+    const custom = deferred(), customBase = "http://127.0.0.1:9002/v1";
+    server.respond("GET", `/api/rag/models?auth_mode=openrouter&base_url=${encodeURIComponent(customBase)}`, () => custom.promise);
+    endpoint.value = customBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    provider.value = "omlx"; provider.dispatchEvent(new Evt("change")); await settle(); custom.resolve(json({models: [{id: "wrong-provider"}]})); await settle();
+    check("Custom OpenRouter endpoint is honored and late provider response cannot replace local draft", endpoint.value === local && model.value === "neutral-generative"
+      && !model.textContent.includes("wrong-provider"));
+    const emptyBase = "http://127.0.0.1:9003/v1"; server.respond("GET", localPath(emptyBase), {models: []});
+    endpoint.value = emptyBase; endpoint.dispatchEvent(new Evt("input")); endpoint.dispatchEvent(new Evt("change")); await settle();
+    check("Empty catalogue retains selected ID with inline explanation", model.value === "neutral-generative" && status.textContent.includes("не вернул моделей"));
+    server.respond("GET", localPath(emptyBase), () => failure("neutral upstream failure", 502)); click("rag-model-refresh"); await settle();
+    check("Unavailable catalogue preserves fallback choice and offers refresh inline", model.value === "neutral-generative"
+      && status.textContent.includes("Не удалось загрузить") && !$("#rag-model-refresh").disabled);
+  });
   await scenario("RAG stage buttons use actual fields and preview before publication", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
     const stages = {corpus: {fingerprint: "corpus-one", documents: 1, words: 20, urls: ["https://example.test/one"]},
@@ -228,6 +280,8 @@ async function main() {
     server.respond("POST", "/api/rag/operations/chunks", {operation_id: "split-one"});
     server.respond("POST", "/api/rag/operations/embeddings", {operation_id: "embed-one"});
     server.respond("DELETE", "/api/rag/stages/chunks", {cleared: "chunks"});
+    server.respond("GET", "/api/rag/models?auth_mode=openrouter&base_url=http%3A%2F%2F127.0.0.1%3A9000%2Fv1", {models: [{id: "offline-boundaries"}]});
+    server.respond("GET", "/api/rag/models?auth_mode=omlx&base_url=http%3A%2F%2F127.0.0.1%3A8005%2Fv1", {models: [{id: "local-generative"}]});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-rag"); await settle();
     check("Loaded working docs are available without any published index", $("#rag-documents").textContent.includes("Neutral") && $("#rag-save").disabled);
     $("#rag-documents").querySelector("button").dispatchEvent(new Evt("click")); await settle();
@@ -237,18 +291,23 @@ async function main() {
     $("#rag-strategy").value = "fixed"; $("#rag-size").value = "512"; $("#rag-overlap").value = "64";
     click("rag-split"); await settle();
     check("Chunk button sends configured character size and overlap", same(requests("POST", "/api/rag/operations/chunks")[0]?.body, {strategy: "fixed", size: 512, overlap: 64}));
+    click("rag-step-chunks");
     $("#rag-strategy").value = "semantic"; $("#rag-strategy").dispatchEvent(new Evt("change"));
-    $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1"; $("#rag-semantic-model").value = "offline-boundaries";
+    $("#rag-semantic-base-url").value = "http://127.0.0.1:9000/v1";
+    $("#rag-semantic-base-url").dispatchEvent(new Evt("change")); await settle();
+    $("#rag-semantic-model").value = "offline-boundaries";
     click("rag-split"); await settle();
     check("Semantic choice sends separate LLM endpoint/model", !$("#rag-semantic-fields").hidden && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
       {strategy: "semantic", size: 512, overlap: 64, semantic_auth_mode: "openrouter", semantic_base_url: "http://127.0.0.1:9000/v1", semantic_model: "offline-boundaries"}));
     $("#rag-semantic-auth-mode").value = "omlx"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
+    await settle();
     check("Local generation has its own editable endpoint and no copied embedding model", $("#rag-semantic-base-url").value === "http://127.0.0.1:8005/v1" && $("#rag-semantic-model").value === "");
     $("#rag-semantic-model").value = "local-generative";
     click("rag-split"); await settle();
     check("Local semantic stage sends explicit auth and generative model", requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_auth_mode === "omlx" && requests("POST", "/api/rag/operations/chunks").at(-1).body.semantic_model === "local-generative");
     $("#rag-semantic-auth-mode").value = "openrouter"; $("#rag-semantic-auth-mode").dispatchEvent(new Evt("change"));
     check("Switching auth restores generative drafts", $("#rag-semantic-model").value === "offline-boundaries" && $("#rag-semantic-base-url").value === "http://127.0.0.1:9000/v1");
+    click("rag-step-embeddings");
     $("#rag-base-url").value = "http://127.0.0.1:8005/v1"; $("#rag-model").value = "offline-model";
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();

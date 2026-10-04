@@ -32,6 +32,12 @@ def status():
     return result
 
 
+@router.get("/models")
+async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: str = Query(max_length=2048)):
+    from .rag_models import models
+    return await models(auth_mode, base_url)
+
+
 class StageRequest(BaseModel):
     urls: list[str] = Field(default_factory=list, max_length=100)
     use_manifest: bool = False

@@ -100,8 +100,9 @@
             <div id="rag-semantic-fields" hidden>
               <label class="field"><span class="field-label">Сервер LLM</span><select class="control" id="rag-semantic-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
               <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
-              <label class="field"><span class="field-label">Модель для границ чанков</span><input class="control" id="rag-semantic-model" type="text" value="openai/gpt-4.1-mini"></label>
-              <p class="hint">LLM выбирает границы исходного текста. Повторное разбиение использует кэш.</p>
+              <label class="field"><span class="field-label">Модель для границ чанков</span><select class="control" id="rag-semantic-model" aria-describedby="rag-model-status"><option value="openai/gpt-4.1-mini">openai/gpt-4.1-mini</option></select></label>
+              <div class="rag-actions"><button id="rag-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-model-status" class="hint" role="status"></span></div>
+              <p class="hint">Выберите генеративную модель. LLM выбирает границы исходного текста. Повторное разбиение использует кэш.</p>
             </div>
             <label class="field"><span class="field-label">Размер чанка, символов</span><input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
             <details class="rag-detail"><summary>Параметры разбиения</summary><label class="field"><span class="field-label">Перекрытие, символов</span><input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>

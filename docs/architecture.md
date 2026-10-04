@@ -649,6 +649,16 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   инспектор читает документы, чанки и векторы опубликованной SQLite, включая stale
   индекс; до публикации доступны текущие staged данные. Смена источника сбрасывает
   поколение preview и отсекает поздние ответы прежнего источника.
+- Модель semantic разбиения выбирается из каталога отдельного генеративного
+  сервера. Стандартный OpenRouter использует общий `/api/models` и его кэш/цены;
+  изменённый URL и oMLX читаются через GET `/api/rag/models` → `{base_url}/models`.
+  OpenRouter следует proxy policy чата, oMLX не наследует proxy окружения.
+  Runtime Bearer остаётся только на сервере; upstream тело ограничено, ошибки
+  не включают его содержимое или ключи. oMLX не обещает model_type в `/v1/models`,
+  поэтому ID не фильтруются по названию. Каталог обновляется при открытии semantic
+  этапа, смене сервера/URL или явно, а не при status poll. Ответы прежнего
+  источника отсекаются; текущий ID сохраняется отдельной опцией при отсутствии
+  в каталоге/ошибке, а пользовательский выбор во время GET не затирается.
 - `checks/rag_check.py` проверяет нейтральный CP1251 legacy HTML, реальные
   character slices/overlap/section boundaries, HTTP stub через отдельный CLI,
   cosine/cache fingerprint, vector validation, atomic failure, writer lock,
