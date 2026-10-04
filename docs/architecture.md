@@ -1,4 +1,4 @@
-# Архитектура и активные ограничения дня 21
+# Архитектура и активные ограничения дня 23
 
 FastAPI обслуживает API и статический клиент без сборки. SQLite — из стандартной
 библиотеки; версии прямых зависимостей заданы в `requirements.txt`, включая
@@ -762,11 +762,11 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   Create/PATCH не принимают строки, числа или null вместо bool. Снимок spec
   снимается один раз на начало обмена; правка в полёте действует со следующего.
 - При OFF Agent.ask не читает индекс/корпус и не вызывает embedding HTTP. При ON
-  retrieval обязателен до сжатия и генерации, не является MCP инструментом и
-  не выбирается моделью. Исходный вопрос эмбеддится один раз за обмен; все MCP
+  retrieval обязателен после optional rewrite и до сжатия и генерации, не является MCP инструментом и
+  не выбирается моделью. Поисковый запрос эмбеддится один раз за обмен; все MCP
   кадры используют уже построенный work с тем же RAG-контекстом.
 - `rag.Index.retrieve` открывает один read connection: index metadata, embedding
-  config/fingerprint и top5 full-text hits принадлежат одному поколению SQLite.
+  config/fingerprint и candidate full-text hits принадлежат одному поколению SQLite.
   Параллельный atomic rebuild не заменяет его identity или чанки. Начальная
   stale-проверка обязательна; начатый snapshot закреплён, следующий обмен читает
   актуальную публикацию. Fixed/structural/semantic strategy не ограничивает поиск.
@@ -779,7 +779,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   транзакции и блокировки event loop. Worker возвращает только данные; после
   возврата Agent проверяет cancel/can_run до compression/LLM. Сам HTTP worker
   может завершиться после отмены, но не запускает модель и не пишет историю.
-- Canonical versioned snapshot `Turn.rag`: query, top_k=5, index_id и corpus/
+- Canonical versioned snapshot `Turn.rag`: query, original_query, top_k, index_id и corpus/
   embedding identity/config/dimension/strategy, hits с полными text/metadata/
   offsets/hash/score, точный context и реальная retrieval duration. Runtime
   credentials/headers не включаются. App redaction применяется до форматирования
@@ -806,9 +806,56 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   или чтения текущих chunk texts. Очистка messages удаляет принадлежащие им rag
   snapshots; rebuilding/deleting index не изменяет прошлые ответы. Пользователь
   сравнивает RAG ON/OFF самостоятельно; нет compare UI или набора видео-вопросов.
-  Query rewrite, filtering/reranking, citation enforcement и task memory вне дня22.
+  Citation enforcement, отдельная reranker-модель и task memory пока отсутствуют.
 - `checks/rag_chat_check.py`: нейтральные temporary HTML/SQLite и HTTP stubs,
   pinned rebuild/all strategies/top5, ON/OFF, actual model JSON+MCP rounds,
   canonical redaction/persistence/restart/fork, terminal errors/regenerate/cancel,
   per-chat bool и legacy migration. Offline contracts не измеряют качество
   retrieval на пользовательском архиве; corpus/questions/reports остаются private.
+
+
+## День 23: rewrite и cosine фильтрация
+
+- Новые `AgentSpec` имеют `rag_rewrite_enabled=true`, `rag_filter_enabled=true`,
+  `rag_candidates_k=20`, `rag_final_k=5`, `rag_similarity_threshold=0.3`.
+  RAG по-прежнему default false. Чтение legacy config выставляет каждый отсутствующий
+  boolean false независимо; миграция не запускает новый платный вызов. API требует
+  строгие bool, finite threshold [-1,1] и 1 ≤ final ≤ candidates ≤ 100; PATCH проверяет
+  effective config до изменения полей. Настройки сохраняются/копируются как конфиг чата.
+- При RAG ON rewrite использует только текущий model ID, отдельный `AgentSpec` и
+  constrained service prompt: исходный вопрос и последние три полные успешные пары
+  до сжатия. Инструкции чата, память, профиль, tools и extra_body не наследуются.
+  JSON query bounded 8000 символами; пустой/invalid JSON, error/null/length finish —
+  явная ошибка. Только finish_reason=stop означает успех. Один вызов, timeout 60s,
+  без retries/fallback. Бюджет 9216 tokens учитывает reasoning; только точный
+  `openai/gpt-6-luna` получает reasoning.effort=none, как semantic preparation.
+  `aclosing` закрывает stream при ошибке/отмене; cancel/can_run проверяются после
+  событий и перед платными границами. Исходный вопрос остаётся вопросом final prompt.
+- `Index.retrieve` закрепляет identity и полные candidate hits в одном SQLite чтении.
+  Один query embedding. Приложение фильтрует score >= threshold и затем cap finalK;
+  порядок cosine/id сохраняется. Без фильтра cap сохраняется; при обоих этапах OFF
+  lookup сразу берёт finalK. Новая индексация не нужна. Фильтр не вызывает LLM.
+- Snapshot version2 расширяет v1: original_query/history_used/config, candidates с
+  полным hit и decision kept/threshold/final_cap, rewrite с query/model/actual usage,
+  timings rewrite_seconds/retrieval_seconds. Retrieval duration включает отбор;
+  отдельное время фильтра не выдумывается. hits/context остаются финальными, полными
+  и канонически redacted; тот же snapshot в prompt/start/done/Turn.rag. Старые v1
+  snapshots читаются без переписывания. Исторический инспектор не читает индекс.
+- SSE retrieval stages rewrite/search/filter обозначают реальные включённые этапы.
+  Нулевой отбор даёт start(generation=false, resolved_messages=[], rag_at=null),
+  deterministic delta/done «В базе не найдена подходящая информация». Сжатие, MCP
+  и final model не запускаются; assistant, snapshot, actual rewrite JSON и usage
+  сохраняются атомарно. Scheduler использует тот же путь и reminder_execution.
+- Rewrite request capture входит первым в preparation_requests, затем compression
+  и final/MCP rounds. Actual rewrite usage отдельно в snapshot, один раз входит в
+  метрики assistant; summaries compression учитываются отдельно как прежде.
+  Cancel/partial final generation сохраняют известную usage без двойного сложения.
+  Unknown cost не оценивается. На интерактивной ошибке до commit доступные usage и
+  actual request_bodies идут в error/done, но failed exchange/долговременный ledger
+  не создаются; regenerate восстанавливает прежний answer/snapshot/requests. Scheduler
+  error assistant объединяет доступные done.metrics с reminder_execution.
+- `checks/rag_refinement_check.py` — компактные offline synthetic hits/temporary Store:
+  threshold inclusive/threshold vs cap, query history/model isolation, strict success,
+  timeout/cancel/closure, nohits/reminders, request JSON/actual usage, restart/deepcopy,
+  legacy и effective API validation. Day22 pinned rebuild/HTTP lookup suite сохранён.
+  Это проверка контрактов; качество живой модели на пользовательском корпусе не измеряется.

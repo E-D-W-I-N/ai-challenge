@@ -202,7 +202,8 @@ class ReminderScheduler:
                     error = error or "исчерпан лимит цикла инструментов"
                 if error and not (done or {}).get("cancelled") and await valid() and not (done or {}).get("committed"):
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
+                                  metrics={**((done or {}).get("metrics") or (rag_result.get("rewrite") or {}).get("usage") or {}),
+                                           "reminder_execution": {"id": item["id"], "server": server.name}},
                                   request_bodies=requests, rag=rag_result or None)
         except asyncio.CancelledError:
             error = "исполнение остановлено; автоматического повтора нет"
@@ -213,7 +214,8 @@ class ReminderScheduler:
             with contextlib.suppress(Exception):
                 if await valid():
                     agent._commit(question, "Ошибка напоминания: " + error, error,
-                                  metrics={"reminder_execution": {"id": item["id"], "server": server.name}},
+                                  metrics={**((done or {}).get("metrics") or (rag_result.get("rewrite") or {}).get("usage") or {}),
+                                           "reminder_execution": {"id": item["id"], "server": server.name}},
                                   request_bodies=requests, rag=rag_result or None)
         finally:
             finish = asyncio.create_task(self._finish(server, item, token, error))

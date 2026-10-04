@@ -1,4 +1,4 @@
-# Карта клиента дня 22
+# Карта клиента дня 23
 
 FastAPI отдаёт HTML, CSS и четыре обычных локальных скрипта; сборки нет.
 `index.html` загружает `text.js` → `records.js` → `rag.js` → `app.js`.
@@ -36,7 +36,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оркестрация | app/mcp.py, agent.py; checks/run_checks.py | Порядок двух серверов/ids/SSE/metrics, полный live payload против API, initialize-down isolation | MCP; Оркестрация нескольких серверов |
-| RAG в чате | app.js: fillPanel, readPanel, exchange, ragSources; rag.js: showSnapshot | Boolean per-chat PATCH/default/reload/switch; реальные retrieval/start события; terminal error/input restore; saved turn.rag без live reads/late GET под Node | Промпт, контекст и метрики; RAG: документы, индекс и инспектор; Клиент |
+| RAG в чате | app.js: fillPanel, readPanel, exchange, ragSources; rag.js: showSnapshot | Per-chat RAG/rewrite/filter и числовые PATCH/default/switch; реальные rewrite/search/filter/start события; terminal error/input restore; saved turn.rag без live reads/late GET под Node | Промпт, контекст и метрики; RAG: документы, индекс и инспектор; Клиент |
 | Работа RAG | rag.js; app/rag_api.py; rag | UI stage payloads и CLI counts; staged documents/chunks, lazy vector, mounted details/drafts/focus и late GET под Node; offline HTTP/cache/fingerprints/deletion/atomic save в Python | RAG: документы, индекс и инспектор |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
 
@@ -147,12 +147,29 @@ OpenRouter показывает общий каталог чата с ценам
 
 На neutral offline-фикстуре откройте «Агент», включите checkbox текущего чата,
 смените чат и вернитесь: выбор сохраняется только в своём конфиге. Отправьте
-вопрос и проверьте «Поиск контекста» → «Генерация» на событиях сервера. При
+вопрос и проверьте реальные стадии «Переформулирование запроса» → «Поиск контекста» →
+«Фильтрация фрагментов» → «Генерация» по включённым переключателям. Настройки
+переформулирования и фильтра независимы; у новых чатов оба включены, legacy
+остаётся без них. В «Параметры поиска» задайте число кандидатов, итоговый лимит
+и порог cosine; лимит не превышает число кандидатов. Переключите чат и вернитесь:
+каждый набор принадлежит своему чату, fork получает настройки родителя.
+Переформулирование использует ту же модель и последние 3 пары вопрос/ответ,
+исходный вопрос сохраняется для ответа. При выключенном RAG все этапы пропускаются.
+Для ручного сравнения используйте переключатели или отдельные чаты.
+При пустом результате фильтра показывается «В базе не найдена подходящая информация»
+без статуса генерации и выдуманных источников/метрик модели. При
 отказе поиска вопрос возвращается в ввод, обмен не добавляется; не должно
 оставаться занятого состояния. Для regenerate прежний ответ восстанавливается.
 
 У сохранённого ответа просмотрите список источников и откройте «Контекст и
-фрагменты ответа». На 1100/1440 px длинные source/title и точный контекст
+фрагменты ответа». Для нового снимка сопоставьте исходный и поисковый запросы,
+использованную историю, настройки, время и фактический usage переформулирования
+(неизвестное не показывается нулём). Все кандидаты содержат cosine, полный текст
+и решение: включён, ниже порога или итогового лимита; контекст содержит выбранные
+фрагменты. Старый снимок дня 22 продолжает показывать сохранённые данные.
+При ошибке переформулирования раскройте «Информация о неудачном запросе» под
+полем ввода: там фактический JSON и доступные метрики вызова. Это временная
+диагностика, она не добавляет упавший обмен в историю или итог чата. На 1100/1440 px длинные source/title и точный контекст
 доступны на полной ширине; данные показываются как текст. Затем измените или
 удалите текущий индекс: исторический снимок этого ответа остаётся прежним.
 В Network открытие снимка не запрашивает status/documents/chunks/vector.
