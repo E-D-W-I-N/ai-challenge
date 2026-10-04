@@ -333,7 +333,7 @@ async function main() {
   });
   await scenario("RAG preparation methods have independent generation drafts and operation payloads", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
-    const status = {state: "missing", stages: {corpus: {fingerprint: "prep-fixture", documents: 1, urls: []},
+    const status = {state: "missing", operation: {kind: "ingest", state: "complete", preparation_report: {config: {timeout_seconds: 1800}}}, stages: {corpus: {fingerprint: "prep-fixture", documents: 1, urls: []},
       chunks: {fingerprint: "prep-chunks", chunks: 1, strategy: "fixed", size: 1200, overlap: 180}}};
     server.respond("GET", "/api/rag/status", () => json(status));
     server.respond("GET", "/api/rag/documents?offset=0&limit=25&working=true", {items: []});
@@ -342,6 +342,9 @@ async function main() {
     client.init(); await settle(); client.state.models = [];
     click("workspace-settings"); click("tab-btn-rag"); await settle(); click("rag-step-documents"); await settle();
     const method = $("#rag-preparation-strategy"), model = $("#rag-preparation-model"), endpoint = $("#rag-preparation-base-url"), provider = $("#rag-preparation-auth-mode");
+    const timeout = $("#rag-preparation-timeout-seconds");
+    check("Preparation timeout seeds saved operation report", Number(timeout.value) === 1800);
+    timeout.value = "900"; timeout.dispatchEvent(new Evt("input"));
     $("#rag-urls").value = "https://example.test/neutral"; $("#rag-manifest").checked = false;
     click("rag-ingest"); await settle();
     check("Document preparation defaults to code and sends no LLM fields", method.value === "programmatic" && $("#rag-preparation-fields").hidden
@@ -354,11 +357,11 @@ async function main() {
     model.value = "prep-cloud-draft"; model.dispatchEvent(new Evt("change"));
     const calls = requests("GET", "/api/models").length;
     status.operation = {kind: "ingest", state: "complete", preparation_report: {model: "actual-prep-model", calls: 1,
-      usage: {prompt_tokens: 321, completion_tokens: 123, total_tokens: 444}, cost_usd: 0.002}};
+      usage: {prompt_tokens: 321, completion_tokens: 123, total_tokens: 444}, cost_usd: 0.002, config: {timeout_seconds: 600}}};
     const actual = $("#rag-operation").querySelector("details"); actual.open = true;
     await settle(1100);
     check("Preparation poll keeps mounted model/focus/details and actual report", model === $("#rag-preparation-model") && model.value === "prep-cloud-draft"
-      && document.activeElement === model && actual.open && actual.textContent.includes('"actual-prep-model"') && actual.textContent.includes('"total_tokens": 444')
+      && Number(timeout.value) === 900 && document.activeElement === model && actual.open && actual.textContent.includes('"actual-prep-model"') && actual.textContent.includes('"total_tokens": 444')
       && actual.textContent.includes('"cost_usd": 0.002') && requests("GET", "/api/models").length === calls);
     const localBase = "http://127.0.0.1:8005/v1", localPath = `/api/rag/models?auth_mode=omlx&base_url=${encodeURIComponent(localBase)}`;
     server.respond("GET", localPath, {models: [{id: "prep-local-draft"}]});
@@ -376,12 +379,12 @@ async function main() {
     await settle(1100); server.respond("GET", localPath, {models: [{id: "prep-local-draft"}]});
     click("rag-step-documents"); await settle(); click("rag-ingest"); await settle();
     check("LLM preparation sends only its independent generation settings", same(requests("POST", "/api/rag/operations/ingest").at(-1)?.body,
-      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_auth_mode: "omlx", preparation_base_url: localBase, preparation_model: "prep-local-draft"}));
+      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_timeout_seconds: 900, preparation_auth_mode: "omlx", preparation_base_url: localBase, preparation_model: "prep-local-draft"}));
     provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
     check("Preparation restores its own provider draft", model.value === "prep-cloud-draft" && endpoint.value === "https://openrouter.ai/api/v1");
     method.value = "programmatic"; method.dispatchEvent(new Evt("change"));
     method.value = "llm"; method.dispatchEvent(new Evt("change")); await settle();
-    check("Code/LLM switching preserves preparation draft", model.value === "prep-cloud-draft" && !$("#rag-preparation-fields").hidden);
+    check("Code/LLM switching preserves preparation draft", model.value === "prep-cloud-draft" && Number(timeout.value) === 900 && !$("#rag-preparation-fields").hidden);
   });
   await scenario("RAG generation model picker preserves choice and rejects late provider/endpoint catalogs", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
