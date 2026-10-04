@@ -5536,6 +5536,12 @@ def check_browser():
     return result.stdout.strip()
 
 
+@check("Shared model providers and full-permutation RAG rerank")
+def shared_model_providers():
+    from checks.models_check import check_models
+    return check_models()
+
+
 def main_() -> int:
     for fn in CHECKS:
         fn()

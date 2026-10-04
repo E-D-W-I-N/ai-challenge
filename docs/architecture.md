@@ -7,8 +7,9 @@ FastAPI обслуживает API и статический клиент без
 
 ## Промпт, контекст и метрики
 
-- Каждый вызов в `app/llm.py:build_payload` требует `provider.require_parameters`,
+- OpenRouter вызов в `app/llm.py:build_payload` требует `provider.require_parameters`,
   отключает `context-compression` и запрашивает `usage: {"include": true}`.
+  Совместимый провайдер получает стандартные поля и stream_options.include_usage.
   Токены и стоимость сообщает провайдер; своих оценок нет.
 - `Agent.context_cut` — единственный разбор стратегии: `full` отправляет всю
   историю; `window` последние `keep_last` реплик; `summary` сводку и хвост.
@@ -75,7 +76,7 @@ FastAPI обслуживает API и статический клиент без
 Runtime принимает только `OPENROUTER_API_KEY` и `RAG_EMBEDDING_API_KEY` из
 окружения/`.env`; dotenv allowlist не переносит другие имена и читает файл один
 раз при запуске приложения/доступе к ключу. Standalone `rag` не загружает `.env`.
-`rag/defaults.py` хранит общий dependency-free default generative model
+`shared_models` хранит общий dependency-free default generative model
 `openai/gpt-6-luna`; сохранённый model чата и явно выбранные модели сохраняются.
 База приложения фиксирована в `data/agents.db`, MCP bootstrap — `mcp.json`,
 RAG — `data/rag`. Лимиты live agents (1000) и HTTP calls (16) фиксированы;
@@ -564,7 +565,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 - Подготовка документов независима от стратегии чанкинга: `programmatic` (default)
   сохраняет прежнюю эвристическую очистку; `llm` отправляет decoded исходный HTML,
   без предварительной normalize_html, в отдельный generative `/chat/completions`.
-  `PreparationConfig` выбирает endpoint/model/auth_mode независимо от semantic config.
+  `PreparationConfig` выбирает provider/model независимо от semantic config;
+  совместимый URL общий для операции, OpenRouter использует фиксированный адрес.
   Prompt требует полный текст без суммаризации, с фактами, числами, списками и таблицами;
   модель возвращает JSON title и ordered blocks (text/kind/section). Заголовок и разделы
   должны быть содержательными и непустыми; при отсутствии исходного heading модель
@@ -619,15 +621,14 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   в неотрицательный report.size_splits, включая cache hit;
   повторного LLM-вызова нет. Последующим чанкам добавляется точный исходный
   overlap. Чанки — source slices, ошибочный JSON/IDs не заменяются fixed.
-  `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
-  64–12000. `auth_mode` выбирает OpenRouter (по умолчанию, тот же runtime
-  `OPENROUTER_API_KEY.strip()`, что в чате) или oMLX (`RAG_EMBEDDING_API_KEY.strip()`).
-  Endpoint и генеративная модель задаются отдельно от embedding config.
-  Runtime ключ читается только HTTP-границей, standalone не загружает `.env`;
-  прежний `RAG_CHUNKING_API_KEY` не выбирает авторизацию. Auth mode входит в
-  nonsecret config/cache identity, ротация ключа identity не меняет.
+  `SemanticConfig` хранит provider/endpoint/model/timeout/prompt_version; размер semantic
+  64–12000. OpenRouter использует `OPENROUTER_API_KEY.strip()` и фиксированный
+  адрес, совместимый сервер — общий URL и `RAG_EMBEDDING_API_KEY.strip()`.
+  Runtime ключ читается только HTTP-границей, standalone не загружает `.env`.
+  Provider входит в nonsecret config/cache identity, ротация ключа identity не меняет.
+  Архивное поле auth_mode принимается только строгой изолированной миграцией.
   Отражённые raw/нормализованные runtime ключи отсекаются до записи trace.
-  OpenRouter наследует proxy environment как HTTP-клиент чата; oMLX идёт
+  OpenRouter наследует proxy environment; совместимый sync HTTP идёт
   напрямую без proxy environment. HTTP-ошибка показывает status и ограниченные
   error.code/message структурированного JSON, отсекая отражённые runtime ключи;
   сырые тела/headers и HTML не попадают в сообщение. Ошибки JSON, незавершённой
@@ -644,14 +645,15 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   исключён из chunks fingerprint: повторное разбиение сохраняет downstream
   vectors, если реальные chunks/параметры неизменны. UI показывает два варианта:
   fixed и semantic LLM, structural сохранён для CLI index/compare.
-- `EmbeddingConfig` фиксирует endpoint/model/dimensions/revision; fingerprint
-  включает их все. Оператор меняет revision при замене весов под прежним ID.
-  oMLX обслуживается отдельно, приложение не устанавливает/скачивает модели.
+- `EmbeddingConfig` фиксирует provider/endpoint/model/dimensions/revision; fingerprint
+  включает их все. У legacy config отсутствующий provider не добавляется в
+  fingerprint: сохранённая identity и кэш проверяются без переписывания. Оператор меняет revision при замене весов под прежним ID.
+  HTTP-сервер обслуживается отдельно, приложение не устанавливает/скачивает модели.
   HTTP `/v1/embeddings` отправляет пакет текстов, принимает ровно соответствующие
   count/index и конечные ненулевые векторы единой размерности. Векторы нормируются;
-  mismatch модели/конфига/размерности — ошибка. Embedding HTTP не наследует proxy
-  окружения, чтобы локальный endpoint оставался локальным.
-  Необязательный `RAG_EMBEDDING_API_KEY` читается только на границе HTTP-запроса
+  mismatch модели/конфига/размерности — ошибка. Совместимый embedding HTTP не наследует proxy
+  окружения, OpenRouter использует свой фиксированный адрес.
+  Необязательный совместимый `RAG_EMBEDDING_API_KEY` читается только на границе HTTP-запроса
   и передаётся как Bearer, включая injected client. Пустое значение не добавляет
   авторизацию. Ключ не входит в `EmbeddingConfig`, fingerprint, кэш, индекс,
   progress/API или сообщения ошибок; ротация ключа не инвалидирует кэш.
@@ -725,25 +727,27 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   инспектор читает документы, чанки и векторы опубликованной SQLite, включая stale
   индекс; до публикации доступны текущие staged данные. Смена источника сбрасывает
   поколение preview и отсекает поздние ответы прежнего источника.
-- Модель semantic разбиения выбирается из каталога отдельного генеративного
-  сервера. Стандартный OpenRouter использует общий `/api/models` и его кэш/цены;
-  изменённый URL и oMLX читаются через GET `/api/rag/models` → `{base_url}/models`.
-  OpenRouter следует proxy policy чата, oMLX не наследует proxy окружения.
-  Runtime Bearer остаётся только на сервере; upstream тело ограничено, ошибки
-  не включают его содержимое или ключи. oMLX не обещает model_type в `/v1/models`,
-  поэтому ID не фильтруются по названию. Каталог обновляется при открытии semantic
-  этапа, смене сервера/URL или явно, а не при status poll. Ответы прежнего
-  источника отсекаются; текущий ID сохраняется отдельной опцией при отсутствии
-  в каталоге/ошибке, а пользовательский выбор во время GET не затирается.
-- Selector эмбеддингов использует точные ID каталога oMLX, default
-  `Qwen3-Embedding-0.6B-8bit`. Сохранённый `mlx-community/ID` сопоставляется с
-  единственным точным `ID` только после успешного каталога; другие namespaces,
-  похожие имена и регистр не нормализуются. Отсутствующая модель показывается
-  placeholder «Выберите модель», без добавления synthetic option и без выбора
-  другой модели. Во время loading/error desired ID хранится приватно; смена URL
-  очищает прежние options, поздние ответы не заменяют новый выбор. Пустой выбор
-  блокирует embeddings POST. Published embedding config/fingerprint не меняются
-  автоматически: новый server ID применяется только при явной операции.
+- Чат, preparation, semantic, embeddings и rerank используют общий контракт
+  provider/model: `openrouter` или `compatible`. `shared_models` не импортирует app
+  и не загружает dotenv; в нём общие endpoint, key и generation payload правила.
+  OpenRouter всегда направляется на канонический URL и только ему передаются
+  routing/plugins/usage/reasoning расширения. Compatible получает стандартный
+  `/chat/completions`, stream_options.include_usage и необязательный общий ключ.
+  Нестандартные явные top_k/min_p/repetition_penalty отклоняются понятной ошибкой.
+- `/api/model-settings` хранит единственный compatible_base_url в Store.meta.
+  GET не выдаёт ключей, PATCH проверяет trusted browser origin до изменений.
+  Agent.ask фиксирует URL до rewrite/retrieval/compression и каждого MCP кадра;
+  binding устанавливается на каждый шаг генератора, не пересекает consumer yield.
+  Stage operation фиксирует URL перед запуском worker. CLI задаёт общий URL через
+  корневой --compatible-base-url и не использует app config или dotenv.
+- `/api/models?provider=...&purpose=generation|embedding` обслуживает все selectors.
+  OpenRouter использует `/models` или `/embeddings/models`, совместимый сервер
+  — `/models`. Runtime Bearer остаётся только на сервере; upstream тело ограничено,
+  ошибки не включают его содержимое или ключи. Без явных сведений каталог не
+  угадывает тип, context_length и цены. Точный сохранённый/ручной ID остаётся
+  доступным при отсутствии в каталоге; namespaces и похожие имена не заменяются.
+  Каталог обновляется явно, не при status poll; поздний ответ прежнего провайдера
+  не меняет новый выбор. Published embedding config не меняется автоматически.
 - GET каталога моделей и POST/DELETE операций RAG проверяют browser metadata
   до доступа к runtime ключу и до запуска писателя. Cross-site/same-site fetch,
   null/malformed/дублированный или несовпадающий Origin получают 403. Сравниваются
@@ -773,7 +777,10 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   Параллельный atomic rebuild не заменяет его identity или чанки. Начальная
   stale-проверка обязательна; начатый snapshot закреплён, следующий обмен читает
   актуальную публикацию. Fixed/structural/semantic strategy не ограничивает поиск.
-  Query embedding использует published endpoint/model/dimensions/revision;
+  Query embedding использует published model/dimensions/revision и provider;
+  compatible HTTP направляется на текущий общий URL, не на старый адрес metadata.
+  Адрес сам по себе не требует rebuild; fingerprint и returned snapshot остаются
+  исходными. OpenRouter направляется только на канонический URL;
   mismatch, missing/deleted/stale/corrupt index и HTTP/векторная ошибка явны.
   При ON `extra_body.messages` отклоняется до retrieval/compression/LLM через
   error/done: оно заменило бы собранный RAG-контекст и исказило snapshot.
@@ -788,7 +795,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   credentials/headers не включаются. App redaction применяется до форматирования
   context: prompt, captured JSON и inspector показывают одну representation.
   Врезка — user data перед исходным вопросом, помечена как недоверенные источники,
-  не команды. Полные top5 не обрезаются скрыто; model context error остаётся явным.
+  не команды. Полные выбранные Top-K фрагменты не обрезаются скрыто; model context error остаётся явным.
 - SSE `retrieval` (query/stage) показывает фактическую подготовку; `start` несёт
   rag и zero-based `rag_at` в resolved_messages (null при OFF), затем генерацию.
   Done несёт тот же snapshot. Turn.rag nullable для OFF/legacy; messages.rag
@@ -809,7 +816,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   или чтения текущих chunk texts. Очистка messages удаляет принадлежащие им rag
   snapshots; rebuilding/deleting index не изменяет прошлые ответы. Пользователь
   сравнивает RAG ON/OFF самостоятельно; нет compare UI или набора видео-вопросов.
-  Citation enforcement, отдельная reranker-модель и task memory пока отсутствуют.
+  Citation enforcement и task memory пока отсутствуют; rerank описан ниже.
 - `checks/rag_chat_check.py`: нейтральные temporary HTML/SQLite и HTTP stubs,
   pinned rebuild/all strategies/top5, ON/OFF, actual model JSON+MCP rounds,
   canonical redaction/persistence/restart/fork, terminal errors/regenerate/cancel,
@@ -817,29 +824,35 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   retrieval на пользовательском архиве; corpus/questions/reports остаются private.
 
 
-## День 23: rewrite и cosine фильтрация
+## День 23: rewrite, cosine фильтрация и реранкинг
 
 - Новые `AgentSpec` имеют `rag_rewrite_enabled=true`, `rag_filter_enabled=true`,
-  `rag_candidates_k=20`, `rag_final_k=5`, `rag_similarity_threshold=0.3`.
+  `rag_top_k=5`, `rag_similarity_threshold=0.3`, `rag_rerank_enabled=false`.
   RAG по-прежнему default false. Чтение legacy config выставляет каждый отсутствующий
   boolean false независимо; миграция не запускает новый платный вызов. API требует
-  строгие bool, finite threshold [-1,1] и 1 ≤ final ≤ candidates ≤ 100; PATCH проверяет
+  строгие bool, finite threshold [-1,1] и Top-K от 1 до 100; PATCH проверяет
   effective config до изменения полей. Настройки сохраняются/копируются как конфиг чата.
-- При RAG ON rewrite использует только текущий model ID, отдельный `AgentSpec` и
+- Legacy final K мигрирует в Top-K; старое candidate K больше не управляет поиском.
+- При RAG ON rewrite использует текущие provider и model ID, отдельный `AgentSpec` и
   constrained service prompt: исходный вопрос и последние три полные успешные пары
   до сжатия. Инструкции чата, память, профиль, tools и extra_body не наследуются.
   JSON query bounded 8000 символами; пустой/invalid JSON, error/null/length finish —
   явная ошибка. Только finish_reason=stop означает успех. Один вызов, timeout 60s,
   без retries/fallback. Бюджет 9216 tokens учитывает reasoning; только точный
-  `openai/gpt-6-luna` получает reasoning.effort=none, как semantic preparation.
+  OpenRouter `openai/gpt-6-luna` получает reasoning.effort=none, как semantic preparation.
   `aclosing` закрывает stream при ошибке/отмене; cancel/can_run проверяются после
   событий и перед платными границами. Исходный вопрос остаётся вопросом final prompt.
 - `Index.retrieve` закрепляет identity и полные candidate hits в одном SQLite чтении.
-  Один query embedding. Приложение фильтрует score >= threshold и затем cap finalK;
-  порядок cosine/id сохраняется. Без фильтра cap сохраняется; при обоих этапах OFF
-  lookup сразу берёт finalK. Новая индексация не нужна. Фильтр не вызывает LLM.
+  Один query embedding на Top-K. При включённом фильтре остаются score >= threshold;
+  иначе все найденные hits. Порядок cosine/id сохраняется до optional rerank.
+  Реранкинг использует отдельно выбранные provider/model, constrained JSON вызов
+  timeout 60s и точную полную перестановку source_ids без повторов, пропусков,
+  чужих IDs и bool. Только finish_reason=stop означает успех; нет retries/fallback,
+  оценок от LLM и скрытого сокращения hits. Отмена не выдаёт identity permutation
+  за результат модели. Новая индексация не нужна. Фильтр не вызывает LLM.
 - Snapshot version2 расширяет v1: original_query/history_used/config, candidates с
-  полным hit и decision kept/threshold/final_cap, rewrite с query/model/actual usage,
+  полным hit и decision kept/threshold, rewrite с query/provider/model/actual usage,
+  rerank с provider/model/permutation/actual usage при успешном выполнении,
   timings rewrite_seconds/retrieval_seconds. Retrieval duration включает отбор;
   отдельное время фильтра не выдумывается. hits/context остаются финальными, полными
   и канонически redacted; тот же snapshot в prompt/start/done/Turn.rag. Старые v1
@@ -849,13 +862,13 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   Итоговые источники, индекс и контекст доступны независимо от этих этапов.
   Настройки RAG текущего чата находятся сверху «Работа RAG», отдельно от глобальной
   индексации и неизменного снимка ответа; без чата индексация остаётся доступной.
-- SSE retrieval stages rewrite/search/filter обозначают реальные включённые этапы.
+- SSE retrieval stages rewrite/search/filter/rerank обозначают реальные включённые этапы.
   Нулевой отбор даёт start(generation=false, resolved_messages=[], rag_at=null),
   deterministic delta/done «В базе не найдена подходящая информация». Сжатие, MCP
   и final model не запускаются; assistant, snapshot, actual rewrite JSON и usage
   сохраняются атомарно. Scheduler использует тот же путь и reminder_execution.
-- Rewrite request capture входит первым в preparation_requests, затем compression
-  и final/MCP rounds. Actual rewrite usage отдельно в snapshot, один раз входит в
+- Rewrite request capture входит первым в preparation_requests, затем rerank и compression
+  и final/MCP rounds. Actual rewrite/rerank usage отдельно в snapshot, каждый один раз входит в
   метрики assistant; summaries compression учитываются отдельно как прежде.
   Cancel/partial final generation сохраняют известную usage без двойного сложения.
   Unknown cost не оценивается. На интерактивной ошибке до commit доступные usage и
@@ -863,7 +876,12 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   не создаются; regenerate восстанавливает прежний answer/snapshot/requests. Scheduler
   error assistant объединяет доступные done.metrics с reminder_execution.
 - `checks/rag_refinement_check.py` — компактные offline synthetic hits/temporary Store:
-  threshold inclusive/threshold vs cap, query history/model isolation, strict success,
+  threshold inclusive/единственный Top-K, query history/model isolation, strict success,
   timeout/cancel/closure, nohits/reminders, request JSON/actual usage, restart/deepcopy,
   legacy и effective API validation. Day22 pinned rebuild/HTTP lookup suite сохранён.
   Это проверка контрактов; качество живой модели на пользовательском корпусе не измеряется.
+
+- `checks/models_check.py` проверяет общие provider payload/auth правила, стандартный
+  usage-only streaming frame, frozen URL при правке в полёте, legacy embedding
+  fingerprint с новым runtime адресом, mismatch dimensions, полный rerank permutation,
+  actual request capture и одно начисление usage при успехе/ошибке/отмене.

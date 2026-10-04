@@ -7,14 +7,14 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, InitVar
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
 from .documents import digest, write_json
-from .defaults import DEFAULT_GENERATIVE_MODEL
+from shared_models import DEFAULT_GENERATIVE_MODEL, OPENROUTER_BASE_URL
 
 WINDOW_CHARS = 12000
 WINDOW_UNITS = 256
@@ -22,16 +22,23 @@ WINDOW_UNITS = 256
 
 @dataclass(frozen=True)
 class SemanticConfig:
-    base_url: str = "https://openrouter.ai/api/v1"
+    base_url: str = OPENROUTER_BASE_URL
     model: str = DEFAULT_GENERATIVE_MODEL
     timeout_seconds: float = 60
     prompt_version: str = "boundary-v2"
-    auth_mode: str = "openrouter"
+    provider: str = "openrouter"
+    auth_mode: InitVar[str | None] = None
     payload_version: str = "boundary-normalization-v3"
 
-    def __post_init__(self):
-        if self.auth_mode not in {"openrouter", "omlx"}:
-            raise ValueError("Semantic auth mode must be openrouter or omlx")
+    def __post_init__(self, auth_mode):
+        from shared_models import provider, validate_url, endpoint
+        if auth_mode is not None:
+            from shared_models import legacy_provider
+            object.__setattr__(self, "provider", legacy_provider(auth_mode))
+        provider(self.provider)
+        validate_url(self.base_url)
+        if self.provider == "openrouter":
+            object.__setattr__(self, "base_url", endpoint("openrouter"))
         url = urlparse(self.base_url)
         if (url.scheme not in {"http", "https"} or not url.netloc or url.username or url.password
                 or url.query or url.fragment):
@@ -130,7 +137,7 @@ def _boundaries(body, units, limit):
 def _reasoning_options(config):
     # This exact provider/model capability is verified in OpenRouter's catalogue.
     # Do not pass provider-specific reasoning controls to arbitrary local models.
-    if (config.auth_mode == "openrouter" and config.base_url.rstrip("/") == "https://openrouter.ai/api/v1"
+    if (config.provider == "openrouter" and config.base_url.rstrip("/") == "https://openrouter.ai/api/v1"
             and config.model == "openai/gpt-6-luna"):
         return {"reasoning": {"effort": "none"}}
     return {}
@@ -141,7 +148,7 @@ def _payload(text, units, config, limit):
     # OpenRouter shares max_tokens between reasoning and visible JSON. Reserve
     # 8192 tokens beyond the bounded ID-list allowance for unknown reasoning models.
     # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-    return {"model": config.model, "temperature": 0, "max_tokens": 8192 + max(1024, 64 + len(units) * 12),
+    payload = {"model": config.model, "temperature": 0, "max_tokens": 8192 + max(1024, 64 + len(units) * 12),
             **_reasoning_options(config),
             "response_format": {"type": "json_object"}, "messages": [
                 {"role": "system", "content": "Choose semantic chunk boundaries in the supplied source units. "
@@ -153,6 +160,8 @@ def _payload(text, units, config, limit):
                  f"Each group's combined original character length must be <= {limit}. "
                  "Adjacent units on the same topic should stay together within that limit."},
                 {"role": "user", "content": json.dumps({"total_units": len(units), "last_unit_id": len(units), "units": numbered}, ensure_ascii=False)}]}
+    from shared_models import generation_payload
+    return generation_payload(payload, config.provider)
 
 
 def _contains_credential(value, credentials):
@@ -210,8 +219,9 @@ def _runtime_credentials():
 
 
 def _call(client, config, payload, trace=None, *, label="Semantic", before_send=None, response_limit=None):
-    raw_key = os.environ.get("OPENROUTER_API_KEY" if config.auth_mode == "openrouter" else "RAG_EMBEDDING_API_KEY", "")
-    key = raw_key.strip()
+    from shared_models import key as model_key, generation_payload
+    key = model_key(config.provider)
+    payload = generation_payload(payload, config.provider)
     credentials = _runtime_credentials()
     if _contains_credential(payload, credentials):
         raise ValueError(f"{label} request contains a runtime credential")
@@ -311,8 +321,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
     config = config or SemanticConfig()
     if client is None:
         # OpenRouter follows the chat transport's operator proxy settings;
-        # local oMLX must remain direct even when those settings are present.
-        with httpx.Client(timeout=config.timeout_seconds, trust_env=config.auth_mode == "openrouter") as local_client:
+        # compatible transport must remain direct even when those settings are present.
+        with httpx.Client(timeout=config.timeout_seconds, trust_env=config.provider == "openrouter") as local_client:
             return semantic_chunks(documents, config, size, overlap, root=root, client=local_client, operation=operation)
     started = time.monotonic()
     directory = Path(root) / "semantic-cache"

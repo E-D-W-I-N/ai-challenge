@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+from shared_models import OPENROUTER_BASE_URL
 _DOTENV_LOADED = False
 
 

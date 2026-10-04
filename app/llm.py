@@ -32,6 +32,7 @@ from typing import AsyncIterator
 import httpx
 
 from .config import OPENROUTER_BASE_URL, api_key, attribution_headers
+from shared_models import endpoint, key as provider_key, generation_payload
 from .schema import AgentSpec
 
 _SPEED_WINDOW_SECONDS = 5.0
@@ -212,6 +213,8 @@ def build_payload(
     `tool_choice` не отправляется вовсе: звать инструмент или ответить словами
     — решение модели, и принуждать её к вызову нам незачем.
     """
+    if session.provider == "compatible" and any(getattr(session, name) is not None for name in ("top_k", "min_p", "repetition_penalty")):
+        raise ValueError("Compatible standard chat API does not support top_k, min_p or repetition_penalty; clear these explicit settings")
     payload: dict = {
         "model": session.model,
         "messages": messages or [],
@@ -244,7 +247,7 @@ def build_payload(
         else:
             payload[key] = value
     from .store import redact
-    return redact(payload)
+    return redact(generation_payload(payload, session.provider))
 
 
 _request_capture = ContextVar("request_capture", default=None)
@@ -308,15 +311,17 @@ async def stream_completion(
     объявил: без `tools` накопитель остаётся пустым и события не бывает вовсе.
     Перебирающие события обязаны переживать незнакомый тип молча.
     """
-    key = api_key()
-    if key is None:
+    base_url = endpoint(session.provider)
+    router_key = api_key()  # Load the two allowed runtime keys at the application boundary.
+    key = router_key if session.provider == "openrouter" else provider_key(session.provider)
+    if not key and session.provider == "openrouter":
         raise MissingKeyError(
-            "OPENROUTER_API_KEY не найден. Скопируйте .env.example в .env и впишите ключ."
+            "Серверный ключ выбранного провайдера не настроен."
         )
 
     payload = build_payload(session, prompt_override, tools=tools)
     headers = {
-        "Authorization": f"Bearer {key}",
+        **({"Authorization": f"Bearer {key}"} if key else {}),
         "Content-Type": "application/json",
         **attribution_headers(),
     }
@@ -337,7 +342,7 @@ async def stream_completion(
             record_request(payload)
             async with client.stream(
                 "POST",
-                f"{OPENROUTER_BASE_URL}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers=headers,
                 json=payload,
             ) as response:

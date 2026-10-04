@@ -29,7 +29,7 @@ def check_preparation():
     assert default.model == "openai/gpt-6-luna"
     assert _payload("<p>Neutral</p>", default)["reasoning"] == {"effort": "none"}
     assert default.payload_version == "preparation-reasoning-v2"
-    for alternate in (replace(default, model="unverified"), replace(default, auth_mode="omlx"), replace(default, base_url="http://neutral.test/v1")):
+    for alternate in (replace(default, model="unverified"), replace(default, provider="compatible"), replace(default, base_url="http://neutral.test/v1", provider="compatible")):
         assert "reasoning" not in _payload("<p>Neutral</p>", alternate)
     for invalid in (True, False, 0, -1, 3601, float("nan"), float("inf"), "600"):
         try:
@@ -93,7 +93,7 @@ def check_preparation():
             html = root / "neutral.html"
             html.write_text(raw)
             inputs = [{"path": str(html), "source": "neutral://temperature"}]
-            config = PreparationConfig(f"http://127.0.0.1:{server.server_port}/v1", "requested-neutral")
+            config = PreparationConfig(f"http://127.0.0.1:{server.server_port}/v1", "requested-neutral", provider="compatible")
             ingest(inputs, root)
             assert not calls  # Default remains fully programmatic.
             legacy = load_corpus(root)
@@ -103,7 +103,7 @@ def check_preparation():
             assert load_corpus(root)["version"] == 1
             with Operation(root, "ingest") as operation:
                 report = ingest(inputs, root, preparation_strategy="llm", preparation_config=config, operation=operation)
-            assert len(calls) == 1 and calls[0][1] == "Bearer offline-chat-key"
+            assert len(calls) == 1 and calls[0][1] == "Bearer offline-local-key"
             assert json.loads(calls[0][0]["messages"][1]["content"])["html"] == raw
             assert calls[0][0]["max_tokens"] == 32768
             assert report["preparation"]["usage"]["total_tokens"] == 170
@@ -166,20 +166,20 @@ def check_preparation():
                 pass
             else:
                 raise AssertionError("Metadata changes retained old chunks")
-            local = replace(config, auth_mode="omlx")
+            local = replace(config, provider="compatible", model="another-neutral")
             ingest(inputs, root, preparation_strategy="llm", preparation_config=local)
             assert calls[-1][1] == "Bearer offline-local-key"
             manifest = root / "manifest.json"
             write_json(manifest, inputs)
             with contextlib.redirect_stdout(io.StringIO()):
-                assert main(["--root", str(root), "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
-                             "--preparation-base-url", local.base_url, "--preparation-model", local.model,
-                             "--preparation-auth-mode", "omlx"]) == 0
-            assert len(calls) == before + 2  # metadata call + oMLX; CLI is a cache hit.
+                assert main(["--root", str(root), "--compatible-base-url", local.base_url, "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
+                             "--preparation-model", local.model,
+                             "--preparation-provider", "compatible"]) == 0
+            assert len(calls) == before + 2  # metadata call + compatible server; CLI is a cache hit.
             with contextlib.redirect_stdout(io.StringIO()):
-                assert main(["--root", str(root), "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
-                             "--preparation-base-url", local.base_url, "--preparation-model", local.model,
-                             "--preparation-auth-mode", "omlx", "--preparation-timeout", "1200"]) == 0
+                assert main(["--root", str(root), "--compatible-base-url", local.base_url, "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
+                             "--preparation-model", local.model,
+                             "--preparation-provider", "compatible", "--preparation-timeout", "1200"]) == 0
             assert load_corpus(root)["preparation_config"]["timeout_seconds"] == 1200
             assert len(calls) == before + 3
             # Metadata bounds include sections, even when text itself would fit.
@@ -195,15 +195,14 @@ def check_preparation():
             mode["section"] = "New section"
             from app.rag_api import StageRequest, start
             from rag.index import Index
-            body = StageRequest(preparation_strategy="llm", preparation_base_url=config.base_url,
-                                preparation_model=config.model, preparation_auth_mode="omlx")
+            body = StageRequest(preparation_strategy="llm", preparation_model=config.model, preparation_provider="compatible")
             assert body.preparation_strategy == "llm" and body.strategy == "fixed"
             # Dispatch the actual API worker with an operator-owned neutral manifest.
             write_json(root / "inputs.json", inputs)
-            with patch("app.rag_api.Index", lambda: Index(root)):
+            with patch("app.rag_api.Index", lambda: Index(root)), patch("app.model_settings.settings", return_value={"compatible_base_url": config.base_url}):
                 before = len(calls)
                 acknowledgement = start("ingest", StageRequest(use_manifest=True, preparation_strategy="llm",
-                    preparation_base_url=config.base_url, preparation_model="api-neutral", preparation_auth_mode="omlx",
+                    preparation_model="api-neutral", preparation_provider="compatible",
                     preparation_timeout_seconds=1700))
                 assert acknowledgement["state"] == "running"
                 deadline = time.monotonic() + 5
