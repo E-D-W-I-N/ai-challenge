@@ -1539,6 +1539,7 @@ function fillPanel(agent) {
   fillStrategy(agent.strategy);
   $("#f-rag_enabled").checked = agent.rag_enabled === true;
   for (const name of ["rag_rewrite_enabled", "rag_filter_enabled"]) $("#f-" + name).checked = agent[name] === true;
+  syncRagFields();
   for (const [name, fallback] of Object.entries({rag_candidates_k: 20, rag_final_k: 5, rag_similarity_threshold: .3})) {
     $("#f-" + name).value = String(agent[name] ?? fallback);
   }
@@ -1581,6 +1582,12 @@ function syncStrategyFields() {
     // незачем, а мелькнуть он успел бы.
     if (label) $("#label-" + name).textContent = label;
   });
+}
+
+function syncRagFields() {
+  const enabled = $("#f-rag_enabled").checked;
+  $("#rag-chat-settings").classList.toggle("hidden", !enabled);
+  $("#rag-chat-parameters").classList.toggle("hidden", !enabled || !$("#f-rag_filter_enabled").checked);
 }
 
 function fillResponseFormat(value) {
@@ -1952,6 +1959,7 @@ function init() {
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
     // которое уже ни на что не влияет, — значит снова обещать не то.
     if (id === "f-strategy") syncStrategyFields();
+    if (id === "f-rag_enabled" || id === "f-rag_filter_enabled") syncRagFields();
     applySettings();
   });
   $("#panel-body").addEventListener("input", (ev) => {

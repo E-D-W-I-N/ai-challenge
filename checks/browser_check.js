@@ -101,7 +101,7 @@ async function main() {
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
     client.init(); await settle(); click("workspace-settings"); click("tab-btn-agent");
-    check("Legacy refinement switches stay off with numeric defaults", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_candidates_k").value === "20");
+    check("Legacy refinement switches stay off with numeric defaults", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_candidates_k").value === "20" && $("#rag-chat-settings").classList.contains("hidden") && $("#rag-chat-parameters").classList.contains("hidden"));
     $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
     $("#f-rag_candidates_k").value = "21"; $("#f-rag_final_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
     $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
@@ -114,8 +114,8 @@ async function main() {
     $("#f-rag_final_k").value = "22"; $("#f-rag_final_k").dispatchEvent(new Evt("change")); await settle();
     check("Final cap above candidate cap blocks PATCH", requests("PATCH", "/api/agents/ag_1").length === count && $("#save-status").textContent.includes("больше кандидатов"));
     $("#f-rag_final_k").value = "4";
-    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_candidates_k").value === "30" && $("#f-rag_final_k").value === "7");
-    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_candidates_k").value === "21" && $("#f-rag_rewrite_enabled").checked);
+    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_candidates_k").value === "30" && $("#f-rag_final_k").value === "7" && !$("#rag-chat-settings").classList.contains("hidden") && !$("#rag-chat-parameters").classList.contains("hidden"));
+    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_candidates_k").value === "21" && $("#f-rag_rewrite_enabled").checked && $("#rag-chat-settings").classList.contains("hidden") && $("#rag-chat-parameters").classList.contains("hidden"));
     click("workspace-chat"); const before = requests("GET", /^\/api\/rag\//).length;
     $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     const snapshot = $("#rag-answer-snapshot");

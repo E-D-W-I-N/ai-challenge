@@ -861,6 +861,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 #rag-answer-snapshot > p { margin: 0; line-height: 1.5; }
 #rag-answer-snapshot > button { align-self: start; }
 
+.rag-chat-settings { display: grid; gap: 20px; }
 .rag-chat-options { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .rag-chat-parameters > summary { cursor: pointer; color: var(--muted); }
 .rag-chat-numbers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
