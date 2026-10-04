@@ -16,7 +16,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rag.documents import digest
-from rag.semantic import SemanticConfig, _boundaries, _http_error, _payload, semantic_chunks
+from rag.semantic import SemanticConfig, _boundaries, _http_error, _payload, _normalize_boundary_ids, semantic_chunks
 
 
 def document(text):
@@ -44,7 +44,12 @@ def check_semantic():
     # packing would choose 40. Subsequent semantic group is capped separately.
     spans = _boundaries({"end_unit_ids": [3, 7]}, units, 20)
     assert spans == [(0, 20), (20, 30), (30, 50), (50, 70)]
-    for ids in ([3, 8], [0, 7], [3, 3, 7], [7, 3], [3], [True, 7], [1.0, 7]):
+    for repaired in ([3, 3, 7], [7, 3], [7, 3, 3], [3]):
+        assert _boundaries({"end_unit_ids": repaired}, units, 20) == spans
+    assert _normalize_boundary_ids({"end_unit_ids": [3, 3, 7]}, 7) == {
+        "model_end_unit_ids": [3, 3, 7], "normalized_end_unit_ids": [3, 7], "reordered": False,
+        "duplicates_removed": 1, "terminal_added": False}
+    for ids in ([3, 8], [0, 7], [True, 7], [1.0, 7], ["3", 7], [], None):
         try:
             _boundaries({"end_unit_ids": ids}, units, 20)
         except ValueError:
@@ -68,6 +73,14 @@ def check_semantic():
             ids = [1, 1, len(ids)]
         if mode["value"] == "missing":
             ids = ids[:-1]
+        if mode["value"] == "unordered":
+            ids = list(reversed(ids))
+        if mode["value"] == "empty":
+            ids = []
+        if mode["value"] == "wrong-type":
+            ids = ["1"]
+        if mode["value"] == "zero":
+            ids = [0]
         if mode["value"] == "oversize":
             ids = [len(ids)]
         content = json.dumps({"end_unit_ids": ids})
@@ -117,7 +130,7 @@ def check_semantic():
         assert cached["cost_usd"] == 0 and cached["model"] == "actual-neutral-model"
         cache_path = root / cached["trace_files"][0]
         saved = json.loads(cache_path.read_text())
-        assert saved["identity"]["config"]["payload_version"] == "boundary-budget-v2"
+        assert saved["identity"]["config"]["payload_version"] == "boundary-normalization-v3"
         saved["spans"][0][1] += 1
         cache_path.write_text(json.dumps(saved))
         rebuilt, fresh = semantic_chunks([doc], config, 90, 15, root=root, client=client)
@@ -155,9 +168,79 @@ def check_semantic():
             same, cached = semantic_chunks([short], config, 35, 5, root=split_root, client=client)
             assert same == bounded and cached["size_splits"] == normalized["size_splits"]
             assert len(requests) == before + 1 and cached["calls"] == 0 and cached["cost_usd"] == 0
-        expected_errors = {"malformed": "content is invalid JSON", "truncated": "token limit", "usage": "usage accounting",
+        # Real default-Luna HTTP payload with benign model contract variations.
+        for repaired, expected in (("missing", {"normalized_rounds": 1, "reordered_rounds": 0, "duplicate_ids_removed": 0, "terminal_cuts_added": 1}),
+                                   ("duplicate", {"normalized_rounds": 1, "reordered_rounds": 0, "duplicate_ids_removed": 1, "terminal_cuts_added": 0}),
+                                   ("unordered", {"normalized_rounds": 1, "reordered_rounds": 1, "duplicate_ids_removed": 0, "terminal_cuts_added": 0})):
+            mode["value"] = repaired
+            with tempfile.TemporaryDirectory() as repaired_root:
+                before = len(requests)
+                bounded, repaired_report = semantic_chunks([short], default, 35, 5, root=repaired_root, client=client)
+                assert len(requests) == before + 1 and repaired_report["calls"] == 1
+                actual_request = requests[-1]
+                supplied = json.loads(actual_request["messages"][-1]["content"])
+                assert actual_request["model"] == "openai/gpt-6-luna" and actual_request["reasoning"] == {"effort": "none"}
+                assert supplied["total_units"] == supplied["last_unit_id"] == len(supplied["units"])
+                assert repaired_report["boundary_normalization"] == expected and repaired_report["size_splits"] >= 0
+                assert repaired_report["usage"]["total_tokens"] == 60 and repaired_report["cost_usd"] == 0.00125
+                assert bounded[0]["start"] == 0 and bounded[-1]["end"] == len(short["text"])
+                assert all(c["text"] == short["text"][c["start"]:c["end"]] and len(c["text"]) <= 35 for c in bounded)
+                assert all(a["end"] - b["start"] == 5 for a, b in zip(bounded, bounded[1:]))
+                record_path = Path(repaired_root) / repaired_report["trace_files"][-1]
+                record = json.loads(record_path.read_text())
+                round_ = record["rounds"][0]
+                metadata = round_["boundary_normalization"]
+                assert json.loads(round_["response"]["choices"][0]["message"]["content"])["end_unit_ids"] == metadata["model_end_unit_ids"]
+                assert set(metadata["model_end_unit_ids"]) <= set(metadata["normalized_end_unit_ids"])
+                ends = {c["end"] for c in bounded}
+                assert all(supplied["units"][i - 1]["id"] == i for i in metadata["normalized_end_unit_ids"])
+                offset = 0
+                unit_ends = {}
+                for u in supplied["units"]:
+                    offset += len(u["text"]); unit_ends[u["id"]] = offset
+                assert all(unit_ends[i] in ends for i in metadata["model_end_unit_ids"])
+                raw_trace = Path(repaired_root) / repaired_report["trace_files"][0]
+                original_trace = raw_trace.read_bytes()
+                same, cached = semantic_chunks([short], default, 35, 5, root=repaired_root, client=client)
+                assert same == bounded and len(requests) == before + 1 and cached["calls"] == 0
+                assert cached["usage"] == {} and cached["cost_usd"] == 0
+                assert cached["boundary_normalization"] == expected and cached["size_splits"] == repaired_report["size_splits"]
+                assert raw_trace.read_bytes() == original_trace
+                # Cached corrections are recomputed from actual response, never trusted.
+                metadata["normalized_end_unit_ids"] = [999]
+                record_path.write_text(json.dumps(record))
+                recomputed, fresh = semantic_chunks([short], default, 35, 5, root=repaired_root, client=client)
+                assert recomputed == bounded and len(requests) == before + 2 and fresh["calls"] == 1
+        # Invalid IDs cannot replace already durable chunks, vectors, or published SQLite.
+        from rag.documents import ingest
+        from rag.embeddings import EmbeddingConfig
+        from rag.index import stage_chunks, stage_embeddings, save_index
+        def embedding(request):
+            body = json.loads(request.content)
+            return httpx.Response(200, json={"data": [{"index": i, "embedding": [1, 2, 3]} for i in range(len(body["input"]))]})
+        with tempfile.TemporaryDirectory() as durable, httpx.Client(transport=httpx.MockTransport(embedding)) as embedding_client:
+            durable = Path(durable)
+            source = durable / "neutral.html"; source.write_text("<article><h1>Neutral</h1><p>" + "Neutral source words. " * 15 + "</p></article>")
+            ingest([{"path": str(source), "source": "https://example.test/neutral"}], durable)
+            stage_chunks(durable, "fixed", 120, 10)
+            stage_embeddings(durable, EmbeddingConfig("http://neutral.test/v1", "offline-vector"), client=embedding_client)
+            save_index(durable)
+            previous = {name: (durable / name).read_bytes() for name in ("corpus.json", "chunks.json", "vectors.json", "index.sqlite")}
+            mode["value"] = "unknown"; before = len(requests)
+            try:
+                stage_chunks(durable, "semantic", 120, 10, semantic_config=default, client=client)
+            except ValueError as error:
+                assert "window 1" in str(error) and "must be within" in str(error)
+            else:
+                raise AssertionError("Accepted out-of-range boundary IDs")
+            assert len(requests) == before + 1
+            assert all((durable / name).read_bytes() == content for name, content in previous.items())
+            progress = json.loads((durable / "progress.json").read_text())
+            assert progress["state"] == "error" and progress["semantic_report"]["calls"] == 1
+            assert progress["semantic_report"]["usage"]["total_tokens"] == 60 and progress["semantic_report"]["cost_usd"] == 0.00125
+        expected_errors = {"unknown": "must be within", "zero": "must be within", "empty": "must not be empty", "wrong-type": "must be integers", "malformed": "content is invalid JSON", "truncated": "token limit", "usage": "usage accounting",
                            "null-content": "must contain JSON text"}
-        for bad in ("unknown", "duplicate", "missing", "malformed", "truncated", "usage", "null-content", "http", "transport", "reflected", "escaped-reflected"):
+        for bad in ("unknown", "zero", "empty", "wrong-type", "malformed", "truncated", "usage", "null-content", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
             with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
                 from types import SimpleNamespace
@@ -170,10 +253,12 @@ def check_semantic():
                     assert "credential-injected-secret" not in str(error)
                     if bad in expected_errors:
                         assert expected_errors[bad] in str(error), str(error)
+                    if bad in {"unknown", "zero", "empty", "wrong-type"}:
+                        assert "window 1" in str(error) and "expected IDs 1.." in str(error)
                 else:
                     raise AssertionError(bad)
                 assert len(requests) == before + 1  # Every error ends after one paid attempt.
-                if bad == "truncated":
+                if bad in {"truncated", "unknown", "zero", "empty", "wrong-type"}:
                     actual = captured["semantic_report"]
                     assert actual["calls"] == 1 and actual["model"] == "actual-neutral-model"
                     assert actual["usage"] == {"prompt_tokens": 51, "completion_tokens": 9, "total_tokens": 60}
