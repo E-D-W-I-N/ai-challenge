@@ -82,29 +82,29 @@
             <div class="save-status" id="save-status" role="status"></div>
           </header>
           <p class="warn hidden" id="settings-no-chat">Выберите или создайте чат, чтобы настроить модель и агента.</p>
-        <section class="tab-page settings-card hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
-          <div class="rag-operation-card">
+        <section class="tab-page hidden" id="tab-rag" role="tabpanel" aria-labelledby="tab-btn-rag" tabindex="0">
+          <div class="settings-card rag-operation-card">
             <p id="rag-status" role="status"></p><p id="rag-error" class="warn" role="alert"></p>
+            <nav id="rag-navigation" class="rag-stages" aria-label="Этапы работы RAG"></nav>
             <div id="rag-operation"></div>
           </div>
-          <p>Выполните четыре этапа последовательно. Документы и чанки доступны для просмотра до сохранения индекса.</p>
-          <nav id="rag-navigation" class="rag-navigation" aria-label="Этапы работы RAG"></nav>
-          <div id="rag-controls" class="rag-controls">
+          <div id="rag-controls" class="settings-card rag-controls">
+            <h3 id="rag-stage-heading">Документы</h3>
             <div id="rag-documents-controls" class="rag-stage-controls">
-            <label>URL документов, по одному на строку<textarea class="control" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
+            <label class="field"><span class="field-label">URL документов, по одному на строку</span><textarea class="control area" id="rag-urls" rows="4" placeholder="https://example.org/article.html"></textarea></label>
             <label id="rag-manifest-label" hidden><input id="rag-manifest" type="checkbox"> Использовать настроенный оператором HTML manifest</label>
             <button id="rag-ingest" class="primary-btn" type="button">Загрузить документы</button>
             </div>
             <div id="rag-chunks-controls" class="rag-stage-controls" hidden>
-            <label>Способ разбиения<select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
+            <label class="field"><span class="field-label">Способ разбиения</span><select class="control" id="rag-strategy"><option value="fixed">По размеру</option><option value="semantic">Семантическое · LLM</option></select></label>
             <div id="rag-semantic-fields" hidden>
-              <label>Сервер LLM<select class="control" id="rag-semantic-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
-              <label>URL сервера LLM<input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
-              <label>Модель для границ чанков<input class="control" id="rag-semantic-model" type="text" value="openai/gpt-4.1-mini"></label>
-              <p class="muted">LLM выбирает границы исходного текста. Повторное разбиение использует кэш. OpenRouter использует ключ чата; oMLX — ключ сервера эмбеддингов. Выберите отдельную генеративную модель для разбиения.</p>
+              <label class="field"><span class="field-label">Сервер LLM</span><select class="control" id="rag-semantic-auth-mode"><option value="openrouter">OpenRouter · ключ чата</option><option value="omlx">oMLX · ключ сервера эмбеддингов</option></select></label>
+              <label class="field"><span class="field-label">URL сервера LLM</span><input class="control" id="rag-semantic-base-url" type="url" value="https://openrouter.ai/api/v1"></label>
+              <label class="field"><span class="field-label">Модель для границ чанков</span><input class="control" id="rag-semantic-model" type="text" value="openai/gpt-4.1-mini"></label>
+              <p class="hint">LLM выбирает границы исходного текста. Повторное разбиение использует кэш.</p>
             </div>
-            <label>Размер чанка, символов<input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
-            <details><summary>Параметры разбиения</summary><label>Перекрытие, символов<input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>
+            <label class="field"><span class="field-label">Размер чанка, символов</span><input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
+            <details class="rag-detail"><summary>Параметры разбиения</summary><label class="field"><span class="field-label">Перекрытие, символов</span><input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>
             <div class="rag-actions">
             <button id="rag-split" class="primary-btn" type="button">Разбить на чанки</button>
             <button id="rag-delete-chunks" class="mcp-button danger" type="button">Удалить чанки</button>
@@ -112,10 +112,9 @@
             </div>
             </div>
             <div id="rag-embeddings-controls" class="rag-stage-controls" hidden>
-            <label>URL сервера эмбеддингов<input class="control" id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
-            <label>Модель эмбеддингов<input class="control" id="rag-model" type="text" value="mlx-community/Qwen3-Embedding-0.6B-8bit"></label>
-            <details><summary>Параметры эмбеддингов</summary><label>Размерность (пусто — от сервера)<input class="control" id="rag-dimensions" type="number" min="1"></label><label>Ревизия модели<input class="control" id="rag-revision" type="text" value="1"></label></details>
-            <p class="muted">Авторизация сервера задаётся оператором через RAG_EMBEDDING_API_KEY.</p>
+            <label class="field"><span class="field-label">URL сервера эмбеддингов</span><input class="control" id="rag-base-url" type="url" value="http://127.0.0.1:8005/v1"></label>
+            <label class="field"><span class="field-label">Модель эмбеддингов</span><input class="control" id="rag-model" type="text" value="mlx-community/Qwen3-Embedding-0.6B-8bit"></label>
+            <details class="rag-detail"><summary>Параметры эмбеддингов</summary><label class="field"><span class="field-label">Размерность (пусто — от сервера)</span><input class="control" id="rag-dimensions" type="number" min="1"></label><label class="field"><span class="field-label">Ревизия модели</span><input class="control" id="rag-revision" type="text" value="1"></label></details>
             <div class="rag-actions">
             <button id="rag-embed" class="primary-btn" type="button">Создать эмбеддинги</button>
             <button id="rag-delete-embeddings" class="mcp-button danger" type="button">Удалить эмбеддинги</button>
@@ -125,10 +124,14 @@
             <div class="rag-actions"><button id="rag-save" class="primary-btn" type="button">Сохранить индекс</button>
             <button id="rag-delete-index" class="mcp-button danger" type="button" hidden>Удалить индекс</button></div>
             </div>
-            <p id="rag-stage-status" role="status"></p>
+            <p id="rag-stage-status" class="hint" role="status"></p>
           </div>
-          <div id="rag-index"></div>
-          <div id="rag-ingestion"></div><div id="rag-documents"></div><div id="rag-document-preview"></div><div id="rag-chunks"></div><div id="rag-chunk"></div>
+          <div id="rag-index" class="settings-card rag-result"></div>
+          <div id="rag-ingestion" class="rag-result"></div>
+          <div id="rag-documents" class="settings-card rag-result"></div>
+          <div id="rag-document-preview" class="settings-card rag-result"></div>
+          <div id="rag-chunks" class="settings-card rag-result"></div>
+          <div id="rag-chunk" class="settings-card rag-result"></div>
         </section>
         <section class="tab-page settings-card" id="tab-model" role="tabpanel" aria-labelledby="tab-btn-model" tabindex="0">
           <label class="field">

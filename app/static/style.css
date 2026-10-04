@@ -809,38 +809,35 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .mcp-button { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-height: 44px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
 .mcp-button:disabled, .mcp-config-actions .mem-add:disabled { opacity: .6; cursor: not-allowed; }
 
-/* Full-width read-only RAG inspector, within the existing workspace. */
+/* RAG uses the same cards, fields and controls as the other settings pages. */
 #tab-rag { min-width: 0; }
-#tab-rag > div { margin-block: 1rem; }
-.rag-stages { display: flex; flex-wrap: wrap; gap: 1.5rem; padding-left: 1.5rem; }
-.rag-stages .active { font-weight: 700; }
-.rag-item, .rag-pager { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-block: .5rem; }
-#rag-chunks > button { display: block; max-width: 100%; margin-block: .5rem; white-space: normal; text-align: left; }
-.rag-detail { margin-block: .7rem; }
-.rag-detail summary { cursor: pointer; overflow-wrap: anywhere; }
-.rag-detail pre, .rag-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: .8rem; background: var(--surface, #f5f5f5); }
-
-.rag-controls { display: grid; gap: .75rem; max-width: 760px; margin-bottom: 1.5rem; }
-.rag-controls label { display: grid; gap: .3rem; }
-.rag-controls label[hidden] { display: none; }
-.rag-controls input:not([type="checkbox"]), .rag-controls textarea, .rag-controls select { width: 100%; }
-.rag-controls > .primary-btn { justify-self: start; }
-.rag-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
-.rag-controls .primary-btn:disabled { opacity: .6; cursor: not-allowed; }
-.rag-actions .danger { color: var(--danger); }
-
-.rag-operation-card { margin-bottom: 1.25rem; padding: 1rem 1.15rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-soft); }
-.rag-operation-card > p:first-child { margin-top: 0; font-weight: 600; }
-.rag-operation-card p { margin-block: .5rem; }
+#tab-rag > .settings-card, #rag-ingestion { margin-bottom: 16px; }
+#tab-rag [hidden], #tab-rag .rag-result:empty { display: none; }
+.rag-operation-card { background: var(--bg-soft); gap: 12px; }
+.rag-operation-card p, .rag-result p { margin: 0; line-height: 1.5; }
+#rag-status { font-weight: 600; font-size: 16px; }
 #rag-error:empty { display: none; }
-.rag-operation-card .rag-stages { list-style: none; padding: 0; gap: .5rem; }
-.rag-operation-card .rag-stages li { padding: .35rem .65rem; border-radius: 6px; color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
-.rag-operation-card .rag-stages .active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
-.rag-stage-controls { display: grid; gap: .75rem; }
-.rag-stage-controls[hidden] { display: none; }
+.rag-stages { display: flex; flex-wrap: wrap; gap: 8px; }
+.rag-step { flex: 1 1 auto; background: var(--bg); }
+.rag-step[aria-current="step"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); font-weight: 600; }
+.rag-step.running::after { content: " · выполняется"; font-size: 11px; font-weight: 400; }
+#rag-operation { display: grid; gap: 8px; color: var(--muted); font-size: 13px; }
+.rag-controls { gap: 14px; }
+.rag-stage-controls, #rag-semantic-fields { display: grid; gap: 14px; }
 .rag-stage-controls > .primary-btn { justify-self: start; }
-.rag-chunk-usage { font-size: 12px; overflow-wrap: anywhere; flex: 1 1 15rem; }
-.rag-chunk-usage[hidden] { display: none; }
-
-.rag-navigation { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
-.rag-navigation button[aria-current="step"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); font-weight: 700; }
+.rag-controls .primary-btn:disabled { opacity: .6; cursor: not-allowed; }
+#rag-manifest-label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.rag-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.rag-actions .danger { color: var(--danger); }
+.rag-chunk-usage { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; flex: 1 1 15rem; }
+.rag-result { gap: 12px; }
+.rag-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.rag-item button { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
+.rag-item .muted, .rag-pager { font-size: 12px; }
+.rag-pager { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+#rag-chunks > button { align-self: stretch; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.rag-detail { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); min-width: 0; }
+.rag-detail summary { padding: 10px 12px; cursor: pointer; overflow-wrap: anywhere; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.rag-detail > label { margin: 0 12px 12px; }
+.rag-detail pre, .rag-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: 12px; background: var(--code-bg); font-size: 12px; line-height: 1.6; border-radius: 7px; }
+.rag-detail pre { border-top: 1px solid var(--line); border-radius: 0 0 7px 7px; }
