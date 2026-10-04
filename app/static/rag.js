@@ -41,6 +41,19 @@ function createRagInspector({ state, $, el, api }) {
     const next = button("Далее", () => action(offset + PAGE)); next.disabled = count < PAGE;
     row.append(previous, el("span", "", `${offset + 1}–${offset + count}`), next); target.append(row);
   }
+  function selectionRows(target, selected) {
+    for (const row of target.querySelectorAll(".rag-list-row")) {
+      const active = row.dataset.itemId === selected;
+      row.classList.toggle("selected", active);
+      row.setAttribute("aria-pressed", String(active));
+    }
+  }
+  function listRow(id, title, metadata, action) {
+    const row = button("", action); row.className = "mcp-button rag-list-row";
+    row.dataset.itemId = id;
+    row.append(el("span", "rag-row-title", title), el("span", "muted rag-row-meta", metadata));
+    return row;
+  }
   async function documents(offset = documentOffset) {
     const token = epoch, preview = previewEpoch, request = ++documentRequest;
     const data = await api(`/api/rag/documents?offset=${offset}&limit=${PAGE}${workingQuery()}`);
@@ -48,34 +61,44 @@ function createRagInspector({ state, $, el, api }) {
     documentOffset = offset;
     const target = $("#rag-documents"); target.replaceChildren(el("h3", "", working ? "Загруженные документы" : "Документы сохранённого индекса"));
     data.items.forEach((item) => {
-      const row = el("div", "rag-item");
-      row.append(button(item.title, () => selectDocument(item).catch(showError)), el("span", "muted", `${item.words} слов · ${item.characters} символов`));
+      const row = listRow(item.document_id, item.title, `${item.words} слов · ${item.characters} символов`, () => selectDocument(item).catch(showError));
       target.append(row);
     });
+    selectionRows(target, selectedDocument?.document_id);
     pager(target, offset, data.items.length, (next) => documents(next).catch(showError));
   }
   async function selectDocument(item, offset = 0) {
+    const changed = selectedDocument?.document_id !== item.document_id;
     selectedDocument = item;
+    selectionRows($("#rag-documents"), item.document_id);
+    if (changed) {
+      selectedChunk = null; textRequest++; vectorView = null;
+      $("#rag-chunk").replaceChildren();
+      $("#rag-document-preview").replaceChildren();
+    }
     const token = epoch, preview = previewEpoch, request = ++chunkRequest;
     const target = $("#rag-chunks");
-    if (working) {
+    target.replaceChildren();
+    if (working && (changed || !$("#rag-document-preview").children.length)) {
       const text = await api(`/api/rag/documents/${encodeURIComponent(item.document_id)}?offset=0&limit=10000`);
       if (token !== epoch || preview !== previewEpoch || request !== chunkRequest || !visible()) return;
       const cleaned = detail(`Очищенный документ · первые ${Math.min(text.characters, 10000)} из ${text.characters} символов`, {});
       cleaned.querySelector("pre").textContent = text.text;
       $("#rag-document-preview").replaceChildren(el("h3", "", item.title), detail("Метаданные документа", item), cleaned);
-      target.replaceChildren();
     }
     if (!hasChunks) return;
     const data = await api(`/api/rag/documents/${encodeURIComponent(item.document_id)}/chunks?offset=${offset}&limit=${PAGE}${workingQuery()}`);
     if (token !== epoch || preview !== previewEpoch || request !== chunkRequest || !visible() || selectedDocument.document_id !== item.document_id) return;
     chunkOffset = offset;
     if (!working) target.replaceChildren(el("h3", "", item.title), detail("Метаданные документа", item));
-    data.items.forEach((chunk) => target.append(button(`${chunk.section || "Без раздела"} · [${chunk.start}, ${chunk.end})`, () => selectChunk(chunk).catch(showError))));
+    data.items.forEach((chunk) => target.append(listRow(chunk.chunk_id, chunk.section || "Без раздела", `[${chunk.start}, ${chunk.end}) · ${chunk.end - chunk.start} символов`, () => selectChunk(chunk).catch(showError))));
+    selectionRows(target, selectedChunk);
     pager(target, offset, data.items.length, (next) => selectDocument(item, next).catch(showError));
   }
   async function selectChunk(item) {
+    if (selectedChunk !== item.chunk_id) { $("#rag-chunk").replaceChildren(); vectorView = null; }
     selectedChunk = item.chunk_id;
+    selectionRows($("#rag-chunks"), selectedChunk);
     const token = epoch, preview = previewEpoch, request = ++textRequest;
     const data = await api(`/api/rag/chunks/${encodeURIComponent(item.chunk_id)}${working ? "?working=true" : ""}`);
     if (token !== epoch || preview !== previewEpoch || request !== textRequest || !visible() || selectedChunk !== item.chunk_id) return;
@@ -245,19 +268,6 @@ function createRagInspector({ state, $, el, api }) {
         : selectedStep === "embeddings" ? (stages.embeddings ? `Эмбеддинги готовы · размерность: ${stages.embeddings.dimension}` : "Эмбеддинги ещё не созданы")
         : data.index ? "Индекс опубликован" : "Готово к сохранению индекса";
     }
-    const usage = $("#rag-chunk-usage"), chunks = stages.chunks;
-    const report = chunks?.strategy === "semantic" ? chunks.report : null;
-    usage.hidden = !report;
-    usage.textContent = "";
-    if (report) {
-      const tokens = report.calls === 0 ? 0 : report.usage?.total_tokens
-        ?? (Number.isInteger(report.usage?.prompt_tokens) && Number.isInteger(report.usage?.completion_tokens)
-          ? report.usage.prompt_tokens + report.usage.completion_tokens : "не сообщены");
-      const cost = report.calls === 0 ? 0 : report.cost_usd;
-      const billed = typeof cost === "number" && Number.isFinite(cost) && cost >= 0
-        ? `${cost.toLocaleString("en-US", {maximumSignificantDigits: 12})} USD` : "недоступна";
-      usage.textContent = `LLM: ${report.model || chunks.semantic_config?.model || "не сообщена"} · токены: ${tokens} · стоимость: ${billed}`;
-    }
   }
   function chunkOptions() {
     const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
@@ -372,6 +382,7 @@ function createRagInspector({ state, $, el, api }) {
     strategy.dataset.dirty = "true";
     const semantic = strategy.value === "semantic";
     $("#rag-semantic-fields").hidden = !semantic;
+    $("#rag-size-label").textContent = semantic ? "Максимальный размер чанка, символов" : "Размер чанка, символов";
     $("#rag-size").max = semantic ? "12000" : "100000";
     if (semantic) loadSemanticModels(); else cancelModelRequest();
   };

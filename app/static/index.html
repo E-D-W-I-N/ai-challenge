@@ -104,12 +104,11 @@
               <div class="rag-actions"><button id="rag-model-refresh" class="mcp-button" type="button">Обновить модели</button><span id="rag-model-status" class="hint" role="status"></span></div>
               <p class="hint">Выберите генеративную модель. LLM выбирает границы исходного текста. Повторное разбиение использует кэш.</p>
             </div>
-            <label class="field"><span class="field-label">Размер чанка, символов</span><input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
+            <label class="field" for="rag-size"><span id="rag-size-label" class="field-label">Размер чанка, символов</span><input class="control" id="rag-size" type="number" min="64" max="100000" value="1200"></label>
             <details class="rag-detail"><summary>Параметры разбиения</summary><label class="field"><span class="field-label">Перекрытие, символов</span><input class="control" id="rag-overlap" type="number" min="0" value="180"></label></details>
             <div class="rag-actions">
             <button id="rag-split" class="primary-btn" type="button">Разбить на чанки</button>
             <button id="rag-delete-chunks" class="mcp-button danger" type="button">Удалить чанки</button>
-            <span id="rag-chunk-usage" class="muted rag-chunk-usage" role="status" hidden></span>
             </div>
             </div>
             <div id="rag-embeddings-controls" class="rag-stage-controls" hidden>
