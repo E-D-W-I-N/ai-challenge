@@ -72,9 +72,13 @@ async function main() {
     const sourceBox = $("#feed").querySelector(".card-rag");
     check("Answer sources render as inert text", sourceBox.textContent.includes("<script>neutral source</script>") && !sourceBox.querySelector("a"));
     const late = deferred(); server.respond("GET", "/api/rag/status", () => late.promise);
-    click("workspace-settings"); click("tab-btn-rag"); await settle(); click("workspace-chat");
+    click("workspace-settings"); click("tab-btn-rag"); await settle();
+    const lateSettings = deferred(); server.respond("PATCH", "/api/agents/ag_1", () => lateSettings.promise);
+    $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
+    click("workspace-chat");
     const before = requests("GET", /^\/api\/rag\//).length;
     sourceBox.querySelector("button").dispatchEvent(new Evt("click"));
+    lateSettings.resolve(json({...server.state.agents[0], rag_enabled: false}));
     late.resolve(json({state: "ready", index: {index_id: "new-index", rows: {documents: 0, chunks: 0}}})); await settle();
     const snapshot = $("#rag-answer-snapshot");
     check("Historical inspector uses saved identity/context without live reads", !snapshot.hidden && $("#rag-workflow").hidden
@@ -83,12 +87,13 @@ async function main() {
       && requests("GET", /^\/api\/rag\//).length === before);
     check("Legacy snapshot has one query and no refinement details", !snapshot.querySelector(".rag-snapshot-original-query") && snapshot.querySelector(".rag-snapshot-query").textContent === rag.query && !snapshot.textContent.includes("Переформулирование") && !snapshot.querySelector(".rag-snapshot-candidate"));
     check("Late current-index response cannot overwrite historical snapshot", !snapshot.textContent.includes("new-index") && snapshot.textContent.includes("0.9234"));
+    check("Historical inspection hides chat editing and its save status", $("#rag-current-chat").hidden && $("#f-rag_enabled").disabled && $("#save-status").classList.contains("hidden") && !$("#settings-scope").hidden);
     server.respond("GET", "/api/rag/status", {state: "missing"});
     snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle();
-    check("Current workflow stays mounted and reachable after historical inspection", snapshot.hidden && !$("#rag-workflow").hidden && $("#rag-status").textContent === "Индекс отсутствует");
+    check("Current workflow stays mounted and restores chat editing after historical inspection", snapshot.hidden && !$("#rag-workflow").hidden && $("#rag-status").textContent === "Индекс отсутствует" && !$("#rag-current-chat").hidden && !$("#f-rag_enabled").disabled && !$("#save-status").classList.contains("hidden"));
     click("workspace-chat"); $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click"));
     open(1); await settle();
-    check("Historical selection is cleared when active chat changes", snapshot.hidden && !snapshot.children.length && !$("#rag-workflow").hidden);
+    check("Historical selection is cleared and chat editing restored when active chat changes", snapshot.hidden && !snapshot.children.length && !$("#rag-workflow").hidden && !$("#rag-current-chat").hidden && !$("#f-rag_enabled").disabled);
   });
   await scenario("RAG refinement fields and saved candidate decisions", async () => {
     const rag = {version: 2, original_query: "А что затем?", query: "neutral rewritten query", index: {index_id: "neutral-v2"},
@@ -150,12 +155,14 @@ async function main() {
         node.querySelector(".rag-snapshot-context").textContent === rag.context && content.includes("final text")
         && content.includes("saved-flags") && JSON.stringify(client.state.current.transcript[1].rag) === saved
         && requests("GET", /^\/api\/rag\//).length === before);
+      node.querySelector("button").dispatchEvent(new Evt("click")); await settle();
       $("#f-rag_filter_enabled").checked = filter;
       $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
+      $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
       check("Changing current settings saves next-answer config without changing inspected snapshot " + rewrite + "/" + filter,
         requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_filter_enabled === filter
         && node.textContent === content && JSON.stringify(client.state.current.transcript[1].rag) === saved
-        && !$("#save-status").classList.contains("hidden"));
+        && $("#rag-current-chat").hidden && $("#save-status").classList.contains("hidden"));
     });
   }
   await scenario("RAG actual stages, deterministic no-hit and failed rewrite diagnostics", async () => {

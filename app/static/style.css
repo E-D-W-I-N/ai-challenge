@@ -463,6 +463,7 @@ select.control {
   font-size: 12px;
   line-height: 1.45;
 }
+.scope-badge[hidden] { display: none; }
 .layer-scope { margin: -7px 0 0; color: var(--muted); font-size: 12px; }
 .tab-page { display: flex; flex-direction: column; gap: 24px; min-width: 0; padding-bottom: 12px; }
 .settings-card {
@@ -850,6 +851,9 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 /* Answer-owned retrieval snapshot uses the existing full-width settings page. */
 #rag-workflow { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 #rag-workflow[hidden] { display: none; }
+#rag-current-chat { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+#rag-current-chat[hidden] { display: none; }
+#rag-current-chat > .scope-badge, #rag-workflow > .scope-badge { align-self: flex-start; }
 .rag-toggle { display: flex; align-items: center; gap: 10px; font-size: 14px; }
 .rag-toggle .control { width: 17px; height: 17px; margin: 0; flex: none; }
 .card-rag { margin: 16px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }

@@ -1411,11 +1411,10 @@ function syncChatControls() {
   const noChat = !state.current;
   $("#settings-no-chat").classList.toggle("hidden", !noChat || !["model", "agent", "rag"].includes(state.section));
   $("#save-status").classList.toggle("hidden", noChat || !["model", "agent", "rag"].includes(state.section));
-  $("#rag-current-chat").hidden = noChat;
   ["model", "agent"].forEach((name) => {
     $("#tab-" + name).querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
   });
-  $("#rag-current-chat").querySelectorAll(".control").forEach((field) => { field.disabled = noChat; });
+  ragInspector.syncChatControls();
 }
 
 function loadVisibleSettings() {
@@ -1467,6 +1466,7 @@ function showSettings(which, load = true) {
   $("#settings-title").textContent = title;
   $("#settings-description").textContent = description;
   $("#settings-scope").textContent = scope;
+  $("#settings-scope").hidden = which === "rag";
   $("#save-status").classList.toggle("hidden", !["model", "agent", "rag"].includes(which));
   $("#panel-body").scrollTop = state.sectionScroll.get(which) || 0;
   syncChatControls();
@@ -1660,6 +1660,7 @@ function saveStatus(text, isError) {
   el.className = "save-status" + (isError ? " error" : "")
     + (!["model", "agent", "rag"].includes(state.section) ? " hidden" : "");
   el.textContent = text || "";
+  ragInspector.syncChatControls();
   if (state.statusTimer) clearTimeout(state.statusTimer);
   state.statusTimer = null;
   if (!text || isError) return;
