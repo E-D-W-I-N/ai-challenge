@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from rag import workflow
@@ -15,6 +15,7 @@ from rag.documents import ingest
 from rag.embeddings import EmbeddingConfig
 from rag.semantic import SemanticConfig
 from rag.index import Index, Operation, stage_chunks, stage_embeddings, save_index
+from .request_security import trusted_rag_request
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
@@ -32,7 +33,7 @@ def status():
     return result
 
 
-@router.get("/models")
+@router.get("/models", dependencies=[Depends(trusted_rag_request)])
 async def model_catalogue(auth_mode: Literal["openrouter", "omlx"], base_url: str = Query(max_length=2048)):
     from .rag_models import models
     return await models(auth_mode, base_url)
@@ -57,7 +58,7 @@ class StageRequest(BaseModel):
         extra = "forbid"
 
 
-@router.post("/operations/{kind}", status_code=202)
+@router.post("/operations/{kind}", status_code=202, dependencies=[Depends(trusted_rag_request)])
 def start(kind: str, body: StageRequest):
     if kind not in {"ingest", "chunks", "embeddings", "save"}:
         raise HTTPException(404, "Unknown RAG stage")
@@ -138,7 +139,7 @@ def chunk(chunk_id: str, vector: bool = False, working: bool = False):
     return read(lambda index: workflow.chunk(index.root, chunk_id, vector) if working else index.chunk(chunk_id, vector))
 
 
-@router.delete("/stages/{kind}")
+@router.delete("/stages/{kind}", dependencies=[Depends(trusted_rag_request)])
 def delete_stage(kind: str):
     if kind not in {"chunks", "embeddings", "index"}:
         raise HTTPException(404, "Unknown RAG stage")

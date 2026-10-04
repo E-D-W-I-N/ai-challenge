@@ -5465,6 +5465,12 @@ def check_rag_model_catalogue():
     return check_rag_models()
 
 
+@check("security: bounded chat errors and trusted-origin RAG credential actions")
+def check_security_boundaries():
+    from checks.security_check import check_security
+    return check_security()
+
+
 @check("RAG: semantic exact source boundaries and cache validation")
 def check_rag_semantic():
     from checks.semantic_check import check_semantic

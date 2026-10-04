@@ -348,8 +348,18 @@ async def stream_completion(
                 json=payload,
             ) as response:
                 if response.status_code >= 400:
-                    body = (await response.aread()).decode("utf-8", "replace")
-                    metrics.error = f"HTTP {response.status_code}: {body[:600]}"
+                    # Provider bodies can reflect Authorization in encoded forms.
+                    # Fixed diagnostics never copy upstream text into SSE/metrics.
+                    messages = {
+                        400: "Сервер модели отклонил параметры запроса.",
+                        401: "Сервер модели отклонил авторизацию. Проверьте серверный ключ.",
+                        402: "Недостаточно средств у провайдера модели.",
+                        403: "Сервер модели запретил доступ. Проверьте права серверного ключа.",
+                        404: "Модель или маршрут сервера не найден.",
+                        429: "Превышен лимит запросов. Попробуйте позже.",
+                    }
+                    description = messages.get(response.status_code, "Сервер модели временно недоступен." if response.status_code >= 500 else "Сервер модели отклонил запрос.")
+                    metrics.error = f"HTTP {response.status_code}: {description}"
                     metrics.elapsed_ms = (time.monotonic() - started) * 1000
                     yield {"type": "error", "message": metrics.error, "metrics": metrics.as_dict()}
                     return
@@ -461,7 +471,15 @@ async def stream_completion(
                         yield {"type": "metrics", "metrics": metrics.as_dict()}
 
     except httpx.HTTPError as exc:
-        metrics.error = f"{type(exc).__name__}: {exc}"
+        # Exception strings may contain URLs, headers or reflected credentials.
+        if isinstance(exc, httpx.TimeoutException):
+            metrics.error = "Сервер модели не ответил вовремя. Попробуйте позже."
+        elif isinstance(exc, httpx.NetworkError):
+            metrics.error = "Не удалось подключиться к серверу модели. Проверьте сеть."
+        elif isinstance(exc, httpx.ProtocolError):
+            metrics.error = "Нарушен протокол связи с сервером модели. Попробуйте позже."
+        else:
+            metrics.error = "Ошибка связи с сервером модели. Попробуйте позже."
         metrics.elapsed_ms = (time.monotonic() - started) * 1000
         yield {"type": "error", "message": metrics.error, "metrics": metrics.as_dict()}
         return

@@ -27,6 +27,7 @@ FastAPI отдаёт HTML, CSS и четыре обычных локальных
 | Markdown, формат, JSON/stop | text.js | Чистый разбор и один путь текста в карточку под Node | Клиент; Промпт, контекст и метрики |
 | Панель → запрос | app.js: readPanel, applySettings, ensurePanelApplied, exchange | Реальные поля → payload под Node; контракт вызова в Python | Клиент; Промпт, контекст и метрики |
 | Поток, метрики, информация JSON | app.js: exchange, refreshCurrent, renderFeed, usageLine, showPrompt | Success/error, persisted JSON rounds/legacy, отмена/смена области; actual outbound payload/restart и серверные суммы | Промпт, контекст и метрики; Клиент |
+| Диагностика HTTP и источник RAG-запроса | app/llm.py; app/request_security.py; app/rag_api.py | Offline HTTP/transport ошибки без отражения ключей; same-origin/default-port и отказ до доступа к ключу/писателю | Промпт, контекст и метрики; RAG: документы, индекс и инспектор |
 | CRUD и ошибки editor | records.js: startRecordEdit, loadMemory, editWorking/editMemory, editInvariant | Scope/id/различающий тип, один PATCH Enter/focusout, текст после отказа | Память и профиль; Инварианты и сторож; Клиент |
 | Профиль и аватар | records.js: loadProfile, saveProfile, toggleProfileMenu | Partial PATCH/dirty/error под Node; глобальность и prompt в Python | Память и профиль; Клиент |
 | Машина задачи | app.js: parseCommand, runCommand, taskApi | Двойной Enter и смена чата при PATCH под Node; stage/gate/atomic в Python | Состояние задачи |
