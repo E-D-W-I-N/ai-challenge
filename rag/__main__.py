@@ -31,9 +31,10 @@ def main(argv=None):
     split.add_argument("--overlap", type=int, default=180)
     split.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
     split.add_argument("--semantic-model", default=SemanticConfig.model)
+    split.add_argument("--semantic-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
     commands.add_parser("save")
     clear_command = commands.add_parser("clear")
-    clear_command.add_argument("stage", choices=("chunks", "embeddings"))
+    clear_command.add_argument("stage", choices=("chunks", "embeddings", "index"))
     for name in ("index", "compare", "embed"):
         command = commands.add_parser(name)
         command.add_argument("--base-url", default=EmbeddingConfig.base_url)
@@ -47,6 +48,7 @@ def main(argv=None):
             command.add_argument("--overlap", type=int, default=180)
             command.add_argument("--semantic-base-url", default=SemanticConfig.base_url)
             command.add_argument("--semantic-model", default=SemanticConfig.model)
+            command.add_argument("--semantic-auth-mode", choices=("openrouter", "omlx"), default="openrouter")
     commands.add_parser("status")
     args = parser.parse_args(argv)
     root = args.root.resolve()
@@ -71,7 +73,7 @@ def main(argv=None):
             with Operation(root, "delete_" + args.stage) as operation:
                 result = clear(root, args.stage, operation)
         elif args.command == "chunks":
-            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model))
+            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model, auth_mode=args.semantic_auth_mode))
         elif args.command == "save":
             result = save_index(root)
         elif args.command == "status":
@@ -79,7 +81,7 @@ def main(argv=None):
         else:
             config = EmbeddingConfig(args.base_url, args.model, args.dimensions, args.revision)
             if args.command == "index":
-                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model))
+                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(args.semantic_base_url, args.semantic_model, auth_mode=args.semantic_auth_mode))
             elif args.command == "embed":
                 result = stage_embeddings(root, config, args.batch_size)
             else:

@@ -552,8 +552,13 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   ограничена size-overlap; последующим чанкам добавляется точный исходный
   overlap. Чанки — source slices, ошибочный JSON/границы не заменяются fixed.
   `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
-  64–12000. Runtime `RAG_CHUNKING_API_KEY` или fallback `OPENROUTER_API_KEY`
-  читается только HTTP-границей, standalone не загружает `.env`.
+  64–12000. `auth_mode` выбирает OpenRouter (по умолчанию, тот же runtime
+  `OPENROUTER_API_KEY.strip()`, что в чате) или oMLX (`RAG_EMBEDDING_API_KEY.strip()`).
+  Endpoint и генеративная модель задаются отдельно от embedding config.
+  Runtime ключ читается только HTTP-границей, standalone не загружает `.env`;
+  прежний `RAG_CHUNKING_API_KEY` не выбирает авторизацию. Auth mode входит в
+  nonsecret config/cache identity, ротация ключа identity не меняет.
+  Отражённые raw/нормализованные runtime ключи отсекаются до записи trace.
   `semantic-cache` хранит приватные проверенные per-document segmentation и
   request/response traces без auth headers; identity включает document/hash,
   config, prompt version, size/overlap, не ключ. Текущий report содержит actual
@@ -614,7 +619,9 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   остаётся отзывчивым. Ошибка запуска/initial progress освобождает lock. HTTP не
   принимает пути; локальный manifest выбирается только через операторский
   `RAG_MANIFEST`, а URL перечисляются явно. Нет реестра нескольких корпусов.
-- DELETE `/stages/chunks` удаляет chunks/vectors/index, semantic/embedding caches
+- DELETE `/stages/index` удаляет только опубликованный индекс и сравнения,
+  сохраняет corpus/chunks/vectors и оба кэша; повторный save не вызывает модели.
+  CLI `clear index` эквивалентен этой кнопке. DELETE `/stages/chunks` удаляет chunks/vectors/index, semantic/embedding caches
   и сравнения; DELETE `/stages/embeddings` сохраняет corpus/chunks, удаляет vectors/
   index/embedding cache и сравнения. Оба берут writer lock и отказывают при busy.
   Atomic tombstone фиксирует невидимость старых артефактов до physical cleanup,
@@ -623,10 +630,12 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   артефактов фиксированы; HTTP никогда не принимает путь удаления.
 - `app/static/rag.js` читает status каждую секунду, пока видима. Уход/скрытие/
   pagehide отменяет запрос; epoch и request ordering отсекают поздние ответы.
-  Карточка статуса операции находится первой. Следующие формы появляются по
-  валидным status.stages: corpus открывает разбиение, chunks — embeddings,
-  vectors — save; старый опубликованный индекс и progress.complete ворота не
-  открывают. При удалении/инвалидации формы снова скрываются. Модель, токены и
+  Карточка статуса операции находится первой. Навигация выбирает ровно один
+  этап с его формой и результатами. По валидным status.stages corpus открывает
+  разбиение, chunks — embeddings, vectors — index; старый опубликованный индекс
+  и progress.complete ворота не открывают. Poll/успех сохраняют выбранный этап,
+  поэтому отчёт чанков доступен до явного перехода. Удаление/инвалидация
+  возвращают выбор к доступному предыдущему этапу. Модель, токены и
   actual USD справа от удаления чанков читаются только из durable report текущих
   semantic chunks; progress.semantic_report не восстанавливает удалённую сводку.
   Status/details и формы mounted; poll меняет только текст/hidden, сохраняя open/close,

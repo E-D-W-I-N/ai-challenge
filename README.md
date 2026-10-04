@@ -143,7 +143,12 @@ UI запускает отдельные этапы «Загрузить док�
 Размер и перекрытие задаются в символах. В UI доступны «По размеру» и
 «Семантическое · LLM». Для semantic по умолчанию OpenRouter /
 `openai/gpt-4.1-mini`; endpoint и модель редактируются, auth берётся из
-`RAG_CHUNKING_API_KEY` или `OPENROUTER_API_KEY` процесса. LLM возвращает
+`OPENROUTER_API_KEY` процесса (тот же ключ, что в чате). Для локальной
+генеративной модели выберите oMLX в UI или передайте CLI
+`--semantic-auth-mode omlx --semantic-base-url http://127.0.0.1:8005/v1`
+и `--semantic-model <generative-model>`: используется `RAG_EMBEDDING_API_KEY`.
+Модель разбиения выбирается отдельно от модели эмбеддингов; URL можно изменить.
+`RAG_CHUNKING_API_KEY` больше не выбирает авторизацию. LLM возвращает
 границы абзацев, а приложение сохраняет точные исходные срезы. Проверенный
 кэш исключает повторные вызовы на том же корпусе/конфиге; UI показывает
 фактические запросы и входные/выходные токены, trace остаётся приватным. Документ и чанки можно проверить до
@@ -161,6 +166,7 @@ UI запускает отдельные этапы «Загрузить док�
   --semantic-base-url https://openrouter.ai/api/v1 --semantic-model openai/gpt-4.1-mini
 .venv/bin/python -m rag embed --base-url http://127.0.0.1:8005/v1 --model YOUR_MODEL
 .venv/bin/python -m rag save
+.venv/bin/python -m rag clear index  # сохраняет все предыдущие этапы и кэши
 .venv/bin/python -m rag clear embeddings
 .venv/bin/python -m rag clear chunks
 ```

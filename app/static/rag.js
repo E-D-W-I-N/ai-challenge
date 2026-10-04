@@ -6,6 +6,13 @@ function createRagInspector({ state, $, el, api }) {
   let previewEpoch = 0, documentRequest = 0, chunkRequest = 0, textRequest = 0;
   let documentOffset = 0, chunkOffset = 0, selectedDocument = null, selectedChunk = null;
   const PAGE = 25;
+  let selectedStep = null;
+  const steps = [["documents", "Документы"], ["chunks", "Чанки"], ["embeddings", "Эмбеддинги"], ["save", "Индекс"]];
+  const navigation = new Map();
+  for (const [id, title] of steps) {
+    const node = button(title, () => { selectedStep = id; updateControls(); });
+    node.id = "rag-step-" + id; navigation.set(id, node); $("#rag-navigation").append(node);
+  }
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
   const workingQuery = () => working ? "&working=true" : "";
@@ -53,9 +60,10 @@ function createRagInspector({ state, $, el, api }) {
       if (token !== epoch || preview !== previewEpoch || request !== chunkRequest || !visible()) return;
       const cleaned = detail(`Очищенный документ · первые ${Math.min(text.characters, 10000)} из ${text.characters} символов`, {});
       cleaned.querySelector("pre").textContent = text.text;
-      target.replaceChildren(el("h3", "", item.title), detail("Метаданные документа", item), cleaned);
+      $("#rag-document-preview").replaceChildren(el("h3", "", item.title), detail("Метаданные документа", item), cleaned);
+      target.replaceChildren();
     }
-    if (!hasChunks) { target.append(el("p", "", "Теперь разбейте документы на чанки.")); return; }
+    if (!hasChunks) return;
     const data = await api(`/api/rag/documents/${encodeURIComponent(item.document_id)}/chunks?offset=${offset}&limit=${PAGE}${workingQuery()}`);
     if (token !== epoch || preview !== previewEpoch || request !== chunkRequest || !visible() || selectedDocument.document_id !== item.document_id) return;
     chunkOffset = offset;
@@ -81,11 +89,11 @@ function createRagInspector({ state, $, el, api }) {
         vector.append(el("pre", "", JSON.stringify(saved.vector))); loaded = true;
       } catch (error) { showError(error); }
     };
-    vector.hidden = !hasVectors; target.append(vector);
+    vector.hidden = !hasVectors || selectedStep !== "embeddings"; target.append(vector);
     vectorView = { node: vector, invalidate: () => {
       loaded = false;
       for (const node of [...vector.querySelectorAll("pre")]) node.remove();
-      vector.hidden = !hasVectors;
+      vector.hidden = !hasVectors || selectedStep !== "embeddings";
       if (hasVectors && vector.open) vector.ontoggle();
     }};
   }
@@ -103,8 +111,8 @@ function createRagInspector({ state, $, el, api }) {
       lastStatus = data;
       const stages = data.stages;
       if (!seeded && stages?.chunks?.semantic_config) {
-        for (const [id, key] of [["semantic-base-url", "base_url"], ["semantic-model", "model"]]) {
-          const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = stages.chunks.semantic_config[key];
+        for (const [id, key] of [["semantic-base-url", "base_url"], ["semantic-model", "model"], ["semantic-auth-mode", "auth_mode"]]) {
+          const input = $("#rag-" + id); if (input && !input.dataset.dirty) input.value = stages.chunks.semantic_config[key] ?? "openrouter";
         }
       }
       if (!seeded) {
@@ -122,6 +130,7 @@ function createRagInspector({ state, $, el, api }) {
           }
         }
         const urls = $("#rag-urls"); if (urls && !urls.dataset.dirty && stages?.corpus) urls.value = stages.corpus.urls.join("\n");
+        previousAuthMode = $("#rag-semantic-auth-mode").value;
         seeded = true;
       }
       if ($("#rag-manifest-label")) $("#rag-manifest-label").hidden = !data.manifest_available;
@@ -131,10 +140,10 @@ function createRagInspector({ state, $, el, api }) {
       working = !!stages?.corpus; hasChunks = !working || !!stages?.chunks; hasVectors = !working || !!stages?.embeddings;
       if (generation && (indexId !== generation || !$("#rag-documents").children.length)) {
         vectorView = null; previewEpoch++; indexId = generation; selectedDocument = null; selectedChunk = null;
-        $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
+        $("#rag-document-preview").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
         await documents(0);
       } else if (!generation) {
-        vectorView = null; previewEpoch++; indexId = null; $("#rag-documents").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
+        vectorView = null; previewEpoch++; indexId = null; $("#rag-documents").replaceChildren(); $("#rag-document-preview").replaceChildren(); $("#rag-chunks").replaceChildren(); $("#rag-chunk").replaceChildren();
       }
       if (vectorFingerprint !== nextVectorFingerprint) {
         vectorFingerprint = nextVectorFingerprint; vectorVersion++;
@@ -170,7 +179,7 @@ function createRagInspector({ state, $, el, api }) {
     if (!savedNodes) {
       const heading = el("h3"), size = el("p"), counts = el("p"), model = el("p");
       const metadata = detail("Метаданные сохранённого индекса", {}), report = detail("Отчёт загрузки HTML", {});
-      target.append(heading, size, counts, model, metadata, report); savedNodes = {heading, size, counts, model, metadata, report};
+      target.append(heading, size, counts, model, metadata); $("#rag-ingestion").append(report); savedNodes = {heading, size, counts, model, metadata, report};
     }
     const n = savedNodes;
     for (const node of [n.heading, n.size, n.counts, n.model, n.metadata]) node.hidden = !info;
@@ -186,15 +195,35 @@ function createRagInspector({ state, $, el, api }) {
   function updateControls() {
     const data = lastStatus || {}, stages = data.stages || {};
     const busy = submitting || data.operation?.state === "running";
-    for (const [id, available] of [["chunks", !!stages.corpus], ["embeddings", !!stages.chunks], ["save", !!stages.embeddings]]) {
-      $("#rag-" + id + "-controls").hidden = !available;
+    const available = {documents: true, chunks: !!stages.corpus, embeddings: !!stages.chunks, save: !!stages.embeddings};
+    if (!selectedStep) selectedStep = available.save ? "save" : available.embeddings ? "embeddings" : available.chunks ? "chunks" : "documents";
+    if (!available[selectedStep]) {
+      const position = steps.findIndex(([id]) => id === selectedStep);
+      selectedStep = steps.slice(0, position).reverse().find(([id]) => available[id])?.[0] || "documents";
     }
-    for (const [id, available] of [["ingest", true], ["split", !!stages.corpus], ["embed", !!stages.chunks], ["save", !!stages.embeddings], ["delete-chunks", !!stages.chunks || !!data.index], ["delete-embeddings", !!stages.embeddings || !!data.index]]) {
-      const node = $("#rag-" + id); if (node) node.disabled = busy || !available;
+    for (const [id] of steps) {
+      $("#rag-" + id + "-controls").hidden = selectedStep !== id;
+      const node = navigation.get(id); node.disabled = !available[id];
+      if (selectedStep === id) node.setAttribute("aria-current", "step");
+      else node.removeAttribute("aria-current");
+    }
+    $("#rag-index").hidden = selectedStep !== "save";
+    $("#rag-ingestion").hidden = selectedStep !== "documents";
+    $("#rag-documents").hidden = selectedStep === "save";
+    $("#rag-document-preview").hidden = !["documents", "chunks"].includes(selectedStep);
+    $("#rag-chunks").hidden = !["chunks", "embeddings"].includes(selectedStep);
+    $("#rag-chunk").hidden = !["chunks", "embeddings"].includes(selectedStep);
+    if (vectorView) vectorView.node.hidden = !hasVectors || selectedStep !== "embeddings";
+    $("#rag-delete-index").hidden = !data.index;
+    for (const [id, enabled] of [["ingest", true], ["split", !!stages.corpus], ["embed", !!stages.chunks], ["save", !!stages.embeddings], ["delete-chunks", !!stages.chunks || !!data.index], ["delete-embeddings", !!stages.embeddings || !!data.index], ["delete-index", !!data.index]]) {
+      const node = $("#rag-" + id); if (node) node.disabled = busy || !enabled;
     }
     const summary = $("#rag-stage-status");
     if (summary) {
-      summary.textContent = `Загружено документов: ${stages.corpus?.documents ?? 0} · чанков: ${stages.chunks?.chunks ?? 0} · эмбеддинги: ${stages.embeddings ? "готовы" : "не созданы"}`;
+      summary.textContent = selectedStep === "documents" ? `Загружено документов: ${stages.corpus?.documents ?? 0}`
+        : selectedStep === "chunks" ? `Чанков: ${stages.chunks?.chunks ?? 0}`
+        : selectedStep === "embeddings" ? (stages.embeddings ? `Эмбеддинги готовы · размерность: ${stages.embeddings.dimension}` : "Эмбеддинги ещё не созданы")
+        : data.index ? "Индекс опубликован" : "Готово к сохранению индекса";
     }
     const usage = $("#rag-chunk-usage"), chunks = stages.chunks;
     const report = chunks?.strategy === "semantic" ? chunks.report : null;
@@ -213,6 +242,7 @@ function createRagInspector({ state, $, el, api }) {
   function chunkOptions() {
     const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
     if (body.strategy === "semantic") {
+      body.semantic_auth_mode = $("#rag-semantic-auth-mode").value;
       body.semantic_base_url = $("#rag-semantic-base-url").value.trim();
       body.semantic_model = $("#rag-semantic-model").value.trim();
     }
@@ -241,9 +271,21 @@ function createRagInspector({ state, $, el, api }) {
     } catch (error) { showError(error); }
     finally { submitting = false; updateControls(); }
   }
-  for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"]]) {
+  for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"], ["delete-index", "index"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
+  const authMode = $("#rag-semantic-auth-mode");
+  const semanticDrafts = new Map();
+  let previousAuthMode = "openrouter";
+  authMode.onchange = () => {
+    const endpoint = $("#rag-semantic-base-url"), model = $("#rag-semantic-model");
+    semanticDrafts.set(previousAuthMode, {endpoint: endpoint.value, model: model.value});
+    const draft = semanticDrafts.get(authMode.value) || (authMode.value === "omlx"
+      ? {endpoint: "http://127.0.0.1:8005/v1", model: ""}
+      : {endpoint: "https://openrouter.ai/api/v1", model: "openai/gpt-4.1-mini"});
+    endpoint.value = draft.endpoint; model.value = draft.model; previousAuthMode = authMode.value;
+    for (const input of [endpoint, model, authMode]) input.dataset.dirty = "true";
+  };
   const strategy = $("#rag-strategy");
   if (strategy) strategy.onchange = () => {
     strategy.dataset.dirty = "true";
@@ -251,7 +293,7 @@ function createRagInspector({ state, $, el, api }) {
     $("#rag-semantic-fields").hidden = !semantic;
     $("#rag-size").max = semantic ? "12000" : "100000";
   };
-  for (const id of ["urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "size", "overlap", "strategy"]) {
+  for (const id of ["urls", "base-url", "model", "dimensions", "revision", "semantic-base-url", "semantic-model", "semantic-auth-mode", "size", "overlap", "strategy"]) {
     const input = $("#rag-" + id); if (input) input.oninput = () => { input.dataset.dirty = "true"; };
   }
   for (const [id, kind] of [["ingest", "ingest"], ["split", "chunks"], ["embed", "embeddings"], ["save", "save"]]) {

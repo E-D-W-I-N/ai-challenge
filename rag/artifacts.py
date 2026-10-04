@@ -27,7 +27,9 @@ def revive(root, name):
 def clear(root, kind, operation):
     root = Path(root)
     names = {"vectors.json", "index.sqlite", "embeddings-cache.sqlite", "comparison.json", "comparisons"}
-    if kind == "chunks":
+    if kind == "index":
+        names = {"index.sqlite", "comparison.json", "comparisons"}
+    elif kind == "chunks":
         names |= {"chunks.json", "semantic-cache"}
     elif kind != "embeddings":
         raise ValueError("Unknown clear stage")

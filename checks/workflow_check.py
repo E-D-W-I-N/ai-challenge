@@ -126,6 +126,8 @@ def check_workflow():
                 assert api.get("/api/rag/status").json()["operation"]["state"] == "running"
                 assert api.post("/api/rag/operations/chunks", json={}).status_code == 409
                 assert api.delete("/api/rag/stages/chunks").status_code == 409
+                assert api.delete("/api/rag/stages/index").status_code == 409
+                assert api.delete("/api/rag/stages/unknown").status_code == 404
                 assert api.post("/api/rag/operations/ingest", json={"path": str(html)}).status_code == 422
                 assert api.get("/api/rag/documents?working=true&limit=1").json()["items"][0]["document_id"]
                 release.set()
@@ -136,9 +138,20 @@ def check_workflow():
                     break
                 time.sleep(.01)
             assert api.get("/api/rag/status").json()["stages"]["chunks"]
+            with httpx.Client(transport=httpx.MockTransport(embed)) as client:
+                stage_embeddings(root, config, client=client)
+            save_index(root)
+            retained = workflow.stages(root)
+            assert api.delete("/api/rag/stages/index").status_code == 200
+            assert api.get("/api/rag/status").json()["index"] is None
+            assert workflow.stages(root) == retained
+            before_calls = len(calls)
+            save_index(root)
+            assert len(calls) == before_calls and Index(root).status()["index"]
             assert api.delete("/api/rag/stages/chunks").status_code == 200
             assert api.get("/api/rag/status").json()["stages"]["chunks"] is None
             assert api.post("/api/rag/operations/chunks", json={"size": 200, "overlap": 200}).status_code == 422
+            assert api.post("/api/rag/operations/chunks", json={"semantic_auth_mode": "unknown"}).status_code == 422
             assert api.post("/api/rag/operations/ingest", json={"urls": ["file:///tmp/sample"]}).status_code == 409
         return "stages/fingerprint/no premature publish; save without HTTP; deletion/recompute/tombstone; async writer/API isolation"
 

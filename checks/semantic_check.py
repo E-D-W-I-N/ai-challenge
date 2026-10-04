@@ -26,7 +26,7 @@ def document(text):
             "source": "neutral.html", "title": "Neutral", "blocks": blocks}
 
 
-@patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "", "OPENROUTER_API_KEY": ""})
+@patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "", "OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""})
 def check_semantic():
     requests, mode, auth = [], {"value": "ok", "cost": 0.00125}, []
     def server(request):
@@ -84,7 +84,7 @@ def check_semantic():
             assert sum(len(u["text"]) for u in units) <= 12000 and len(units) <= 256
             assert request["max_tokens"] <= 4096
         before = len(requests)
-        with patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "rotated-neutral-key"}):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "rotated-neutral-key"}):
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
         assert same == chunks and len(requests) == before and cached["calls"] == 0
         assert cached["usage"] == {} and cached["cached"] == 1
@@ -117,7 +117,7 @@ def check_semantic():
         short = document("First short topic.\nSecond short topic.\nThird short topic.\n")
         for bad in ("unknown", "duplicate", "missing", "oversize", "malformed", "truncated", "usage", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
-            with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "credential-injected-secret"}):
+            with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
                 try:
                     semantic_chunks([short], config, 35, 5, root=rejected, client=client)
                 except ValueError as error:
@@ -130,7 +130,7 @@ def check_semantic():
                 if bad in {"reflected", "escaped-reflected"}:
                     assert not artifacts
         mode["value"] = "ok"
-        with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"RAG_CHUNKING_API_KEY": "credential-injected-secret"}):
+        with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
             before = len(requests)
             try:
                 semantic_chunks([document("Text credential-injected-secret end.")], config, 100, 0, root=rejected, client=client)
@@ -142,10 +142,31 @@ def check_semantic():
         with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "fallback-neutral"}):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
-        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "fallback-neutral", "RAG_CHUNKING_API_KEY": "preferred-neutral"}):
+        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  fallback-neutral  ", "RAG_CHUNKING_API_KEY": "preferred-neutral"}):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
-            assert auth[-1] == "Bearer preferred-neutral"
+            assert auth[-1] == "Bearer fallback-neutral"
             assert "preferred-neutral" not in next((Path(authorized) / "semantic-cache").glob("*.json")).read_text()
+        local_config = replace(config, auth_mode="omlx")
+        with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {
+                "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  ",
+                "RAG_CHUNKING_API_KEY": "ignored-legacy-neutral"}):
+            local_chunks, _ = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
+            assert auth[-1] == "Bearer local-neutral"
+            before = len(requests)
+            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "rotated-local-neutral"}):
+                repeated, cached = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
+            assert repeated == local_chunks and len(requests) == before and cached["calls"] == 0
+            with tempfile.TemporaryDirectory() as rotated, patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "rotated-local-neutral"}):
+                semantic_chunks([short], local_config, 35, 5, root=rotated, client=client)
+                assert auth[-1] == "Bearer rotated-local-neutral"
+            assert all(secret not in path.read_text() for path in (Path(local) / "semantic-cache").glob("*.json")
+                       for secret in ("chat-neutral", "local-neutral", "ignored-legacy-neutral"))
+        try:
+            replace(config, auth_mode="unknown")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unknown auth mode accepted")
     print("semantic checks passed")
 
 

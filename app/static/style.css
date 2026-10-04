@@ -841,3 +841,6 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-stage-controls > .primary-btn { justify-self: start; }
 .rag-chunk-usage { font-size: 12px; overflow-wrap: anywhere; flex: 1 1 15rem; }
 .rag-chunk-usage[hidden] { display: none; }
+
+.rag-navigation { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+.rag-navigation button[aria-current="step"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); font-weight: 700; }
