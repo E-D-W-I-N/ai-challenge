@@ -56,6 +56,12 @@ def check_rag_models():
                         assert error.status_code == 502 and "secret" not in error.detail
                     else: raise AssertionError("OpenRouter reflected a runtime key")
                     assert calls[-1] == ("https://openrouter.ai/api/v1/embeddings/models", "Bearer neutral-router-secret")
+                with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "neutral%41secret"}):
+                    state["payload"] = {"data": [{"id": "neutral%41secret"}]}
+                    try: await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
+                    except HTTPException as error:
+                        assert error.status_code == 502 and "secret" not in error.detail
+                    else: raise AssertionError("Percent-containing runtime key reflected raw")
                 state["payload"] = {"data": [{"id": "neutral-vector"}]}
                 safe = await rag_models.models("openrouter", "http://unused.test/v1", "embedding")
                 assert safe["models"][0]["id"] == "neutral-vector" and safe["models"][0]["prompt_price_per_m"] is None

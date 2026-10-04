@@ -55,10 +55,11 @@ def _safe_models(payload: dict) -> list[dict]:
     serialized = json.dumps(rows, ensure_ascii=False)
     if len(serialized.encode("utf-8")) > 2 * 1024 * 1024:
         raise ValueError("Invalid model catalogue")
-    for _ in range(3):
+    secrets = (key("openrouter"), key("compatible"))
+    for _ in range(4):
+        if any(secret and secret in serialized for secret in secrets):
+            raise ValueError("Invalid model catalogue")
         serialized = unquote(serialized)
-    if any(secret and secret in serialized for secret in (key("openrouter"), key("compatible"))):
-        raise ValueError("Invalid model catalogue")
     if any(not isinstance(row, dict) or not isinstance(row.get("id"), str)
            or not row["id"].strip() or len(row["id"]) > 512 for row in rows):
         raise ValueError("Invalid model catalogue")
