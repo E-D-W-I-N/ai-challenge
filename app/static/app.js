@@ -574,7 +574,7 @@ function answerCard(agent, turn, index) {
   const actions = el("div", "card-actions");
   actions.append(
     iconButton("refresh", "Перегенерировать", () => regenerate()),
-    iconButton("dots", "Показать сырой текст", () => showRaw(card, turn)),
+    iconButton("dots", "Показать сырой текст", () => showRaw(card, turn, index)),
     // Ветка отсюда — у каждого ответа и при любой стратегии: ветвление про
     // структуру разговора, а не про то, что уезжает в модель, и от выбора
     // в переключателе оно не зависит.
@@ -588,7 +588,7 @@ function answerCard(agent, turn, index) {
   if (turn.reasoning) card.appendChild(thinkingBlock(turn.reasoning));
 
   const body = el("div", "card-body md");
-  body.innerHTML = renderMarkdown(turn.content);
+  body.innerHTML = renderMarkdown(turn.content, ragReferences(turn.rag, index));
   card.appendChild(body);
 
   // Отметка сторожа — выше чисел: задетый запрет весомее приписки про обрезку.
@@ -600,7 +600,7 @@ function answerCard(agent, turn, index) {
   const tools = toolLine(turn);
   if (tools) card.appendChild(tools);
 
-  if (turn.rag) card.appendChild(ragSources(turn.rag));
+  if (turn.rag) card.appendChild(ragSources(turn.rag, index));
 
   const usage = usageLine(turn);
   if (usage) card.appendChild(usage);
@@ -609,18 +609,54 @@ function answerCard(agent, turn, index) {
   return card;
 }
 
-function ragSources(snapshot) {
+function ragReferences(snapshot, index) {
+  const references = {};
+  if (snapshot?.answer?.status !== "verified") return references;
+  for (const citation of snapshot.answer.citations || []) {
+    if (Number.isSafeInteger(citation.source_id) && citation.source_id > 0)
+      references[citation.source_id] = "rag-source-" + index + "-" + citation.source_id;
+  }
+  return references;
+}
+
+function ragSources(snapshot, index) {
   const box = el("div", "card-rag");
-  box.appendChild(el("div", "field-label", (snapshot.hits || []).length ? "Источники RAG" : "RAG · подходящих фрагментов нет"));
+  const answer = snapshot.answer;
+  const verified = answer?.status === "verified";
+  const sources = verified ? (answer.citations || []) : answer ? [] : (snapshot.hits || []);
+  const label = verified ? "Цитаты проверены" : answer?.status === "receipt" ? "RAG · напоминание запланировано"
+    : answer?.status === "insufficient" ? "RAG · недостаточно информации"
+    : sources.length ? "Фрагменты RAG · проверка цитат недоступна" : "RAG · подходящих фрагментов нет";
+  box.appendChild(el("div", "field-label", label));
   const list = el("ol", "rag-answer-sources");
-  for (const hit of snapshot.hits || []) {
-    const item = el("li", "");
+  const references = ragReferences(snapshot, index);
+  for (const hit of sources) {
+    const item = el("li", verified ? "rag-source-card" : "");
+    if (verified) {
+      item.id = references[hit.source_id];
+      item.setAttribute("value", hit.source_id);
+      item.tabIndex = -1;
+    }
     item.appendChild(el("span", "", hit.title || hit.source || hit.chunk_id));
-    if (hit.section) item.appendChild(el("span", "muted", " · " + hit.section));
-    if (hit.source) item.appendChild(el("div", "muted rag-source-url", hit.source));
+    if (hit.section || (verified && hit.chunk_id)) {
+      const locator = el("span", "muted rag-source-locator", " · " + (hit.section || hit.chunk_id));
+      if (hit.chunk_id) locator.title = hit.chunk_id;
+      item.appendChild(locator);
+    }
+    if (hit.source) {
+      const safeUrl = verified && /^https?:\/\/[^\s]+$/i.test(hit.source);
+      const source = el(safeUrl ? "a" : "div", "muted rag-source-url", hit.source);
+      if (safeUrl) {
+        source.setAttribute("href", hit.source);
+        source.setAttribute("target", "_blank");
+        source.setAttribute("rel", "noreferrer noopener");
+      }
+      item.appendChild(source);
+    }
+    if (verified) item.appendChild(el("blockquote", "rag-source-quote", hit.quote));
     list.appendChild(item);
   }
-  box.appendChild(list);
+  if (sources.length) box.appendChild(list);
   const inspect = el("button", "mcp-button", "Контекст и фрагменты ответа");
   inspect.type = "button";
   inspect.onclick = () => { showSettings("rag", false); ragInspector.showSnapshot(snapshot); $("#panel-body").scrollTop = 0; };
@@ -802,12 +838,12 @@ function thinkingBlock(text) {
   return box;
 }
 
-function showRaw(card, turn) {
+function showRaw(card, turn, index) {
   const body = card.querySelector(".card-body");
   if (card.dataset.raw === "1") {
     body.className = "card-body md";
     body.style.whiteSpace = "";
-    body.innerHTML = renderMarkdown(turn.content);
+    body.innerHTML = renderMarkdown(turn.content, ragReferences(turn.rag, index));
     card.dataset.raw = "0";
   } else {
     body.className = "card-body";

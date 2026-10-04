@@ -55,11 +55,11 @@ function escapeHtml(text) {
 // разметка не разбирается.
 const CODE_MARK = "\u0000";
 
-function inlineMarkdown(text) {
+function inlineMarkdown(text, references = {}) {
   let out = escapeHtml(text);
   const codes = [];
   out = out.replace(/`([^`]+)`/g, (_, code) => {
-    codes.push(code);
+    codes.push("<code>" + code + "</code>");
     return CODE_MARK + (codes.length - 1) + CODE_MARK;
   });
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -68,16 +68,30 @@ function inlineMarkdown(text) {
   // Ссылка только на http(s): javascript: в href из ответа модели недопустим.
   out = out.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    '<a href="$2" rel="noreferrer noopener" target="_blank">$1</a>'
+    (_, label, url) => {
+      const restoreCodes = (value) => value.replace(new RegExp(CODE_MARK + "(\\d+)" + CODE_MARK, "g"), (_, i) => codes[Number(i)] || "");
+      codes.push('<a href="' + restoreCodes(url) + '" rel="noreferrer noopener" target="_blank">' + restoreCodes(label) + '</a>');
+      return CODE_MARK + (codes.length - 1) + CODE_MARK;
+    }
   );
+  // Only server-verified source numbers get local anchors. Code and URLs are masked.
+  out = out.replace(/\[(\d+)\]/g, (label, number, offset, input) => {
+    // Preserve escaped brackets, Markdown reference syntax and bare URL tokens.
+    if (/[\\\]!]/.test(input[offset - 1] || "") || /^[\[:(]/.test(input.slice(offset + label.length))
+        || /https?:\/\/[^\s<]*$/i.test(input.slice(0, offset))) return label;
+    const target = references[number];
+    if (!target || !/^rag-source-[a-z0-9-]+$/.test(target)) return label;
+    codes.push('<a class="rag-citation-ref" href="#' + target + '" aria-label="Источник ' + number + '">' + label + '</a>');
+    return CODE_MARK + (codes.length - 1) + CODE_MARK;
+  });
   out = out.replace(
     new RegExp(CODE_MARK + "(\\d+)" + CODE_MARK, "g"),
-    (_, i) => "<code>" + (codes[Number(i)] || "") + "</code>"
+    (_, i) => codes[Number(i)] || ""
   );
   return out;
 }
 
-function renderMarkdown(text) {
+function renderMarkdown(text, references = {}) {
   const lines = String(text || "").split("\n");
   const html = [];
   let list = null;        // "ul" | "ol" | null
@@ -86,7 +100,7 @@ function renderMarkdown(text) {
 
   const closeParagraph = () => {
     if (paragraph.length) {
-      html.push("<p>" + inlineMarkdown(paragraph.join("\n")) + "</p>");
+      html.push("<p>" + inlineMarkdown(paragraph.join("\n"), references) + "</p>");
       paragraph = [];
     }
   };
@@ -112,7 +126,7 @@ function renderMarkdown(text) {
     if (heading) {
       closeParagraph(); closeList();
       const level = heading[1].length;
-      html.push("<h" + level + ">" + inlineMarkdown(heading[2]) + "</h" + level + ">");
+      html.push("<h" + level + ">" + inlineMarkdown(heading[2], references) + "</h" + level + ">");
       continue;
     }
     if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
@@ -121,19 +135,19 @@ function renderMarkdown(text) {
     const quote = line.match(/^>\s?(.*)$/);
     if (quote) {
       closeParagraph(); closeList();
-      html.push("<blockquote>" + inlineMarkdown(quote[1]) + "</blockquote>");
+      html.push("<blockquote>" + inlineMarkdown(quote[1], references) + "</blockquote>");
       continue;
     }
     const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
     if (bullet) {
       closeParagraph(); openList("ul");
-      html.push("<li>" + inlineMarkdown(bullet[1]) + "</li>");
+      html.push("<li>" + inlineMarkdown(bullet[1], references) + "</li>");
       continue;
     }
     const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
     if (ordered) {
       closeParagraph(); openList("ol");
-      html.push("<li>" + inlineMarkdown(ordered[1]) + "</li>");
+      html.push("<li>" + inlineMarkdown(ordered[1], references) + "</li>");
       continue;
     }
     closeList();
