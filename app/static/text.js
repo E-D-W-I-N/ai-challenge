@@ -74,7 +74,7 @@ function inlineMarkdown(text, references = {}) {
       return CODE_MARK + (codes.length - 1) + CODE_MARK;
     }
   );
-  // Only server-verified source numbers get local anchors. Code and URLs are masked.
+  // Only server-mapped source numbers get local anchors. Code and URLs are masked.
   out = out.replace(/\[(\d+)\]/g, (label, number, offset, input) => {
     // Preserve escaped brackets, Markdown reference syntax and bare URL tokens.
     if (/[\\\]!]/.test(input[offset - 1] || "") || /^[\[:(]/.test(input.slice(offset + label.length))

@@ -32,11 +32,14 @@ def check_rag_citations():
     assert text == valid["answer"] and proof["citations"][0] == {
         "source_id": 2, "chunk_id": "neutral-second", "source": "fixture:second",
         "title": "Second", "section": "Notes", "quote": "second item is green"}
+    paraphrase = {**valid, "citations": [{"source_id": 2, "quote": "Зелёный цвет второго объекта"}]}
+    _, paraphrase_record = rag.validate_answer(json.dumps(paraphrase), snapshot, {"finish_reason": "stop"})
+    assert paraphrase_record["status"] == "answered" and paraphrase_record["citations"][0]["quote"] == paraphrase["citations"][0]["quote"]
     invalids = [
+        {"status": "insufficient"},
         {**valid, "citations": []},
         {**valid, "citations": [{"source_id": True, "quote": "second item is green"}]},
         {**valid, "citations": [{"source_id": 3, "quote": "second item is green"}]},
-        {**valid, "citations": [{"source_id": 2, "quote": "SECOND ITEM IS GREEN"}]},
         {**valid, "citations": [{"source_id": 2, "quote": " "}]},
         {**valid, "citations": valid["citations"] * 2},
         {**valid, "citations": [{**valid["citations"][0], "source": "invented"}]},
@@ -91,7 +94,7 @@ def check_rag_citations():
         assert chat.history[-1].rag == before.rag
 
         # A malformed result is not shown, committed or retried; actual paid diagnostics remain.
-        for output in ("raw untrusted output", json.dumps(invalids[2]),
+        for output in ("raw untrusted output", json.dumps(invalids[3]),
                        '{"answer":"x [1]","citations":[{"source_id":' + '1' * 5000 + ',"quote":"x"}]}',
                        '{"status":"unknown","status":"insufficient"}',
                        '[' * 1100 + '0' + ']' * 1100):
@@ -108,14 +111,37 @@ def check_rag_citations():
             restored = await drain(main._regenerate_events(chat, taken))
         assert restored[-1]["restored"] and chat.history[-1] == before
 
-        # Only the exact explicit semantic refusal branch permits missing citations after model usage.
+        # A compound question can publish two supported facts and explicitly name its gap.
+        compound = {"answer": "Первый объект окрашен синим [1]. Второй зелёный [2]. В источниках нет данных о массе третьего объекта.",
+                    "citations": [{"source_id": 1, "quote": "Первый объект синего цвета"},
+                                  {"source_id": 2, "quote": "second item is green"}]}
         _stub.reset()
+        with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(json.dumps(compound))):
+            supported = await drain(chat.ask("Назови цвет первого и второго объектов и массу третьего."))
+        assert supported[-1]["committed"] and supported[-1]["text"] == compound["answer"]
+        assert supported[-1]["rag"]["answer"]["status"] == "answered"
+        assert [event["text"] for event in supported if event["type"] == "delta"] == [compound["answer"]]
+        assert [(citation["source_id"], citation["chunk_id"]) for citation in chat.history[-1].rag["answer"]["citations"]] == [(1, "neutral-first"), (2, "neutral-second")]
+        # The removed model-only refusal now follows the ordinary paid validation-error lifecycle.
+        depth = len(chat.history); _stub.reset()
         with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make('{"status":"insufficient"}')):
-            refused = await drain(chat.ask("neutral semantic request"))
-        assert refused[-1]["committed"] and refused[-1]["text"] == rag.NO_HITS
-        assert refused[-1]["rag"]["answer"] == {"status": "insufficient", "reason": "model", "citations": []}
-        assert len(_stub.CALLS) == 1 and len(chat.history[-1].request_bodies) == 1
-        assert chat.history[-1].metrics["cost_usd"] == 0.000123
+            refused = await drain(chat.ask("neutral unsupported schema"))
+        assert not refused[-1]["committed"] and len(chat.history) == depth
+        assert "формата RAG-ответа" in refused[-1]["error"] and not any(event["type"] == "delta" for event in refused)
+        assert "answer" not in refused[-1]["rag"] and len(_stub.CALLS) == 1
+        assert refused[-1]["metrics"]["cost_usd"] == 0.000123
+        assert refused[-1]["request_bodies"] == [_stub.CALLS[0]["payload"]]
+        # Archived model refusals remain opaque saved data, including restart and deep-copy fork.
+        legacy_snapshot = copy.deepcopy(chat.history[-1].rag)
+        legacy_snapshot["answer"] = {"status": "insufficient", "reason": "model", "citations": []}
+        legacy = agents.Agent(AgentSpec(label="legacy refusal", model="stub/model"), store=store)
+        assert legacy._commit("neutral archived request", rag.NO_HITS, None, "", None, [], legacy_snapshot)
+        loaded_legacy = agents.Agent(legacy.spec, agent_id=legacy.id, store=store)
+        assert loaded_legacy.history[-1].rag == legacy_snapshot
+        archived_branch = loaded_legacy.carry_off(2)
+        assert archived_branch["history"][-1].rag == legacy_snapshot
+        archived_branch["history"][-1].rag["answer"]["reason"] = "changed"
+        assert loaded_legacy.history[-1].rag == legacy_snapshot
 
         # All weak candidates skip paid rerank and mark the cosine selection provisional.
         chat.spec.rag_rerank_enabled = True
@@ -236,10 +262,10 @@ def check_rag_citations():
         scheduler.claims[(server.name, item["id"])] = {}
         _stub.reset()
         with patch.object(scheduler, "receipt", return_value=True), patch.object(rag.Index, "retrieve", retrieved), \
-             patch.object(agents, "stream_completion", _stub.make(json.dumps(invalids[2]))):
+             patch.object(agents, "stream_completion", _stub.make(json.dumps(invalids[3]))):
             await scheduler._execute(server, item, "neutral token", chat)
         error = chat.history[-1]
-        assert error.error and "проверки RAG-цитат" in error.error
+        assert error.error and "формата RAG-ответа" in error.error
         assert error.metrics["cost_usd"] == 0.000123 and error.metrics["reminder_execution"]["id"] == 4
         assert error.request_bodies == [_stub.CALLS[0]["payload"]]
         assert "answer" not in error.rag and error.rag["index"]["index_id"] == "neutral-pinned"
