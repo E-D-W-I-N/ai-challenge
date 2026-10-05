@@ -63,7 +63,7 @@ def check_rag_citations():
     async def scenarios(root):
         store = Store(str(root / "neutral.sqlite")).init()
         spec = AgentSpec(label="citations", model="stub/model", rag_enabled=True,
-                         rag_rewrite_enabled=False, rag_filter_enabled=False,
+                         rag_rewrite_enabled=False,
                          response_format={"type": "text"}, extra_body={"response_format": {"type": "text"}})
         chat = agents.Agent(spec, store=store)
         unchanged = copy.deepcopy(chat.spec)
@@ -77,8 +77,8 @@ def check_rag_citations():
         body = chat.history[-1].request_bodies[0]
         assert body["response_format"] == {"type": "json_object"}
         assert chat.history[-1].rag["answer"] == proof
-        assert len(chat.history[-1].rag["hits"]) == 2, "filterOFF must retain weak hits when gate passes"
-        assert chat.history[-1].rag["answer_policy"] == {"weak_context_enabled": True, "similarity_threshold": 0.3}
+        assert len(chat.history[-1].rag["hits"]) == 2, "selection must retain weak hits when gate passes"
+        assert chat.history[-1].rag["answer_policy"] == {"weak_context_enabled": True, "similarity_threshold": 0.3, "context_scope": "selected", "gate_stage": "selected"}
         context = chat.history[-1].rag["context"]
         assert [h["source_id"] for h in json.loads(context.split("\n", 1)[1])] == [1, 2]
         before = copy.deepcopy(chat.history[-1])
@@ -115,27 +115,44 @@ def check_rag_citations():
         assert len(_stub.CALLS) == 1 and len(chat.history[-1].request_bodies) == 1
         assert chat.history[-1].metrics["cost_usd"] == 0.000123
 
-        # Inclusive gate always applies, independently of filtering, before compression/model lease.
+        # All weak candidates skip paid rerank and mark the cosine selection provisional.
         chat.spec.rag_rerank_enabled = True
-        for filtering in (False, True):
-            chat.spec.rag_filter_enabled = filtering
-            chat.spec.rag_similarity_threshold = 0.31
-            _stub.reset()
-            with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", side_effect=AssertionError("weak context model")), \
-                 patch.object(chat, "compress", side_effect=AssertionError("weak context compression")):
-                refused = await drain(chat.ask("neutral weak request"))
-            assert refused[-1]["committed"] and refused[-1]["text"] == rag.NO_HITS and not _stub.CALLS
-            assert refused[-1]["rag"]["answer"] == {"status": "insufficient", "reason": "low_similarity", "citations": []}
-            assert len(refused[-1]["rag"]["hits"]) == (0 if filtering else 2)
-        chat.spec.rag_filter_enabled = False
+        chat.spec.rag_similarity_threshold = 0.31
+        _stub.reset()
+        with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", side_effect=AssertionError("weak context model")), \
+             patch.object(chat, "compress", side_effect=AssertionError("weak context compression")):
+            refused = await drain(chat.ask("neutral weak request"))
+        assert refused[-1]["committed"] and refused[-1]["text"] == rag.NO_HITS and not _stub.CALLS
+        weak = refused[-1]["rag"]
+        assert weak["answer"] == {"status": "insufficient", "reason": "low_similarity", "citations": []}
+        assert len(weak["hits"]) == 2 and weak["answer_policy"]["gate_stage"] == "candidates"
+        assert weak["selection"]["ordering"] == "cosine" and "rerank" not in weak
         chat.spec.rag_similarity_threshold = 0.3
         chat.spec.rag_rerank_enabled = False
 
         # Reordering assigns citation IDs from final context order for both providers.
         for provider in ("openrouter", "compatible"):
             ranked = agents.Agent(AgentSpec(label="ranked citations", model="neutral-final", provider=provider,
-                rag_enabled=True, rag_rewrite_enabled=False, rag_filter_enabled=False,
+                rag_enabled=True, rag_rewrite_enabled=False,
                 rag_rerank_enabled=True, rag_rerank_provider=provider, rag_rerank_model="neutral-ranker"), store=store)
+            # A discarded strong candidate cannot authorize the selected weak context.
+            ranked.spec.rag_final_k = 1
+            _stub.reset()
+            def weak_selection_reply(messages, index):
+                assert index == 0, "weak selected context must not call final model"
+                return '{"source_ids":[2,1]}'
+            with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(weak_selection_reply)):
+                refused = await drain(ranked.ask("neutral discarded strong request"))
+            assert refused[-1]["committed"] and refused[-1]["text"] == rag.NO_HITS
+            assert len(_stub.CALLS) == 1 and refused[-1]["metrics"]["total_tokens"] == 100
+            assert refused[-1]["metrics"]["cost_usd"] == .000123
+            assert refused[-1]["rag"]["answer_policy"]["gate_stage"] == "selected"
+            assert [h["chunk_id"] for h in refused[-1]["rag"]["hits"]] == ["neutral-second"]
+            assert refused[-1]["rag"]["selection"]["selected_source_ids"] == [2]
+            assert ranked.history[-1].request_bodies == [_stub.CALLS[0]["payload"]]
+            assert len(json.loads(_stub.CALLS[0]["messages"][-1]["content"])["sources"]) == 2
+            # Retaining a strong source permits a promoted low-cosine citation in final order.
+            ranked.spec.rag_final_k = 2
             ordered_answer = {"answer": "The second item is green [1].",
                               "citations": [{"source_id": 1, "quote": "second item is green"}]}
             _stub.reset()

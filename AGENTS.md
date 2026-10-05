@@ -24,22 +24,27 @@ Standalone CLI не импортирует `app.config`/`.env`. В чате `rag
 prompt, JSON запросов и assistant.rag; исторический инспектор не перечитывает
 чанки актуального индекса. Ошибки retrieval дают error/done без silent fallback;
 перегенерация восстанавливает снятый ответ. Fork глубоко копирует rag и
-request_bodies. Query rewrite и cosine filter независимы: new chats default true, legacy false;
-RAG остаётся OFF. Rewrite — один отдельный constrained вызов модели чата, последние
-3 успешные пары, timeout 60s, strict finish_reason stop/JSON, без retries/fallback.
-Единый Top-K default5, включительный threshold0.3; необязательный реранкинг
-переставляет все оставшиеся hits одним strict JSON вызовом без retries/fallback; nohits — детерминированный ответ
-без финального LLM. Snapshot v2 хранит original/query/history/config/candidates decisions/
-hits/context/timing/rewrite usage; JSON включает actual rewrite, aggregate без двойного счёта.
+request_bodies. Query rewrite и реранкинг независимы: new rewrite default true,
+legacy false; rerank default false; RAG остаётся OFF. Rewrite — один constrained
+вызов модели чата, последние 3 успешные пары, timeout 60s, strict stop/JSON,
+без retries/fallback. Retrieval default20 → rerank всех кандидатов → context first5;
+без rerank первые5 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
+Предварительного cosine-фильтра нет; день24 сохраняет отдельный порог ответа. Snapshot v3 хранит original/query/
+history/config, всех candidates с original/final ranks/selected, selection и финальные
+hits/context/identity/timing/actual usage. Legacy v1/v2 история не переписывается.
+Прежний rag_top_k мигрирует в final_k с candidate default max(20, final_k);
+его наличие имеет приоритет над оставшимися старыми двумя K. Новый save удаляет
+устаревший top_k из config, restart/fork сохраняют effective counts.
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
 сохраняет доступные метрики в error assistant. При RAG ON финальный JSON answer/citations
 проверяется до публикации: ссылки [n] — позиции pinned hits; source/section/chunk_id
 берутся только оттуда, quote — точная подстрока canonical redacted text. Ошибка —
 no-commit/restore без retry; непроверенный partial RAG не сохраняется при отмене.
 Порог слабого контекста действует всегда при ON: отсутствие hits либо max(score)<threshold
-даёт детерминированное «Не знаю» с уточнением без final LLM. FilterOFF не меняет отбор,
-если gate пройден. Явный strict JSON {status:insufficient} модели даёт тот же отказ с
-paid usage. Snapshot v2 дополнен answer_policy и answer(status/citations/reason);
+для выбранных hits даёт детерминированное «Не знаю» с уточнением без final LLM.
+Все слабые кандидаты допускают ранний отказ до rerank, помеченный gate_stage=candidates;
+иначе gate_stage=selected, оплаченный rerank учитывается один раз. Явный strict JSON {status:insufficient} модели даёт тот же отказ с
+paid usage. Snapshot v3 дополнен answer_policy и answer(status/citations/reason);
 история и ветки не перечитывают индекс. Receipt планирования — отдельное исключение,
 содержательный результат напоминания проверяется. Дословность не доказывает смысл;
 10 вопросов и оценка качества остаются приватной ручной работой. Task memory отсутствует.

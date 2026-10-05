@@ -25,22 +25,19 @@ def check_rag_refinement():
         queries.append((query, top_k))
         return {"query": query, "top_k": top_k, "index": {"index_id": "pinned-neutral"},
                 "hits": [{"chunk_id": str(i), "source": "fixture:neutral", "text": f"neutral chunk {i}", "score": score}
-                         for i, score in enumerate((0.9, 0.6, 0.3, 0.299, -0.2))][:top_k]}
+                         for i, score in enumerate(() if query == "empty lookup" else (0.9, 0.6, 0.3, 0.299, -0.2))][:top_k]}
 
     queries = []
-    spec = AgentSpec(label="refined", model="stub/chat", rag_enabled=True, rag_top_k=2)
+    spec = AgentSpec(label="refined", model="stub/chat", rag_enabled=True, rag_candidates_k=5, rag_final_k=2)
     with patch.object(rag.Index, "retrieve", candidates):
         filtered = rag.retrieve("search", original_query="question", spec=spec)
-        assert queries == [("search", 2)]
-        assert [c["decision"] for c in filtered["candidates"]] == ["kept", "kept"]
+        assert queries == [("search", 5)]
+        assert len(filtered["candidates"]) == 5 and [c["selected"] for c in filtered["candidates"]] == [True, True, False, False, False]
         assert [h["score"] for h in filtered["hits"]] == [0.9, 0.6]
-        spec.rag_top_k = 5
-        inclusive = rag.retrieve("search", spec=spec)
-        assert [h["score"] for h in inclusive["hits"]] == [0.9, 0.6, 0.3]
-        spec.rag_filter_enabled = False; spec.rag_rewrite_enabled = False
+        spec.rag_final_k = 5
         plain = rag.retrieve("plain", spec=spec)
-        assert queries[-1] == ("plain", 5) and len(plain["hits"]) == 5
-        assert all(c["decision"] == "kept" for c in plain["candidates"])
+        assert queries[-1] == ("plain", 5) and [h["score"] for h in plain["hits"]] == [0.9, 0.6, 0.3, 0.299, -0.2]
+        assert plain["selection"]["ordering"] == "cosine" and all(c["selected"] for c in plain["candidates"])
 
     async def scenarios(root):
         store = Store(str(root / "chat.sqlite")).init()
@@ -58,8 +55,8 @@ def check_rag_refinement():
         with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(reply)):
             events = await drain(chat.ask("current question 42"))
         assert events[-1]["committed"] and len(_stub.CALLS) == 2
-        assert [e["stage"] for e in events if e["type"] == "retrieval"] == ["rewrite", "search", "filter"]
-        assert queries == [("standalone neutral 42", 5)]
+        assert [e["stage"] for e in events if e["type"] == "retrieval"] == ["rewrite", "search"]
+        assert queries == [("standalone neutral 42", 20)]
         bodies = chat.history[-1].request_bodies; snapshot = chat.history[-1].rag
         assert bodies == [c["payload"] for c in _stub.CALLS]
         first = bodies[0]; last = bodies[-1]
@@ -87,7 +84,6 @@ def check_rag_refinement():
         assert chat.history[-1].rag["rewrite"]["usage"]["cost_usd"] is None
 
         # No hits skip compression, tool lease and final generation; persist rewrite request.
-        chat.spec.rag_similarity_threshold = 1.0
         _stub.reset()
         with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make('{"query":"empty lookup"}')), \
              patch.object(chat, "compress", side_effect=AssertionError("nohit compression")):
@@ -139,7 +135,6 @@ def check_rag_refinement():
             else:
                 yield {"type":"delta", "text":"partial", "metrics":{"total_tokens":7,"cost_usd":0.1}}
                 raise asyncio.CancelledError()
-        chat.spec.rag_similarity_threshold = 0.3
         with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", partial):
             try: await drain(chat.ask("disconnect"))
             except asyncio.CancelledError: pass
@@ -176,19 +171,24 @@ def check_rag_refinement():
     with tempfile.TemporaryDirectory(prefix="rag-refinement-") as temp:
         asyncio.run(scenarios(Path(temp)))
     legacy = agents.spec_from_config({"label":"legacy", "model":"stub/model", "rag_enabled": True}, fallback=spec)
-    assert legacy.rag_enabled and not legacy.rag_rewrite_enabled and not legacy.rag_filter_enabled
+    assert legacy.rag_enabled and not legacy.rag_rewrite_enabled and not hasattr(legacy, "rag_filter_enabled")
     half = agents.spec_from_config({"model":"stub/model", "rag_rewrite_enabled": True}, fallback=spec)
-    assert half.rag_rewrite_enabled and not half.rag_filter_enabled
+    assert half.rag_rewrite_enabled and not half.rag_rerank_enabled
     with TestClient(main.app) as client:
         result = client.post("/api/agents", json={"agent":{"label":"new defaults", "model":"stub/model"}}).json()["agents"][0]
-        assert not result["rag_enabled"] and result["rag_rewrite_enabled"] and result["rag_filter_enabled"]
-        assert (result["rag_top_k"],result["rag_similarity_threshold"]) == (5,0.3)
+        assert not result["rag_enabled"] and result["rag_rewrite_enabled"] and not result["rag_rerank_enabled"]
+        assert (result["rag_candidates_k"],result["rag_final_k"]) == (20,5)
         route = f'/api/agents/{result["id"]}'
-        for invalid in ({"rag_rewrite_enabled": None}, {"rag_filter_enabled": 1}, {"rag_top_k": True}, {"rag_top_k": 101}, {"rag_similarity_threshold": "0.3"}, {"rag_candidates_k": 4}, {"rag_rewrite_enabled": False, "system": 123}):
+        for invalid in ({"rag_rewrite_enabled": None}, {"rag_candidates_k": True}, {"rag_final_k": 1.5}, {"rag_candidates_k": 101}, {"rag_final_k": 0}, {"rag_candidates_k": 4}, {"rag_filter_enabled": True}, {"rag_similarity_threshold": True}, {"rag_similarity_threshold": 1.1}, {"rag_rewrite_enabled": False, "system": 123}):
             before = copy.deepcopy(main.REGISTRY.require(result["id"]).spec)
             assert client.patch(route,json=invalid).status_code == 400
             assert main.REGISTRY.require(result["id"]).spec == before
-        assert client.patch(route, json={"rag_top_k": 2, "rag_similarity_threshold": -1}).status_code == 200
-        assert client.patch(route, json={"rag_top_k": 101}).status_code == 400
+        saved = client.patch(route, json={"rag_similarity_threshold": .57})
+        assert saved.status_code == 200 and saved.json()["rag_similarity_threshold"] == .57
+        agent = main.REGISTRY.require(result["id"])
+        assert agents.Agent(agent.spec, agent_id=agent.id, store=agent.store).spec.rag_similarity_threshold == .57
+        assert agents.spec_from_config(saved.json(), fallback=spec).rag_similarity_threshold == .57
+        assert client.patch(route, json={"rag_candidates_k": 2, "rag_final_k": 2}).status_code == 200
+        assert client.patch(route, json={"rag_final_k": 3}).status_code == 400
         client.delete(route)
-    return "threshold inclusive/cap reasons; rewrite 3pairs/model/strictstop/cancel/timeout; nohits/reminders; exactJSON/usage/restart/deepcopy/legacy/API"
+    return "candidate/prefix counts; rewrite 3pairs/model/strictstop/cancel/timeout; nohits/reminders; exactJSON/usage/restart/deepcopy/legacy/API"

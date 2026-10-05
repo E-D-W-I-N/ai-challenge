@@ -106,7 +106,7 @@ async function main() {
       && $("#rag-threshold-field").querySelector("#f-rag_similarity_threshold") === $("#f-rag_similarity_threshold"));
     $("#f-rag_similarity_threshold").value = ".55"; $("#f-rag_similarity_threshold").dispatchEvent(new Evt("change")); await settle();
     check("Visible shared threshold saves with Filtering OFF", requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_similarity_threshold === .55
-      && requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_filter_enabled === false);
+      && !("rag_filter_enabled" in requests("PATCH", "/api/agents/ag_1").at(-1).body));
     $("#f-rag_enabled").checked = false; $("#f-rag_enabled").dispatchEvent(new Evt("change")); await settle();
     check("RAG OFF hides safeguard while preserving its value", $("#rag-chat-settings").classList.contains("hidden") && Number($("#f-rag_similarity_threshold").value) === .55);
   });
@@ -327,18 +327,20 @@ async function main() {
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
     client.init(); await settle(); click("chat-settings"); click("tab-btn-rag");
-    check("Legacy refinement switches stay off with a single Top-K", !$("#f-rag_rewrite_enabled").checked && !$("#f-rag_filter_enabled").checked && $("#f-rag_top_k").value === "5" && $("#rag-chat-settings").classList.contains("hidden"));
-    $("#f-rag_rewrite_enabled").checked = true; $("#f-rag_filter_enabled").checked = true;
-    $("#f-rag_top_k").value = "4"; $("#f-rag_similarity_threshold").value = "0.45";
-    $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
+    check("Legacy rewrite stays off with default candidate and answer counts", !$("#f-rag_rewrite_enabled").checked && $("#f-rag_candidates_k").value === "20" && $("#f-rag_final_k").value === "5" && $("#rag-chat-settings").classList.contains("hidden"));
+    $("#f-rag_rewrite_enabled").checked = true;
+    $("#f-rag_candidates_k").value = "12"; $("#f-rag_final_k").value = "4";
+    $("#f-rag_rewrite_enabled").dispatchEvent(new Evt("change")); await settle();
     const patch = requests("PATCH", "/api/agents/ag_1").at(-1).body;
-    check("Refinement controls emit one Top-K and independent flags", patch.rag_rewrite_enabled === true && patch.rag_filter_enabled === true && patch.rag_top_k === 4 && patch.rag_similarity_threshold === .45 && patch.rag_enabled === false && !("rag_candidates_k" in patch) && !("rag_final_k" in patch));
+    check("Both counts and independent rewrite save without obsolete filter fields", patch.rag_rewrite_enabled === true && patch.rag_candidates_k === 12 && patch.rag_final_k === 4 && patch.rag_enabled === false && !("rag_top_k" in patch) && !("rag_filter_enabled" in patch) && patch.rag_similarity_threshold === .3);
     const count = requests("PATCH", "/api/agents/ag_1").length;
-    $("#f-rag_top_k").value = "1.5"; $("#f-rag_top_k").dispatchEvent(new Evt("change")); await settle();
-    check("Fractional Top-K blocks PATCH and preserves input", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_top_k").value === "1.5" && $("#save-status").textContent.includes("целое"));
-    $("#f-rag_top_k").value = "4";
-    open(1); await settle(); check("Switch loads independent refinement settings", $("#f-rag_top_k").value === "7" && !$("#rag-chat-settings").classList.contains("hidden") && !$("#rag-chat-parameters").classList.contains("hidden"));
-    open(0); await settle(); check("Switch restores saved refinements", $("#f-rag_top_k").value === "4" && $("#f-rag_rewrite_enabled").checked && $("#rag-chat-settings").classList.contains("hidden"));
+    $("#f-rag_candidates_k").value = "1.5"; $("#f-rag_candidates_k").dispatchEvent(new Evt("change")); await settle();
+    check("Fractional candidate count blocks PATCH and preserves input", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_candidates_k").value === "1.5" && $("#save-status").textContent.includes("целое"));
+    $("#f-rag_candidates_k").value = "3"; $("#f-rag_candidates_k").dispatchEvent(new Evt("change")); await settle();
+    check("Answer count exceeding candidates blocks one atomic PATCH", requests("PATCH", "/api/agents/ag_1").length === count && $("#f-rag_final_k").value === "4" && $("#save-status").textContent.includes("больше"));
+    $("#f-rag_candidates_k").value = "12";
+    open(1); await settle(); check("Switch loads independent counts", $("#f-rag_candidates_k").value === "30" && $("#f-rag_final_k").value === "7" && !$("#rag-chat-settings").classList.contains("hidden") && !$("#rag-chat-parameters").classList.contains("hidden"));
+    open(0); await settle(); check("Switch restores saved counts", $("#f-rag_candidates_k").value === "12" && $("#f-rag_final_k").value === "4" && $("#f-rag_rewrite_enabled").checked && $("#rag-chat-settings").classList.contains("hidden"));
     click("workspace-chat"); const before = requests("GET", /^\/api\/rag\//).length;
     $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     const snapshot = $("#rag-answer-snapshot");
@@ -373,28 +375,27 @@ async function main() {
         && requests("GET", /^\/api\/rag\//).length === before);
       node.querySelector("button").dispatchEvent(new Evt("click")); await settle();
       click("chat-settings"); click("tab-btn-rag");
-      $("#f-rag_filter_enabled").checked = filter;
-      $("#f-rag_filter_enabled").dispatchEvent(new Evt("change")); await settle();
+      $("#f-rag_rewrite_enabled").checked = !rewrite;
+      $("#f-rag_rewrite_enabled").dispatchEvent(new Evt("change")); await settle();
       $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
       check("Changing current settings saves next-answer config without changing inspected snapshot " + rewrite + "/" + filter,
-        requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_filter_enabled === filter
+        requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_rewrite_enabled === !rewrite
         && node.textContent === content && JSON.stringify(client.state.current.transcript[1].rag) === saved
         && $("#rag-current-chat").hidden && $("#save-status").classList.contains("hidden"));
     });
   }
   await scenario("RAG actual stages, deterministic no-hit and failed rewrite diagnostics", async () => {
     const {client, server, $, send, requests} = freshClient({agents: [{rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true}]});
-    const search = deferred(), filter = deferred(), nohit = deferred(), finish = deferred();
+    const search = deferred(), nohit = deferred(), finish = deferred();
     const empty = {version: 2, original_query: "neutral", query: "rewritten", hits: [], candidates: [], context: ""};
     server.respond("POST", "/api/agents/ag_1/messages", () => stream([
-      {event: "retrieval", stage: "rewrite"}, {event: "retrieval", stage: "search"}, {event: "retrieval", stage: "filter"},
+      {event: "retrieval", stage: "rewrite"}, {event: "retrieval", stage: "search"},
       {...start, generation: false, resolved_messages: []}, {event: "delta", text: "В базе не найдена подходящая информация"}, {event: "done", committed: true, answer_index: 1}
-    ], {beforeRead: async (i) => { if (i === 1) await search.promise; if (i === 2) await filter.promise; if (i === 3) await nohit.promise; if (i === 4) await finish.promise; },
+    ], {beforeRead: async (i) => { if (i === 1) await search.promise; if (i === 2) await nohit.promise; if (i === 3) await finish.promise; },
       finish: () => Object.assign(server.state.agents[0], {transcript: [turns[0], {...turns[1], content: "В базе не найдена подходящая информация", rag: empty}], history_len: 2})}));
     client.init(); await settle(); send("neutral"); await settle();
     check("Actual rewrite announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Переформулирование запроса");
     search.resolve(); await settle(); check("Actual search announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Поиск контекста");
-    filter.resolve(); await settle(); check("Actual filter announces its stage", $("#feed").querySelector(".card-status-text").textContent === "Фильтрация фрагментов");
     nohit.resolve(); await settle(); check("No-hit start does not announce generation", $("#feed").querySelector(".card-status-text").textContent === "Подходящих фрагментов нет");
     finish.resolve(); await settle(); check("No-hit answer has empty sources and no fabricated usage", $("#feed").querySelector(".card-rag").textContent.includes("подходящих фрагментов нет") && !$("#feed").querySelector(".card-rag").querySelector("li") && !$("#feed").querySelector(".card-usage"));
     const payload = {model: "neutral", messages: [{role: "user", content: "neutral rewrite input"}]};
@@ -778,7 +779,7 @@ async function main() {
     server.respond("POST", "/api/agents/ag_1/messages", () => stream(success));
     client.init(); await settle(); check("Compatible chat remains available without OpenRouter key", !$("#send").disabled && $("#f-provider").value === "compatible");
     click("chat-settings"); click("tab-btn-rag"); await settle();
-    check("Top-K stays visible with RAG enabled and filtering off", !$("#rag-chat-parameters").classList.contains("hidden") && !$("#rag-threshold-field").classList.contains("hidden") && $("#rag-rerank-fields").classList.contains("hidden"));
+    check("Both counts stay visible without a cosine filter", !$("#rag-chat-parameters").classList.contains("hidden") && !!$("#f-rag_candidates_k") && !!$("#f-rag_final_k") && !$("#f-rag_filter_enabled") && !$("#rag-threshold-field").classList.contains("hidden") && $("#rag-rerank-fields").classList.contains("hidden"));
     $("#f-rag_rerank_enabled").checked = true; $("#f-rag_rerank_enabled").dispatchEvent(new Evt("change"));
     $("#f-rag_rerank_provider").value = "compatible"; $("#f-rag_rerank_provider").dispatchEvent(new Evt("change"));
     $("#f-rag_rerank_model").value = "ranker-only"; $("#f-rag_rerank_model").dispatchEvent(new Evt("input")); $("#f-rag_rerank_model").dispatchEvent(new Evt("change")); await settle();
@@ -786,13 +787,53 @@ async function main() {
     const saved = JSON.stringify(rag), before = requests("GET", /^\/api\/rag\//).length;
     $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
     const snapshot = $("#rag-answer-snapshot"), rows = snapshot.querySelectorAll(".rag-snapshot-candidate");
-    check("Saved rerank report shows original/final ranks and cosine only", rows[0].textContent.includes("1 → 2") && rows[1].textContent.includes("2 → 1") && snapshot.textContent.includes("ranker-only") && !snapshot.textContent.includes("similarity_threshold"));
-    rows[1].querySelector("button").dispatchEvent(new Evt("click"));
+    check("Saved rerank report shows original/final ranks and cosine only", rows[0].textContent.includes("2 → 1") && rows[1].textContent.includes("1 → 2") && snapshot.textContent.includes("ranker-only") && !snapshot.textContent.includes("similarity_threshold"));
+    rows[0].querySelector("button").dispatchEvent(new Evt("click"));
     check("Selecting one candidate shows its complete saved text without index reads", snapshot.querySelectorAll(".rag-snapshot-text").length === 1 && snapshot.querySelector(".rag-snapshot-text").textContent === b.text && requests("GET", /^\/api\/rag\//).length === before && JSON.stringify(client.state.current.transcript[1].rag) === saved);
     snapshot.querySelector("button").dispatchEvent(new Evt("click")); await settle(); click("workspace-chat"); send("neutral request"); await settle();
     check("Compatible chat posts without an OpenRouter key", requests("POST", "/api/agents/ag_1/messages").length === 1);
     open(1); await settle(); check("OpenRouter chat still needs its configured key", $("#send").disabled && $("#f-provider").value === "openrouter");
     open(0); await settle(); check("Chat switch restores independent provider and rerank selection", $("#f-provider").value === "compatible" && $("#f-model").value === "chat-only" && $("#f-rag_rerank_model").value === "ranker-only");
+  });
+  await scenario("All saved candidates appear in final order with a selected prefix", async () => {
+    const candidates = [
+      {chunk_id: "a", title: "Neutral A", score: .8, text: "full A", original_rank: 1, final_rank: 3, selected: false},
+      {chunk_id: "b", title: "Neutral B", score: .6, text: "full B", original_rank: 2, final_rank: 2, selected: false},
+      {chunk_id: "c", title: "Neutral C", score: -.1, text: "full C", original_rank: 3, final_rank: 1, selected: true}];
+    const rag = {version: 3, query: "neutral", index: {index_id: "saved-selection"},
+      config: {candidates_k: 3, final_k: 1, rewrite_enabled: false, rerank_enabled: true},
+      rerank: {enabled: true, model: "saved-ranker", source_ids: [3,2,1]},
+      selection: {ordering: "rerank", ordered_source_ids: [3,2,1], selected_source_ids: [3]},
+      candidates, hits: [candidates[2]], context: "selected full C"};
+    const saved = JSON.stringify(rag);
+    const {client, $, requests, server, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2}, {}]});
+    client.init(); await settle(); const before = requests("GET", /^\/api\/rag\//).length;
+    $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const report = $("#rag-answer-snapshot"), rows = report.querySelector("tbody").querySelectorAll("tr");
+    check("Three columns and all candidates follow final rank", same(Array.from(report.querySelectorAll("th")).map(n => n.textContent), ["Источник", "До → после", "Cosine"])
+      && rows.length === 3 && rows[0].textContent.includes("Neutral C") && rows[0].textContent.includes("3 → 1") && rows[0].textContent.includes("-0.1000") && rows[2].textContent.includes("Neutral A") && rows[2].textContent.includes("1 → 3"));
+    check("Only selected prefix has its unobtrusive source marker", rows[0].querySelector(".rag-context-selection")?.textContent === "В контексте" && !rows[1].querySelector(".rag-context-selection") && !rows[2].querySelector(".rag-context-selection"));
+    rows[2].querySelector("button").dispatchEvent(new Evt("click"));
+    check("Unselected full candidate text stays available without live index or mutation", report.querySelector(".rag-snapshot-text").textContent === "full A" && report.querySelector(".rag-snapshot-context").textContent === rag.context && requests("GET", /^\/api\/rag\//).length === before && JSON.stringify(client.state.current.transcript[1].rag) === saved);
+    const off = {...rag, config: {...rag.config, rerank_enabled: false}, rerank: undefined,
+      selection: {ordering: "cosine", ordered_source_ids: [1,2,3], selected_source_ids: [1]},
+      candidates: candidates.map((c, i) => ({...c, final_rank: i + 1, selected: i === 0})), hits: [candidates[0]]};
+    server.state.agents[0].transcript[1].rag = off;
+    open(1); await settle(); open(0); await settle();
+    $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    check("Rerank OFF retains all cosine candidates but no ranking diagnostics", report.querySelector("tbody").querySelectorAll("tr").length === 3 && same(Array.from(report.querySelectorAll("th")).map(n => n.textContent), ["Источник", "Cosine"])
+      && !report.textContent.includes("saved-ranker") && !report.textContent.includes("До → после") && !report.textContent.includes("rerank_enabled") && !report.textContent.includes("original_rank") && !report.textContent.includes("final_rank"));
+  });
+  await scenario("Legacy filtered rerank ranks use saved final identity", async () => {
+    const a = {chunk_id: "rejected", title: "Rejected A", score: .1, decision: "threshold", text: "full rejected"};
+    const b = {chunk_id: "b", title: "Saved B", score: .8, decision: "kept", text: "full B"};
+    const c = {chunk_id: "c", title: "Saved C", score: .6, decision: "kept", text: "full C"};
+    const rag = {version: 2, query: "neutral", config: {filter_enabled: true, rerank_enabled: true},
+      rerank: {source_ids: [2,1]}, candidates: [a,b,c], hits: [c,b], context: "saved C B"};
+    const {client, $} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2}]});
+    client.init(); await settle(); $("#feed").querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const rows = $("#rag-answer-snapshot").querySelector("tbody").querySelectorAll("tr");
+    check("Legacy excluded candidate cannot shift saved permutation IDs", rows[0].textContent.includes("Saved C") && rows[0].textContent.includes("2 → 1") && rows[1].textContent.includes("Saved B") && rows[1].textContent.includes("1 → 2") && rows[2].textContent.includes("Rejected A") && rows[2].textContent.includes("— → —") && rows[2].textContent.includes("Ниже порога"));
   });
   await scenario("Configured rerank without a result does not claim a completed ranking", async () => {
     const rag = {version: 2, query: "neutral no-hit", index: {index_id: "saved-nohit"},
