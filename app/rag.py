@@ -216,7 +216,7 @@ async def lookup(query: str, **options) -> dict:
 
 
 def _rerank_ids(text, count, usage):
-    """Accept one bounded object after an optional prose prefix; never repair order."""
+    """Accept one bounded object with plain prose around it; never repair order."""
     def fail(detail):
         raise RewriteError("Некорректный ответ RAG rerank: " + detail, usage)
 
@@ -237,8 +237,9 @@ def _rerank_ids(text, count, usage):
         raise
     except (ValueError, TypeError, RecursionError):
         fail("невалидный JSON")
-    if text[end:].strip():
-        fail("лишний текст или второй объект после JSON")
+    suffix = text[end:]
+    if any(char in suffix for char in "{}[]") or "```" in suffix or "~~~" in suffix:
+        fail("неоднозначное структурированное содержимое после JSON")
     if not isinstance(value, dict) or set(value) != {"source_ids"} or not isinstance(value["source_ids"], list):
         fail("ожидается объект только с массивом source_ids")
     ids = value["source_ids"]
