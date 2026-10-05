@@ -35,6 +35,8 @@ def check_rag_citations():
     paraphrase = {**valid, "citations": [{"source_id": 2, "quote": "Зелёный цвет второго объекта"}]}
     _, paraphrase_record = rag.validate_answer(json.dumps(paraphrase), snapshot, {"finish_reason": "stop"})
     assert paraphrase_record["status"] == "answered" and paraphrase_record["citations"][0]["quote"] == paraphrase["citations"][0]["quote"]
+    no_inline = {**valid, "answer": "The second item is green."}
+    assert rag.validate_answer(json.dumps(no_inline), snapshot, {"finish_reason": "stop"}) == (no_inline["answer"], proof)
     invalid_cases = [
         ({"status": "insufficient"}, "только с полями answer и citations"),
         ({**valid, "answer": " "}, "answer должен быть непустой строкой"),
@@ -44,8 +46,8 @@ def check_rag_citations():
         ({**valid, "citations": [{"source_id": 2, "quote": " "}]}, "quote должен быть непустой строкой"),
         ({**valid, "citations": valid["citations"] * 2}, "повторяющиеся source_id"),
         ({**valid, "citations": [{**valid["citations"][0], "source": "invented"}]}, "только source_id и quote"),
-        ({**valid, "answer": "The item is green."}, "отсутствуют ссылки"),
         ({**valid, "answer": "The item is green [1]."}, "ссылки в answer не совпадают"),
+        ({**valid, "citations": [{"source_id": 1, "quote": "blue"}, *valid["citations"]]}, "ссылки в answer не совпадают"),
         ({**valid, "answer": "The item is green [" + "1" * 5000 + "]."}, "ссылки в answer не совпадают"),
         ({**valid, "answer": "The item is green [02]."}, "ссылки в answer не совпадают"),
     ]
@@ -85,10 +87,10 @@ def check_rag_citations():
         chat = agents.Agent(spec, store=store)
         unchanged = copy.deepcopy(chat.spec)
         _stub.reset()
-        with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(json.dumps(valid), reasoning="neutral reasoning")):
+        with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(json.dumps(no_inline), reasoning="neutral reasoning")):
             result = await drain(chat.ask("neutral request"))
-        assert result[-1]["committed"] and result[-1]["text"] == valid["answer"]
-        assert [e["text"] for e in result if e["type"] == "delta"] == [valid["answer"]]
+        assert result[-1]["committed"] and result[-1]["text"] == no_inline["answer"]
+        assert [e["text"] for e in result if e["type"] == "delta"] == [no_inline["answer"]]
         assert any(e["type"] == "reasoning" for e in result)
         assert chat.spec == unchanged
         body = chat.history[-1].request_bodies[0]
@@ -100,8 +102,10 @@ def check_rag_citations():
         assert [h["source_id"] for h in json.loads(context.split("\n", 1)[1])] == [1, 2]
         before = copy.deepcopy(chat.history[-1])
         loaded = agents.Agent(chat.spec, agent_id=chat.id, store=store)
-        assert loaded.history[-1].rag == before.rag
+        assert loaded.history[-1].rag == before.rag and loaded.history[-1].content == no_inline["answer"]
+        assert loaded.history[-1].request_bodies == chat.history[-1].request_bodies
         branch = chat.carry_off(len(chat.history))
+        assert branch["history"][-1].content == no_inline["answer"]
         branch["history"][-1].rag["answer"]["citations"][0]["quote"] = "mutated"
         assert chat.history[-1].rag == before.rag
 

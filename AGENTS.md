@@ -41,7 +41,9 @@ hits/context/identity/timing/actual usage. Legacy v1/v2 история не пе
 устаревший top_k из config, restart/fork сохраняют effective counts.
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
 сохраняет доступные метрики в error assistant. При RAG ON финальный JSON answer/citations
-проверяется до публикации: ссылки [n] — позиции pinned hits; source/section/chunk_id
+проверяется до публикации: inline ссылки [n] предпочтительны, но необязательны;
+если есть, их набор строго совпадает с citations. Текст не дополняется ссылками.
+Номера — позиции pinned hits; source/section/chunk_id
 берутся только оттуда. Quote непустая, но её дословность и смысловая поддержка
 не проверяются; cosine — единственный автоматический content gate. Ошибка —
 no-commit/restore без retry; непроверенный partial RAG не сохраняется при отмене

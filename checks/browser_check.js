@@ -75,6 +75,19 @@ async function main() {
     check("Answered history shows saved quotes and no verification claim or index fetch", historical.querySelectorAll(".rag-snapshot-citation").length === 2 && historical.textContent.includes("Источники и цитаты") && !historical.textContent.includes("Цитаты проверены") && requests("GET", /^\/api\/rag\//).length === before);
   });
 
+  await scenario("Answer without inline references retains source cards and unchanged text", async () => {
+    const content = "Первый объект синий. Данных о массе нет.";
+    const rag = {version: 3, hits: [{chunk_id: "neutral", text: "Neutral item is blue.", score: .8}],
+      answer: {status: "answered", citations: [{source_id: 1, chunk_id: "neutral", source: "fixture:neutral", title: "Neutral", quote: "Neutral <b>blue</b> item."}]}};
+    const {client, $} = freshClient({agents: [{rag_enabled: true, transcript: [turns[0], {...turns[1], content, rag}], history_len: 2}]});
+    client.init(); await settle();
+    const card = $("#feed").querySelector(".card"), body = card.querySelector(".card-body"), sources = card.querySelectorAll(".rag-source-card");
+    check("No-inline answer renders unchanged with no invented reference", body.textContent === content && !body.innerHTML.includes("rag-citation-ref"));
+    check("No-inline citations retain safe source cards", sources.length === 1 && sources[0].id === "rag-source-1-1" && sources[0].querySelector("blockquote").textContent === "Neutral <b>blue</b> item." && !sources[0].querySelector("b"));
+    const raw = button(card, "Показать сырой текст"); raw.dispatchEvent(new Evt("click")); raw.dispatchEvent(new Evt("click"));
+    check("No-inline text and cards survive raw-view restoration", body.textContent === content && !body.innerHTML.includes("rag-citation-ref") && card.querySelectorAll(".rag-source-card").length === 1);
+  });
+
   await scenario("Verified citations use saved ranks, inert quotes and safe local references", async () => {
     const rag = {version: 2, query: "neutral question", config: {rewrite_enabled: false, filter_enabled: false},
       answer_policy: {weak_context_enabled: true, similarity_threshold: .4},
