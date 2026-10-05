@@ -25,7 +25,7 @@ from typing import AsyncIterator
 
 from .llm import SAMPLING_FIELDS, MissingKeyError, capture_requests, stream_completion
 from .mcp import MANAGER
-from .rag import lookup as rag_lookup, rewrite as rag_rewrite, rerank as rag_rerank, format_context, history_pairs, NO_HITS
+from .rag import lookup as rag_lookup, rewrite as rag_rewrite, rerank as rag_rerank, select_context, history_pairs, NO_HITS
 from .schema import (
     CONTEXT_FIELDS,
     GATED_MOVES,
@@ -1663,11 +1663,8 @@ class Agent:
                                 spec=spec, rewrite_result=rewrite_result))
                             if rag_result is not None:
                                 rag_result.update(copy.deepcopy(rag_snapshot))
-                            if spec.rag_filter_enabled:
-                                yield {"type": "retrieval", "stage": "filter", "query": query,
-                                       "count": len(rag_snapshot["hits"])}
-                            if spec.rag_rerank_enabled and rag_snapshot["hits"] and not cancel.is_set() and (can_run is None or await can_run()):
-                                yield {"type": "retrieval", "stage": "rerank", "query": query, "count": len(rag_snapshot["hits"])}
+                            if spec.rag_rerank_enabled and rag_snapshot["candidates"] and not cancel.is_set() and (can_run is None or await can_run()):
+                                yield {"type": "retrieval", "stage": "rerank", "query": query, "count": len(rag_snapshot["candidates"])}
                                 if not cancel.is_set() and (can_run is None or await can_run()):
                                     with capture_requests() as rerank_requests:
                                         try:
@@ -1675,9 +1672,7 @@ class Agent:
                                         finally:
                                             preparation_requests.extend(copy.deepcopy(rerank_requests))
                                     if not rerank_result.get("cancelled"):
-                                        original_hits = rag_snapshot["hits"]
-                                        rag_snapshot["hits"] = [original_hits[i - 1] for i in rerank_result["source_ids"]]
-                                        rag_snapshot["context"] = format_context(rag_snapshot["hits"])
+                                        select_context(rag_snapshot, rerank_result["source_ids"])
                                         rag_snapshot["rerank"] = copy.deepcopy(rerank_result)
                                         rag_snapshot["timings"]["rerank_seconds"] = rerank_result["duration_seconds"]
                                         if rag_result is not None:
@@ -2124,7 +2119,7 @@ def spec_as_dict(
         "model": spec.model,
         "provider": spec.provider,
         "rag_enabled": spec.rag_enabled,
-        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_filter_enabled", "rag_top_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")},
+        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")},
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2173,9 +2168,12 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
     if not known.get("model"):
         return fallback
     known.setdefault("label", fallback.label)
-    known.setdefault("rag_top_k", (config or {}).get("rag_final_k", 5))
+    # The single-K schema may have retained older two-K keys: its effective K wins.
+    final_k = (config or {}).get("rag_top_k", known.get("rag_final_k", 5))
+    candidates_k = 20 if "rag_top_k" in (config or {}) else known.get("rag_candidates_k", 20)
+    known["rag_final_k"] = final_k
+    known["rag_candidates_k"] = max(candidates_k, final_k)
     known["rag_rerank_enabled"] = known.get("rag_rerank_enabled") is True
     known["rag_enabled"] = known.get("rag_enabled") is True
     known["rag_rewrite_enabled"] = known.get("rag_rewrite_enabled") is True
-    known["rag_filter_enabled"] = known.get("rag_filter_enabled") is True
     return AgentSpec(**known)

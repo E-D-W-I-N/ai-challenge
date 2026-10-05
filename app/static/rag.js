@@ -378,6 +378,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     const parameters = {version: snapshot.version, index: snapshot.index, top_k: snapshot.top_k,
       duration_seconds: snapshot.duration_seconds, retrieval_seconds: snapshot.timings?.retrieval_seconds};
     if (rewriteEnabled) parameters.rewrite_seconds = snapshot.timings?.rewrite_seconds;
+    if (snapshot.version >= 3) parameters.selection = {candidates_k: snapshot.config.candidates_k, final_k: snapshot.config.final_k, ...snapshot.selection};
     if (filterEnabled) parameters.filter = {top_k: snapshot.config.top_k ?? snapshot.top_k,
       similarity_threshold: snapshot.config.similarity_threshold};
     if (filterEnabled && snapshot.config.candidates_k != null) parameters.filter.candidates_k = snapshot.config.candidates_k;
@@ -404,12 +405,21 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
       usage: snapshot.rerank?.usage ?? "Неизвестно", duration_seconds: snapshot.timings?.rerank_seconds ?? snapshot.rerank?.duration_seconds}));
     target.append(diagnostics);
     const hits = snapshot.hits || [];
-    const candidates = (filterEnabled || rerankEnabled) && snapshot.candidates ? snapshot.candidates : hits;
+    let candidates = (snapshot.version >= 3 || filterEnabled || rerankEnabled) && snapshot.candidates ? snapshot.candidates : hits;
+    if (snapshot.version >= 3) candidates = [...candidates].sort((a, b) => a.final_rank - b.final_rank);
+    else if (rerankPerformed) {
+      // Legacy permutations describe the filtered rerank input, not all candidates.
+      candidates = candidates.map((hit) => {
+        const after = hits.findIndex(item => item.chunk_id === hit.chunk_id);
+        return {...hit, original_rank: after < 0 ? "—" : snapshot.rerank.source_ids[after],
+          final_rank: after < 0 ? "—" : after + 1};
+      }).sort((a, b) => (typeof a.final_rank === "number" ? a.final_rank : Infinity) - (typeof b.final_rank === "number" ? b.final_rank : Infinity));
+    }
     target.append(el("h3", "", rerankPerformed ? "Фрагменты · порядок до и после ранжирования" : "Фрагменты поиска"));
     if (!candidates.length) target.append(el("p", "hint", "Подходящих фрагментов нет"));
     else {
       const table = el("table", "rag-ranking-table"), head = el("thead"), headings = el("tr"), body = el("tbody");
-      for (const label of [...(rerankPerformed ? ["До → после"] : []), "Источник / раздел", "Cosine", "Контекст"]) headings.append(el("th", "", label));
+      for (const label of ["Источник", ...(rerankPerformed ? ["До → после"] : []), "Cosine"]) headings.append(el("th", "", label));
       head.append(headings); table.append(head, body);
       const textView = el("div", "rag-selected-fragment");
       const decisions = {kept: "В контексте", threshold: "Ниже порога", final_cap: "Лимит фрагментов"};
@@ -419,6 +429,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
           node.querySelector("button").setAttribute("aria-pressed", String(selected));
         }
         const {text, decision, ...metadata} = hit;
+        if (!rerankPerformed) { delete metadata.original_rank; delete metadata.final_rank; }
         if (filterEnabled && decision !== undefined) metadata.decision = decision;
         textView.replaceChildren(el("h3", "", hit.section || hit.title || hit.chunk_id),
           el("pre", "rag-snapshot-text", text || ""), detail("Источник и метаданные фрагмента", metadata));
@@ -426,12 +437,14 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
       for (const [i, hit] of candidates.entries()) {
         const after = hits.findIndex(item => item.chunk_id === hit.chunk_id);
         const row = el("tr", (filterEnabled || rerankEnabled ? "rag-snapshot-candidate" : "") + (after >= 0 ? " rag-snapshot-hit" : ""));
-        if (rerankPerformed) row.append(el("td", "rag-rank", `${i + 1} → ${after < 0 ? "—" : after + 1}`));
         const source = el("td"); const choose = button(hit.title || hit.source || hit.chunk_id, () => select(hit, row));
         choose.className = "rag-fragment-button"; choose.setAttribute("aria-pressed", "false");
-        source.append(choose, el("span", "hint", hit.section || "")); row.append(source);
+        source.append(choose, el("span", "hint", hit.section || ""));
+        if (after >= 0) source.append(el("span", "hint rag-context-selection", "В контексте"));
+        else if (filterEnabled && hit.decision) source.append(el("span", "hint", decisions[hit.decision] || hit.decision));
+        row.append(source);
+        if (rerankPerformed) row.append(el("td", "rag-rank", `${hit.original_rank ?? i + 1} → ${hit.final_rank ?? (after < 0 ? "—" : after + 1)}`));
         row.append(el("td", "rag-cosine", Number.isFinite(hit.score) ? hit.score.toFixed(4) : "—"));
-        row.append(el("td", "", after >= 0 ? `[${after + 1}]` : (filterEnabled ? decisions[hit.decision] || hit.decision || "—" : "—")));
         body.append(row); if (i === 0) select(hit, row);
       }
       target.append(table, textView);
