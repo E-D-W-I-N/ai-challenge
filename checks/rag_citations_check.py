@@ -35,32 +35,44 @@ def check_rag_citations():
     paraphrase = {**valid, "citations": [{"source_id": 2, "quote": "Зелёный цвет второго объекта"}]}
     _, paraphrase_record = rag.validate_answer(json.dumps(paraphrase), snapshot, {"finish_reason": "stop"})
     assert paraphrase_record["status"] == "answered" and paraphrase_record["citations"][0]["quote"] == paraphrase["citations"][0]["quote"]
-    invalids = [
-        {"status": "insufficient"},
-        {**valid, "citations": []},
-        {**valid, "citations": [{"source_id": True, "quote": "second item is green"}]},
-        {**valid, "citations": [{"source_id": 3, "quote": "second item is green"}]},
-        {**valid, "citations": [{"source_id": 2, "quote": " "}]},
-        {**valid, "citations": valid["citations"] * 2},
-        {**valid, "citations": [{**valid["citations"][0], "source": "invented"}]},
-        {**valid, "answer": "The item is green [1]."},
-        {**valid, "answer": "The item is green [" + "1" * 5000 + "]."},
-        {**valid, "answer": "The item is green [02]."},
+    invalid_cases = [
+        ({"status": "insufficient"}, "только с полями answer и citations"),
+        ({**valid, "answer": " "}, "answer должен быть непустой строкой"),
+        ({**valid, "citations": []}, "citations должен быть непустым массивом"),
+        ({**valid, "citations": [{"source_id": True, "quote": "second item is green"}]}, "source_id должен быть целым числом"),
+        ({**valid, "citations": [{"source_id": 3, "quote": "second item is green"}]}, "ни одному переданному источнику"),
+        ({**valid, "citations": [{"source_id": 2, "quote": " "}]}, "quote должен быть непустой строкой"),
+        ({**valid, "citations": valid["citations"] * 2}, "повторяющиеся source_id"),
+        ({**valid, "citations": [{**valid["citations"][0], "source": "invented"}]}, "только source_id и quote"),
+        ({**valid, "answer": "The item is green."}, "отсутствуют ссылки"),
+        ({**valid, "answer": "The item is green [1]."}, "ссылки в answer не совпадают"),
+        ({**valid, "answer": "The item is green [" + "1" * 5000 + "]."}, "ссылки в answer не совпадают"),
+        ({**valid, "answer": "The item is green [02]."}, "ссылки в answer не совпадают"),
     ]
-    for invalid in invalids:
+    for invalid, category in invalid_cases:
         try:
             rag.validate_answer(json.dumps(invalid), snapshot, {"finish_reason": "stop"})
-        except rag.CitationError:
-            pass
+        except rag.CitationError as error:
+            assert category in str(error)
         else:
             raise AssertionError("invalid provenance contract accepted")
-    for finish in (None, "length", "tool_calls"):
+    for finish in (None, "length", "tool_calls", "untrusted-status-marker"):
         try:
             rag.validate_answer(json.dumps(valid), snapshot, {"finish_reason": finish})
-        except rag.CitationError:
-            pass
+        except rag.CitationError as error:
+            assert "статусом stop" in str(error) and "untrusted-status-marker" not in str(error)
         else:
             raise AssertionError("incomplete final frame accepted")
+    for metadata in ({"source": ""}, {"chunk_id": None}):
+        broken_snapshot = copy.deepcopy(snapshot)
+        broken_snapshot["hits"][1].update(metadata)
+        try: rag.validate_answer(json.dumps(valid), broken_snapshot, {"finish_reason": "stop"})
+        except rag.CitationError as error: assert "source или chunk_id" in str(error)
+        else: raise AssertionError("invalid pinned source accepted")
+    try: rag.validate_answer(json.dumps(valid), snapshot, {"finish_reason": "stop", "error": "untrusted-error-marker"})
+    except rag.CitationError as error:
+        assert "модель сообщила об ошибке" in str(error) and "untrusted-error-marker" not in str(error)
+    else: raise AssertionError("model error accepted")
 
     async def drain(stream):
         return [event async for event in stream]
@@ -94,13 +106,17 @@ def check_rag_citations():
         assert chat.history[-1].rag == before.rag
 
         # A malformed result is not shown, committed or retried; actual paid diagnostics remain.
-        for output in ("raw untrusted output", json.dumps(invalids[3]),
-                       '{"answer":"x [1]","citations":[{"source_id":' + '1' * 5000 + ',"quote":"x"}]}',
-                       '{"status":"unknown","status":"insufficient"}',
-                       '[' * 1100 + '0' + ']' * 1100):
+        malformed = [(json.dumps(value), category) for value, category in invalid_cases] + [
+            ("raw untrusted output", "не является корректным JSON"),
+            ('{"answer":"x [1]","citations":[{"source_id":' + '1' * 5000 + ',"quote":"x"}]}', "не является корректным JSON"),
+            ('{"status":"unknown","status":"insufficient"}', "повторяющиеся ключи JSON"),
+            ('[' * 1100 + '0' + ']' * 1100, "не является корректным JSON"),
+        ]
+        for output, category in malformed:
             _stub.reset()
             with patch.object(rag.Index, "retrieve", retrieved), patch.object(agents, "stream_completion", _stub.make(output)):
                 failed = await drain(chat.ask("neutral invalid request"))
+            assert category in failed[-1]["error"]
             assert len(_stub.CALLS) == 1 and len(chat.history) == 2
             assert not failed[-1]["committed"] and failed[-1]["question"] == "neutral invalid request"
             assert failed[-1]["metrics"]["cost_usd"] == 0.000123
@@ -262,7 +278,7 @@ def check_rag_citations():
         scheduler.claims[(server.name, item["id"])] = {}
         _stub.reset()
         with patch.object(scheduler, "receipt", return_value=True), patch.object(rag.Index, "retrieve", retrieved), \
-             patch.object(agents, "stream_completion", _stub.make(json.dumps(invalids[3]))):
+             patch.object(agents, "stream_completion", _stub.make(json.dumps(invalid_cases[4][0]))):
             await scheduler._execute(server, item, "neutral token", chat)
         error = chat.history[-1]
         assert error.error and "формата RAG-ответа" in error.error

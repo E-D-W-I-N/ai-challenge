@@ -2041,7 +2041,7 @@ class Agent:
                 elif failure is None and not cancelled:
                     try:
                         if not final_frame_complete or calls:
-                            raise CitationError("Ошибка проверки RAG-цитат: окончательный ответ не завершён")
+                            raise CitationError("Ошибка формата RAG-ответа: окончательный ответ не завершён")
                         text, rag_snapshot["answer"] = validate_answer(piece, rag_snapshot, final_metrics)
                     except CitationError as exc:
                         failure = str(exc)

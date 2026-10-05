@@ -47,39 +47,55 @@ def sufficient_context(snapshot: dict, threshold: float) -> bool:
 
 def validate_answer(raw: str, snapshot: dict, metrics: dict | None) -> tuple[str, dict]:
     """Validate structure and source mapping, without judging content or exact wording."""
-    failure = "Ошибка формата RAG-ответа: структура ответа, ссылок или источников некорректна"
-    if not metrics or metrics.get("finish_reason") != "stop" or metrics.get("error"):
-        raise CitationError(failure)
+    def fail(reason):
+        raise CitationError("Ошибка формата RAG-ответа: " + reason) from None
+
+    if not metrics or metrics.get("finish_reason") != "stop":
+        fail("модель не завершила окончательный ответ со статусом stop")
+    if metrics.get("error"):
+        fail("модель сообщила об ошибке окончательного ответа")
+
     def unique_object(pairs):
         result = dict(pairs)
         if len(result) != len(pairs):
-            raise CitationError(failure)
+            fail("повторяющиеся ключи JSON")
         return result
     try:
         data = json.loads(raw, object_pairs_hook=unique_object)
+    except CitationError:
+        raise
     except (TypeError, ValueError, RecursionError):
-        raise CitationError(failure) from None
-    if (not isinstance(data, dict) or set(data) != {"answer", "citations"}
-            or not isinstance(data["answer"], str) or not data["answer"].strip()
-            or not isinstance(data["citations"], list) or not data["citations"]):
-        raise CitationError(failure)
+        fail("ответ не является корректным JSON")
+    if not isinstance(data, dict) or set(data) != {"answer", "citations"}:
+        fail("ожидается объект только с полями answer и citations")
+    if not isinstance(data["answer"], str) or not data["answer"].strip():
+        fail("answer должен быть непустой строкой")
+    if not isinstance(data["citations"], list) or not data["citations"]:
+        fail("citations должен быть непустым массивом")
     references = set(re.findall(r"\[(\d+)\]", data["answer"]))
     citations = {}
     for citation in data["citations"]:
         if not isinstance(citation, dict) or set(citation) != {"source_id", "quote"}:
-            raise CitationError(failure)
+            fail("каждая цитата должна содержать только source_id и quote")
         source_id, quote = citation["source_id"], citation["quote"]
-        if (type(source_id) is not int or not 1 <= source_id <= len(snapshot["hits"])
-                or source_id in citations or not isinstance(quote, str) or not quote.strip()):
-            raise CitationError(failure)
+        if type(source_id) is not int:
+            fail("source_id должен быть целым числом")
+        if not 1 <= source_id <= len(snapshot["hits"]):
+            fail("source_id не соответствует ни одному переданному источнику")
+        if source_id in citations:
+            fail("повторяющиеся source_id в citations")
+        if not isinstance(quote, str) or not quote.strip():
+            fail("quote должен быть непустой строкой")
         hit = snapshot["hits"][source_id - 1]
         if any(not isinstance(hit.get(key), str) or not hit[key].strip() for key in ("source", "chunk_id")):
-            raise CitationError(failure)
+            fail("в сохранённом источнике отсутствует source или chunk_id")
         citations[source_id] = {"source_id": source_id,
                                 **{key: hit.get(key, "") for key in ("chunk_id", "source", "title", "section")},
                                 "quote": quote}
+    if not references:
+        fail("в answer отсутствуют ссылки вида [1] на источники")
     if references != {str(source_id) for source_id in citations}:
-        raise CitationError(failure)
+        fail("ссылки в answer не совпадают с source_id в citations")
     return data["answer"], {"status": "answered", "citations": [citations[key] for key in sorted(citations)]}
 
 

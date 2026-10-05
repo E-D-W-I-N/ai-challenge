@@ -985,6 +985,12 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   citations дают безопасную явную ошибку. Номера не перенумеровываются по цитируемому
   поднабору; используются только фактически отправленные hits. Сервер выводит
   source/title/section/chunk_id из snapshot, не из заявления модели.
+  Ошибки диагностики отдельно называют незавершённый/model-error ответ, invalid JSON,
+  duplicate keys, root fields, пустые/неверного типа answer/citations/quote, поля цитаты,
+  type/range/duplicate source_id, missing pinned metadata и absent/mismatched inline refs.
+  Сообщения фиксированные: raw response, ID, цитаты, finish/error значения не отражаются.
+  CitationError от duplicate-key hook сохраняется до общего JSON ValueError catch.
+  Категории не меняют acceptance: только полный JSON без префикса/Markdown, без retry.
 - После cosine gate принимается только answer/citations; модельный
   `{status:"insufficient"}` даёт обычную ошибку формата с paid diagnostics,
   без подмены ответа отказом или платного retry. Prompt просит ответить на
