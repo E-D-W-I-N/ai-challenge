@@ -5479,6 +5479,12 @@ def check_rag_workflow_http():
     return check_workflow_http()
 
 
+@check("Day25: frozen working memory in Rewrite and final context")
+def check_rewrite_working_memory():
+    from checks.rewrite_memory_check import check_rewrite_memory
+    return check_rewrite_memory()
+
+
 @check("RAG: generation model catalogue HTTP/auth and safe failures")
 def check_rag_model_catalogue():
     from checks.rag_models_check import check_rag_models

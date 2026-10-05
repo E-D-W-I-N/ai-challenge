@@ -934,7 +934,7 @@ class Agent:
         return self.store.list_invariants()
 
     def prompt_head(
-        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None, *, working=None
     ) -> tuple[list[dict], dict[str, int | None], int]:
         """Начало промпта разом: сообщения **до** истории, номер каждой врезки
         в них и срез, с которого история уезжает дальше.
@@ -982,7 +982,7 @@ class Agent:
             slots["memory_at"] = len(messages)
             messages.append(memory_message(records))
 
-        items = self.working_items(spec)
+        items = self.working_items(spec) if working is None else working
         if items:
             slots["working_at"] = len(messages)
             messages.append(working_message(items))
@@ -1008,6 +1008,7 @@ class Agent:
         memory=None,
         profile=None,
         invariants=None,
+        working=None,
     ) -> list[dict]:
         """Системное сообщение + обе памяти + состояние задачи + начало
         истории по стратегии + хвост + вопрос.
@@ -1026,13 +1027,13 @@ class Agent:
         сообщения; `spec` передаёт обмен — он собирает промпт и тело запроса
         из одного слепка, и память читает один раз на обмен.
         """
-        messages, _, cut = self.prompt_head(spec, memory, profile, invariants)
+        messages, _, cut = self.prompt_head(spec, memory, profile, invariants, working=working)
         messages.extend(turn.as_message() for turn in self.history[cut:])
         messages.append({"role": "user", "content": user_text})
         return messages
 
     def prompt_slots(
-        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None
+        self, spec: AgentSpec | None = None, memory=None, profile=None, invariants=None, *, working=None
     ) -> dict[str, int | None]:
         """Номера всех врезок промпта разом: `memory_at`, `working_at`,
         `task_at`, `summary_at`. `None` у любого — врезки в промпте нет вовсе.
@@ -1042,7 +1043,7 @@ class Agent:
         формулы, и разошлись бы они молча. Уезжают они тоже разом — одним
         кадром `start`, — и спрашивать их порознь было бы неоткуда.
         """
-        return self.prompt_head(spec, memory, profile, invariants)[1]
+        return self.prompt_head(spec, memory, profile, invariants, working=working)[1]
 
     def compress_plan(self, spec: AgentSpec) -> tuple[int, int] | None:
         """Что предстоит свернуть этим обменом: `(свёрнуто, новая граница)` —
@@ -1619,6 +1620,8 @@ class Agent:
             self._cancel = asyncio.Event()
             cancel = self._cancel
             self.last_used_at = time.time()
+            # Freeze before the first await: Rewrite and final prompt/slots share this exchange.
+            working = copy.deepcopy(self.working_items())
             if can_run is not None and not await can_run():
                 return
 
@@ -1655,7 +1658,7 @@ class Agent:
                         if not cancel.is_set() and (can_run is None or await can_run()):
                             with capture_requests() as preparation_requests:
                                 rewrite_result = await rag_rewrite(user_text, used_history, spec.model,
-                                                                   stream_completion, cancel, provider=spec.provider, reasoning_enabled=spec.reasoning_enabled)
+                                                                   stream_completion, cancel, provider=spec.provider, reasoning_enabled=spec.reasoning_enabled, working_memory=working)
                             query = rewrite_result["query"]
                     if not cancel.is_set() and (can_run is None or await can_run()):
                         yield {"type": "retrieval", "stage": "search", "query": query}
@@ -1776,6 +1779,7 @@ class Agent:
                         memory=memory,
                         profile=profile,
                         invariants=invariants,
+                        working=working,
                     )
 
                     rag_at = None
@@ -1802,7 +1806,7 @@ class Agent:
                         "question": user_text,
                         "rag": copy.deepcopy(rag_snapshot),
                         "rag_at": rag_at,
-                        **self.prompt_slots(spec, memory, profile, invariants),
+                        **self.prompt_slots(spec, memory, profile, invariants, working=working),
                         "strategy": spec.strategy,
                     }
 
