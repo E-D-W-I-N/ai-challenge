@@ -68,9 +68,11 @@ class AgentSpec:
     `plugins` мержатся по `id`: выключенный `context-compression` уцелеет
     рядом с вашим, а названный тем же `id` — победит."""
     rag_rewrite_enabled: bool = True
-    rag_candidates_k: int = 20
-    rag_final_k: int = 5
+    reasoning_enabled: bool = False
+    rag_candidates_k: int = 10
+    rag_final_k: int = 3
     rag_rerank_enabled: bool = False
+    rag_rerank_reasoning_enabled: bool = False
     rag_rerank_provider: str = "openrouter"
     rag_rerank_model: str = "openai/gpt-6-luna"
     rag_enabled: bool = False

@@ -59,6 +59,7 @@ class StageRequest(BaseModel):
     urls: list[str] = Field(default_factory=list, max_length=100)
     use_manifest: bool = False
     preparation_strategy: Literal["programmatic", "llm"] = "programmatic"
+    preparation_reasoning_enabled: bool = Field(default=False, strict=True)
     preparation_model: str = PreparationConfig.model
     preparation_provider: Literal["openrouter", "compatible"] = "openrouter"
     preparation_timeout_seconds: float = Field(default=PreparationConfig.timeout_seconds, ge=1, le=3600, strict=True, allow_inf_nan=False)
@@ -66,9 +67,11 @@ class StageRequest(BaseModel):
     size: int = Field(default=1200, ge=64, le=100000, strict=True)
     overlap: int = Field(default=180, ge=0, strict=True)
     provider: Literal["openrouter", "compatible"] = "compatible"
+    reasoning_enabled: bool = Field(default=False, strict=True)
     model: str = EmbeddingConfig.model
     dimensions: int | None = Field(default=None, gt=0, strict=True)
     revision: str = "1"
+    semantic_reasoning_enabled: bool = Field(default=False, strict=True)
     semantic_model: str = SemanticConfig.model
     semantic_provider: Literal["openrouter", "compatible"] = "openrouter"
     batch_size: int = Field(default=16, ge=1, le=256, strict=True)
@@ -91,11 +94,11 @@ def start(kind: str, body: StageRequest):
         from .config import api_key
         compatible_url = settings(REGISTRY.store)["compatible_base_url"]
         api_key()
-        preparation_config = PreparationConfig(endpoint(body.preparation_provider, compatible_url), body.preparation_model, body.preparation_timeout_seconds, provider=body.preparation_provider)
-        semantic_config = SemanticConfig(endpoint(body.semantic_provider, compatible_url), body.semantic_model, provider=body.semantic_provider)
+        preparation_config = PreparationConfig(endpoint(body.preparation_provider, compatible_url), body.preparation_model, body.preparation_timeout_seconds, provider=body.preparation_provider, reasoning_enabled=body.preparation_reasoning_enabled)
+        semantic_config = SemanticConfig(endpoint(body.semantic_provider, compatible_url), body.semantic_model, provider=body.semantic_provider, reasoning_enabled=body.semantic_reasoning_enabled)
         if body.strategy == "semantic" and body.size > 12000:
             raise ValueError("Semantic chunk size must not exceed 12000 characters")
-        config = EmbeddingConfig(endpoint(body.provider, compatible_url), body.model, body.dimensions, body.revision, provider=body.provider)
+        config = EmbeddingConfig(endpoint(body.provider, compatible_url), body.model, body.dimensions, body.revision, provider=body.provider, reasoning_enabled=body.reasoning_enabled)
         inputs = [{"url": url} for url in body.urls]
         if kind == "ingest":
             from urllib.parse import urlparse

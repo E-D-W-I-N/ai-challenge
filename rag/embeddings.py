@@ -22,8 +22,11 @@ class EmbeddingConfig:
     revision: str = "1"
     # None is archived compatible identity: do not change its serialized fingerprint.
     provider: str | None = None
+    reasoning_enabled: bool = False
 
     def __post_init__(self):
+        if type(self.reasoning_enabled) is not bool:
+            raise ValueError("reasoning_enabled must be boolean")
         from shared_models import provider, validate_url, endpoint
         provider(self.provider or "compatible")
         validate_url(self.base_url)
@@ -39,6 +42,7 @@ class EmbeddingConfig:
 
     def fingerprint(self):
         identity = asdict(self)
+        identity.pop("reasoning_enabled")
         if self.provider is None:
             identity.pop("provider")
         return digest(json.dumps(identity, sort_keys=True, separators=(",", ":")))

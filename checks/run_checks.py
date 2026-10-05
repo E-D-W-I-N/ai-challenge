@@ -3153,7 +3153,7 @@ def _parsed_metrics(lines, **kwargs) -> dict:
     gap = kwargs.pop("gap", None)
     with patch.object(llm, "shared_client", lambda: _FakeClient(_FakeResponse(lines, gap_after=gap))), \
             patch.object(llm, "api_key", lambda: "sk-or-проверочный"):
-        spec = AgentSpec(label="разбор", model="stub/thinking")
+        spec = AgentSpec(label="разбор", model="stub/thinking", reasoning_enabled=True)
         events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[], **kwargs)))
     return next(e for e in events if e["type"] == "done")["metrics"]
 
@@ -5534,6 +5534,12 @@ def check_browser():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.strip()
+
+
+@check("Independent reasoning preferences and actual provider controls")
+def check_reasoning():
+    from checks.reasoning_check import check_reasoning
+    return check_reasoning()
 
 
 @check("Shared model providers and full-permutation RAG rerank")

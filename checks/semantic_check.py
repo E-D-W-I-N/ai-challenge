@@ -34,12 +34,12 @@ def check_semantic():
     default = SemanticConfig()
     assert default.model == "openai/gpt-6-luna"
     short_payload = _payload("x", [(0, 1)], default, 10)
-    assert short_payload["reasoning"] == {"effort": "none"} and short_payload["max_tokens"] == 9216
+    assert short_payload["reasoning"] == {"effort": "none", "enabled": False, "exclude": False} and short_payload["max_tokens"] == 9216
     full_payload = _payload("x" * 256, [(i, i + 1) for i in range(256)], default, 10)
     assert full_payload["max_tokens"] == 11328
     for alternative in (replace(default, model="unverified-model"), replace(default, provider="compatible"),
                         replace(default, base_url="http://neutral.test/v1", provider="compatible")):
-        assert "reasoning" not in _payload("x", [(0, 1)], alternative, 10)
+        assert _payload("x", [(0, 1)], alternative, 10).get("reasoning", {}).get("effort", _payload("x", [(0, 1)], alternative, 10).get("reasoning_effort")) == "none"
     # The requested end at 30 survives even though greedy whole-document
     # packing would choose 40. Subsequent semantic group is capped separately.
     spans = _boundaries({"end_unit_ids": [3, 7]}, units, 20)
@@ -121,7 +121,7 @@ def check_semantic():
             units = json.loads(request["messages"][1]["content"])["units"]
             assert sum(len(u["text"]) for u in units) <= 12000 and len(units) <= 256
             assert request["max_tokens"] == 8192 + max(1024, 64 + len(units) * 12)
-            assert request["reasoning"] == {"effort": "none"}
+            assert request["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
         before = len(requests)
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "rotated-neutral-key"}):
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
@@ -179,7 +179,7 @@ def check_semantic():
                 assert len(requests) == before + 1 and repaired_report["calls"] == 1
                 actual_request = requests[-1]
                 supplied = json.loads(actual_request["messages"][-1]["content"])
-                assert actual_request["model"] == "openai/gpt-6-luna" and actual_request["reasoning"] == {"effort": "none"}
+                assert actual_request["model"] == "openai/gpt-6-luna" and actual_request["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
                 assert supplied["total_units"] == supplied["last_unit_id"] == len(supplied["units"])
                 assert repaired_report["boundary_normalization"] == expected and repaired_report["size_splits"] >= 0
                 assert repaired_report["usage"]["total_tokens"] == 60 and repaired_report["cost_usd"] == 0.00125

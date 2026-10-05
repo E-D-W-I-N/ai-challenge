@@ -1653,7 +1653,7 @@ class Agent:
                         if not cancel.is_set() and (can_run is None or await can_run()):
                             with capture_requests() as preparation_requests:
                                 rewrite_result = await rag_rewrite(user_text, used_history, spec.model,
-                                                                   stream_completion, cancel, provider=spec.provider)
+                                                                   stream_completion, cancel, provider=spec.provider, reasoning_enabled=spec.reasoning_enabled)
                             query = rewrite_result["query"]
                     if not cancel.is_set() and (can_run is None or await can_run()):
                         yield {"type": "retrieval", "stage": "search", "query": query}
@@ -2118,8 +2118,9 @@ def spec_as_dict(
         "label": spec.label,
         "model": spec.model,
         "provider": spec.provider,
+        "reasoning_enabled": spec.reasoning_enabled,
         "rag_enabled": spec.rag_enabled,
-        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")},
+        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model")},
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2169,10 +2170,12 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
         return fallback
     known.setdefault("label", fallback.label)
     # The single-K schema may have retained older two-K keys: its effective K wins.
-    final_k = (config or {}).get("rag_top_k", known.get("rag_final_k", 5))
-    candidates_k = 20 if "rag_top_k" in (config or {}) else known.get("rag_candidates_k", 20)
+    final_k = (config or {}).get("rag_top_k", known.get("rag_final_k", 3))
+    candidates_k = 10 if "rag_top_k" in (config or {}) else known.get("rag_candidates_k", 10)
     known["rag_final_k"] = final_k
     known["rag_candidates_k"] = max(candidates_k, final_k)
+    known["reasoning_enabled"] = known.get("reasoning_enabled") is True
+    known["rag_rerank_reasoning_enabled"] = known.get("rag_rerank_reasoning_enabled") is True
     known["rag_rerank_enabled"] = known.get("rag_rerank_enabled") is True
     known["rag_enabled"] = known.get("rag_enabled") is True
     known["rag_rewrite_enabled"] = known.get("rag_rewrite_enabled") is True

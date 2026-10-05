@@ -270,6 +270,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
     if (body.strategy === "semantic") {
       body.semantic_provider = $("#rag-semantic-provider").value;
+      body.semantic_reasoning_enabled = semanticPicker.value().reasoning_enabled;
       body.semantic_model = $("#rag-semantic-model").value.trim();
     }
     return body;
@@ -278,6 +279,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     const body = {urls: $("#rag-urls").value.split(/\n/).map(x => x.trim()).filter(Boolean), use_manifest: $("#rag-manifest").checked,
       preparation_strategy: $("#rag-preparation-strategy").value};
     if (body.preparation_strategy === "llm") {
+      body.preparation_reasoning_enabled = preparationPicker.value().reasoning_enabled;
       body.preparation_timeout_seconds = Number($("#rag-preparation-timeout-seconds").value);
       for (const key of ["provider", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
     }
@@ -289,7 +291,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     try {
       const body = kind === "ingest" ? preparationOptions()
         : kind === "chunks" ? chunkOptions()
-        : kind === "embeddings" ? {provider: $("#rag-provider").value, model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
+        : kind === "embeddings" ? {reasoning_enabled: embeddingPicker.value().reasoning_enabled, provider: $("#rag-provider").value, model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
       const model = kind === "embeddings" ? body.model : body.semantic_model ?? body.preparation_model;
       if (model !== undefined && !model) throw new Error("Выберите модель или введите её ID.");
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
