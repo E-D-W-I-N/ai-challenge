@@ -11,6 +11,26 @@ FastAPI обслуживает API и статический клиент без
   отключает `context-compression` и запрашивает `usage: {"include": true}`.
   Совместимый провайдер получает стандартные поля и stream_options.include_usage.
   Токены и стоимость сообщает провайдер; своих оценок нет.
+- Общий selector всегда показывает «Рассуждения (если модель поддерживает)».
+  `reasoning_enabled` — strict bool default false для чата (включая legacy),
+  подготовки, семантического разбиения и embedding preference; rerank имеет
+  отдельный `rag_rerank_reasoning_enabled`. Состояния не распространяются между
+  сценариями или чатами; каталог/смена провайдера не сбрасывает локальный выбор.
+  Rewrite наследует chat flag, compression копирует spec; прочие сервисы независимы.
+- `shared_models.generation_payload` применяет политику после extra_body:
+  OpenRouter OFF `{effort:none, enabled:false, exclude:false}`, ON
+  `{enabled:true, exclude:false}`, принудительный require_parameters=true;
+  compatible reasoning_effort none/medium. Известные top-level/nested aliases
+  очищаются с сохранением иных параметров; per-message reasoning overrides
+  при OFF отклоняются до HTTP. Поддержка параметров зависит от модели/сервера;
+  нет платных probing/retry/fallback. Reasoning output/positive reported tokens
+  при OFF дают фиксированную ошибку с фактическим usage; tools объявляются только
+  после terminal usage check. Отсутствие evidence не доказывает внутреннее OFF.
+- Preparation/Semantic config содержит независимый strict bool, поэтому изменение
+  режима меняет private cache identity; CLI включает его только явным флагом.
+  EmbeddingConfig сохраняет preference, но исключает его из fingerprint:
+  standard /embeddings payload и опубликованная identity не меняются. Старые
+  embedding configs без поля читаются с прежним точным fingerprint.
 - `Agent.context_cut` — единственный разбор стратегии: `full` отправляет всю
   историю; `window` последние `keep_last` реплик; `summary` сводку и хвост.
   Незнакомая сохранённая стратегия читается как `full`; числа без выбранной
@@ -856,15 +876,15 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 
 ## День 23: rewrite, реранкинг всех кандидатов и отбор контекста
 
-- Новые `AgentSpec`: `rag_rewrite_enabled=true`, `rag_candidates_k=20`,
-  `rag_final_k=5`, `rag_rerank_enabled=false`; RAG default false. API требует
+- Новые `AgentSpec`: `rag_rewrite_enabled=true`, `rag_candidates_k=10`,
+  `rag_final_k=3`, `rag_rerank_enabled=false`; RAG default false. API требует
   строгие bool и целые 1..100, final<=candidates; PATCH проверяет effective
   пару до изменения любых полей. Уменьшить только candidates ниже текущего final
   нельзя: нужно одновременно задать допустимую пару. Предварительный cosine-filter
   удалён; день24 сохраняет отдельный rag_similarity_threshold для ответа.
-- Legacy config с rag_top_k сохраняет его как final_k; candidates=max(20, final_k).
+- Legacy config с rag_top_k сохраняет его как final_k; candidates=max(10, final_k).
   Это поле имеет приоритет над оставшимися obsolete candidates/final из старой
-  схемы. Без top_k старые candidates/final сохраняются; полностью legacy default20/5.
+  схемы. Без top_k старые candidates/final сохраняются; полностью legacy default10/3.
   Отсутствующие rewrite/rerank false; миграция не запускает новый платный вызов.
   save_config пишет только новую схему, restart/fork не возвращают старый top_k.
 - При RAG ON rewrite использует текущие provider и model ID, отдельный `AgentSpec` и
@@ -872,8 +892,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   до сжатия. Инструкции чата, память, профиль, tools и extra_body не наследуются.
   JSON query bounded 8000 символами; пустой/invalid JSON, error/null/length finish —
   явная ошибка. Только finish_reason=stop означает успех. Один вызов, timeout 60s,
-  без retries/fallback. Бюджет 9216 tokens учитывает reasoning; только точный
-  OpenRouter `openai/gpt-6-luna` получает reasoning.effort=none, как semantic preparation.
+  без retries/fallback. Бюджет 9216 tokens учитывает reasoning.
+  Rewrite наследует reasoning_enabled чата; подготовка и чанкинг имеют собственные флаги.
   `aclosing` закрывает stream при ошибке/отмене; cancel/can_run проверяются после
   событий и перед платными границами. Исходный вопрос остаётся вопросом final prompt.
 - `Index.retrieve` закрепляет identity и все полные candidate hits в одном SQLite
@@ -961,7 +981,10 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   отсутствие цитат или invalid JSON не интерпретируются как отказ. Состоявшийся
   финальный вызов сохраняет фактические запросы и usage без двойного счёта.
 - RAG delta буферизуются до проверки конечного кадра; промежуточная MCP проза и
-  сырой JSON не становятся ответом. Reasoning/metrics/tool_call идут как прежде.
+  сырой JSON не становятся ответом. При разрешённом ON reasoning/metrics/tool_call идут как прежде.
+  Наблюдаемое reasoning при OFF даёт error/done committed=false, даже если
+  провайдер прислал валидный JSON цитат до terminal usage. Нет RAG delta или
+  исполнения MCP; фактические запросы и оплаченный usage сохраняются в диагностике.
   Успех публикует answer и `rag.answer={status:verified,citations:[{source_id,
   chunk_id,source,title,section,quote}]}` в порядке source_id. `start` содержит
   snapshot поиска с policy, `done` и atomic assistant — дополненный результатом

@@ -200,8 +200,8 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 PATCHABLE = (
     "label",
     "rag_enabled", "rag_rewrite_enabled",
-    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model",
-    "provider",
+    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model",
+    "provider", "reasoning_enabled",
     "system",
     "model",
     "stop",
@@ -220,14 +220,21 @@ def _rag_enabled(payload: dict, where: str = "") -> bool:
     return value
 
 
+def _reasoning_enabled(payload: dict, where: str = "") -> bool:
+    value = payload.get("reasoning_enabled", False)
+    if type(value) is not bool:
+        raise HTTPException(400, detail=f"{where}reasoning_enabled: boolean true/false")
+    return value
+
+
 def _rag_settings(payload: dict, where: str = "") -> dict:
     values = {}
-    for name in ("rag_rewrite_enabled", "rag_rerank_enabled"):
-        value = payload.get(name, name != "rag_rerank_enabled")
+    for name in ("rag_rewrite_enabled", "rag_rerank_enabled", "rag_rerank_reasoning_enabled"):
+        value = payload.get(name, name == "rag_rewrite_enabled")
         if type(value) is not bool:
             raise HTTPException(400, detail=f"{where}{name}: boolean true/false")
         values[name] = value
-    for name, default in (("rag_candidates_k", 20), ("rag_final_k", 5)):
+    for name, default in (("rag_candidates_k", 10), ("rag_final_k", 3)):
         value = payload.get(name, default)
         if type(value) is not int or not 1 <= value <= 100:
             raise HTTPException(400, detail=f"{where}{name}: integer 1..100")
@@ -555,6 +562,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
         model=_model_field(payload, where),
         provider=_choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter", where),
         rag_enabled=_rag_enabled(payload, where),
+        reasoning_enabled=_reasoning_enabled(payload, where),
         **_rag_settings(payload, where),
         system=_text_field(payload, "system", where),
         stop=_stop_field(payload, where),
@@ -674,7 +682,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
     rag_enabled = _rag_enabled(payload)
-    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
+    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
     # Validate the complete patch before mutating the live configuration.
     validated = {}
     for name, parser in (("model", _model_field), ("label", _label_field),
@@ -687,6 +695,8 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         validated["response_format"] = _optional_field(payload, "response_format", (dict,), "объект или null")
     if "provider" in payload:
         validated["provider"] = _choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter")
+    if "reasoning_enabled" in payload:
+        validated["reasoning_enabled"] = _reasoning_enabled(payload)
     updated_context_length = agent.context_length
     if "model" in validated or "provider" in validated:
         updated_context_length = (await _context_lengths()).get(validated.get("model", agent.spec.model)) if validated.get("provider", agent.spec.provider) == "openrouter" else None

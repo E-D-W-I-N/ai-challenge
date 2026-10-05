@@ -100,7 +100,8 @@ def check_rag_chat():
                 assert snapshot == events[-1]["rag"]
                 assert snapshot["context"] == _stub.CALLS[0]["payload"]["messages"][start["rag_at"]]["content"]
                 assert answer.request_bodies[0] == _stub.CALLS[0]["payload"]
-                assert fake_key not in json.dumps(snapshot) and len(snapshot["hits"]) == 5
+                assert fake_key not in json.dumps(snapshot) and len(snapshot["hits"]) == 3
+                assert snapshot["config"]["candidates_k"] == 10 and snapshot["config"]["final_k"] == 3
                 assert store.load_messages(agent.id)[-1]["rag"] == snapshot
                 loaded = agents.Agent(agent.spec, agent_id=agent.id, store=store)
                 assert loaded.spec.rag_enabled and loaded.history[-1].rag == snapshot

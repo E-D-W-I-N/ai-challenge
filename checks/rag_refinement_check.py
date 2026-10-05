@@ -56,12 +56,12 @@ def check_rag_refinement():
             events = await drain(chat.ask("current question 42"))
         assert events[-1]["committed"] and len(_stub.CALLS) == 2
         assert [e["stage"] for e in events if e["type"] == "retrieval"] == ["rewrite", "search"]
-        assert queries == [("standalone neutral 42", 20)]
+        assert queries == [("standalone neutral 42", 10)]
         bodies = chat.history[-1].request_bodies; snapshot = chat.history[-1].rag
         assert bodies == [c["payload"] for c in _stub.CALLS]
         first = bodies[0]; last = bodies[-1]
         assert first["model"] == last["model"] == "openai/gpt-6-luna"
-        assert first["reasoning"] == {"effort": "none"} and first["max_tokens"] == 9216
+        assert first["reasoning"] == {"effort": "none", "enabled": False, "exclude": False} and first["max_tokens"] == 9216
         assert "seed" not in first and "tools" not in first and first["messages"][0]["content"] != chat.spec.system
         used = json.loads(first["messages"][1]["content"])
         assert used["question"] == "current question 42"
@@ -177,9 +177,9 @@ def check_rag_refinement():
     with TestClient(main.app) as client:
         result = client.post("/api/agents", json={"agent":{"label":"new defaults", "model":"stub/model"}}).json()["agents"][0]
         assert not result["rag_enabled"] and result["rag_rewrite_enabled"] and not result["rag_rerank_enabled"]
-        assert (result["rag_candidates_k"],result["rag_final_k"]) == (20,5)
+        assert (result["rag_candidates_k"],result["rag_final_k"]) == (10,3)
         route = f'/api/agents/{result["id"]}'
-        for invalid in ({"rag_rewrite_enabled": None}, {"rag_candidates_k": True}, {"rag_final_k": 1.5}, {"rag_candidates_k": 101}, {"rag_final_k": 0}, {"rag_candidates_k": 4}, {"rag_filter_enabled": True}, {"rag_similarity_threshold": True}, {"rag_similarity_threshold": 1.1}, {"rag_rewrite_enabled": False, "system": 123}):
+        for invalid in ({"rag_rewrite_enabled": None}, {"rag_candidates_k": True}, {"rag_final_k": 1.5}, {"rag_candidates_k": 101}, {"rag_final_k": 0}, {"rag_candidates_k": 2}, {"rag_filter_enabled": True}, {"rag_similarity_threshold": True}, {"rag_similarity_threshold": 1.1}, {"rag_rewrite_enabled": False, "system": 123}):
             before = copy.deepcopy(main.REGISTRY.require(result["id"]).spec)
             assert client.patch(route,json=invalid).status_code == 400
             assert main.REGISTRY.require(result["id"]).spec == before

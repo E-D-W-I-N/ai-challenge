@@ -34,7 +34,7 @@ function createModelSelectors({ $, el, api }) {
     try { return await pending; }
     finally { if (saveRequest === pending) saveRequest = null; }
   }
-  function create({ host, modelId, providerId, refreshId, statusId, title = "Модель", purpose = "generation",
+  function create({ host, modelId, providerId, refreshId, statusId, reasoningId = modelId + "-reasoning", title = "Модель", purpose = "generation",
     active = () => true, onCatalog = () => {}, onChange = () => {} }) {
     const provider = el("select", "control"); provider.id = providerId;
     for (const [value, label] of [["openrouter", "OpenRouter"], ["compatible", "OpenAI-совместимый"]]) {
@@ -50,11 +50,13 @@ function createModelSelectors({ $, el, api }) {
     model.setAttribute("aria-describedby", statusId);
     function field(label, input) { const node = el("label", "field"); node.append(el("span", "field-label", label), input); return node; }
     const row = el("div", "model-selector-row"); row.append(field("Провайдер", provider), field(title, model), refresh);
-    host.append(row, list, status); host.classList.add("model-selector");
+    const reasoning = el("input", "control"); reasoning.type = "checkbox"; reasoning.id = reasoningId;
+    const toggle = el("label", "rag-toggle"); toggle.append(reasoning, el("span", "", "Рассуждения (если модель поддерживает)"));
+    host.append(row, list, status, toggle); host.classList.add("model-selector");
     let modelsShown = [], catalogueNote = "";
     let request = 0, controller = null, pending = null, previousProvider = "openrouter";
     const drafts = new Map();
-    const value = () => ({provider: provider.value, model: model.value.trim()});
+    const value = () => ({provider: provider.value, model: model.value.trim(), reasoning_enabled: reasoning.checked});
     function stop() { if (pending) catalogues.delete(pending); request++; controller?.abort(); controller = null; pending = null; refresh.disabled = false; }
     function catalogue(models, message = "") {
       modelsShown = models; catalogueNote = message;
@@ -91,13 +93,14 @@ function createModelSelectors({ $, el, api }) {
       } finally { if (ticket === request) { controller = null; pending = null; refresh.disabled = false; } }
     }
     function restore(config = {}) {
+      if (!reasoning.dataset.dirty) reasoning.checked = config.reasoning_enabled === true;
       if (provider.dataset.dirty || model.dataset.dirty) return;
       stop(); provider.value = config.provider === "compatible" ? "compatible" : "openrouter";
       model.value = config.model || ""; previousProvider = provider.value;
       drafts.clear(); drafts.set(previousProvider, model.value); catalogue([], "Каталог ещё не загружен.");
     }
     function set(config = {}) {
-      provider.dataset.dirty = ""; model.dataset.dirty = ""; restore(config);
+      provider.dataset.dirty = ""; model.dataset.dirty = ""; reasoning.dataset.dirty = ""; restore(config);
     }
     provider.onchange = () => {
       drafts.set(previousProvider, model.value); stop();
@@ -106,6 +109,7 @@ function createModelSelectors({ $, el, api }) {
     };
     model.oninput = () => { model.dataset.dirty = "true"; };
     model.onchange = () => { model.dataset.dirty = "true"; drafts.set(provider.value, model.value); if (!controller) catalogue(modelsShown, catalogueNote); onChange(); };
+    reasoning.onchange = () => { reasoning.dataset.dirty = "true"; onChange(); };
     refresh.onclick = () => load(true);
     const picker = {value, load, stop, cancel: stop, active, restore, set, invalidate: () => { stop(); catalogue([], "Сервер изменён. Каталог обновляется при открытии сценария."); }, pending: () => pending};
     pickers.add(picker); return picker;

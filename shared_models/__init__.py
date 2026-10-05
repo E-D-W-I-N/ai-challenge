@@ -55,16 +55,57 @@ def bind_compatible_url(value: str):
         _bound_url.reset(token)
 
 
-def generation_payload(payload: dict, value: str) -> dict:
+def generation_payload(payload: dict, value: str, *, reasoning_enabled: bool = False) -> dict:
     """Only OpenRouter receives routing/accounting extensions."""
+    if type(reasoning_enabled) is not bool:
+        raise ValueError("reasoning_enabled must be boolean")
     result = dict(payload)
+    for name in ("reasoning", "reasoning_effort", "include_reasoning", "enable_thinking", "thinking", "thinking_budget"):
+        result.pop(name, None)
+    if not reasoning_enabled:
+        for message in result.get("messages") or []:
+            if isinstance(message, dict) and any(isinstance(message.get(name), dict) and field in message[name]
+                    for name, field in (("configuration_update", "reasoning"), ("output_config", "effort"))):
+                raise ValueError("Per-message reasoning controls require reasoning_enabled")
+    for name, controls in (("chat_template_kwargs", ("enable_thinking", "reasoning_effort", "thinking_budget")), ("output_config", ("effort",))):
+        if isinstance(result.get(name), dict):
+            cleaned = {key: item for key, item in result[name].items() if key not in controls}
+            if cleaned:
+                result[name] = cleaned
+            else:
+                result.pop(name)
     if provider(value) == "openrouter":
-        result.setdefault("provider", {"require_parameters": True})
+        result["provider"] = {**(result.get("provider") or {}), "require_parameters": True}
+        result["reasoning"] = {"enabled": True, "exclude": False} if reasoning_enabled else {"effort": "none", "enabled": False, "exclude": False}
         result.setdefault("usage", {"include": True})
         result.setdefault("plugins", [{"id": "context-compression", "enabled": False}])
     else:
+        result["reasoning_effort"] = "medium" if reasoning_enabled else "none"
         for name in ("provider", "plugins", "usage", "reasoning", "transforms", "route", "models"):
             result.pop(name, None)
         if result.get("stream"):
             result["stream_options"] = {**(result.get("stream_options") or {}), "include_usage": True}
     return result
+
+
+def reports_reasoning(body: dict) -> bool:
+    """Observable provider evidence only; absence cannot prove internal behavior."""
+    if not isinstance(body, dict):
+        return False
+    usage = body.get("usage")
+    details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+    details = details if isinstance(details, dict) else {}
+    tokens = details.get("reasoning_tokens")
+    if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens > 0:
+        return True
+    choices = body.get("choices")
+    for choice in choices if isinstance(choices, list) else []:
+        if not isinstance(choice, dict):
+            continue
+        frame = choice.get("delta") or choice.get("message") or {}
+        if not isinstance(frame, dict):
+            continue
+        if any(isinstance(frame.get(name), str) and frame[name].strip()
+               for name in ("reasoning", "reasoning_content")) or frame.get("reasoning_details"):
+            return True
+    return False

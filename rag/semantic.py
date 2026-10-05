@@ -27,10 +27,13 @@ class SemanticConfig:
     timeout_seconds: float = 60
     prompt_version: str = "boundary-v2"
     provider: str = "openrouter"
+    reasoning_enabled: bool = False
     auth_mode: InitVar[str | None] = None
     payload_version: str = "boundary-normalization-v3"
 
     def __post_init__(self, auth_mode):
+        if type(self.reasoning_enabled) is not bool:
+            raise ValueError("reasoning_enabled must be boolean")
         from shared_models import provider, validate_url, endpoint
         if auth_mode is not None:
             from shared_models import legacy_provider
@@ -135,11 +138,7 @@ def _boundaries(body, units, limit):
 
 
 def _reasoning_options(config):
-    # This exact provider/model capability is verified in OpenRouter's catalogue.
-    # Do not pass provider-specific reasoning controls to arbitrary local models.
-    if (config.provider == "openrouter" and config.base_url.rstrip("/") == "https://openrouter.ai/api/v1"
-            and config.model == "openai/gpt-6-luna"):
-        return {"reasoning": {"effort": "none"}}
+    # The common provider policy is applied to the final payload below.
     return {}
 
 
@@ -161,7 +160,7 @@ def _payload(text, units, config, limit):
                  "Adjacent units on the same topic should stay together within that limit."},
                 {"role": "user", "content": json.dumps({"total_units": len(units), "last_unit_id": len(units), "units": numbered}, ensure_ascii=False)}]}
     from shared_models import generation_payload
-    return generation_payload(payload, config.provider)
+    return generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
 
 
 def _contains_credential(value, credentials):
@@ -221,7 +220,7 @@ def _runtime_credentials():
 def _call(client, config, payload, trace=None, *, label="Semantic", before_send=None, response_limit=None):
     from shared_models import key as model_key, generation_payload
     key = model_key(config.provider)
-    payload = generation_payload(payload, config.provider)
+    payload = generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
     credentials = _runtime_credentials()
     if _contains_credential(payload, credentials):
         raise ValueError(f"{label} request contains a runtime credential")
@@ -257,6 +256,9 @@ def _call(client, config, payload, trace=None, *, label="Semantic", before_send=
                         raise ValueError(f"{label} response contains a runtime credential")
     if trace is not None:
         trace(body)
+    from shared_models import reports_reasoning
+    if not getattr(config, "reasoning_enabled", False) and reports_reasoning(body):
+        raise ValueError(f"{label} server returned reasoning while disabled")
     decoded = _decode_response(body, label=label)
     # Preserve the actual request and response, with no request headers.
     return decoded, body
