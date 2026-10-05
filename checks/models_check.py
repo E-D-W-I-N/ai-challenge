@@ -140,7 +140,7 @@ def check_models():
 
         async def pipeline():
             spec = AgentSpec(label="rerank", model="saved-chat", provider="compatible", rag_enabled=True,
-                             rag_candidates_k=3, rag_final_k=2, rag_rerank_enabled=True,
+                             rag_candidates_k=10, rag_final_k=2, rag_rerank_enabled=True,
                              rag_rerank_provider="compatible", rag_rerank_model="saved-ranking-model")
             chat = agents.Agent(spec, store=store)
             lookup_urls = []; round_urls = []
@@ -155,7 +155,7 @@ def check_models():
                     # User changes settings during an in-flight ask; this ask remains on its frozen URL.
                     store.save_model_settings({"compatible_base_url": "http://later-neutral.test/v1"})
                     return '{"query":"neutral rewritten"}'
-                return '{"source_ids":[3,1,2]}' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
+                return 'Neutral ranking explanation.\n{"source_ids":[3,1,2]}' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
             _stub.reset()
             with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(reply)):
                 events = await collect(chat.ask("neutral question"))
@@ -166,6 +166,8 @@ def check_models():
             assert [c["score"] for c in chat.history[-1].rag["candidates"]] == [.9, .3, .1]
             assert chat.history[-1].rag["selection"]["selected_source_ids"] == [3, 1]
             assert len(json.loads(_stub.CALLS[1]["messages"][-1]["content"])["sources"]) == 3
+            rank_prompt = _stub.CALLS[1]["messages"][0]["content"]
+            assert "exactly 3 sources" in rank_prompt and "[1, 2, 3]" in rank_prompt and "ONLY one JSON" in rank_prompt
             final_context = _stub.CALLS[-1]["messages"][-2]["content"]
             assert final_context == chat.history[-1].rag["context"]
             assert json.loads(final_context.split("\n", 1)[1]) == [{**hit, "source_id": i} for i, hit in enumerate(chat.history[-1].rag["hits"], 1)]
@@ -175,13 +177,28 @@ def check_models():
             assert bodies == [c["payload"] for c in _stub.CALLS] and bodies[1]["model"] == "saved-ranking-model"
             assert all("provider" not in body and "plugins" not in body for body in bodies)
             assert chat.history[-1].metrics["total_tokens"] == 300 and chat.history[-1].metrics["cost_usd"] == .000369
-            assert chat.spec.model == "saved-chat" and chat.spec.rag_candidates_k == 3 and chat.spec.rag_final_k == 2
-            for invalid in ('{"source_ids":[1]}', '{"source_ids":[1,1]}', '{"source_ids":[true,2]}', '{"source_ids":[1,2],"scores":[1,0]}', 'invalid'):
+            assert chat.spec.model == "saved-chat" and chat.spec.rag_candidates_k == 10 and chat.spec.rag_final_k == 2
+            invalid_cases = (
+                ('{"source_ids":[1]}', "неполный список"),
+                ('{"source_ids":[1,1,2]}', "повторяющиеся source_ids"),
+                ('{"source_ids":[true,2,3]}', "целыми числами"),
+                ('{"source_ids":[1,2,3],"scores":[1,0]}', "только с массивом"),
+                ('invalid', "невалидный JSON"),
+                ('Neutral {broken} {"source_ids":[3,1,2]}', "невалидный JSON"),
+                ('{"source_ids":[3,1,2]} {"source_ids":[1,2,3]}', "второй объект"),
+                ('{"source_ids":[3,1,2]} trailing neutral text', "лишний текст"),
+                ('{"source_ids":[3,1,2],"source_ids":[1,2,3]}', "ключи JSON"),
+                ('{"source_ids":[1,2,4]}', "вне диапазона"),
+                ('{"wrapper":{"source_ids":[3,1,2]}}', "только с массивом"),
+                ('{"source_ids":["3",1,2]}', "целыми числами"),
+            )
+            for invalid, category in invalid_cases:
                 depth = len(chat.history); _stub.reset()
                 def invalid_reply(messages, index):
                     return '{"query":"neutral rewritten"}' if index == 0 else invalid
                 with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(invalid_reply)):
                     failed = await collect(chat.ask("neutral invalid"))
+                assert any(category in event.get("message", "") for event in failed if event["type"] == "error"), failed
                 assert not failed[-1]["committed"] and len(chat.history) == depth and len(_stub.CALLS) == 2
                 assert failed[-1]["metrics"]["total_tokens"] == 200 and failed[-1]["request_bodies"] == [c["payload"] for c in _stub.CALLS]
             # Cancelled rerank exposes paid metrics without fabricated identity permutation.
