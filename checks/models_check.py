@@ -155,7 +155,7 @@ def check_models():
                     # User changes settings during an in-flight ask; this ask remains on its frozen URL.
                     store.save_model_settings({"compatible_base_url": "http://later-neutral.test/v1"})
                     return '{"query":"neutral rewritten"}'
-                return 'Neutral ranking explanation.\n{"source_ids":[3,1,2]}' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
+                return 'Neutral ranking explanation.\n{"source_ids":[3,1,2]}\nNeutral prose recommends one, two, three instead.' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
             _stub.reset()
             with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(reply)):
                 events = await collect(chat.ask("neutral question"))
@@ -178,6 +178,15 @@ def check_models():
             assert all("provider" not in body and "plugins" not in body for body in bodies)
             assert chat.history[-1].metrics["total_tokens"] == 300 and chat.history[-1].metrics["cost_usd"] == .000369
             assert chat.spec.model == "saved-chat" and chat.spec.rag_candidates_k == 10 and chat.spec.rag_final_k == 2
+            # Plain prose is ignored: JSON alone determines the complete order.
+            for output in ('{"source_ids":[3,1,2]}',
+                           'Neutral prefix. {"source_ids":[3,1,2]}',
+                           '{"source_ids":[3,1,2]} Neutral suffix.'):
+                _stub.reset()
+                ranked = await rag.rerank("neutral", {"hits": [{"text": str(i)} for i in range(3)]}, spec,
+                                          _stub.make(output), asyncio.Event())
+                assert ranked["source_ids"] == [3, 1, 2] and ranked["usage"]["total_tokens"] == 100
+                assert len(_stub.CALLS) == 1
             invalid_cases = (
                 ('{"source_ids":[1]}', "неполный список"),
                 ('{"source_ids":[1,1,2]}', "повторяющиеся source_ids"),
@@ -185,8 +194,12 @@ def check_models():
                 ('{"source_ids":[1,2,3],"scores":[1,0]}', "только с массивом"),
                 ('invalid', "невалидный JSON"),
                 ('Neutral {broken} {"source_ids":[3,1,2]}', "невалидный JSON"),
-                ('{"source_ids":[3,1,2]} {"source_ids":[1,2,3]}', "второй объект"),
-                ('{"source_ids":[3,1,2]} trailing neutral text', "лишний текст"),
+                ('{"source_ids":[3,1,2]} {"source_ids":[1,2,3]}', "структурированное содержимое"),
+                ('{"source_ids":[3,1,2]} [1,2,3]', "структурированное содержимое"),
+                ('{"source_ids":[3,1,2]} {broken', "структурированное содержимое"),
+                ('{"source_ids":[3,1,2]} ```', "структурированное содержимое"),
+                ('{"source_ids":[3,1,2]} ~~~', "структурированное содержимое"),
+                ('{"source_ids":[3,1,2]}' + 'x' * 100_000, "превышен размер"),
                 ('{"source_ids":[3,1,2],"source_ids":[1,2,3]}', "ключи JSON"),
                 ('{"source_ids":[1,2,4]}', "вне диапазона"),
                 ('{"wrapper":{"source_ids":[3,1,2]}}', "только с массивом"),

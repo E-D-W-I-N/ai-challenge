@@ -29,8 +29,9 @@ legacy false; rerank default false; RAG остаётся OFF. Rewrite — оди
 вызов модели чата, последние 3 успешные пары и существующая рабочая память
 (kind/content), timeout 60s, strict stop/JSON,
 без retries/fallback. Rerank требует только JSON и полный набор фактически найденных
-integer source_ids; допускает prose prefix перед первым полным объектом, но только
-whitespace после него. Ошибки формата/ID различаются без отражения raw ответа;
+integer source_ids; допускает обычное пояснение перед первым полным объектом
+и после него. Suffix с {}[] или ```/~~~ отклоняется как неоднозначный;
+порядок берётся только из JSON, пояснения игнорируются. Ошибки формата/ID различаются без отражения raw ответа;
 порядок не исправляется, IDs не дополняются. Retrieval default10 → rerank всех кандидатов → context first3;
 без rerank первые3 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
 Предварительного cosine-фильтра нет; RAG сохраняет отдельный порог ответа. Snapshot v3 хранит original/query/
