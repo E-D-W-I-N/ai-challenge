@@ -837,6 +837,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-chat-numbers { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 0; }
 .rag-chat-numbers .field { width: 155px; }
 .model-selector { min-width: 0; }
+#rag-preparation-picker { margin-bottom: 12px; }
 .model-selector-row { display: grid; grid-template-columns: minmax(170px, 200px) minmax(160px, 1fr) 36px; gap: 10px; align-items: end; }
 .model-refresh { width: 36px; height: 36px; min-width: 36px; padding: 0; font-size: 19px; }
 .model-status { display: block; font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }

@@ -56,6 +56,25 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Independent reasoning toggles in every model selector", async () => {
+    const {client, $, click, open, requests} = freshClient({agents: [{reasoning_enabled: true, rag_rerank_reasoning_enabled: false}, {reasoning_enabled: false}]});
+    client.init(); await settle(); click("chat-settings"); await settle();
+    const ids = ["f-reasoning_enabled", "f-rag_rerank_reasoning_enabled", "rag-semantic-model-reasoning", "rag-preparation-model-reasoning", "rag-model-reasoning"];
+    check("All five common selectors have independent conditional-support toggles", ids.every(id => $("#" + id)?.type === "checkbox") && $("#chat-model-picker").textContent.includes("если модель поддерживает"));
+    check("Chat ON does not enable the four independent scenarios", $("#f-reasoning_enabled").checked && ids.slice(1).every(id => !$("#" + id).checked));
+    $("#f-rag_rerank_reasoning_enabled").checked = true; $("#f-rag_rerank_reasoning_enabled").dispatchEvent(new Evt("change")); await settle();
+    check("Chat PATCH persists distinct reasoning choices", requests("PATCH", "/api/agents/ag_1").at(-1).body.reasoning_enabled === true && requests("PATCH", "/api/agents/ag_1").at(-1).body.rag_rerank_reasoning_enabled === true);
+    open(1); await settle(); check("Other chat defaults reasoning OFF", !$("#f-reasoning_enabled").checked && !$("#f-rag_rerank_reasoning_enabled").checked);
+    open(0); await settle(); check("Saved chat reasoning restores independently", $("#f-reasoning_enabled").checked && $("#f-rag_rerank_reasoning_enabled").checked);
+    const semantic = $("#rag-semantic-model-reasoning"); semantic.checked = true; semantic.dispatchEvent(new Evt("change"));
+    check("Chunking ON cannot enable preparation or embeddings", semantic.checked && !$("#rag-preparation-model-reasoning").checked && !$("#rag-model-reasoning").checked);
+    const before = requests("PATCH", "/api/agents/ag_1").length;
+    click("application-settings"); click("tab-btn-rag"); await settle();
+    $("#rag-model-reasoning").checked = true; $("#rag-model-reasoning").dispatchEvent(new Evt("change"));
+    click("rag-embedding-model-refresh"); await settle();
+    check("Embedding catalogue/status preserve its local dirty flag without chat PATCH", $("#rag-model-reasoning").checked && semantic.checked && requests("PATCH", "/api/agents/ag_1").length === before);
+  });
+
   await scenario("Reminder capability discovery, disconnect fallback and stale owner", async () => {
     const {client, server, $, click, open, requests} = freshClient();
     const connected = {servers: [{name: "arbitrary-neutral", status: "ok", tools: [{name: "neutral__reminders", schema: {}}], reminders: {items: []}}]};
@@ -273,7 +292,7 @@ async function main() {
     const {client, $, click, requests, open} = freshClient({agents: [{transcript: [turns[0], {...turns[1], rag}], history_len: 2},
       {rag_enabled: true, rag_rewrite_enabled: true, rag_filter_enabled: true, rag_candidates_k: 30, rag_final_k: 7, rag_similarity_threshold: .4}]});
     client.init(); await settle(); click("chat-settings"); click("tab-btn-rag");
-    check("Legacy rewrite stays off with default candidate and answer counts", !$("#f-rag_rewrite_enabled").checked && $("#f-rag_candidates_k").value === "20" && $("#f-rag_final_k").value === "5" && $("#rag-chat-settings").classList.contains("hidden"));
+    check("Legacy rewrite stays off with default candidate and answer counts", !$("#f-rag_rewrite_enabled").checked && $("#f-rag_candidates_k").value === "10" && $("#f-rag_final_k").value === "3" && $("#rag-chat-settings").classList.contains("hidden"));
     $("#f-rag_rewrite_enabled").checked = true;
     $("#f-rag_candidates_k").value = "12"; $("#f-rag_final_k").value = "4";
     $("#f-rag_rewrite_enabled").dispatchEvent(new Evt("change")); await settle();
@@ -625,7 +644,7 @@ async function main() {
     check("Empty catalogue restores compatible exact-ID draft", model.value === "manual/vector" && list.children.length === 0 && message.textContent.includes("Каталог пуст"));
     click("rag-embed"); await settle();
     check("Embedding payload uses shared provider/model with no scenario URL", same(requests("POST", "/api/rag/operations/embeddings").at(-1)?.body,
-      {provider: "compatible", model: "manual/vector", dimensions: 3, revision: "saved"}));
+      {reasoning_enabled: false, provider: "compatible", model: "manual/vector", dimensions: 3, revision: "saved"}));
   });
   await scenario("RAG preparation methods have independent generation drafts and operation payloads", async () => {
     const {client, server, $, click, requests} = freshClient({agents: []});
@@ -675,7 +694,7 @@ async function main() {
     await settle(1100); server.respond("GET", localPath, {models: [{id: "prep-local-draft"}]});
     click("rag-step-documents"); await settle(); click("rag-ingest"); await settle();
     check("LLM preparation sends only its independent generation settings", same(requests("POST", "/api/rag/operations/ingest").at(-1)?.body,
-      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_timeout_seconds: 900, preparation_provider: "compatible", preparation_model: "prep-local-draft"}));
+      {urls: ["https://example.test/neutral"], use_manifest: false, preparation_strategy: "llm", preparation_reasoning_enabled: false, preparation_timeout_seconds: 900, preparation_provider: "compatible", preparation_model: "prep-local-draft"}));
     provider.value = "openrouter"; provider.dispatchEvent(new Evt("change")); await settle();
     check("Preparation restores its own provider draft", model.value === "prep-cloud-draft");
     method.value = "programmatic"; method.dispatchEvent(new Evt("change"));
@@ -822,7 +841,7 @@ async function main() {
     $("#rag-semantic-model").value = "offline-boundaries"; $("#rag-semantic-model").dispatchEvent(new Evt("change"));
     click("rag-split"); await settle();
     check("Semantic choice sends independent provider/model", !$("#rag-semantic-fields").hidden && $("#rag-size-label").textContent === "Максимальный размер чанка, символов" && same(requests("POST", "/api/rag/operations/chunks").at(-1)?.body,
-      {strategy: "semantic", size: 512, overlap: 64, semantic_provider: "openrouter", semantic_model: "offline-boundaries"}));
+      {strategy: "semantic", size: 512, overlap: 64, semantic_provider: "openrouter", semantic_reasoning_enabled: false, semantic_model: "offline-boundaries"}));
     $("#rag-semantic-provider").value = "compatible"; $("#rag-semantic-provider").dispatchEvent(new Evt("change"));
     await settle();
     check("Compatible generation starts with its own model draft", $("#rag-semantic-model").value === "");
@@ -836,7 +855,7 @@ async function main() {
     $("#rag-dimensions").value = "3"; $("#rag-revision").value = "fixture";
     click("rag-embed"); await settle();
     check("Embedding button uses mounted fields and never starts save", same(requests("POST", "/api/rag/operations/embeddings")[0]?.body,
-      {provider: "compatible", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
+      {reasoning_enabled: false, provider: "compatible", model: "offline-model", dimensions: 3, revision: "fixture"}) && requests("POST", "/api/rag/operations/save").length === 0);
     stages.embeddings = {embedding_fingerprint: "vectors-one"};
     const vectorPath = "/api/rag/chunks/chunk?vector=true&working=true";
     server.respond("GET", vectorPath, {vector: [1, 0, 0]});

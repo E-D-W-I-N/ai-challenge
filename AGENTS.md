@@ -27,12 +27,12 @@ prompt, JSON запросов и assistant.rag; исторический инс�
 request_bodies. Query rewrite и реранкинг независимы: new rewrite default true,
 legacy false; rerank default false; RAG остаётся OFF. Rewrite — один constrained
 вызов модели чата, последние 3 успешные пары, timeout 60s, strict stop/JSON,
-без retries/fallback. Retrieval default20 → rerank всех кандидатов → context first5;
-без rerank первые5 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
+без retries/fallback. Retrieval default10 → rerank всех кандидатов → context first3;
+без rerank первые3 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
 Cosine-фильтра и порога в активном дне23 нет. Snapshot v3 хранит original/query/
 history/config, всех candidates с original/final ranks/selected, selection и финальные
 hits/context/identity/timing/actual usage. Legacy v1/v2 история не переписывается.
-Прежний rag_top_k мигрирует в final_k с candidate default max(20, final_k);
+Прежний rag_top_k мигрирует в final_k с candidate default max(10, final_k);
 его наличие имеет приоритет над оставшимися старыми двумя K. Новый save удаляет
 устаревший top_k из config, restart/fork сохраняют effective counts.
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
@@ -50,7 +50,14 @@ Runtime поддерживает только OPENROUTER_API_KEY и RAG_EMBEDDIN
 mcp.json и optional data/rag/inputs.json. Проверки внедряют временные Store/пути
 явно до импорта реестра; прикладные env overrides удалены. Общая генеративная
 модель по умолчанию — openai/gpt-6-luna из независимого shared_models (rag/defaults.py реэкспортирует её).
-Общие provider/endpoint/key/payload правила находятся в shared_models. Совместимый
+Общие provider/endpoint/key/payload правила находятся в shared_models.
+Reasoning default OFF у пяти независимых селекторов; strictbool/API/persist/fork.
+Чат, сжатие и Rewrite используют chat reasoning_enabled; rerank отдельный флаг.
+Подготовка/чанкинг включают флаг в cache identity; embedding preference исключён
+из fingerprint и не передаётся в стандартный /embeddings. OFF применяется после
+extra_body, известные aliases не обходят его; наблюдаемое reasoning при OFF —
+фиксированная ошибка с actual usage, без paid retry/fallback. Не обещайте соблюдение
+параметра любым совместимым сервером или внутренний reasoning без reported evidence. Совместимый
 URL единственный для приложения и замораживается на обмен; ключ остаётся runtime.
 Published embedding identity неизменна: query использует pinned model/revision/dims
 по текущему совместимому URL, смена адреса сама по себе не требует rebuild.

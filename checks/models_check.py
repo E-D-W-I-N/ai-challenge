@@ -34,9 +34,9 @@ def check_models():
     legacy = agents.spec_from_config({"model": "saved-exact-id", "rag_final_k": 7, "rag_candidates_k": 20}, fallback=generic)
     assert legacy.model == "saved-exact-id" and legacy.rag_final_k == 7 and legacy.rag_candidates_k == 20 and not legacy.rag_rerank_enabled
 
-    for config, expected in (({"rag_top_k": 7}, (20, 7)),
+    for config, expected in (({"rag_top_k": 7}, (10, 7)),
                              ({"rag_top_k": 40}, (40, 40)),
-                             ({"rag_top_k": 8, "rag_candidates_k": 30, "rag_final_k": 2}, (20, 8)),
+                             ({"rag_top_k": 8, "rag_candidates_k": 30, "rag_final_k": 2}, (10, 8)),
                              ({"rag_candidates_k": 30, "rag_final_k": 9}, (30, 9))):
         migrated = agents.spec_from_config({"model": "saved-exact-id", **config}, fallback=generic)
         assert (migrated.rag_candidates_k, migrated.rag_final_k) == expected
@@ -64,6 +64,10 @@ def check_models():
     assert restored["index"] == archived["index"] and legacy_stages == original
     restored["embedding_defaults"]["model"] = "editable"
     assert restored["stages"]["embeddings"]["embedding_config"]["model"] == "saved-vector"
+    enabled_stages = copy.deepcopy(original)
+    enabled_stages["embeddings"]["embedding_config"]["reasoning_enabled"] = True
+    with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=enabled_stages):
+        assert rag_api.status()["embedding_defaults"]["reasoning_enabled"] is True
     invalid = copy.deepcopy(original); invalid["corpus"]["preparation_config"]["auth_mode"] = "unknown"
     with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=invalid):
         assert "stage_error" in rag_api.status()
@@ -103,10 +107,10 @@ def check_models():
         assert migrated_chat.spec.rag_final_k == 8 and "rag_top_k" not in store.load_session("migration")["config"]
         migrated_chat.spec.rag_final_k = 3; migrated_chat.save_config()
         restarted = agents.Agent(generic, agent_id="migration", store=store)
-        assert restarted.spec.rag_final_k == 3 and restarted.spec.rag_candidates_k == 20
+        assert restarted.spec.rag_final_k == 3 and restarted.spec.rag_candidates_k == 10
         from app.registry import AgentRegistry
         forked = AgentRegistry(store=store).fork(restarted, 0, label="migrated branch")
-        assert forked.spec.rag_final_k == 3 and forked.spec.rag_candidates_k == 20
+        assert forked.spec.rag_final_k == 3 and forked.spec.rag_candidates_k == 10
         assert store.load_session(forked.id)["config"]["rag_final_k"] == 3
         html = root / "neutral.html"; html.write_text("<html><title>Neutral</title><p>The neutral object is blue.</p></html>")
         ingest([{"path": str(html)}], root)
@@ -122,7 +126,7 @@ def check_models():
         with httpx.Client(transport=httpx.MockTransport(embeddings)) as client:
             metadata = build_index(root, config, client=client)
             # Reproduce exact legacy four-field metadata without rewriting its fingerprint.
-            old_config = {k: v for k, v in asdict(config).items() if k != "provider"}
+            old_config = {k: v for k, v in asdict(config).items() if k not in {"provider", "reasoning_enabled"}}
             with sqlite3.connect(root / "index.sqlite") as db:
                 db.execute("UPDATE metadata SET value=? WHERE key='embedding_config'", (json.dumps(old_config),))
             mode["query"] = True

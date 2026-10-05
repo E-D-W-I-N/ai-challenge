@@ -91,10 +91,10 @@ const {
 
 const createSelectors = typeof module !== "undefined" ? require("./models.js") : globalThis.createModelSelectors;
 const modelSelectors = createSelectors({ $, el, api });
-const chatModelPicker = modelSelectors.create({host: $("#chat-model-picker"), modelId: "f-model", providerId: "f-provider",
+const chatModelPicker = modelSelectors.create({host: $("#chat-model-picker"), modelId: "f-model", reasoningId: "f-reasoning_enabled", providerId: "f-provider",
   refreshId: "chat-model-refresh", statusId: "chat-model-status", title: "Модель ответа", active: () => !!state.current && state.workspace === "settings" && state.settingsScope === "chat" && state.section === "model" && document.visibilityState !== "hidden",
   onCatalog: models => { state.models = models; renderWarnings(); }});
-const rerankModelPicker = modelSelectors.create({host: $("#rag-rerank-picker"), modelId: "f-rag_rerank_model", providerId: "f-rag_rerank_provider",
+const rerankModelPicker = modelSelectors.create({host: $("#rag-rerank-picker"), modelId: "f-rag_rerank_model", reasoningId: "f-rag_rerank_reasoning_enabled", providerId: "f-rag_rerank_provider",
   refreshId: "rag-rerank-model-refresh", statusId: "rag-rerank-model-status", title: "Модель ранжирования",
   active: () => !!state.current && state.workspace === "settings" && state.settingsScope === "chat" && state.section === "rag" && $("#f-rag_enabled").checked && $("#f-rag_rerank_enabled").checked && !$("#rag-current-chat").hidden});
 const createRag = typeof module !== "undefined" ? require("./rag.js") : globalThis.createRagInspector;
@@ -1650,9 +1650,10 @@ function fillPanel(agent) {
     el.value = agent[name] === null || agent[name] === undefined ? "" : String(agent[name]);
   });
   fillStrategy(agent.strategy);
+  $("#f-reasoning_enabled").checked = agent.reasoning_enabled === true;
   $("#f-rag_enabled").checked = agent.rag_enabled === true;
   for (const name of ["rag_rewrite_enabled", "rag_rerank_enabled"]) $("#f-" + name).checked = agent[name] === true;
-  for (const [name, fallback] of Object.entries({rag_candidates_k: agent.rag_top_k != null ? Math.max(20, agent.rag_top_k) : Math.max(agent.rag_candidates_k ?? 20, agent.rag_final_k ?? 5), rag_final_k: agent.rag_top_k ?? agent.rag_final_k ?? 5})) {
+  for (const [name, fallback] of Object.entries({rag_candidates_k: agent.rag_top_k != null ? Math.max(10, agent.rag_top_k) : Math.max(agent.rag_candidates_k ?? 10, agent.rag_final_k ?? 3), rag_final_k: agent.rag_top_k ?? agent.rag_final_k ?? 3})) {
     $("#f-" + name).value = String(agent[name] ?? fallback);
   }
   $("#f-system").value = agent.system || "";
@@ -1661,8 +1662,8 @@ function fillPanel(agent) {
   fillResponseFormat(agent.response_format);
   // Модель ставим сразу, не дожидаясь каталога: панель — источник правды,
   // и её пустоту нельзя пролить в агента.
-  chatModelPicker.set({provider: agent.provider, model: agent.model});
-  rerankModelPicker.set({provider: agent.rag_rerank_provider, model: agent.rag_rerank_model || "openai/gpt-6-luna"});
+  chatModelPicker.set({provider: agent.provider, model: agent.model, reasoning_enabled: agent.reasoning_enabled});
+  rerankModelPicker.set({provider: agent.rag_rerank_provider, model: agent.rag_rerank_model || "openai/gpt-6-luna", reasoning_enabled: agent.rag_rerank_reasoning_enabled});
   syncRagFields();
   state.baseModel = agent.model;
   chatModelPicker.load().then(renderWarnings);
@@ -1769,6 +1770,7 @@ function readPanel() {
   const patch = {
     system: $("#f-system").value,
     provider: $("#f-provider").value,
+    reasoning_enabled: $("#f-reasoning_enabled").checked,
     model: $("#f-model").value.trim(),
     stop: readStopLines($("#f-stop").value),
     response_format: parseResponseFormat(
@@ -1779,6 +1781,7 @@ function readPanel() {
     rag_enabled: $("#f-rag_enabled").checked,
     rag_rewrite_enabled: $("#f-rag_rewrite_enabled").checked,
     rag_rerank_enabled: $("#f-rag_rerank_enabled").checked,
+    rag_rerank_reasoning_enabled: $("#f-rag_rerank_reasoning_enabled").checked,
     rag_rerank_provider: $("#f-rag_rerank_provider").value,
     rag_rerank_model: $("#f-rag_rerank_model").value.trim(),
   };
