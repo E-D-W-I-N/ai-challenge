@@ -981,16 +981,20 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 - Только завершённый terminal frame без tool calls и с finish_reason=stop
   принимается как ответ. Обычный строгий JSON: `{answer: string,
   citations: [{source_id: int, quote: string}]}`. Лишние/отсутствующие поля,
-  bool вместо ID, неизвестные ID, повтор источника, пустая цитата и несовпадение наборов `[n]` и
-  citations дают безопасную явную ошибку. Номера не перенумеровываются по цитируемому
+  bool вместо ID, неизвестные ID, повтор источника и пустая цитата дают безопасную
+  явную ошибку. При наличии распознанных ссылок `[n]` их набор строго совпадает с
+  citations. Ноль inline ссылок допускается при корректном непустом citations;
+  исходный answer не меняется, ссылки автоматически не вставляются. Prompt
+  предпочитает inline ссылки, но отсутствие допускается; карточки цитат остаются. Номера не перенумеровываются по цитируемому
   поднабору; используются только фактически отправленные hits. Сервер выводит
   source/title/section/chunk_id из snapshot, не из заявления модели.
   Ошибки диагностики отдельно называют незавершённый/model-error ответ, invalid JSON,
   duplicate keys, root fields, пустые/неверного типа answer/citations/quote, поля цитаты,
-  type/range/duplicate source_id, missing pinned metadata и absent/mismatched inline refs.
+  type/range/duplicate source_id, missing pinned metadata и mismatched присутствующие inline refs.
   Сообщения фиксированные: raw response, ID, цитаты, finish/error значения не отражаются.
   CitationError от duplicate-key hook сохраняется до общего JSON ValueError catch.
-  Категории не меняют acceptance: только полный JSON без префикса/Markdown, без retry.
+  Только полный JSON без префикса/Markdown, без retry. Диагностика отсутствия
+  inline refs больше не применяется: без них карточки всё равно строятся из citations.
 - После cosine gate принимается только answer/citations; модельный
   `{status:"insufficient"}` даёт обычную ошибку формата с paid diagnostics,
   без подмены ответа отказом или платного retry. Prompt просит ответить на
