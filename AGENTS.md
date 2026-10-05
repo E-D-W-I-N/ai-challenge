@@ -27,7 +27,10 @@ prompt, JSON запросов и assistant.rag; исторический инс�
 request_bodies. Query rewrite и реранкинг независимы: new rewrite default true,
 legacy false; rerank default false; RAG остаётся OFF. Rewrite — один constrained
 вызов модели чата, последние 3 успешные пары, timeout 60s, strict stop/JSON,
-без retries/fallback. Retrieval default10 → rerank всех кандидатов → context first3;
+без retries/fallback. Rerank требует только JSON и полный набор фактически найденных
+integer source_ids; допускает prose prefix перед первым полным объектом, но только
+whitespace после него. Ошибки формата/ID различаются без отражения raw ответа;
+порядок не исправляется, IDs не дополняются. Retrieval default10 → rerank всех кандидатов → context first3;
 без rerank первые3 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
 Предварительного cosine-фильтра нет; день24 сохраняет отдельный порог ответа. Snapshot v3 хранит original/query/
 history/config, всех candidates с original/final ranks/selected, selection и финальные
