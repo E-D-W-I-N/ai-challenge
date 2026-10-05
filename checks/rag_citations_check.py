@@ -5,6 +5,8 @@ import asyncio
 import copy
 import json
 import tempfile
+
+import httpx
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -13,7 +15,7 @@ from checks import _stub
 
 
 def check_rag_citations():
-    from app import agent as agents, main, rag
+    from app import agent as agents, main, rag, llm
     from app.schema import AgentSpec
     from app.store import Store
 
@@ -63,7 +65,7 @@ def check_rag_citations():
     async def scenarios(root):
         store = Store(str(root / "neutral.sqlite")).init()
         spec = AgentSpec(label="citations", model="stub/model", rag_enabled=True,
-                         rag_rewrite_enabled=False,
+                         rag_rewrite_enabled=False, reasoning_enabled=True,
                          response_format={"type": "text"}, extra_body={"response_format": {"type": "text"}})
         chat = agents.Agent(spec, store=store)
         unchanged = copy.deepcopy(chat.spec)
@@ -134,7 +136,7 @@ def check_rag_citations():
         for provider in ("openrouter", "compatible"):
             ranked = agents.Agent(AgentSpec(label="ranked citations", model="neutral-final", provider=provider,
                 rag_enabled=True, rag_rewrite_enabled=False,
-                rag_rerank_enabled=True, rag_rerank_provider=provider, rag_rerank_model="neutral-ranker"), store=store)
+                reasoning_enabled=True, rag_rerank_enabled=True, rag_rerank_provider=provider, rag_rerank_model="neutral-ranker"), store=store)
             # A discarded strong candidate cannot authorize the selected weak context.
             ranked.spec.rag_final_k = 1
             _stub.reset()
@@ -170,6 +172,49 @@ def check_rag_citations():
             assert saved.request_bodies == [call["payload"] for call in _stub.CALLS]
             assert len(saved.rag["hits"]) == 2 and saved.rag["rerank"]["source_ids"] == [2, 1]
             assert ("provider" in saved.request_bodies[0]) == (provider == "openrouter")
+
+        # Real transport + Agent: ON accepts grounded text; OFF violations never publish RAG.
+        for provider in ("openrouter", "compatible"):
+            actual = agents.Agent(AgentSpec(label="actual reasoning citations", model="neutral/model", provider=provider,
+                reasoning_enabled=True, rag_enabled=True, rag_rewrite_enabled=False), store=store)
+            mode = {"value": "on"}; dispatched = []
+            def respond(request):
+                dispatched.append(json.loads(request.content))
+                if mode["value"] == "tools":
+                    frames = [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "neutral-call", "function": {"name": "neutral_tool", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}]
+                else:
+                    frames = [{"choices": [{"delta": {"content": json.dumps(valid)}, "finish_reason": "stop"}]}]
+                    if mode["value"] in ("on", "early"):
+                        frames.insert(0, {"choices": [{"delta": {"reasoning_content": "neutral reasoning"}}]})
+                frames.append({"choices": [], "usage": {"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100,
+                    "cost": .000123, "completion_tokens_details": {"reasoning_tokens": 5}}})
+                return httpx.Response(200, text="".join("data: " + json.dumps(frame) + "\n\n" for frame in frames) + "data: [DONE]\n\n")
+            declaration = [{"type": "function", "function": {"name": "neutral_tool", "description": "neutral fixture", "parameters": {"type": "object", "properties": {}}}}]
+            never_run = AsyncMock(side_effect=AssertionError("OFF violation must not execute MCP"))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value="neutral-fixture-key"), \
+                     patch.object(agents, "stream_completion", llm.stream_completion), patch.object(rag.Index, "retrieve", retrieved), \
+                     patch.object(agents, "declared_tools", return_value=declaration), patch.object(agents, "run_tool", never_run):
+                    completed = await drain(actual.ask("neutral actual grounded request"))
+                    assert completed[-1]["committed"] and completed[-1]["text"] == valid["answer"]
+                    assert [event["text"] for event in completed if event["type"] == "delta"] == [valid["answer"]]
+                    assert any(event["type"] == "reasoning" for event in completed)
+                    before_actual = copy.deepcopy(actual.history[-1])
+                    actual.spec.reasoning_enabled = False
+                    for violation in ("early", "late", "tools"):
+                        mode["value"] = violation; dispatched.clear()
+                        failed = await drain(actual.ask("neutral actual violation"))
+                        assert not failed[-1]["committed"] and len(actual.history) == 2
+                        assert not any(event["type"] in ("delta", "tool_call") for event in failed)
+                        assert failed[-1]["metrics"]["total_tokens"] == 100 and failed[-1]["metrics"]["cost_usd"] == .000123
+                        assert failed[-1]["request_bodies"] == dispatched and len(dispatched) == 1
+                        assert dispatched[0]["tools"] == declaration and "answer" not in failed[-1]["rag"]
+                        assert (dispatched[0].get("reasoning", {}).get("effort") or dispatched[0].get("reasoning_effort")) == "none"
+                    mode["value"] = "late"
+                    taken = actual.take_last_exchange()
+                    restored = await drain(main._regenerate_events(actual, taken))
+                    assert restored[-1]["restored"] and actual.history[-1] == before_actual
+                    never_run.assert_not_awaited()
 
         # Cancellation at the newly buffered publication boundary cannot commit the answer.
         depth = len(chat.history)

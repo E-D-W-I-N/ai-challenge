@@ -20,6 +20,7 @@ class PreparationConfig:
     timeout_seconds: float = 600
     prompt_version: str = "preparation-v1"
     provider: str = "openrouter"
+    reasoning_enabled: bool = False
     auth_mode: InitVar[str | None] = None
     max_html_characters: int = 200000
     max_output_characters: int = 200000
@@ -27,6 +28,8 @@ class PreparationConfig:
     payload_version: str = "preparation-reasoning-v2"
 
     def __post_init__(self, auth_mode):
+        if type(self.reasoning_enabled) is not bool:
+            raise ValueError("reasoning_enabled must be boolean")
         # Reuse endpoint/model/auth validation, with an independent preparation timeout.
         checked = SemanticConfig(self.base_url, self.model, provider=self.provider, auth_mode=auth_mode)
         object.__setattr__(self, "provider", checked.provider)
@@ -58,7 +61,7 @@ def _payload(html, config):
                 {"role": "user", "content": json.dumps({"html": html}, ensure_ascii=False)}]}
 
     from shared_models import generation_payload
-    return generation_payload(payload, config.provider)
+    return generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
 
 
 def _document(body, source, config):

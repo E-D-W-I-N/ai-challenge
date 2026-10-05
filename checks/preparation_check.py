@@ -27,10 +27,10 @@ def check_preparation():
     assert PreparationConfig().timeout_seconds == 600
     default = PreparationConfig()
     assert default.model == "openai/gpt-6-luna"
-    assert _payload("<p>Neutral</p>", default)["reasoning"] == {"effort": "none"}
+    assert _payload("<p>Neutral</p>", default)["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
     assert default.payload_version == "preparation-reasoning-v2"
     for alternate in (replace(default, model="unverified"), replace(default, provider="compatible"), replace(default, base_url="http://neutral.test/v1", provider="compatible")):
-        assert "reasoning" not in _payload("<p>Neutral</p>", alternate)
+        assert _payload("<p>Neutral</p>", alternate).get("reasoning", {}).get("effort", _payload("<p>Neutral</p>", alternate).get("reasoning_effort")) == "none"
     for invalid in (True, False, 0, -1, 3601, float("nan"), float("inf"), "600"):
         try:
             PreparationConfig(timeout_seconds=invalid)

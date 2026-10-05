@@ -247,7 +247,7 @@ def build_payload(
         else:
             payload[key] = value
     from .store import redact
-    return redact(generation_payload(payload, session.provider))
+    return redact(generation_payload(payload, session.provider, reasoning_enabled=session.reasoning_enabled))
 
 
 _request_capture = ContextVar("request_capture", default=None)
@@ -333,6 +333,7 @@ async def stream_completion(
     reasoning_parts: list[str] = []
     calls: dict[int, dict] = {}
     announced = False
+    reasoning_violation = False
 
     try:
         # Клиент общий на процесс, а семафор держится на всё время стрима:
@@ -384,6 +385,9 @@ async def stream_completion(
                     if chunk.get("model"):
                         metrics.model = chunk["model"]
 
+                    from shared_models import reports_reasoning
+                    if not session.reasoning_enabled and reports_reasoning(chunk):
+                        reasoning_violation = True
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
 
@@ -391,7 +395,11 @@ async def stream_completion(
                         # не входит. В счётчик токенов не идёт — его считает
                         # usage.completion_tokens_details.reasoning_tokens,
                         # и удваивать эту цифру своей оценкой нельзя.
-                        thought = delta.get("reasoning") or ""
+                        if reasoning_violation:
+                            if choice.get("finish_reason"):
+                                metrics.finish_reason = choice["finish_reason"]
+                            continue
+                        thought = delta.get("reasoning") or delta.get("reasoning_content") or ""
                         if thought:
                             if metrics.first_token_ms is None:
                                 metrics.first_token_ms = (now - started) * 1000
@@ -456,6 +464,7 @@ async def stream_completion(
                                 choice["finish_reason"] == "tool_calls"
                                 and calls
                                 and not announced
+                                and session.reasoning_enabled
                             ):
                                 announced = True
                                 yield {
@@ -490,12 +499,18 @@ async def stream_completion(
     # и наличие вызовов говорит о них надёжнее, чем слово про причину. Событие
     # уходит здесь, до `done`: `done` — конец обмена, и после него слушателю
     # уже нечего делать с вызовом.
-    if calls and not announced:
+    if calls and not announced and not reasoning_violation:
         yield {
             "type": "tool_calls",
             "calls": collected_calls(calls),
             "metrics": metrics.as_dict(),
         }
+    if reasoning_violation:
+        metrics.error = "Сервер модели вернул reasoning при выключенной настройке. Проверьте поддержку reasoning_effort."
+        yield {"type": "error", "message": metrics.error, "metrics": metrics.as_dict()}
+        text_parts.clear()
+        reasoning_parts.clear()
+        calls.clear()
     yield {
         "type": "done",
         "text": "".join(text_parts),
