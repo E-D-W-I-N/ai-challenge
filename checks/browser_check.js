@@ -56,6 +56,25 @@ async function scenario(name, run) {
 }
 
 async function main() {
+  await scenario("Answered partial facts show neutral source cards without exact-quote claims", async () => {
+    const rag = {version: 3, query: "neutral compound", config: {rewrite_enabled: false, candidates_k: 10, final_k: 3, rerank_enabled: false},
+      answer_policy: {weak_context_enabled: true, similarity_threshold: .3},
+      hits: [{chunk_id: "first", text: "First neutral object is blue.", score: .8}, {chunk_id: "second", text: "Second neutral object is green.", score: .6}],
+      answer: {status: "answered", citations: [{source_id: 1, chunk_id: "first", source: "fixture:first", title: "First", quote: "Первый объект синего цвета"},
+        {source_id: 2, chunk_id: "second", source: "fixture:second", title: "Second", quote: "Второй <b>зелёный</b> объект"}]}};
+    const {client, $, requests} = freshClient({agents: [{rag_enabled: true, transcript: [turns[0], {...turns[1], content: "Первый синий [1], второй зелёный [2]. Данных о массе третьего нет.", rag}], history_len: 2}]});
+    client.init(); await settle();
+    const card = $("#feed").querySelector(".card"), cards = card.querySelectorAll(".rag-source-card");
+    check("New status labels sources neutrally and retains the supported partial answer", card.textContent.includes("Источники и цитаты") && !card.textContent.includes("Цитаты проверены") && card.textContent.includes("Данных о массе третьего нет"));
+    check("Paraphrased quotes are displayed as inert text with matching source links", cards.length === 2 && cards[1].querySelector("blockquote").textContent === "Второй <b>зелёный</b> объект" && !cards[1].querySelector("b") && (card.querySelector(".card-body").innerHTML.match(/class="rag-citation-ref"/g) || []).length === 2);
+    const raw = button(card, "Показать сырой текст"); raw.dispatchEvent(new Evt("click")); raw.dispatchEvent(new Evt("click"));
+    check("Neutral answered references survive raw view restoration", card.querySelector(".card-body").innerHTML.includes('href="#rag-source-1-2"'));
+    const before = requests("GET", /^\/api\/rag\//).length;
+    card.querySelector(".card-rag").querySelector("button").dispatchEvent(new Evt("click")); await settle();
+    const historical = $("#rag-answer-snapshot");
+    check("Answered history shows saved quotes and no verification claim or index fetch", historical.querySelectorAll(".rag-snapshot-citation").length === 2 && historical.textContent.includes("Источники и цитаты") && !historical.textContent.includes("Цитаты проверены") && requests("GET", /^\/api\/rag\//).length === before);
+  });
+
   await scenario("Verified citations use saved ranks, inert quotes and safe local references", async () => {
     const rag = {version: 2, query: "neutral question", config: {rewrite_enabled: false, filter_enabled: false},
       answer_policy: {weak_context_enabled: true, similarity_threshold: .4},

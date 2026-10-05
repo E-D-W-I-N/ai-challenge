@@ -38,16 +38,19 @@ hits/context/identity/timing/actual usage. Legacy v1/v2 история не пе
 Интерактивные failed calls сохраняют no-commit/restore, diagnostics transient; scheduler
 сохраняет доступные метрики в error assistant. При RAG ON финальный JSON answer/citations
 проверяется до публикации: ссылки [n] — позиции pinned hits; source/section/chunk_id
-берутся только оттуда, quote — точная подстрока canonical redacted text. Ошибка —
+берутся только оттуда. Quote непустая, но её дословность и смысловая поддержка
+не проверяются; cosine — единственный автоматический content gate. Ошибка —
 no-commit/restore без retry; непроверенный partial RAG не сохраняется при отмене
 или reasoning OFF violation, MCP при таком отказе не выполняется.
 Порог слабого контекста действует всегда при ON: отсутствие hits либо max(score)<threshold
 для выбранных hits даёт детерминированное «Не знаю» с уточнением без final LLM.
 Все слабые кандидаты допускают ранний отказ до rerank, помеченный gate_stage=candidates;
-иначе gate_stage=selected, оплаченный rerank учитывается один раз. Явный strict JSON {status:insufficient} модели даёт тот же отказ с
-paid usage. Snapshot v3 дополнен answer_policy и answer(status/citations/reason);
+иначе gate_stage=selected, оплаченный rerank учитывается один раз. После gate
+модель отвечает на подтверждённые части и указывает пробелы, только answer/citations.
+Модельный {status:insufficient} — ошибка формата, без retry. Новые статусы answered
+и подпись «Источники и цитаты»; старые verified/reason=model снимки читаются без миграции. Snapshot v3 дополнен answer_policy и answer(status/citations/reason);
 история и ветки не перечитывают индекс. Receipt планирования — отдельное исключение,
-содержательный результат напоминания проверяется. Дословность не доказывает смысл;
+содержательный результат напоминания проверяется. Автоматической проверки цитат по тексту и semantic judge нет;
 10 вопросов и оценка качества остаются приватной ручной работой. Task memory отсутствует.
 Подготовка документов: programmatic default или полный decoded исходный HTML через
 LLM, независимо от чанкинга; валидируемые title/blocks/sections и bounded input/output,

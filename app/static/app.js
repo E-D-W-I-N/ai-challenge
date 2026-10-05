@@ -665,7 +665,7 @@ function answerCard(agent, turn, index) {
 
 function ragReferences(snapshot, index) {
   const references = {};
-  if (snapshot?.answer?.status !== "verified") return references;
+  if (!["answered", "verified"].includes(snapshot?.answer?.status)) return references;
   for (const citation of snapshot.answer.citations || []) {
     if (Number.isSafeInteger(citation.source_id) && citation.source_id > 0)
       references[citation.source_id] = "rag-source-" + index + "-" + citation.source_id;
@@ -676,29 +676,29 @@ function ragReferences(snapshot, index) {
 function ragSources(snapshot, index) {
   const box = el("div", "card-rag");
   const answer = snapshot.answer;
-  const verified = answer?.status === "verified";
-  const sources = verified ? (answer.citations || []) : answer ? [] : (snapshot.hits || []);
-  const label = verified ? "Цитаты проверены" : answer?.status === "receipt" ? "RAG · напоминание запланировано"
+  const hasCitations = ["answered", "verified"].includes(answer?.status);
+  const sources = hasCitations ? (answer.citations || []) : answer ? [] : (snapshot.hits || []);
+  const label = answer?.status === "answered" ? "Источники и цитаты" : answer?.status === "verified" ? "Цитаты проверены" : answer?.status === "receipt" ? "RAG · напоминание запланировано"
     : answer?.status === "insufficient" ? "RAG · недостаточно информации"
     : sources.length ? "Фрагменты RAG · проверка цитат недоступна" : "RAG · подходящих фрагментов нет";
   box.appendChild(el("div", "field-label", label));
   const list = el("ol", "rag-answer-sources");
   const references = ragReferences(snapshot, index);
   for (const hit of sources) {
-    const item = el("li", verified ? "rag-source-card" : "");
-    if (verified) {
+    const item = el("li", hasCitations ? "rag-source-card" : "");
+    if (hasCitations) {
       item.id = references[hit.source_id];
       item.setAttribute("value", hit.source_id);
       item.tabIndex = -1;
     }
     item.appendChild(el("span", "", hit.title || hit.source || hit.chunk_id));
-    if (hit.section || (verified && hit.chunk_id)) {
+    if (hit.section || (hasCitations && hit.chunk_id)) {
       const locator = el("span", "muted rag-source-locator", " · " + (hit.section || hit.chunk_id));
       if (hit.chunk_id) locator.title = hit.chunk_id;
       item.appendChild(locator);
     }
     if (hit.source) {
-      const safeUrl = verified && /^https?:\/\/[^\s]+$/i.test(hit.source);
+      const safeUrl = hasCitations && /^https?:\/\/[^\s]+$/i.test(hit.source);
       const source = el(safeUrl ? "a" : "div", "muted rag-source-url", hit.source);
       if (safeUrl) {
         source.setAttribute("href", hit.source);
@@ -707,7 +707,7 @@ function ragSources(snapshot, index) {
       }
       item.appendChild(source);
     }
-    if (verified) item.appendChild(el("blockquote", "rag-source-quote", hit.quote));
+    if (hasCitations) item.appendChild(el("blockquote", "rag-source-quote", hit.quote));
     list.appendChild(item);
   }
   if (sources.length) box.appendChild(list);

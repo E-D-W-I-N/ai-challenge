@@ -400,13 +400,13 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
       target.append(detail("Защита от слабого контекста", snapshot.answer_policy));
     }
     if (snapshot.answer) {
-      const status = {verified: "Цитаты проверены", insufficient: "Недостаточно информации", receipt: "Подтверждение напоминания: цитаты не требуются"};
+      const status = {answered: "Источники и цитаты", verified: "Цитаты проверены", insufficient: "Недостаточно информации", receipt: "Подтверждение напоминания: цитаты не требуются"};
       target.append(el("h3", "", status[snapshot.answer.status] || "Состояние проверки цитат"));
       if (snapshot.answer.reason) {
         const reasons = {low_similarity: snapshot.answer_policy?.gate_stage === "candidates" ? "Все кандидаты ниже порога cosine. Реранкинг не выполнялся; показан предварительный порядок поиска." : "Ни один выбранный фрагмент не достиг порога cosine.", model: "Модель не нашла в источниках достаточно данных для ответа."};
         target.append(el("p", "hint", reasons[snapshot.answer.reason] || snapshot.answer.reason));
       }
-      for (const citation of snapshot.answer.status === "verified" ? snapshot.answer.citations || [] : []) {
+      for (const citation of ["answered", "verified"].includes(snapshot.answer.status) ? snapshot.answer.citations || [] : []) {
         const node = el("details", "rag-detail rag-snapshot-citation");
         node.append(el("summary", "", `[${citation.source_id}] ${citation.title || citation.source || citation.chunk_id}`),
           el("blockquote", "rag-source-quote", citation.quote), detail("Источник цитаты", citation));
