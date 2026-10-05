@@ -840,7 +840,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .primary-btn { border-radius: 6px; padding: 9px 13px; font-size: 13px; }
 #rag-workflow, #rag-current-chat { gap: 10px; }
 .rag-chat-settings { gap: 12px; }
-.rag-chat-numbers { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 0; }
+.rag-chat-numbers { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; margin-top: 0; }
 .rag-chat-numbers .field { width: 155px; }
 .model-selector { min-width: 0; }
 .model-selector-row { display: grid; grid-template-columns: minmax(170px, 200px) minmax(160px, 1fr) 36px; gap: 10px; align-items: end; }

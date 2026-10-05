@@ -854,15 +854,19 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   retrieval на пользовательском архиве; corpus/questions/reports остаются private.
 
 
-## День 23: rewrite, cosine фильтрация и реранкинг
+## День 23: rewrite, реранкинг всех кандидатов и отбор контекста
 
-- Новые `AgentSpec` имеют `rag_rewrite_enabled=true`, `rag_filter_enabled=true`,
-  `rag_top_k=5`, `rag_similarity_threshold=0.3`, `rag_rerank_enabled=false`.
-  RAG по-прежнему default false. Чтение legacy config выставляет каждый отсутствующий
-  boolean false независимо; миграция не запускает новый платный вызов. API требует
-  строгие bool, finite threshold [-1,1] и Top-K от 1 до 100; PATCH проверяет
-  effective config до изменения полей. Настройки сохраняются/копируются как конфиг чата.
-- Legacy final K мигрирует в Top-K; старое candidate K больше не управляет поиском.
+- Новые `AgentSpec`: `rag_rewrite_enabled=true`, `rag_candidates_k=20`,
+  `rag_final_k=5`, `rag_rerank_enabled=false`; RAG default false. API требует
+  строгие bool и целые 1..100, final<=candidates; PATCH проверяет effective
+  пару до изменения любых полей. Уменьшить только candidates ниже текущего final
+  нельзя: нужно одновременно задать допустимую пару. Предварительный cosine-filter
+  удалён; день24 сохраняет отдельный rag_similarity_threshold для ответа.
+- Legacy config с rag_top_k сохраняет его как final_k; candidates=max(20, final_k).
+  Это поле имеет приоритет над оставшимися obsolete candidates/final из старой
+  схемы. Без top_k старые candidates/final сохраняются; полностью legacy default20/5.
+  Отсутствующие rewrite/rerank false; миграция не запускает новый платный вызов.
+  save_config пишет только новую схему, restart/fork не возвращают старый top_k.
 - При RAG ON rewrite использует текущие provider и model ID, отдельный `AgentSpec` и
   constrained service prompt: исходный вопрос и последние три полные успешные пары
   до сжатия. Инструкции чата, память, профиль, tools и extra_body не наследуются.
@@ -872,32 +876,32 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   OpenRouter `openai/gpt-6-luna` получает reasoning.effort=none, как semantic preparation.
   `aclosing` закрывает stream при ошибке/отмене; cancel/can_run проверяются после
   событий и перед платными границами. Исходный вопрос остаётся вопросом final prompt.
-- `Index.retrieve` закрепляет identity и полные candidate hits в одном SQLite чтении.
-  Один query embedding на Top-K. При включённом фильтре остаются score >= threshold;
-  иначе все найденные hits. Порядок cosine/id сохраняется до optional rerank.
-  Реранкинг использует отдельно выбранные provider/model, constrained JSON вызов
-  timeout 60s и точную полную перестановку source_ids без повторов, пропусков,
-  чужих IDs и bool. Только finish_reason=stop означает успех; нет retries/fallback,
-  оценок от LLM и скрытого сокращения hits. Отмена не выдаёт identity permutation
-  за результат модели. Новая индексация не нужна. Фильтр не вызывает LLM.
-- Snapshot version2 расширяет v1: original_query/history_used/config, candidates с
-  полным hit и decision kept/threshold, rewrite с query/provider/model/actual usage,
-  rerank с provider/model/permutation/actual usage при успешном выполнении,
-  timings rewrite_seconds/retrieval_seconds. Retrieval duration включает отбор;
-  отдельное время фильтра не выдумывается. hits/context остаются финальными, полными
-  и канонически redacted; тот же snapshot в prompt/start/done/Turn.rag. Старые v1
-  snapshots читаются без переписывания. Исторический инспектор не читает индекс.
-  При выключенном rewrite показан один запрос без истории/модели/usage этого этапа;
-  решения фильтра видны только при сохранённом filter_enabled=true; таблица
-  до/после — только при сохранённой фактически выполненной перестановке rerank.
-  В текущих настройках «Количество чанков» (Top-K) видно всегда при RAG ON.
-  Итоговые источники, индекс и контекст доступны независимо от этих этапов;
-  сохранённые answer_policy и порог слабого контекста не зависят от фильтра.
-  Настройки RAG текущего чата находятся в «Настройках чата → Поиск RAG».
-  Pipeline находится в «Настройках приложения → Индекс RAG» и доступен без чата.
-  Исторический инспектор у ответа открыт отдельно и read-only: он не переносит
-  формы текущего чата или pipeline в сохранённый снимок.
-- SSE retrieval stages rewrite/search/filter/rerank обозначают реальные включённые этапы.
+- `Index.retrieve` закрепляет identity и все полные candidate hits в одном SQLite
+  чтении. Один query embedding, поиск до candidates_k в cosine/id порядке.
+  Предварительного cosine порога нет. Реранкинг получает ВСЕ найденные тексты,
+  использует отдельно выбранные provider/model и constrained JSON вызов timeout60s.
+  Валидируется точная полная перестановка source_ids: без bool, дублей, пропусков,
+  чужих IDs и выдуманных scores. Только stop означает успех; нет retries/fallback.
+  После успешной перестановки выбираются первые final_k; при OFF та же операция
+  берёт cosine prefix. Отмена не выдаёт identity permutation за результат модели.
+- Snapshot v3 хранит полный original cosine candidates набор с original_rank,
+  final_rank и selected; selection хранит ordering (cosine/rerank), полный порядок
+  ordered_source_ids и selected_source_ids. hits/context содержат только выбранный
+  префикс, полные canonical redacted text/metadata с pinned index identity.
+  Служебный rerank input содержит весь candidates набор, не provisional hits.
+  Actual rewrite/rerank records и timings не начисляют cache/прошлый usage.
+  Config содержит оба количества и включённые этапы; prompt/start/done/Turn.rag
+  используют один снимок. Legacy v1/v2 snapshots не мигрируются и не перечитывают индекс.
+- Историческая таблица показывает «Источник», затем при actual rerank «До → после»,
+  затем «Cosine»; строки в финальном порядке, метка «В контексте» у выбранных.
+  Все кандидаты доступны для чтения независимо от отбора. Rerank OFF не показывает
+  модель/ранги выключенной функции; rewrite OFF не показывает историю/usage этапа.
+  Для legacy filtered v2 порядок/rerank IDs восстанавливаются только через chunk_id
+  сохранённых hits; исключённым источникам не выдумываются модельные ранги.
+  Сохранённая диагностика фильтра и лимитов остаётся доступной только по flags
+  старого снимка. Настройки чата — «Поиск RAG», pipeline приложения — «Индекс RAG»;
+  исторический inspector отдельный read-only scope, current edits не меняют историю.
+- SSE retrieval stages rewrite/search/rerank обозначают реальные включённые этапы.
   Нулевой отбор даёт start(generation=false, resolved_messages=[], rag_at=null),
   deterministic delta/done с отказом «Не знаю» и просьбой уточнить вопрос. Сжатие, MCP
   и final model не запускаются; assistant, snapshot, actual rewrite JSON и usage
@@ -911,7 +915,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   не создаются; regenerate восстанавливает прежний answer/snapshot/requests. Scheduler
   error assistant объединяет доступные done.metrics с reminder_execution.
 - `checks/rag_refinement_check.py` — компактные offline synthetic hits/temporary Store:
-  threshold inclusive/единственный Top-K, query history/model isolation, strict success,
+  candidate/prefix counts, query history/model isolation, strict success,
   timeout/cancel/closure, nohits/reminders, request JSON/actual usage, restart/deepcopy,
   legacy и effective API validation. Day22 pinned rebuild/HTTP lookup suite сохранён.
   Это проверка контрактов; качество живой модели на пользовательском корпусе не измеряется.
@@ -923,14 +927,19 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 
 ## День 24: источники, цитаты и отказ при слабом контексте
 
-- При каждом RAG ON snapshot v2 получает `answer_policy` с
-  `weak_context_enabled=true` и фактическим `similarity_threshold`. Gate перед
-  платным rerank/compression/MCP/final LLM требует хотя бы один hit с score >= threshold,
-  независимо от `filter_enabled`. Нулевой или слабый контекст даёт детерминированный
-  «Не знаю: в базе не найдена достаточно релевантная информация. Уточните вопрос.»
-  и `answer={status:insufficient, reason:low_similarity, citations:[]}`. Rewrite
-  request/usage сохраняются, если состоялись. FilterOFF при пройденном gate не
-  меняет существующие hits/candidates; дополнительного per-source порога нет.
+- При каждом RAG ON snapshot v3 получает `answer_policy` с
+  `weak_context_enabled=true`, фактическим `similarity_threshold`,
+  `context_scope=selected` и `gate_stage`. Порог не фильтрует кандидатов.
+  Если все кандидаты ниже порога, `gate_stage=candidates` допускает отказ до
+  платного rerank; selection тогда остаётся предварительным cosine prefix,
+  без actual rerank record и без модельных рангов в инспекторе. Иначе полный
+  набор ранжируется и отбирается, затем `gate_stage=selected` требует хотя бы
+  один выбранный hit с score >= threshold до compression/MCP/final LLM.
+  Отброшенный сильный источник не разрешает ответ по слабому выбранному набору.
+  Нулевой или слабый контекст даёт детерминированный «Не знаю: в базе не найдена
+  достаточно релевантная информация. Уточните вопрос.» и
+  `answer={status:insufficient, reason:low_similarity, citations:[]}`.
+  Actual rewrite/rerank requests и оплаченный usage сохраняются один раз.
 - Для успешного gate копия spec получает обязательный `response_format=json_object`,
   в том числе поверх `extra_body.response_format`, и доверенное системное правило
   ответа. Сохранённые настройки не меняются; actual JSON показывает реальный формат.

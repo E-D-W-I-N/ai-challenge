@@ -32,7 +32,19 @@ def check_models():
     router = llm.build_payload(AgentSpec(label="neutral", model="same-id"), [])
     assert router["provider"] == {"require_parameters": True} and router["usage"] == {"include": True}
     legacy = agents.spec_from_config({"model": "saved-exact-id", "rag_final_k": 7, "rag_candidates_k": 20}, fallback=generic)
-    assert legacy.model == "saved-exact-id" and legacy.rag_top_k == 7 and not legacy.rag_rerank_enabled
+    assert legacy.model == "saved-exact-id" and legacy.rag_final_k == 7 and legacy.rag_candidates_k == 20 and not legacy.rag_rerank_enabled
+
+    for config, expected in (({"rag_top_k": 7}, (20, 7)),
+                             ({"rag_top_k": 40}, (40, 40)),
+                             ({"rag_top_k": 8, "rag_candidates_k": 30, "rag_final_k": 2}, (20, 8)),
+                             ({"rag_candidates_k": 30, "rag_final_k": 9}, (30, 9))):
+        migrated = agents.spec_from_config({"model": "saved-exact-id", **config}, fallback=generic)
+        assert (migrated.rag_candidates_k, migrated.rag_final_k) == expected
+        saved_config = asdict(migrated)
+        assert "rag_top_k" not in saved_config
+        migrated.rag_final_k = 3
+        reloaded = agents.spec_from_config(asdict(migrated), fallback=generic)
+        assert reloaded.rag_final_k == 3 and reloaded.model == "saved-exact-id"
 
     # Status exposes editable canonical selectors while archived identities stay exact.
     from app import rag_api
@@ -84,6 +96,18 @@ def check_models():
         reopened = Store(root / "chat.sqlite").init()
         assert reopened.load_model_settings() == store.load_model_settings()
         reopened.close()
+        archived_config = {"label": "saved count", "model": "saved-exact-id", "rag_top_k": 8,
+                           "rag_candidates_k": 30, "rag_final_k": 2}
+        store.save_session("migration", label="saved count", config=archived_config, created_at=1)
+        migrated_chat = agents.Agent(generic, agent_id="migration", store=store)
+        assert migrated_chat.spec.rag_final_k == 8 and "rag_top_k" not in store.load_session("migration")["config"]
+        migrated_chat.spec.rag_final_k = 3; migrated_chat.save_config()
+        restarted = agents.Agent(generic, agent_id="migration", store=store)
+        assert restarted.spec.rag_final_k == 3 and restarted.spec.rag_candidates_k == 20
+        from app.registry import AgentRegistry
+        forked = AgentRegistry(store=store).fork(restarted, 0, label="migrated branch")
+        assert forked.spec.rag_final_k == 3 and forked.spec.rag_candidates_k == 20
+        assert store.load_session(forked.id)["config"]["rag_final_k"] == 3
         html = root / "neutral.html"; html.write_text("<html><title>Neutral</title><p>The neutral object is blue.</p></html>")
         ingest([{"path": str(html)}], root)
         config = EmbeddingConfig("http://old-neutral.test/v1", "saved-vector-id", 2, "saved-revision")
@@ -112,7 +136,7 @@ def check_models():
 
         async def pipeline():
             spec = AgentSpec(label="rerank", model="saved-chat", provider="compatible", rag_enabled=True,
-                             rag_top_k=3, rag_filter_enabled=True, rag_rerank_enabled=True,
+                             rag_candidates_k=3, rag_final_k=2, rag_rerank_enabled=True,
                              rag_rerank_provider="compatible", rag_rerank_model="saved-ranking-model")
             chat = agents.Agent(spec, store=store)
             lookup_urls = []; round_urls = []
@@ -127,21 +151,27 @@ def check_models():
                     # User changes settings during an in-flight ask; this ask remains on its frozen URL.
                     store.save_model_settings({"compatible_base_url": "http://later-neutral.test/v1"})
                     return '{"query":"neutral rewritten"}'
-                return '{"source_ids":[2,1]}' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 1"}]})
+                return '{"source_ids":[3,1,2]}' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
             _stub.reset()
             with patch.object(rag.Index, "retrieve", candidates), patch.object(agents, "stream_completion", _stub.make(reply)):
                 events = await collect(chat.ask("neutral question"))
             assert events[-1]["committed"] and len(_stub.CALLS) == 3
             assert round_urls == ["http://new-neutral.test/v1"] * 3 and lookup_urls == ["http://new-neutral.test/v1"]
-            assert [h["chunk_id"] for h in chat.history[-1].rag["hits"]] == ["1", "0"]
-            assert [c["decision"] for c in chat.history[-1].rag["candidates"]] == ["kept", "kept", "threshold"]
+            assert [h["chunk_id"] for h in chat.history[-1].rag["hits"]] == ["2", "0"]
+            assert [c["selected"] for c in chat.history[-1].rag["candidates"]] == [True, False, True]
+            assert [c["score"] for c in chat.history[-1].rag["candidates"]] == [.9, .3, .1]
+            assert chat.history[-1].rag["selection"]["selected_source_ids"] == [3, 1]
+            assert len(json.loads(_stub.CALLS[1]["messages"][-1]["content"])["sources"]) == 3
+            final_context = _stub.CALLS[-1]["messages"][-2]["content"]
+            assert final_context == chat.history[-1].rag["context"]
+            assert json.loads(final_context.split("\n", 1)[1]) == [{**hit, "source_id": i} for i, hit in enumerate(chat.history[-1].rag["hits"], 1)]
             proof = chat.history[-1].rag["rerank"]
-            assert proof["source_ids"] == [2, 1] and "scores" not in proof
+            assert proof["source_ids"] == [3, 1, 2] and "scores" not in proof
             bodies = chat.history[-1].request_bodies
             assert bodies == [c["payload"] for c in _stub.CALLS] and bodies[1]["model"] == "saved-ranking-model"
             assert all("provider" not in body and "plugins" not in body for body in bodies)
             assert chat.history[-1].metrics["total_tokens"] == 300 and chat.history[-1].metrics["cost_usd"] == .000369
-            assert chat.spec.model == "saved-chat" and chat.spec.rag_top_k == 3
+            assert chat.spec.model == "saved-chat" and chat.spec.rag_candidates_k == 3 and chat.spec.rag_final_k == 2
             for invalid in ('{"source_ids":[1]}', '{"source_ids":[1,1]}', '{"source_ids":[true,2]}', '{"source_ids":[1,2],"scores":[1,0]}', 'invalid'):
                 depth = len(chat.history); _stub.reset()
                 def invalid_reply(messages, index):
