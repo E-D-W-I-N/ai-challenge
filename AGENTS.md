@@ -1,4 +1,4 @@
-# Инструкции для агентов — день 24
+# Инструкции для агентов — день 25
 
 Чат на FastAPI, ванильном JS без сборки и SQLite; MCP подключается,
 показывает инструменты и исполняет вызовы модели в ограниченном цикле.
@@ -26,13 +26,14 @@ prompt, JSON запросов и assistant.rag; исторический инс�
 перегенерация восстанавливает снятый ответ. Fork глубоко копирует rag и
 request_bodies. Query rewrite и реранкинг независимы: new rewrite default true,
 legacy false; rerank default false; RAG остаётся OFF. Rewrite — один constrained
-вызов модели чата, последние 3 успешные пары, timeout 60s, strict stop/JSON,
+вызов модели чата, последние 3 успешные пары и существующая рабочая память
+(kind/content), timeout 60s, strict stop/JSON,
 без retries/fallback. Rerank требует только JSON и полный набор фактически найденных
 integer source_ids; допускает prose prefix перед первым полным объектом, но только
 whitespace после него. Ошибки формата/ID различаются без отражения raw ответа;
 порядок не исправляется, IDs не дополняются. Retrieval default10 → rerank всех кандидатов → context first3;
 без rerank первые3 по cosine. Количества1..100, final<=candidates, атомарный PATCH.
-Предварительного cosine-фильтра нет; день24 сохраняет отдельный порог ответа. Snapshot v3 хранит original/query/
+Предварительного cosine-фильтра нет; RAG сохраняет отдельный порог ответа. Snapshot v3 хранит original/query/
 history/config, всех candidates с original/final ranks/selected, selection и финальные
 hits/context/identity/timing/actual usage. Legacy v1/v2 история не переписывается.
 Прежний rag_top_k мигрирует в final_k с candidate default max(10, final_k);
@@ -54,7 +55,10 @@ no-commit/restore без retry; непроверенный partial RAG не со
 и подпись «Источники и цитаты»; старые verified/reason=model снимки читаются без миграции. Snapshot v3 дополнен answer_policy и answer(status/citations/reason);
 история и ветки не перечитывают индекс. Receipt планирования — отдельное исключение,
 содержательный результат напоминания проверяется. Автоматической проверки цитат по тексту и semantic judge нет;
-10 вопросов и оценка качества остаются приватной ручной работой. Task memory отсутствует.
+10 вопросов и оценка качества остаются приватной ручной работой. Автоматического ведения памяти задачи нет. Рабочую память ведёт человек;
+Rewrite и final prompt/slots используют один deep snapshot до первого await обмена.
+Текущий вопрос приоритетен; память только релевантный недоверенный контекст, не
+инструкции/факты источника. Global/profile/invariants/task FSM в Rewrite не входят.
 Подготовка документов: programmatic default или полный decoded исходный HTML через
 LLM, независимо от чанкинга; валидируемые title/blocks/sections и bounded input/output,
 без обрезки, silent fallback и платных retries. Private preparation-cache; corpus v2

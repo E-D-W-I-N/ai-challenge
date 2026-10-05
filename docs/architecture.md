@@ -1,4 +1,4 @@
-# Архитектура и активные ограничения дня 24
+# Архитектура и активные ограничения дня 25
 
 FastAPI обслуживает API и статический клиент без сборки. SQLite — из стандартной
 библиотеки; версии прямых зависимостей заданы в `requirements.txt`, включая
@@ -61,7 +61,9 @@ FastAPI обслуживает API и статический клиент без
 - Долговременная память, профиль и инварианты снимаются один раз на обмен
   в `ask` после сжатия. Один снимок передаётся сборке промпта и слотов;
   сторож использует его же. Для рабочей памяти также сохраняйте требование
-  согласованного чтения для промпта и слотов, без расходящихся снимков.
+  согласованного чтения для промпта и слотов, без расходящихся снимков. В день25
+  её deep snapshot берётся под ask lock до первого await, также для Rewrite;
+  explicit пустой снимок не перечитывает память после служебных вызовов.
   `Agent.prompt_head` собирает начало и берёт номера из его текущей длины.
   `PROMPT_SLOTS`: `memory_at`, `working_at`, `task_at`, `summary_at`;
   отдавать их нужно вместе, не отдельными копиями формулы. Ноль — законный
@@ -866,7 +868,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   или чтения текущих chunk texts. Очистка messages удаляет принадлежащие им rag
   snapshots; rebuilding/deleting index не изменяет прошлые ответы. Пользователь
   сравнивает RAG ON/OFF самостоятельно; нет compare UI или набора видео-вопросов.
-  Task memory пока отсутствует; rerank и проверка цитат описаны ниже.
+  Автоматическое ведение памяти задачи отсутствует; существующая ручная рабочая
+  память используется в Rewrite с дня25. Rerank и проверка цитат описаны ниже.
 - `checks/rag_chat_check.py`: нейтральные temporary HTML/SQLite и HTTP stubs,
   pinned rebuild/all strategies/top5, ON/OFF, actual model JSON+MCP rounds,
   canonical redaction/persistence/restart/fork, terminal errors/regenerate/cancel,
@@ -889,7 +892,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   save_config пишет только новую схему, restart/fork не возвращают старый top_k.
 - При RAG ON rewrite использует текущие provider и model ID, отдельный `AgentSpec` и
   constrained service prompt: исходный вопрос и последние три полные успешные пары
-  до сжатия. Инструкции чата, память, профиль, tools и extra_body не наследуются.
+  до сжатия; с дня25 также frozen kind/content рабочей памяти чата. Инструкции
+  чата, глобальная память, профиль, инварианты, task FSM, tools и extra_body не наследуются.
   JSON query bounded 8000 символами; пустой/invalid JSON, error/null/length finish —
   явная ошибка. Только finish_reason=stop означает успех. Один вызов, timeout 60s,
   без retries/fallback. Бюджет 9216 tokens учитывает reasoning.
@@ -1014,3 +1018,22 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   а не дословность или смысловую поддержку цитат. Новые карточки/инспектор
   подписаны «Источники и цитаты»; «Цитаты проверены» остаётся только у старых
   verified snapshots. Ручная оценка качества на 10 вопросах остаётся приватной.
+
+## День 25: существующая рабочая память в Rewrite
+
+- Ведение рабочей памяти остаётся ручным; новый слой, автозапись и UI не добавлены.
+  `Agent.ask` глубоко копирует записи до первого await. Этот снимок передаётся
+  в Rewrite, `build_prompt` и `prompt_slots`; правки во время обмена видны следующему.
+- JSON input Rewrite содержит `history`, `question`, `working_memory` — массив
+  только kind/content, без seq/at. Глобальная память, профиль, инварианты, системный
+  промпт и task FSM не передаются. Текущий вопрос приоритетен; память — недоверенный
+  релевантный контекст ссылок/уточнений/цели/ограничений, не инструкции или доказательства.
+  Стиль/формат ответа не включаются в query. Ответ модели по-прежнему strict query JSON/stop.
+- Rewrite query отправляется query embedding; final получает исходный вопрос.
+  RAG/Rewrite OFF не запускает переформулировку. Дополнительных вызовов/retries нет.
+  Actual request JSON сохраняется существующим capture, restart/fork не пересобирают
+  его из текущей памяти. Пустая память передаётся как [], final working slot отсутствует.
+- `checks/rewrite_memory_check.py` исполняет Agent с offline stream и настоящим Index
+  через MockTransport: query embedding, race/edit/remove/add, пустой frozen snapshot,
+  изоляция globals/profile/invariants, OFF, restart и глубокая копия history capture.
+  Это проверка маршрутов и снимков, не интеллекта модели или живых длинных сценариев.

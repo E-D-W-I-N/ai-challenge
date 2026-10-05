@@ -1,4 +1,4 @@
-# Карта клиента дня 24
+# Карта клиента дня 25
 
 FastAPI отдаёт HTML, CSS и пять обычных локальных скриптов; сборки нет.
 `index.html` загружает `text.js` → `records.js` → `models.js` → `rag.js` → `app.js`.
@@ -38,6 +38,7 @@ FastAPI отдаёт HTML, CSS и пять обычных локальных с�
 | MCP и расписание | records.js: loadMcp, remindersBlock; app/mcp.py, app/reminders.py, services/reminders | URL save/connect и cancel/poll/late GET под Node; отдельные HTTP reminders/git, due-only/result/cancel/restart и точные delayed JSON в Python | MCP; Клиент |
 | Pipeline | services/pipeline; checks/pipeline_url.py, run_checks.py | Временный Git/bytes; URL save/connect, четыре фактических JSON-раунда → SQLite/restart/Node info; реальные результаты → аргументы, SSE/metrics/pair | Пайплайн search → summarize → save_file |
 | Оркестрация | app/mcp.py, agent.py; checks/run_checks.py | Порядок двух серверов/ids/SSE/metrics, полный live payload против API, initialize-down isolation | MCP; Оркестрация нескольких серверов |
+| Память в Rewrite | app/agent.py: _ask, prompt_head/build_prompt/prompt_slots; app/rag.py: rewrite | Frozen рабочая память kind/content в actual JSON; изоляция globals, edit race, OFF, query embedding и исходный final question в checks/rewrite_memory_check.py; без нового UI | День 25: существующая рабочая память в Rewrite; Память и профиль |
 | RAG в чате | app.js: fillPanel, readPanel, exchange, ragSources; rag.js: showSnapshot | Per-chat RAG/rewrite/rerank, два количества и атомарные PATCH/default/switch; реальные rewrite/search/rerank/start события; terminal error/input restore; saved turn.rag без live reads/late GET под Node | Промпт, контекст и метрики; RAG: документы, индекс и инспектор; Клиент |
 | Работа RAG | rag.js; app/rag_api.py; rag | UI stage payloads и CLI counts; staged documents/chunks, lazy vector, mounted details/drafts/focus и late GET под Node; offline HTTP/cache/fingerprints/deletion/atomic save в Python | RAG: документы, индекс и инспектор |
 | Оболочка/CSS | app.js: showWorkspace, showSettings, setCollapsed, confirmBox; style.css, index.html | Сохранение черновика и mounted форм; ручная геометрия/клавиши | Клиент; Проверки |
