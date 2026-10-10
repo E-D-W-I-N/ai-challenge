@@ -9,6 +9,7 @@ import time
 
 from rag.index import Index
 from .schema import AgentSpec
+from shared_models.admission import limits
 from .store import redact
 
 NO_HITS = "Не знаю: в базе не найдена достаточно релевантная информация. Уточните вопрос."
@@ -127,7 +128,7 @@ def history_pairs(history) -> list[dict]:
 async def rewrite(question, history, model, stream, cancel, *, reasoning_enabled=False, working_memory=None) -> dict:
     """One constrained call, with cancellation and no retry or fallback."""
     started = time.monotonic()
-    spec = AgentSpec(label="RAG query rewrite", model=model, reasoning_enabled=reasoning_enabled, max_tokens=9216,
+    spec = AgentSpec(label="RAG query rewrite", model=model, reasoning_enabled=reasoning_enabled, max_tokens=limits().get("output_limit") or 9216,
                      response_format={"type": "json_object"})
     prompt = [{"role": "system", "content": _REWRITE_PROMPT},
               {"role": "user", "content": json.dumps(redact({"history": history, "question": question, "working_memory": [{"kind": item["kind"], "content": item["content"]} for item in (working_memory or [])]}), ensure_ascii=False)}]
@@ -212,7 +213,21 @@ def select_context(snapshot, source_ids=None):
 
 
 async def lookup(query: str, **options) -> dict:
-    return await asyncio.to_thread(retrieve, query, **options)
+    # Cancelling asyncio.to_thread does not stop the HTTP worker. Keep its
+    # exchange reservation until the worker actually finishes.
+    worker = asyncio.create_task(asyncio.to_thread(retrieve, query, **options))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+        # Consume a worker error without replacing cancellation.
+        if not worker.cancelled():
+            worker.exception()
+        raise
 
 
 def _rerank_ids(text, count, usage):
@@ -258,7 +273,7 @@ async def rerank(question, snapshot, spec, stream, cancel):
     """One isolated generative call returns a full permutation, never scores/subsets."""
     started = time.monotonic()
     config = AgentSpec(label="RAG rerank", model=spec.rag_rerank_model,
-                       reasoning_enabled=spec.rag_rerank_reasoning_enabled, max_tokens=9216,
+                       reasoning_enabled=spec.rag_rerank_reasoning_enabled, max_tokens=limits().get("output_limit") or 9216,
                        response_format={"type": "json_object"})
     hits = snapshot.get("candidates", snapshot["hits"])
     allowed_ids = list(range(1, len(hits) + 1))

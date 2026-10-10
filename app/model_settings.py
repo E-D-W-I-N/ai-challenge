@@ -12,14 +12,13 @@ _lock = threading.Lock()
 
 
 def connection_path(store=None):
-    return Path(store.path).parent / "model-connection.json" if store is not None and str(store.path) != ":memory:" else DEFAULT_CONNECTION_PATH
+    return DEFAULT_CONNECTION_PATH
 
 
 def current_connection(store=None):
-    if store is None:
-        from .store import _STORE
-        store = _STORE
-    return load_connection(connection_path(store))
+    if os.environ.get("INFERENCE_CAPACITY_FILE") is not None and not connection_path().exists():
+        return Connection("http://127.0.0.1:11434/v1")
+    return load_connection(connection_path())
 
 
 def settings(store=None):

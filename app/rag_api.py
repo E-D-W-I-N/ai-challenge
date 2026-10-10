@@ -83,8 +83,8 @@ def start(kind: str, body: StageRequest):
     try:
         from shared_models import bind_connection
         from .model_settings import current_connection
-        from .registry import REGISTRY
-        frozen = current_connection(REGISTRY.store)
+        from .registry import current_registry
+        frozen = current_connection(current_registry().store)
         preparation_config = PreparationConfig(frozen.base_url, body.preparation_model, body.preparation_timeout_seconds, reasoning_enabled=body.preparation_reasoning_enabled) if kind == "ingest" and body.preparation_strategy == "llm" else None
         semantic_config = SemanticConfig(frozen.base_url, body.semantic_model, reasoning_enabled=body.semantic_reasoning_enabled) if kind == "chunks" and body.strategy == "semantic" else None
         if body.strategy == "semantic" and body.size > 12000:
@@ -126,9 +126,27 @@ def start(kind: str, body: StageRequest):
         else:
             operation.__exit__(None, None, None)
 
+    from .auth import current_principal, accounts
+    principal = current_principal.get(None)
+    model_ids = tuple(c.model for c in (preparation_config, semantic_config, config) if c is not None)
     def run():
-        with bind_connection(frozen):
-            work()
+        from shared_models.admission import acquire, release, bind_lease
+        lease = None
+        try:
+            with bind_connection(frozen):
+                if model_ids:
+                    lease = acquire(model_ids, "rag-pipeline",
+                        cancel=lambda: principal is not None and not accounts().valid(principal),
+                        on_queue=lambda state: operation.update(state="running", queued=state))
+                if principal is not None and not accounts().valid(principal):
+                    raise ValueError("Operation cancelled")
+                with bind_lease(lease):
+                    work()
+        except Exception as error:
+            operation.__exit__(type(error), error, error.__traceback__)
+        finally:
+            if lease is not None:
+                release(lease)
 
     try:
         threading.Thread(target=run, name="rag-operation", daemon=True).start()

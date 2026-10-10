@@ -19,7 +19,7 @@ import sys
 from . import llm, store
 from .agent import Agent, AgentBusyError
 
-from .registry import REGISTRY
+from .registry import current_registry
 from .schema import AgentSpec
 from .store import StoreBusyError
 
@@ -64,7 +64,7 @@ def build_agent(args: argparse.Namespace) -> Agent:
     не применяются: иначе продолжение молча сменило бы модель на дефолтную.
     """
     if args.session:
-        agent = REGISTRY.load(args.session)
+        agent = current_registry().load(args.session)
         if agent is None:
             raise SystemExit(
                 f"сессии {args.session} нет в базе ({store.db_path()}). "
@@ -80,7 +80,7 @@ def build_agent(args: argparse.Namespace) -> Agent:
         max_tokens=args.max_tokens,
         system=args.system,
     )
-    return REGISTRY.create(spec)
+    return current_registry().create(spec)
 
 
 async def ask(agent: Agent, text: str, out=sys.stdout) -> str:
@@ -122,7 +122,7 @@ def _print_history(agent: Agent, out=sys.stdout) -> None:
 
 def _print_sessions(out=sys.stdout) -> None:
     """Сохранённые сессии — те, что переживут перезапуск."""
-    sessions = REGISTRY.sessions()
+    sessions = current_registry().sessions()
     if not sessions:
         out.write("[сохранённых сессий нет]\n")
         return
@@ -141,8 +141,8 @@ def _print_sessions(out=sys.stdout) -> None:
 
 
 def _print_agents(out=sys.stdout) -> None:
-    out.write(f"живых агентов: {len(REGISTRY)} (потолок {REGISTRY.max_agents})\n")
-    for agent in REGISTRY.list():
+    out.write(f"живых агентов: {len(current_registry())} (потолок {current_registry().max_agents})\n")
+    for agent in current_registry().list():
         out.write(f"  {agent.id}  {agent.spec.label}  {agent.spec.model}  сообщений {len(agent.history)}\n")
 
 
@@ -203,6 +203,16 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    from . import auth
+    from .registry import _current
+    import getpass
+    try:
+        current_registry()
+    except LookupError:
+        name = input("Username: ")
+        _, principal = await asyncio.to_thread(auth.accounts().authenticate, name, getpass.getpass("Password: "))
+        auth.current_principal.set(principal)
+        _current.set(auth.accounts().registry(principal.public()))
     agent = build_agent(args)
     try:
         return await repl(agent, once=args.once)

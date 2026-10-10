@@ -71,8 +71,11 @@ class Embeddings:
             key = model_key()
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             try:
-                response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload, headers=headers)
-                response.raise_for_status()
+                from shared_models.admission import slot, validate_payload
+                with slot((self.config.model,), "embedding"):
+                    validate_payload(payload)
+                    response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload, headers=headers)
+                    response.raise_for_status()
             except httpx.HTTPStatusError as error:
                 raise ValueError(f"Embedding HTTP error: status {error.response.status_code}") from None
             except (httpx.HTTPError, UnicodeError):

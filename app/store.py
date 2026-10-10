@@ -293,7 +293,10 @@ _CLAIM_ATTEMPTS = 50
 
 def db_path() -> Path:
     """Fixed application database; tests inject an explicit Store before registry import."""
-    return DEFAULT_DB_PATH
+    if _STORE is not None:
+        return Path(_STORE.path)
+    from .registry import current_registry
+    return Path(current_registry().store.path)
 
 
 def _dumps(value) -> str:
@@ -1329,8 +1332,7 @@ _STORE_LOCK = threading.Lock()
 
 def shared_store() -> Store:
     """Хранилище процесса. Открывается один раз в data/agents.db."""
-    global _STORE
-    with _STORE_LOCK:
-        if _STORE is None:
-            _STORE = Store().init()
-        return _STORE
+    if _STORE is not None:
+        return _STORE  # Explicit offline fixture injection.
+    from .registry import current_registry
+    return current_registry().store

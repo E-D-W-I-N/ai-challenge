@@ -23,49 +23,24 @@ _SPEED_WINDOW_SECONDS = 5.0
 
 _TIMEOUT = httpx.Timeout(180.0, connect=20.0)
 
-DEFAULT_MAX_CONCURRENCY = 16
-"""Сколько вызовов к модели идёт одновременно, в общем процессе."""
-
-
-def max_concurrency() -> int:
-    """Fixed concurrency; excess calls wait on the shared semaphore."""
-    return DEFAULT_MAX_CONCURRENCY
-
-
-# Клиент и семафор привязаны к циклу событий, в котором их создали: у httpx
-# внутри пул соединений этого цикла, а у asyncio.Semaphore — его ожидающие.
+# HTTP clients belong to their event loop. Admission is shared across loops/threads.
 # Ключ — сам цикл, слабой ссылкой, чтобы завершённый цикл не держался в памяти.
 _clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
     weakref.WeakKeyDictionary()
 )
-_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
-    weakref.WeakKeyDictionary()
-)
-
-
 def shared_client() -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
     client = _clients.get(loop)
     if client is None or client.is_closed:
-        limit = max_concurrency()
         client = httpx.AsyncClient(
             timeout=_TIMEOUT, trust_env=False,
             limits=httpx.Limits(
-                max_connections=max(10, limit * 2),
-                max_keepalive_connections=max(10, limit),
+                max_connections=None,
+                max_keepalive_connections=10,
             ),
         )
         _clients[loop] = client
     return client
-
-
-def call_slots() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    semaphore = _semaphores.get(loop)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(max_concurrency())
-        _semaphores[loop] = semaphore
-    return semaphore
 
 
 async def aclose() -> None:
@@ -276,9 +251,9 @@ async def stream_completion(
     reasoning_violation = False
 
     try:
-        # Клиент общий на процесс, а семафор держится на всё время стрима:
-        # ограничивать надо одновременные вызовы, а не их старты.
-        async with call_slots():
+        from shared_models.admission import validate_payload
+        validate_payload(payload)
+        with contextlib.nullcontext():
             client = shared_client()
             record_request(payload)
             async with client.stream(

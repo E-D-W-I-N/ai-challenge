@@ -26,6 +26,9 @@ class PreparationConfig:
     payload_version: str = "preparation-reasoning-v2"
 
     def __post_init__(self):
+        from shared_models.admission import limits
+        if limits().get("output_limit"):
+            object.__setattr__(self, "max_tokens", limits()["output_limit"])
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
         # Reuse endpoint/model/auth validation, with an independent preparation timeout.
