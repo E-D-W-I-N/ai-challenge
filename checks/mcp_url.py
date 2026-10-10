@@ -156,7 +156,7 @@ def check_request_capture():
         path = str(Path(tmp) / "app.sqlite")
         store = Store(path).init()
         spec = AgentSpec(label="capture", model="fixture/model", temperature=.37, max_tokens=17, extra_body={"tools": [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}}]})
-        chat = agent.Agent(spec, store=store)
+        chat = agent.Agent(spec, store=store, allow_tools=True)
         received = []
         fake_key = "fixture-provider-secret-only"
         store.save_model_settings({"api_key": fake_key})
@@ -187,7 +187,7 @@ def check_request_capture():
         identity = chat.id
         store.close()
         reopened = Store(path).init()
-        restored = agent.Agent(AgentSpec(label="fallback", model="ignored"), store=reopened, agent_id=identity)
+        restored = agent.Agent(AgentSpec(label="fallback", model="ignored"), store=reopened, agent_id=identity, allow_tools=True)
         assert restored.transcript()[-1]["request_bodies"] == received
         restored.remember("assistant", "legacy")
         assert restored.history[-1].request_bodies is None

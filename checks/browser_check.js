@@ -257,7 +257,7 @@ async function main() {
     check("Chat memory hides global form and reads only aggregate chat memory", !$("#mem-working-layer").hidden && !$("#mem-short-layer").hidden && $("#mem-long-layer").hidden && requests("GET", "/api/memory").length === 0);
     click("application-settings"); await settle();
     check("Avatar opens global model connection without chat form", client.state.settingsScope === "app" && !$("#model-app-settings").hidden && $("#model-chat-settings").hidden);
-    check("Application navigation exposes only its six sections", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "memory", "profile", "invariants", "mcp", "rag"]));
+    check("Application navigation exposes its administrator sections", same(document.querySelectorAll(".tab").filter(t => !t.hidden).map(t => t.dataset.tab), ["model", "memory", "profile", "invariants", "mcp", "rag", "account", "users"]));
     const before = requests("PATCH", "/api/agents/ag_1").length;
     $("#f-system").dispatchEvent(new Evt("change")); await settle();
     check("Hidden chat controls cannot PATCH from application settings", requests("PATCH", "/api/agents/ag_1").length === before);

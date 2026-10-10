@@ -819,6 +819,7 @@ async function mutateMcp(path, method, body) {
 }
 
 async function loadMcp(discover = false) {
+  if (state.user?.role !== "admin") return;
   const discovery = discover && state.workspace === "settings" && state.settingsScope === "chat" && document.visibilityState !== "hidden";
   if ((!toolsVisible() && !discovery) || state.mcpRequest || state.mcpMutation) return;
   if (state.mcpTimer !== null) clearTimeout(state.mcpTimer);

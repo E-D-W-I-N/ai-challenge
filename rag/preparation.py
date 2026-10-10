@@ -1,5 +1,6 @@
 """Full HTML preparation by a generative endpoint, with validated private caching."""
 from __future__ import annotations
+from contextlib import nullcontext
 
 import json
 import math
@@ -26,6 +27,9 @@ class PreparationConfig:
     payload_version: str = "preparation-reasoning-v2"
 
     def __post_init__(self):
+        from shared_models.admission import limits
+        if limits().get("output_limit"):
+            object.__setattr__(self, "max_tokens", limits()["output_limit"])
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
         # Reuse endpoint/model/auth validation, with an independent preparation timeout.
@@ -164,7 +168,8 @@ class Preparer:
         else:
             body, response = _call(self.client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)
         document = _document(body, source, config)
-        write_json(path, {"identity": identity, "request": payload, "response": response})
+        with self.operation.publication() if self.operation else nullcontext():
+            write_json(path, {"identity": identity, "request": payload, "response": response})
         self.report["computed"] += 1
         self.publish()
         return document

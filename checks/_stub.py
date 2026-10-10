@@ -205,6 +205,43 @@ def use_temp_db(path: str | None = None) -> str:
             raise ValueError("Explicit database injection must happen before registry import")
         return str(store._STORE.path)
 
+    # One explicit temporary authenticated admin context for existing fixtures.
+    import app.auth as auth
+    import app.registry as registry
+    if auth._accounts is None:
+        auth._accounts = auth.Accounts(Path(path).parent / "accounts.db", Path(path).parent / "users")
+        with auth._accounts.lock:
+            existing = auth._accounts.db.execute("SELECT id FROM users WHERE username='offline-admin'").fetchone()
+        if existing:
+            user = auth._accounts.user(existing["id"])
+        else:
+            try:
+                user = auth._accounts.create("offline-admin", "offline-password", role="admin")
+            except auth.HTTPException as error:
+                if error.status_code != 409:
+                    raise
+                with auth._accounts.lock:
+                    user = dict(auth._accounts.db.execute("SELECT * FROM users WHERE username='offline-admin'").fetchone())
+        token, principal = auth._accounts.authenticate("offline-admin", "offline-password")
+        fixture_registry = registry.AgentRegistry(store=store._STORE, allow_tools=True)
+        auth._accounts.registries[user["id"]] = fixture_registry
+        registry.REGISTRY = fixture_registry  # Old check imports, never a runtime fallback.
+        registry._current.set(fixture_registry)
+        from starlette.testclient import TestClient
+        import httpx
+        original_test_init = TestClient.__init__
+        original_async_init = httpx.AsyncClient.__init__
+        def test_init(client, *args, **kwargs):
+            kwargs.setdefault("cookies", {auth.COOKIE: token})
+            original_test_init(client, *args, **kwargs)
+        def async_init(client, *args, **kwargs):
+            if isinstance(kwargs.get("transport"), httpx.ASGITransport):
+                kwargs.setdefault("cookies", {auth.COOKIE: token})
+            original_async_init(client, *args, **kwargs)
+        TestClient.__init__ = test_init
+        httpx.AsyncClient.__init__ = async_init
+        # Existing legacy checks exercise many exchanges rather than rate limits.
+        auth.rate_limit = lambda *args, **kwargs: None
     return path
 
 
@@ -221,7 +258,9 @@ def install_offline(db_path: str | None = None) -> None:
     import app.main as main
     import app.mcp as mcp
     from pathlib import Path
-    mcp.DEFAULT_CONFIG_PATH = Path(main.REGISTRY.store.path).parent / "fixture-no-mcp.json"
+    from app.registry import current_registry
+    main.REGISTRY = current_registry()  # Existing check alias only.
+    mcp.DEFAULT_CONFIG_PATH = Path(current_registry().store.path).parent / "fixture-no-mcp.json"
 
     async def no_catalog(purpose="generation", connection=None):
         return []

@@ -27,7 +27,9 @@ from .rag_api import router as rag_router
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 
 from .llm import MissingKeyError
-from .registry import REGISTRY, UnknownAgentError
+from .registry import current_registry, UnknownAgentError
+from . import auth
+from shared_models.admission import limits
 from .reminders import ReminderScheduler
 from .schema import (
     CONTEXT_FIELDS,
@@ -64,7 +66,7 @@ CHAT_NUMBER_KEY = "chat_number"
 
 
 def _next_chat_label() -> str:
-    return f"Новый чат {REGISTRY.store.next_counter(CHAT_NUMBER_KEY)}"
+    return f"Новый чат {current_registry().store.next_counter(CHAT_NUMBER_KEY)}"
 
 
 def _next_branch_label() -> str:
@@ -73,15 +75,20 @@ def _next_branch_label() -> str:
     разные имена — а в этом весь смысл задания, «создайте 2 ветки от одного
     места». Имя родителя в имя не вписывается: его меняют из списка слева,
     и вписанное разошлось бы с ним; от кого отделились, говорит пометка."""
-    return f"Ветка {REGISTRY.store.next_counter(CHAT_NUMBER_KEY)}"
+    return f"Ветка {current_registry().store.next_counter(CHAT_NUMBER_KEY)}"
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # MCP — до yield: к первому запросу список инструментов уже на руках.
     # Пустой менеджер (нет конфига) неотличим от дня 15.
-    await mcp.MANAGER.start(REGISTRY.store)
-    scheduler = ReminderScheduler(mcp.MANAGER, REGISTRY)
+    admin = auth.accounts().admin_registry()
+    if admin is None:
+        yield
+        await llm.aclose()
+        return
+    await mcp.MANAGER.start(admin.store)
+    scheduler = ReminderScheduler(mcp.MANAGER, admin)
     _app.state.reminder_scheduler = scheduler
     mcp.MANAGER.before_change = scheduler.invalidate
     mcp.MANAGER.after_change = scheduler.resume
@@ -98,6 +105,8 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="AI Challenge Agents", version="2.0.0", lifespan=_lifespan)
+app.add_middleware(auth.AuthMiddleware)
+app.include_router(auth.router)
 app.include_router(rag_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -120,9 +129,9 @@ async def index() -> FileResponse:
 async def _context_lengths() -> dict[str, int]:
     """Длины контекста по моделям. Каталог недоступен — просто не покажем заполнение."""
     try:
-        frozen = model_settings.current_connection(REGISTRY.store)
+        frozen = model_settings.current_connection(current_registry().store)
         models = await catalog.fetch_models(connection=frozen)
-        if model_settings.current_connection(REGISTRY.store).revision != frozen.revision:
+        if model_settings.current_connection(current_registry().store).revision != frozen.revision:
             return {}
     except Exception:
         return {}
@@ -578,7 +587,7 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
 
 def _agent(agent_id: str) -> Agent:
     try:
-        return REGISTRY.require(agent_id)
+        return current_registry().require(agent_id)
     except UnknownAgentError as exc:
         raise HTTPException(
             status_code=404,
@@ -596,12 +605,12 @@ async def list_agents() -> dict:
     нет и быть не может — наружу уходит только факт его наличия. Счётчики,
     которых список не касается, живут в /api/health."""
     return {
-        "has_key": model_settings.settings(REGISTRY.store)["has_api_key"],
-        "live": len(REGISTRY),
-        "max_agents": REGISTRY.max_agents,
+        "has_key": model_settings.settings(current_registry().store)["has_api_key"],
+        "live": len(current_registry()),
+        "max_agents": current_registry().max_agents,
         # Список — по базе: чат, вытесненный из памяти по потолку, из него
         # исчезать не должен. Выгрузка — не удаление.
-        "agents": REGISTRY.catalogue(),
+        "agents": current_registry().catalogue(),
     }
 
 
@@ -638,11 +647,11 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
         for i, item in enumerate(raw)
     ]
     context_lengths = await _context_lengths()
-    agents = REGISTRY.create_many(specs, context_lengths=context_lengths)
+    agents = current_registry().create_many(specs, context_lengths=context_lengths)
     return {
         "created": len(agents),
         "spawn_ms": round((time.perf_counter() - started) * 1000, 2),
-        "live": len(REGISTRY),
+        "live": len(current_registry()),
         "agents": [a.as_dict() for a in agents],
     }
 
@@ -717,8 +726,8 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(agent_id: str) -> dict:
     _agent(agent_id)
-    REGISTRY.kill(agent_id)
-    return {"killed": [agent_id], "live": len(REGISTRY)}
+    current_registry().kill(agent_id)
+    return {"killed": [agent_id], "live": len(current_registry())}
 
 
 @app.post("/api/agents/{agent_id}/fork")
@@ -736,11 +745,11 @@ async def fork_agent(agent_id: str, payload: dict = Body(default=None)) -> dict:
     parent = _agent(agent_id)
     at = _fork_point({} if payload is None else payload, len(parent.history))
     started = time.perf_counter()
-    branch = REGISTRY.fork(parent, at, label=_next_branch_label())
+    branch = current_registry().fork(parent, at, label=_next_branch_label())
     return {
         "created": 1,
         "spawn_ms": round((time.perf_counter() - started) * 1000, 2),
-        "live": len(REGISTRY),
+        "live": len(current_registry()),
         "agents": [branch.as_dict()],
     }
 
@@ -763,7 +772,7 @@ async def cancel_agent(agent_id: str) -> dict:
 async def list_memory() -> dict:
     """Вся долговременная память целиком: отбирать не по чему, и скрывать
     от пользователя часть того, что уезжает в его промпты, нельзя."""
-    records = REGISTRY.store.list_memory()
+    records = current_registry().store.list_memory()
     return {"total": len(records), "records": records}
 
 
@@ -778,7 +787,7 @@ async def add_memory(payload: dict = Body(...)) -> dict:
     записанное, а не присланное: `redact()` чистит текст по дороге в базу.
     """
     _record_body(payload, ("kind", "content"))
-    return REGISTRY.store.add_memory(_kind_field(payload), _content_field(payload))
+    return current_registry().store.add_memory(_kind_field(payload), _content_field(payload))
 
 
 @app.patch("/api/memory/{seq}")
@@ -795,14 +804,14 @@ async def edit_memory(seq: int, payload: dict = Body(...)) -> dict:
             detail="тело правки пустое: назовите kind, content или оба",
         )
     current = next(
-        (r for r in REGISTRY.store.list_memory() if r["seq"] == seq), None
+        (r for r in current_registry().store.list_memory() if r["seq"] == seq), None
     )
     if current is None:
         raise HTTPException(
             status_code=404,
             detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
         )
-    record = REGISTRY.store.update_memory(
+    record = current_registry().store.update_memory(
         seq,
         kind=_kind_field(payload) if "kind" in payload else current["kind"],
         content=_content_field(payload) if "content" in payload else current["content"],
@@ -820,7 +829,7 @@ async def delete_memory(seq: int) -> dict:
     """Удаляет одну запись по номеру. Нет такой — 404, а не тихое «ок»:
     вторая вкладка показывает список с прошлой минуты, и разница между
     «удалил» и «нечего было удалять» ей важна."""
-    if not REGISTRY.store.delete_memory(seq):
+    if not current_registry().store.delete_memory(seq):
         raise HTTPException(
             status_code=404,
             detail=f"записи памяти {seq} нет: её уже удалили или номера такого не было",
@@ -843,7 +852,7 @@ async def get_profile() -> dict:
     Пустых значений в ответе не бывает: снятое поле не хранится пустой
     строкой, а удаляется. Вкладка показывает пустым то, чего в ответе нет.
     """
-    return {"profile": REGISTRY.store.load_profile()}
+    return {"profile": current_registry().store.load_profile()}
 
 
 @app.patch("/api/profile")
@@ -865,7 +874,7 @@ async def patch_profile(payload: dict = Body(...)) -> dict:
             detail=f"тело правки пустое: назовите {', '.join(PROFILE_FIELDS)} или часть",
         )
     values = {name: _profile_field(payload, name) for name in payload}
-    return {"profile": REGISTRY.store.save_profile(values)}
+    return {"profile": current_registry().store.save_profile(values)}
 
 
 # ── инварианты: чего ассистент не вправе предлагать ───────────────────────
@@ -885,7 +894,7 @@ async def list_invariants() -> dict:
     """Все инварианты целиком. Запрещённые слова отдаются вместе с записью:
     на экране их правят, и скрывать от человека то, что он сам вписал,
     незачем. В **промпт** они при этом не уезжают ни одним символом."""
-    records = REGISTRY.store.list_invariants()
+    records = current_registry().store.list_invariants()
     return {"total": len(records), "records": records}
 
 
@@ -899,7 +908,7 @@ async def add_invariant(payload: dict = Body(...)) -> dict:
     текстом: `redact()` работает по дороге в базу.
     """
     _record_body(payload, INVARIANT_FIELDS)
-    return REGISTRY.store.add_invariant(
+    return current_registry().store.add_invariant(
         _kind_field(payload, INVARIANT_KINDS),
         _content_field(payload),
         _banned_field(payload),
@@ -918,11 +927,11 @@ async def edit_invariant(seq: int, payload: dict = Body(...)) -> dict:
             detail=f"тело правки пустое: назовите {', '.join(INVARIANT_FIELDS)} или часть",
         )
     current = next(
-        (r for r in REGISTRY.store.list_invariants() if r["seq"] == seq), None
+        (r for r in current_registry().store.list_invariants() if r["seq"] == seq), None
     )
     if current is None:
         raise HTTPException(status_code=404, detail=_no_invariant(seq))
-    record = REGISTRY.store.update_invariant(
+    record = current_registry().store.update_invariant(
         seq,
         kind=_kind_field(payload, INVARIANT_KINDS) if "kind" in payload else current["kind"],
         content=_content_field(payload) if "content" in payload else current["content"],
@@ -937,7 +946,7 @@ async def edit_invariant(seq: int, payload: dict = Body(...)) -> dict:
 async def delete_invariant(seq: int) -> dict:
     """Удаляет один инвариант. Нет такого — 404, а не тихое «ок»: вторая
     вкладка показывает список с прошлой минуты."""
-    if not REGISTRY.store.delete_invariant(seq):
+    if not current_registry().store.delete_invariant(seq):
         raise HTTPException(status_code=404, detail=_no_invariant(seq))
     return {"deleted": seq}
 
@@ -973,7 +982,7 @@ async def agent_memory(agent_id: str) -> dict:
             ],
         },
         "working": {"records": list(agent.working)},
-        "long_term": {"records": REGISTRY.store.list_memory()},
+        "long_term": {"records": current_registry().store.list_memory()},
     }
 
 
@@ -1151,7 +1160,7 @@ async def stop_task(agent_id: str) -> dict:
 @app.get("/api/model-settings")
 async def get_model_settings() -> dict:
     from .model_settings import settings
-    return settings(REGISTRY.store)
+    return settings(current_registry().store)
 
 
 @app.patch("/api/model-settings")
@@ -1160,11 +1169,12 @@ async def patch_model_settings(request: Request, payload: dict = Body(...)) -> d
     trusted_rag_request(request)
     from .model_settings import save_settings
     try:
-        old_url = model_settings.settings(REGISTRY.store)["base_url"]
-        saved = save_settings(payload, REGISTRY.store)
+        old_url = model_settings.settings(current_registry().store)["base_url"]
+        saved = save_settings(payload, current_registry().store)
         if saved["base_url"] != old_url:
-            for agent in REGISTRY.list():
-                agent.context_length = None
+            for registry in auth.accounts().registries.values():
+                for agent in registry.list():
+                    agent.context_length = None
         return saved
     except ValueError as error:
         raise HTTPException(422, str(error)) from None
@@ -1178,7 +1188,7 @@ async def list_models(request: Request, purpose: str = "generation") -> dict:
     from .rag_models import models
     from .model_settings import current_connection
     trusted_rag_request(request)
-    return await models(current_connection(REGISTRY.store), purpose)
+    return await models(current_connection(current_registry().store), purpose)
 
 
 # --- разговор -----------------------------------------------------------------
@@ -1221,7 +1231,8 @@ async def send_message(
     agent = _agent(agent_id)
     text = _require_text(payload)
     _reserve(agent)
-    return _stream(lambda: _chat_events(agent, text), request, agent.release)
+    frozen = model_settings.current_connection()
+    return _stream(lambda: _chat_events(agent, text, frozen), request, agent.release)
 
 
 @app.post("/api/agents/{agent_id}/regenerate")
@@ -1234,6 +1245,7 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
     """
     agent = _agent(agent_id)
     _reserve(agent)
+    frozen = model_settings.current_connection()
     taken = agent.take_last_exchange()
     if taken is None:
         agent.release()
@@ -1241,7 +1253,7 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
             status_code=409, detail="перегенерировать нечего: последнего ответа в истории нет"
         )
     return _stream(
-        lambda: _regenerate_events(agent, taken), request, _restore_and_release(agent, taken)
+        lambda: _regenerate_events(agent, taken, frozen), request, _restore_and_release(agent, taken)
     )
 
 
@@ -1260,11 +1272,11 @@ def _restore_and_release(agent: Agent, taken) -> Callable[[], None]:
     return close
 
 
-async def _regenerate_events(agent: Agent, taken) -> AsyncIterator[dict]:
+async def _regenerate_events(agent: Agent, taken, frozen=None) -> AsyncIterator[dict]:
     """Обмен перегенерации плюс возврат снятой пары, если ответа не случилось."""
     restored = False
     try:
-        stream = _chat_events(agent, taken.question)
+        stream = _chat_events(agent, taken.question, frozen)
         async with contextlib.aclosing(stream):
             async for event in stream:
                 if event.get("event") == "done" and not event.get("committed"):
@@ -1279,10 +1291,10 @@ async def _regenerate_events(agent: Agent, taken) -> AsyncIterator[dict]:
             agent.restore(taken)
 
 
-async def _chat_events(agent: Agent, text: str) -> AsyncIterator[dict]:
+async def _chat_events(agent: Agent, text: str, frozen=None) -> AsyncIterator[dict]:
     """Обмен агента с моделью, переложенный в события SSE."""
     try:
-        stream = agent.ask(text)
+        stream = agent.ask(text, connection=frozen)
         async with contextlib.aclosing(stream):
             async for event in stream:
                 out = {key: value for key, value in event.items() if key != "type"}
@@ -1321,7 +1333,7 @@ async def list_mcp(request: Request) -> dict:
     active = manager._lock.locked()
     view = manager.view() if active else await manager.status()
     chat_id = request.headers.get("X-Chat-ID", "")
-    chat = REGISTRY.load(chat_id) if chat_id else None
+    chat = current_registry().load(chat_id) if chat_id else None
     for row in view["servers"]:
         server = next((s for s in manager.servers if s.name == row["name"] and s.status == "ok"), None)
         if server is None or not manager.schedules(server):
@@ -1358,12 +1370,12 @@ async def cancel_scheduled_reminder(agent_id: str, server_name: str, reminder_id
 async def health() -> dict:
     """Что живо прямо сейчас: ключ, реестр, число сохранённых чатов."""
     return {
-        "has_key": model_settings.settings(REGISTRY.store)["has_api_key"],
-        "agents_live": len(REGISTRY),
-        "agents_max": REGISTRY.max_agents,
-        "agents_evicted": REGISTRY.evicted,
-        "sessions_stored": REGISTRY.store.count_sessions(),
-        "llm_max_concurrency": llm.max_concurrency(),
+        "has_key": model_settings.settings(current_registry().store)["has_api_key"],
+        "agents_live": len(current_registry()),
+        "agents_max": current_registry().max_agents,
+        "agents_evicted": current_registry().evicted,
+        "sessions_stored": current_registry().store.count_sessions(),
+        "llm_max_concurrency": limits()["ceiling"],
     }
 
 

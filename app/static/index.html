@@ -7,14 +7,24 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="app" id="app">
+  <section id="login-screen" class="login-screen">
+    <form id="login-form" class="settings-card login-card">
+      <h1>AI Challenge</h1>
+      <p class="hint">Войдите в свой аккаунт</p>
+      <label class="field"><span class="field-label">Имя пользователя</span><input id="login-username" class="control" autocomplete="username" required></label>
+      <label class="field"><span class="field-label">Пароль</span><input id="login-password" type="password" class="control" autocomplete="current-password" required></label>
+      <button id="login-submit" class="primary-btn" type="submit">Войти</button>
+      <p id="login-status" class="hint" role="status"></p>
+    </form>
+  </section>
+  <div class="app" id="app" hidden>
     <aside class="sidebar" id="sidebar">
       <header class="sidebar-head">
         <div class="brand">
           <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M7 33 20 7l13 26M13 25h14" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 29</span>
+            <span class="brand-sub">чат · день 30</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -34,6 +44,8 @@
         <h1 id="chat-title">AI Challenge</h1>
         <button id="workspace-chat" class="workspace-return" type="button" aria-controls="chat-workspace" hidden>← Вернуться в чат</button>
         <button id="app-settings" class="icon-btn app-settings-button" type="button" aria-label="Настройки приложения" title="Настройки приложения" aria-controls="panel"></button>
+        <span id="account-name" class="account-name"></span>
+        <button id="account-logout" class="mcp-button" type="button">Выйти</button>
       </header>
       <div class="task-head hidden" id="task-head" role="status"></div>
     <section class="chat" id="chat-workspace" role="tabpanel" aria-labelledby="workspace-chat">
@@ -62,6 +74,8 @@
 <button class="tab" id="tab-btn-invariants" data-tab="invariants" type="button" role="tab" aria-controls="tab-invariants" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Инварианты</span></button>
 <button class="tab" id="tab-btn-mcp" data-tab="mcp" type="button" role="tab" aria-controls="tab-mcp" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Инструменты</span></button>
 <button class="tab" id="tab-btn-rag" data-tab="rag" type="button" role="tab" aria-controls="tab-rag" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Работа RAG</span></button>
+<button class="tab" id="tab-btn-account" type="button" data-tab="account" role="tab" aria-controls="tab-account" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Аккаунт</span></button>
+          <button class="tab" id="tab-btn-users" type="button" data-tab="users" role="tab" aria-controls="tab-users" aria-selected="false" tabindex="-1"><span class="tab-icon" aria-hidden="true"></span><span class="tab-label">Пользователи</span></button>
           </div>
         </nav>
         <div class="panel-body" id="panel-body">
@@ -287,7 +301,7 @@
           </div>
 
           <div class="mem-layer" id="mem-long-layer" hidden>
-            <h3 class="mem-title">Долговременная — записи навсегда</h3><p class="layer-scope">Для всех чатов</p>
+            <h3 class="mem-title">Долговременная — записи навсегда</h3><p class="layer-scope">Для ваших чатов</p>
             <div class="mem-body" id="mem-long"></div>
 
             <label class="field">
@@ -353,6 +367,26 @@
           </div>
         </section>
 
+        <section class="tab-page hidden" id="tab-account" role="tabpanel" aria-labelledby="tab-btn-account" tabindex="0">
+          <form id="password-form" class="settings-card">
+            <h3>Сменить пароль</h3>
+            <label class="field"><span class="field-label">Текущий пароль</span><input id="account-current-password" class="control" type="password" autocomplete="current-password" required></label>
+            <label class="field"><span class="field-label">Новый пароль</span><input id="account-new-password" class="control" type="password" autocomplete="new-password" required></label>
+            <button id="password-submit" class="primary-btn" type="submit">Сменить пароль</button>
+            <p class="hint">После смены пароля нужно войти снова на всех устройствах.</p>
+            <p id="password-status" class="hint" role="status"></p>
+          </form>
+        </section>
+        <section class="tab-page hidden" id="tab-users" role="tabpanel" aria-labelledby="tab-btn-users" tabindex="0">
+          <div class="settings-card"><h3>Пользователи</h3><div id="users-list" class="account-users"></div></div>
+          <form id="user-create-form" class="settings-card">
+            <h3>Создать пользователя</h3>
+            <label class="field"><span class="field-label">Имя пользователя</span><input id="user-create-username" class="control" autocomplete="off" required></label>
+            <label class="field"><span class="field-label">Начальный пароль</span><input id="user-create-password" class="control" type="password" autocomplete="new-password" required></label>
+            <button id="user-create-submit" class="primary-btn" type="submit">Создать</button>
+            <p id="users-status" class="hint" role="status"></p>
+          </form>
+        </section>
         <section class="tab-page hidden" id="tab-mcp" role="tabpanel" aria-labelledby="tab-btn-mcp" tabindex="0">
           <div class="mem-layer">
             <h3 class="mem-title" id="mcp-heading">Инструменты MCP</h3>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import math
 import os
 import sys
@@ -247,7 +248,7 @@ def check_semantic():
             with tempfile.TemporaryDirectory() as rejected, bind_connection(Connection(api_key="  credential-injected-secret  ")):
                 from types import SimpleNamespace
                 captured = {}
-                operation = SimpleNamespace(update=lambda **fields: captured.update(fields))
+                operation = SimpleNamespace(update=lambda **fields: captured.update(fields), publication=contextlib.nullcontext)
                 before = len(requests)
                 try:
                     semantic_chunks([short], config, 35, 5, root=rejected, client=client, operation=operation)

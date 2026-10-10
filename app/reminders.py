@@ -17,6 +17,8 @@ RUN_SECONDS = 240  # Below the service's 300-second claim expiry; no automatic r
 
 class ReminderScheduler:
     def __init__(self, manager, registry):
+        if not registry.allow_tools:
+            raise ValueError("Reminder scheduler requires an administrator registry")
         self.manager, self.registry = manager, registry
         self.loop = None
         self.running = {}

@@ -22,7 +22,8 @@ from typing import Iterable
 
 from .agent import Agent, reserve_ids, spec_as_dict, spec_from_config, task_view
 from .schema import AgentSpec
-from .store import Store, shared_store
+from .store import Store
+from contextvars import ContextVar
 
 DEFAULT_MAX_AGENTS = 1000
 """Фиксированный потолок живых агентов. С запасом больше ста: спавн
@@ -35,14 +36,17 @@ class UnknownAgentError(KeyError):
 
 
 class AgentRegistry:
-    def __init__(self, max_agents: int | None = None, store: Store | None = None) -> None:
+    def __init__(self, max_agents: int | None = None, store: Store | None = None, *, allow_tools: bool = False) -> None:
         self._agents: dict[str, Agent] = {}
         self.max_agents = max_agents if max_agents is not None else DEFAULT_MAX_AGENTS
         self.evicted = 0
         """Сколько чатов выгружено из памяти за жизнь процесса. Именно
         выгружено, а не удалено: в базе они остались."""
 
-        self.store = shared_store() if store is None else store
+        if store is None:
+            raise ValueError("Registry requires an explicit user Store")
+        self.store = store
+        self.allow_tools = allow_tools
         # Иначе свежий агент получил бы id уже сохранённого чата
         # и унаследовал бы его историю.
         reserve_ids(self.store.max_agent_seq())
@@ -67,6 +71,7 @@ class AgentRegistry:
                     spec,
                     context_length=(context_lengths or {}).get(spec.model),
                     store=self.store,
+                    allow_tools=self.allow_tools,
                 )
                 for spec in specs
             ]
@@ -122,7 +127,7 @@ class AgentRegistry:
         # Место освобождаем до создания: поднятый чат встаёт в общую очередь
         # на вытеснение.
         self._make_room(1)
-        agent = Agent(_spec_from_row(saved), agent_id=saved["id"], store=self.store)
+        agent = Agent(_spec_from_row(saved), agent_id=saved["id"], store=self.store, allow_tools=self.allow_tools)
         self._agents[agent.id] = agent
         return agent
 
@@ -247,4 +252,7 @@ def _spec_from_row(saved: dict) -> AgentSpec:
     return spec_from_config(saved.get("config") or {}, fallback=fallback)
 
 
-REGISTRY = AgentRegistry()
+_current: ContextVar[AgentRegistry] = ContextVar("user_registry")
+
+def current_registry() -> AgentRegistry:
+    return _current.get()

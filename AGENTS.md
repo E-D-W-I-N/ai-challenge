@@ -1,4 +1,4 @@
-# Инструкции для агентов — день 29
+# Инструкции для агентов — день 30
 
 День 29 использует существующие параметры генерации, системный промпт и метрики.
 Стартовый профиль temperature=0.2/max_tokens=512 и контекст 2048/4096 на сервере
@@ -91,8 +91,21 @@ Provider отсутствует в runtime/UI/new saves; legacy chat поля и
 Chat Completions reasoning_effort none/medium после extra_body, без
 автоматических OpenRouter plugins/require_parameters. Явные параметры
 сохраняются, unsupported upstream даёт отказ без retry/fallback.
-Приложение использует data/agents.db, data/rag, mcp.json и optional
- data/rag/inputs.json; checks внедряют temp Store и connection path.
+Приложение использует fresh data/accounts.db и data/users/<UUID>/agents.db:
+чаты, профиль, память и инварианты приватны для пользователя, admin не читает чужие чаты.
+Старую data/agents.db не открываем и не мигрируем. Общие data/rag, mcp.json,
+optional data/rag/inputs.json и data/model-connection.json не зависят от user Store.
+Argon2id и непрозрачная HttpOnly session cookie; public signup нет, первый admin
+создаётся явно `python -m app.auth bootstrap-admin`. Middleware связывает user Registry
+до конца SSE, без admin fallback. Logout/reset/disable отзывает сессии и отменяет обмены.
+GET model-settings доступен авторизованным всем, PATCH/admin users/MCP/RAG pipeline
+и инспектор корпуса — admin-only; tools проверяются также внутри Agent.ask.
+Shared RAG retrieval доступен пользователям, исторические snapshots приватны.
+Общая FIFO inference очередь finite: queued SSE, cancel/logout/disconnect снимают ожидание;
+ресурсы резервируются только при запуске и держатся до конца HTTP/worker.
+VPS capacity policy задаёт предел контекста/служебного вывода явно; чат сверх лимита
+отклоняется без обрезки, retries и правки сохранённого конфига. Mac без policy сохраняет поведение.
+Checks внедряют единую временную auth/Registry fixture и connection path.
 Reasoning default OFF у пяти независимых селекторов; strictbool/API/persist/fork.
 Чат, сжатие и Rewrite используют chat reasoning_enabled; rerank отдельный флаг.
 Подготовка/чанкинг включают флаг в cache identity; embedding preference исключён

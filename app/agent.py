@@ -617,7 +617,9 @@ class Agent:
         agent_id: str | None = None,
         context_length: int | None = None,
         store: Store | None = None,
+        allow_tools: bool = False,
     ) -> None:
+        self.allow_tools = allow_tools
         # Свежий id занимает база, а не процесс: сервер и консоль ходят в один
         # файл, и локальный счётчик выдал бы обоим один номер (см. app/store.py).
         # Без хранилища агент живёт только в памяти — там и счётчика хватает.
@@ -1091,7 +1093,8 @@ class Agent:
         # {"type": "json_object"} вернул бы вместо пересказа объект, а
         # стоп-строка оборвала бы пересказ на середине. Модель и параметры
         # сэмплирования — те же: вторая модель развалила бы счёт на две цены.
-        folding = replace(spec, response_format=None, stop=None)
+        from shared_models.admission import limits
+        folding = replace(spec, response_format=None, stop=None, max_tokens=limits().get("output_limit") or spec.max_tokens)
         prompt = build_compress_prompt(chunk, self.summaries[-1]["content"] if covered else None)
 
         content = ""
@@ -1109,14 +1112,19 @@ class Agent:
             # Сжатие — не сам обмен: не вышло свернуть, значит история уедет
             # целиком. Про отсутствие ключа расскажет сам обмен, следом.
             return
-        if not content.strip():
+        from .auth import current_principal, accounts
+        principal = current_principal.get(None)
+        if not content.strip() or self._cancel.is_set() or (principal is not None and not accounts().valid(principal)):
             return
 
-        self.summaries.append(
-            {"upto": border, "content": content, "metrics": metrics, "at": time.time()}
-        )
-        if self.store is not None:
-            self.store.save_summaries(self.id, self.summaries)
+        with accounts().lock if principal is not None else contextlib.nullcontext():
+            if principal is not None and not accounts().valid(principal):
+                return
+            self.summaries.append(
+                {"upto": border, "content": content, "metrics": metrics, "at": time.time()}
+            )
+            if self.store is not None:
+                self.store.save_summaries(self.id, self.summaries)
 
     def service_plan(self, spec: AgentSpec) -> list[str]:
         """Какие служебные вызовы предстоят этому обмену: `summary` — сжатие.
@@ -1569,27 +1577,95 @@ class Agent:
 
     # --- обмен ---------------------------------------------------------------
 
+    def inference_models(self, spec=None):
+        spec = spec or self.spec
+        models = [spec.extra_body.get("model", spec.model)]
+        from shared_models.admission import limits
+        if spec.rag_enabled and limits().get("context_limit"):
+            from .rag import Index
+            models.append(Index().metadata()["embedding_config"]["model"])
+            if spec.rag_rerank_enabled:
+                models.append(spec.rag_rerank_model)
+        return tuple(dict.fromkeys(m for m in models if m))
+
     async def ask(self, user_text: str, **options) -> AsyncIterator[dict]:
         from shared_models import bind_connection
         from .model_settings import current_connection
-        frozen_connection = current_connection(self.store)
-        response = self._ask(user_text, **options)
+        from .auth import current_principal, accounts
+        principal = current_principal.get(None)
+        original_can_run = options.get("can_run")
+        if principal is not None:
+            from .registry import current_registry
+            if self.store is not current_registry().store:
+                raise ValueError("Chat ownership mismatch")
+            async def valid():
+                return accounts().valid(principal) and (original_can_run is None or await original_can_run())
+            options["can_run"] = valid
+        if not self.allow_tools and any(name in (self.spec.extra_body or {}) for name in ("tools", "tool_choice", "functions", "function_call")):
+            raise ValueError("Tools are available only to administrators")
+        from shared_models.admission import acquire_async, release, bind_lease, ResourceBusy
+        if self._lock.locked():
+            raise AgentBusyError(f"агент {self.id} уже занят")
+        self._cancel = asyncio.Event()
+        frozen_connection = options.pop("connection", None) or current_connection(self.store)
+        frozen_spec = copy_spec(self.spec)
+        working = copy.deepcopy(self.working_items())
+        notices = asyncio.Queue()
+        def stopped():
+            return self._cancel.is_set() or (principal is not None and not accounts().valid(principal))
+        async def admit():
+            try:
+                return await acquire_async(self.inference_models(frozen_spec), "exchange", cancel=stopped, on_queue=notices.put_nowait)
+            finally:
+                notices.put_nowait(None)
+        with bind_connection(frozen_connection):
+            waiting = asyncio.create_task(admit())
+        lease = None
+        response = None
         try:
             while True:
+                notice = await notices.get()
+                if notice is None:
+                    break
+                yield {"type": "queued", **notice}
+            try:
+                lease = waiting.result()
+            except ResourceBusy:
+                if stopped():
+                    yield {"type": "done", "committed": False, "cancelled": True, "question": user_text, "text": ""}
+                    return
+                raise
+            if stopped():
+                yield {"type": "done", "committed": False, "cancelled": True, "question": user_text, "text": ""}
+                return
+            response = self._ask(user_text, frozen_spec=frozen_spec, frozen_working=working, **options)
+            while True:
                 # Tokens cannot cross generator yields: consumers may resume in another task.
-                with bind_connection(frozen_connection):
+                with bind_connection(frozen_connection), bind_lease(lease):
                     try:
                         event = await anext(response)
                     except StopAsyncIteration:
                         break
                 yield event
         finally:
-            with bind_connection(frozen_connection):
-                await response.aclose()
+            if not waiting.done():
+                waiting.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiting
+            # Cancellation may arrive after acquire returned but before lease assignment.
+            if lease is None and waiting.done() and not waiting.cancelled() and waiting.exception() is None:
+                lease = waiting.result()
+            try:
+                if response is not None:
+                    with bind_connection(frozen_connection), bind_lease(lease):
+                        await response.aclose()
+            finally:
+                if lease is not None:
+                    release(lease)
 
     async def _ask(self, user_text: str, *, scheduled: dict | None = None,
                   can_run=None, request_bodies: list[dict] | None = None,
-                  rag_result: dict | None = None) -> AsyncIterator[dict]:
+                  rag_result: dict | None = None, frozen_spec=None, frozen_working=None) -> AsyncIterator[dict]:
         """Один обмен: вопрос → поток событий → запись в историю.
 
         События: `compressing`, `start`, `reasoning`, `delta`, `tool_call`,
@@ -1611,11 +1687,10 @@ class Agent:
             raise AgentBusyError(f"агент {self.id} уже занят: дождитесь текущего ответа")
 
         async with self._lock:
-            self._cancel = asyncio.Event()
             cancel = self._cancel
             self.last_used_at = time.time()
             # Freeze before the first await: Rewrite and final prompt/slots share this exchange.
-            working = copy.deepcopy(self.working_items())
+            working = frozen_working if frozen_working is not None else copy.deepcopy(self.working_items())
             if can_run is not None and not await can_run():
                 return
 
@@ -1628,7 +1703,7 @@ class Agent:
             # добавят один `await` — и окно откроется молча. Со слепком
             # «текущий вызов идёт целиком на одном конфиге» верно
             # по построению, а не по совпадению.
-            spec = copy_spec(self.spec)
+            spec = frozen_spec or copy_spec(self.spec)
             context_length = self.context_length
 
             rag_snapshot = None
@@ -1851,12 +1926,12 @@ class Agent:
             piece = ""
 
             try:
-                async with MANAGER.lease():
+                async with (MANAGER.lease() if self.allow_tools else contextlib.nullcontext()):
                     with capture_requests() as requests:
                         requests.extend(copy.deepcopy(preparation_requests))
                         # Объявления берутся под lease, как и все раунды обмена.
                         # Пустой реестр не меняет тело запроса.
-                        tools = declared_tools(MANAGER)
+                        tools = declared_tools(MANAGER) if self.allow_tools else []
                         if scheduled:
                             tools = [t for t in tools if not MANAGER.scheduling_tool(t["function"]["name"])]
                         # Цикл вызовов: стрим → модель попросила инструменты →
@@ -1945,6 +2020,8 @@ class Agent:
                                     run = {"name": call["name"], "server": tool_server(MANAGER, call["name"]), "ms": 0, "ok": False}
                                     arguments, content = {}, "срок наступил: новое планирование запрещено, выполните задачу сейчас"
                                 else:
+                                    if not self.allow_tools:
+                                        raise ValueError("Tools are available only to administrators")
                                     run, arguments, content = await run_tool(MANAGER, call, chat_id=self.id)
                                 tool_runs.append(run)
                                 # Событие о каждом вызове — сразу: пауза на сервере
@@ -1976,7 +2053,7 @@ class Agent:
                 yield {"type": "error", "message": failure, "metrics": None}
             except asyncio.CancelledError:
                 # OFF preserves paid partial answers; RAG must not persist unchecked JSON.
-                if scheduled is None and rag_snapshot is None:
+                if scheduled is None and rag_snapshot is None and (can_run is None or await can_run()):
                     known = list(iteration_metrics)
                     if isinstance(final_metrics, dict) and (not known or known[-1] is not final_metrics):
                         known.append(final_metrics)
@@ -2108,16 +2185,21 @@ class Agent:
         if not answer.strip():
             return False
 
-        # Вопрос и ответ ложатся в базу парой, одной транзакцией: иначе,
-        # умри процесс между ними, в базе остался бы вопрос без ответа.
-        with self.store.tx() if self.store is not None else contextlib.nullcontext():
-            self.remember("user", user_text, persist=False)
-            # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
-            # следующий вопрос должен видеть, что предыдущий ответ неполный.
-            self.remember(
-                "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies, rag=rag
-            )
-        return True
+        from .auth import current_principal, accounts
+        principal = current_principal.get(None)
+        with accounts().lock if principal is not None else contextlib.nullcontext():
+            if principal is not None and not accounts().valid(principal):
+                return False
+            # Вопрос и ответ ложатся в базу парой, одной транзакцией: иначе,
+            # умри процесс между ними, в базе остался бы вопрос без ответа.
+            with self.store.tx() if self.store is not None else contextlib.nullcontext():
+                self.remember("user", user_text, persist=False)
+                # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
+                # следующий вопрос должен видеть, что предыдущий ответ неполный.
+                self.remember(
+                    "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies, rag=rag
+                )
+            return True
 
     def take_last_exchange(self) -> Exchange | None:
         """Снимает последнюю пару «вопрос — ответ»: перегенерация обязана

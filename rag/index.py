@@ -1,7 +1,7 @@
 """Atomic SQLite index and embedding cache, bounded inspection and exact cosine."""
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, nullcontext
 import json
 import os
 import sqlite3
@@ -37,8 +37,12 @@ def read_json(path, default=None):
 
 class Operation:
     """One writer, recoverable OS lock, durable status shared with UI."""
-    def __init__(self, root, kind):
+    def __init__(self, root, kind, *, guard=None):
         self.root, self.kind = Path(root), kind
+        self.guard = guard
+
+    def publication(self):
+        return self.guard() if self.guard is not None else nullcontext()
 
     def __enter__(self):
         import fcntl
@@ -101,8 +105,9 @@ def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operatio
     value["fingerprint"] = digest(json.dumps(value, sort_keys=True, separators=(",", ":")))
     if report is not None:
         value["report"] = report
-    write_json(root / "chunks.json", value)
-    revive(root, "chunks.json")
+    with operation.publication():
+        write_json(root / "chunks.json", value)
+        revive(root, "chunks.json")
     operation.update(chunks=len(chunks), state="complete", **({"semantic_report": report} if report is not None else {}))
     return {key: item for key, item in value.items() if key != "chunks"} | {"chunks": len(chunks)}
 
@@ -157,13 +162,15 @@ def stage_embeddings(root, config=None, batch_size=16, *, client=None, operation
                 vectors[key] = vector
                 cache.execute("INSERT OR REPLACE INTO embeddings VALUES (?,?,?)", (fingerprint, key, json.dumps(vector)))
                 computed += 1
-            cache.commit()
+            with operation.publication():
+                cache.commit()
             operation.update(computed=computed, dimension=dimension, pending=len(items) - computed)
     value = {"version": 1, "chunks_fingerprint": staged["fingerprint"], "embedding_config": asdict(config),
              "embedding_fingerprint": fingerprint, "dimension": dimension, "vectors": vectors,
              "computed": computed, "cached": cached}
-    write_json(root / "vectors.json", value)
-    revive(root, "vectors.json")
+    with operation.publication():
+        write_json(root / "vectors.json", value)
+        revive(root, "vectors.json")
     operation.update(state="complete")
     return {key: item for key, item in value.items() if key != "vectors"}
 
@@ -209,8 +216,9 @@ def save_index(root, *, operation=None):
             db.commit()
         with open(temporary, "rb") as file:
             os.fsync(file.fileno())
-        os.replace(temporary, root / "index.sqlite")
-        revive(root, "index.sqlite")
+        with operation.publication():
+            os.replace(temporary, root / "index.sqlite")
+            revive(root, "index.sqlite")
         # replace is the success boundary. Telemetry cannot undo publication.
         operation.value.update(state="ready", index_id=metadata["index_id"])
         try:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 import json
 import re
 from datetime import datetime, timezone
@@ -266,11 +267,13 @@ def ingest(inputs: list[dict], root: Path, *, client=None, operation=None, prepa
     if preparer:
         preparer.publish()
         report["preparation"] = preparer.report
-    write_json(root / "ingest-report.json", report)
+    with operation.publication() if operation else nullcontext():
+        write_json(root / "ingest-report.json", report)
     if errors or not documents:
         raise ValueError(f"Ingestion failed: {len(errors)} failed inputs; see ingest-report.json")
     fingerprint = corpus_fingerprint(documents, 2)
-    write_json(root / "corpus.json", {"version": 2, "fingerprint": fingerprint, "preparation_strategy": preparation_strategy, "preparation_config": preparer.report["config"] if preparer else None, "documents": documents})
+    with operation.publication() if operation else nullcontext():
+        write_json(root / "corpus.json", {"version": 2, "fingerprint": fingerprint, "preparation_strategy": preparation_strategy, "preparation_config": preparer.report["config"] if preparer else None, "documents": documents})
     return report
 
 

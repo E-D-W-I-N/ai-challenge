@@ -73,7 +73,7 @@ def service_claims(path):
 
 async def execution(config, git_root, restart_service):
     store = Store(Path(git_root) / "app.db").init()
-    registry = AgentRegistry(store=store)
+    registry = AgentRegistry(store=store, allow_tools=True)
     manager = mcp.McpManager()
     with patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(config)), \
             patch.object(mcp, "ROOT", Path(git_root)), patch.object(agent_module, "MANAGER", manager):
@@ -184,7 +184,7 @@ async def execution(config, git_root, restart_service):
                 assert len(retrieval_queries) == 2 and error.rag["query"] == retrieval_queries[-1]
                 assert error.rag["index"]["index_id"] == "neutral-scheduled-index"
                 assert all(any(m.get("content") == error.rag["context"] for m in body["messages"]) for body in expected)
-                restored = AgentRegistry(store=store).require(timeout_agent.id)
+                restored = AgentRegistry(store=store, allow_tools=True).require(timeout_agent.id)
                 assert restored.history[-1].request_bodies == expected
                 assert restored.history[-1].rag == error.rag
                 captured[-1]["model"] = "mutated after receipt"
@@ -323,7 +323,7 @@ async def execution(config, git_root, restart_service):
             assert len(_stub.CALLS) == 1
             await manager.start()
             remote = manager.servers[0]
-            registry = AgentRegistry(store=store)
+            registry = AgentRegistry(store=store, allow_tools=True)
             origin = registry.require(origin.id)
             scheduler = ReminderScheduler(manager, registry)
             _stub.install(reply="Результат после рестарта")
@@ -361,7 +361,7 @@ def clear_acceptance(config, directory):
     scoped_config = directory / "clear-mcp.json"
     scoped_config.write_text(json.dumps({"servers": {"clock": {"url": url, "enabled": True}}}))
     store = Store(directory / "clear-app.db").init()
-    registry = AgentRegistry(store=store)
+    registry = AgentRegistry(store=store, allow_tools=True)
     manager = mcp.McpManager()
 
     async def external_call(tool, args):
@@ -460,7 +460,7 @@ def clear_acceptance(config, directory):
 def lifespan_acceptance(config, directory):
     from app import main
     store = Store(directory / "lifespan.db").init()
-    registry = AgentRegistry(store=store)
+    registry = AgentRegistry(store=store, allow_tools=True)
     manager = mcp.McpManager()
     _stub.reset()
     _stub.install(reply=lambda ms, i: "" if i == 0 else "Автоматический итог в исходном чате",

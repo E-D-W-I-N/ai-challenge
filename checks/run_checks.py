@@ -448,7 +448,7 @@ def check_spec_deep_copy():
         response_format={"type": "json_object"},
         extra_body={"provider": {"allow_fallbacks": False}},
     )
-    registry = AgentRegistry(max_agents=100)
+    registry = AgentRegistry(max_agents=100, store=REGISTRY.store)
     first, second = registry.create_many([shared, shared])
 
     assert first.spec.extra_body is not shared.extra_body

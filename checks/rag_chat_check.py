@@ -311,7 +311,7 @@ def check_rag_chat():
             chat = agents.Agent(AgentSpec(label="cancel reminder", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False), store=store)
             server = SimpleNamespace(name="neutral", status="ok", timeout_s=1)
             manager = SimpleNamespace(servers=[server], reminder_protocol=AsyncMock(return_value=True))
-            scheduler = ReminderScheduler(manager, SimpleNamespace(store=store))
+            scheduler = ReminderScheduler(manager, SimpleNamespace(store=store, allow_tools=True))
             item = {"id": 1, "text": "neutral", "context_id": "neutral"}
             scheduler.claims[(server.name, item["id"])] = {}
             ready, release = asyncio.Event(), asyncio.Event()

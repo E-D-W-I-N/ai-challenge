@@ -1,5 +1,6 @@
 """LLM-selected boundaries over exact source slices, with a private per-document cache."""
 from __future__ import annotations
+from contextlib import nullcontext
 
 import json
 import math
@@ -28,8 +29,14 @@ class SemanticConfig:
     prompt_version: str = "boundary-v2"
     reasoning_enabled: bool = False
     payload_version: str = "boundary-normalization-v3"
+    max_tokens: int | None = None
 
     def __post_init__(self):
+        from shared_models.admission import limits
+        if self.max_tokens is None and limits().get("output_limit"):
+            object.__setattr__(self, "max_tokens", limits()["output_limit"])
+        if self.max_tokens is not None and (type(self.max_tokens) is not int or self.max_tokens <= 0):
+            raise ValueError("max_tokens must be a positive integer")
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
         from shared_models import validate_url
@@ -139,7 +146,7 @@ def _payload(text, units, config, limit):
     # OpenRouter shares max_tokens between reasoning and visible JSON. Reserve
     # 8192 tokens beyond the bounded ID-list allowance for unknown reasoning models.
     # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-    payload = {"model": config.model, "temperature": 0, "max_tokens": 8192 + max(1024, 64 + len(units) * 12),
+    payload = {"model": config.model, "temperature": 0, "max_tokens": config.max_tokens or 8192 + max(1024, 64 + len(units) * 12),
             **_reasoning_options(config),
             "response_format": {"type": "json_object"}, "messages": [
                 {"role": "system", "content": "Choose semantic chunk boundaries in the supplied source units. "
@@ -189,8 +196,11 @@ def _call(client, config, payload, trace=None, *, label="Semantic", before_send=
     if before_send:
         before_send()
     try:
-        response = client.post(config.base_url.rstrip("/") + "/chat/completions", json=payload, headers=headers)
-        response.raise_for_status()
+        from shared_models.admission import slot, validate_payload
+        with slot((config.model,), "semantic"):
+            validate_payload(payload)
+            response = client.post(config.base_url.rstrip("/") + "/chat/completions", json=payload, headers=headers)
+            response.raise_for_status()
     except httpx.HTTPStatusError as error:
         raise ValueError(_http_error(error.response, credentials, label)) from None
     except (httpx.HTTPError, UnicodeError):
@@ -334,7 +344,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                         actual_models.append(model)
                         report["model"] = " / ".join(actual_models)
                     trace_path = directory / ("round-" + uuid.uuid4().hex + ".json")
-                    write_json(trace_path, {"request": payload, "response": response})
+                    with operation.publication() if operation else nullcontext():
+                        write_json(trace_path, {"request": payload, "response": response})
                     report["trace_files"].append(str(trace_path.relative_to(root)))
                     usage = response.get("usage", {}) if isinstance(response, dict) else {}
                     if isinstance(usage, dict):
@@ -368,7 +379,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                     operation.update(semantic_report=report.copy())
                 spans.extend(selected)
                 rounds.append({"request": payload, "response": response, "boundary_normalization": metadata})
-            write_json(path, {"identity": identity, "spans": spans, "rounds": rounds})
+            with operation.publication() if operation else nullcontext():
+                write_json(path, {"identity": identity, "spans": spans, "rounds": rounds})
             report["computed"] += 1
         report["trace_files"].append(str(path.relative_to(root)))
         for position, (core_start, end) in enumerate(spans):

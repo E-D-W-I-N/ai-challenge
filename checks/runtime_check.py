@@ -26,11 +26,12 @@ def check_runtime():
         'MCP_CONFIG_PATH', 'MCP_DISABLED', 'REMIND_DB_PATH', 'REMIND_HOST', 'REMIND_PORT',
         'PIPELINE_FILES_DIR', 'OPENROUTER_SITE_URL', 'OPENROUTER_SITE_NAME')}
     with patch.dict(os.environ, retired):
-        assert store.db_path() == store.DEFAULT_DB_PATH
+        assert store.db_path() == Path(store.shared_store().path)
         assert Path(store.shared_store().path).is_relative_to(Path(tempfile.gettempdir()))
         assert store.shared_store().path != store.DEFAULT_DB_PATH
         assert AgentRegistry(store=store.shared_store()).max_agents == DEFAULT_MAX_AGENTS
-        assert llm.max_concurrency() == 16
+        from shared_models.admission import limits
+        assert limits()["context_limit"] is None and limits()["ready"]
         assert mcp.McpManager().disabled is False
         assert storage_root() == Path(__file__).resolve().parent.parent / 'data/rag'
         assert reminders.db_path() == reminders.ROOT / 'data/reminders.db'

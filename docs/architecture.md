@@ -1,4 +1,4 @@
-# Архитектура и активные ограничения дня 29
+# Архитектура и активные ограничения дня 30
 
 FastAPI обслуживает API и статический клиент без сборки. SQLite — из стандартной
 библиотеки; версии прямых зависимостей заданы в `requirements.txt`, включая
@@ -1065,3 +1065,48 @@ Temperature, max_tokens и системный промпт остаются па
 Смена генеративного квантования не меняет embedding identity индекса. Качество,
 скорость по существующим метрикам и память через macOS оценивает человек;
 runtime, телеметрия, панели и тесты дня 29 не добавлены.
+
+
+## День 30: учётные записи и общий inference runtime
+
+`app.auth` открывает только новую `data/accounts.db`: users (UUID, username,
+Argon2id hash, role, enabled) и sessions (SHA256 непрозрачного token, user_id,
+expiry). Первый admin создаётся явной операторской командой
+`.venv/bin/python -m app.auth bootstrap-admin` с getpass. Public signup нет.
+API `/api/auth/me`, `/login`, `/logout`, `/password` использует HttpOnly cookie,
+SameSite=Lax, Secure при HTTPS. Login ограничен пятью неудачами за 15 минут
+по IP и имени; enqueue генерации — десятью запросами в минуту на пользователя.
+GET/POST `/api/users` и PATCH password/enabled доступны admin; единственного
+активного admin отключить нельзя. Смена пароля проверяет current_password,
+повторно проверяет исходный hash и действительность сессии перед записью.
+HTTP hash/verify jobs имеют один общий nonblocking допуск до thread pool:
+занятость даёт 429, отмена запроса удерживает допуск до фактического конца Argon2.
+Logout отзывает текущую сессию; password/reset/disable — все сессии пользователя.
+Активные и ожидающие обмены отменяются; перед tools/commit проверяется сессия.
+
+Каждый UUID имеет отдельные Store/AgentRegistry в
+`data/users/<UUID>/agents.db`. Старая `data/agents.db` не открывается, не читается,
+не удаляется и не мигрируется. Registry выбирается ASGI middleware через ContextVar
+на весь запрос, включая окончание SSE; без привязки current_registry ошибается.
+Agent.store передаётся явно. Профиль, память, инварианты, чаты, forks и снимки
+истории изолированы Store; admin не получает доступ к чужим чатам.
+
+Model connection file общий `data/model-connection.json`, независимо от user Store.
+GET safe settings и каталог моделей доступны всем авторизованным, PATCH только admin.
+MCP/reminders и RAG pipeline/инспектор корпуса admin-only также на runtime границе:
+обычный Agent не объявляет инструменты, не приобретает manager lease и не исполняет
+model tool_calls; extra_body tools/function aliases отклоняются. Scheduler получает
+admin Registry явно при startup. Общий retrieval остаётся доступен пользователям;
+снимки результата сохраняются только в их собственную историю.
+
+Admission общий для generation/embeddings и всех служебных вызовов. Конечная FIFO
+очередь начинает SSE сразу и сообщает queued/position; отмена, разрыв соединения и
+отзыв сессии снимают ожидание. Lease выдаётся только при фактическом запуске и
+сохраняется до конца обмена/операции. HTTP pool не создаёт дополнительный лимит
+со скрытым ожиданием. Отмена retrieval ждёт фактического завершения sync HTTP worker
+до release. RAG worker имеет одну reservation на всю операцию. Невозможный model
+профиль или превышение resource policy — ошибка, не бесконечное ожидание.
+VPS policy задаёт context/output лимиты; служебные запросы используют её output_limit,
+пользовательский chat config не урезается. Без VPS policy поведение Mac сохраняется.
+Offline checks используют checks/_stub с временными accounts/Store и настоящей
+фикстурной session cookie; production auth bypass отсутствует. Новых проверок нет.
