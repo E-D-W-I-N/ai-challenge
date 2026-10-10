@@ -34,6 +34,21 @@ _accounts = None
 _attempts = {}
 _cleanup_at = 0.0
 _rate_lock = threading.Lock()
+_password_gate = threading.Lock()
+
+
+async def password_job(function, *args, **kwargs):
+    # Admit before submitting to the executor; Argon2 work never queues there.
+    if not _password_gate.acquire(blocking=False):
+        raise HTTPException(429, "Password service is busy; try again later")
+    job = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    def finished(task):
+        _password_gate.release()
+        if not task.cancelled():
+            task.exception()  # Consume errors if the HTTP request disconnected.
+    job.add_done_callback(finished)
+    # Cancelling HTTP cannot stop Argon2; retain the bound until its worker ends.
+    return await asyncio.shield(job)
 
 
 @dataclass(frozen=True)
@@ -264,8 +279,10 @@ async def login(request: Request, response: Response, body: dict = Body(...)):
     for key in keys:
         rate_limit(key, 5, 900, record=False)
     try:
-        token, principal = await asyncio.to_thread(accounts().authenticate, name, secret)
-    except HTTPException:
+        token, principal = await password_job(accounts().authenticate, name, secret)
+    except HTTPException as error:
+        if error.status_code != 401:
+            raise
         for key in keys:
             rate_limit(key, 5, 900)
         raise
@@ -285,10 +302,10 @@ async def change_password(response: Response, body: dict = Body(...)):
     principal = current_principal.get()
     user = accounts().user(principal.id)
     try:
-        await asyncio.to_thread(_hasher.verify, user["password_hash"], body.get("current_password", ""))
+        await password_job(_hasher.verify, user["password_hash"], body.get("current_password", ""))
     except (VerificationError, InvalidHashError, TypeError):
         raise HTTPException(403, "Current password is incorrect") from None
-    await asyncio.to_thread(accounts().update, principal.id, {"password": body.get("new_password")}, principal=principal, expected_hash=user["password_hash"])
+    await password_job(accounts().update, principal.id, {"password": body.get("new_password")}, principal=principal, expected_hash=user["password_hash"])
     response.delete_cookie(COOKIE)
 
 
@@ -302,12 +319,12 @@ def list_users():
 async def create_user(body: dict = Body(...)):
     if set(body) != {"username", "password"}:
         raise HTTPException(422, "Provide username and password")
-    return await asyncio.to_thread(accounts().create, body["username"], body["password"])
+    return await password_job(accounts().create, body["username"], body["password"])
 
 
 @router.patch("/api/users/{user_id}")
 async def update_user(user_id: str, body: dict = Body(...)):
-    return await asyncio.to_thread(accounts().update, user_id, body)
+    return await password_job(accounts().update, user_id, body)
 
 
 def main():

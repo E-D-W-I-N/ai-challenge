@@ -1079,6 +1079,8 @@ SameSite=Lax, Secure при HTTPS. Login ограничен пятью неуд�
 GET/POST `/api/users` и PATCH password/enabled доступны admin; единственного
 активного admin отключить нельзя. Смена пароля проверяет current_password,
 повторно проверяет исходный hash и действительность сессии перед записью.
+HTTP hash/verify jobs имеют один общий nonblocking допуск до thread pool:
+занятость даёт 429, отмена запроса удерживает допуск до фактического конца Argon2.
 Logout отзывает текущую сессию; password/reset/disable — все сессии пользователя.
 Активные и ожидающие обмены отменяются; перед tools/commit проверяется сессия.
 
