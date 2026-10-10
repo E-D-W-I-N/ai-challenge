@@ -1,0 +1,18 @@
+[Unit]
+Description=Private CPU Ollama with calculated admission capacity
+After=network-online.target
+
+[Service]
+User=aichat
+Group=aichat
+WorkingDirectory=/opt/aichat
+Slice=aichat.slice
+ExecStart=/opt/aichat/.venv/bin/python -m deploy.start_ollama
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Private authenticated chat
+After=network-online.target aichat-ollama.service
+Requires=aichat-ollama.service
+
+[Service]
+User=aichat
+Group=aichat
+WorkingDirectory=/opt/aichat
+Slice=aichat.slice
+Environment=INFERENCE_CAPACITY_FILE=/opt/aichat/data/inference-capacity.json
+ExecStart=/opt/aichat/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Shared application and CPU inference memory budget
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=6G
