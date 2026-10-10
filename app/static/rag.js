@@ -154,7 +154,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
         }
         const defaults = data.embedding_defaults;
         if (defaults) {
-          embeddingPicker.restore({...defaults, provider: defaults.provider || "compatible"});
+          embeddingPicker.restore(defaults);
           for (const [id, key] of [["dimensions", "dimensions"], ["revision", "revision"]]) {
             const input = $("#rag-" + id); if (!input.dataset.dirty) input.value = defaults[key] ?? "";
           }
@@ -269,7 +269,6 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
   function chunkOptions() {
     const body = {strategy: $("#rag-strategy").value, size: Number($("#rag-size").value), overlap: Number($("#rag-overlap").value)};
     if (body.strategy === "semantic") {
-      body.semantic_provider = $("#rag-semantic-provider").value;
       body.semantic_reasoning_enabled = semanticPicker.value().reasoning_enabled;
       body.semantic_model = $("#rag-semantic-model").value.trim();
     }
@@ -281,7 +280,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     if (body.preparation_strategy === "llm") {
       body.preparation_reasoning_enabled = preparationPicker.value().reasoning_enabled;
       body.preparation_timeout_seconds = Number($("#rag-preparation-timeout-seconds").value);
-      for (const key of ["provider", "model"]) body["preparation_" + key] = $("#rag-preparation-" + key.replaceAll("_", "-")).value.trim();
+      body.preparation_model = $("#rag-preparation-model").value.trim();
     }
     return body;
   }
@@ -291,7 +290,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     try {
       const body = kind === "ingest" ? preparationOptions()
         : kind === "chunks" ? chunkOptions()
-        : kind === "embeddings" ? {reasoning_enabled: embeddingPicker.value().reasoning_enabled, provider: $("#rag-provider").value, model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
+        : kind === "embeddings" ? {reasoning_enabled: embeddingPicker.value().reasoning_enabled, model: $("#rag-model").value.trim(), dimensions: $("#rag-dimensions").value ? Number($("#rag-dimensions").value) : null, revision: $("#rag-revision").value.trim()} : {};
       const model = kind === "embeddings" ? body.model : body.semantic_model ?? body.preparation_model;
       if (model !== undefined && !model) throw new Error("Выберите модель или введите её ID.");
       await api(`/api/rag/operations/${kind}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
@@ -313,18 +312,18 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
   for (const [id, kind] of [["delete-chunks", "chunks"], ["delete-embeddings", "embeddings"], ["delete-index", "index"]]) {
     const node = $("#rag-" + id); if (node) node.onclick = () => clearStage(kind);
   }
-  const semanticPicker = modelSelectors.create({host: $("#rag-semantic-picker"), modelId: "rag-semantic-model", providerId: "rag-semantic-provider",
+  const semanticPicker = modelSelectors.create({host: $("#rag-semantic-picker"), modelId: "rag-semantic-model",
     refreshId: "rag-model-refresh", statusId: "rag-model-status", title: "Модель разбиения",
     active: () => visible() && selectedStep === "chunks" && $("#rag-strategy").value === "semantic"});
-  const preparationPicker = modelSelectors.create({host: $("#rag-preparation-picker"), modelId: "rag-preparation-model", providerId: "rag-preparation-provider",
+  const preparationPicker = modelSelectors.create({host: $("#rag-preparation-picker"), modelId: "rag-preparation-model",
     refreshId: "rag-preparation-model-refresh", statusId: "rag-preparation-model-status", title: "Модель подготовки",
     active: () => visible() && selectedStep === "documents" && $("#rag-preparation-strategy").value === "llm"});
-  const embeddingPicker = modelSelectors.create({host: $("#rag-embedding-picker"), modelId: "rag-model", providerId: "rag-provider",
+  const embeddingPicker = modelSelectors.create({host: $("#rag-embedding-picker"), modelId: "rag-model",
     refreshId: "rag-embedding-model-refresh", statusId: "rag-embedding-model-status", title: "Модель эмбеддингов", purpose: "embedding",
     active: () => visible() && selectedStep === "embeddings", onChange: () => { if (lastStatus) updateControls(); }});
-  semanticPicker.set({provider: "openrouter", model: "openai/gpt-6-luna"});
-  preparationPicker.set({provider: "openrouter", model: "openai/gpt-6-luna"});
-  embeddingPicker.set({provider: "compatible", model: ""});
+  semanticPicker.set({model: ""});
+  preparationPicker.set({model: ""});
+  embeddingPicker.set({model: ""});
   const modelPickers = [semanticPicker, preparationPicker, embeddingPicker];
   function loadModelsForStage() {
     for (const picker of modelPickers) {
