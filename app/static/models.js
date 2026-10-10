@@ -25,8 +25,8 @@ function createModelSelectors({ $, el, api }) {
     const pending = (previous || Promise.resolve()).catch(() => {}).then(() => api("/api/model-settings", {
       method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)
     })).then(saved => {
+      settings = saved;
       if (revision === connectionRevision) {
-        settings = saved;
         for (const picker of pickers) picker.load(true);
       }
       return saved;
@@ -79,6 +79,11 @@ function createModelSelectors({ $, el, api }) {
         controller = new AbortController(); pending = identity; refresh.disabled = true; status.textContent = "Загрузка моделей…";
         const data = await api(`/api/models?purpose=${purpose}`, {signal: controller.signal});
         if (ticket !== request || revision !== connectionRevision || !active()) return;
+        if ((data.base_url != null && data.base_url !== config.base_url) ||
+            (data.revision != null && data.revision !== config.revision)) {
+          settings = null;
+          throw new Error("Каталог принадлежит другому подключению.");
+        }
         const models = data.models || []; catalogues.set(identity, models); catalogue(models);
       } catch (error) {
         if (error.name !== "AbortError" && ticket === request && active()) {
