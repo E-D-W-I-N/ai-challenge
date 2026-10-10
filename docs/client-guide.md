@@ -1,4 +1,4 @@
-# Карта клиента дня 25
+# Карта клиента дня 26
 
 FastAPI отдаёт HTML, CSS и пять обычных локальных скриптов; сборки нет.
 `index.html` загружает `text.js` → `records.js` → `models.js` → `rag.js` → `app.js`.
