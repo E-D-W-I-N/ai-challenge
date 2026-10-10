@@ -1,20 +1,4 @@
-"""Стриминг OpenRouter + сбор метрик. Без стриминга нет ни TTFT,
-ни живого счётчика скорости.
-
-Общее правило для всех вызовов — provider.require_parameters = true.
-Без него OpenRouter вправе увести запрос к провайдеру, который молча
-проигнорирует temperature или stop, и день покажет неправду.
-
-Второе такое же правило — плагин context-compression выключен. На каждом
-эндпоинте с окном 8k и меньше OpenRouter включает его по умолчанию: когда
-промпт не влезает, он молча выбрасывает середину разговора и отправляет
-остаток. Ошибки нет, ответ приходит — и память чата теряет середину, а
-пользователь списывает это на модель.
-
-HTTP-клиент на процесс один, и одновременных вызовов не больше
-16: клиент внутри каждого вызова — это на сотне агентов
-сотня пулов соединений и сотня одновременных запросов к OpenRouter.
-"""
+"""OpenAI-compatible streaming, actual usage and bounded tool frames."""
 
 from __future__ import annotations
 
@@ -31,8 +15,8 @@ from typing import AsyncIterator
 
 import httpx
 
-from .config import OPENROUTER_BASE_URL, api_key, attribution_headers
-from shared_models import endpoint, key as provider_key, generation_payload
+
+from shared_models import endpoint, key as model_key, generation_payload
 from .schema import AgentSpec
 
 _SPEED_WINDOW_SECONDS = 5.0
@@ -174,36 +158,13 @@ SAMPLING_FIELDS = (
 """Параметры сэмплирования, которые уходят в тело запроса как есть."""
 
 
-NO_COMPRESSION_PLUGIN = {"id": "context-compression", "enabled": False}
-"""Выключенное сжатие контекста — на каждом вызове, как require_parameters.
-
-Умолчание OpenRouter для окон 8k и меньше — стратегия middle-out: середина
-разговора молча выбрасывается, запрос проходит, ошибки нет. С выключенным
-плагином переполнение становится честной ошибкой, а история едет целиком.
-"""
-
-
-def merge_plugins(ours: list[dict], theirs: list) -> list:
-    """Плагины из extra_body — поверх наших, по `id`, как provider по ключам.
-
-    Наш выключенный context-compression не пропадает оттого, что пользователь
-    добавил себе веб-поиск: чужие плагины дописываются рядом. А если он назвал
-    тот же `id` сам — побеждает его запись: включить сжатие обратно можно,
-    но только написав это своей рукой, а не случайным соседством ключей.
-    """
-    named = {item["id"] for item in theirs if isinstance(item, dict) and "id" in item}
-    kept = [item for item in ours if item.get("id") not in named]
-    return [*kept, *theirs]
-
-
 def build_payload(
     session: AgentSpec,
     messages: list[dict] | None = None,
     *,
     tools: list[dict] | None = None,
 ) -> dict:
-    """Тело запроса к OpenRouter. require_parameters и выключенное сжатие
-    контекста — на каждом вызове.
+    """Тело запроса к общему серверу моделей.
 
     Промпт приходит снаружи: собирает его агент, из слепка конфига. Инструменты
     — тоже снаружи и тем же порядком: что объявить модели, решает вызывающий,
@@ -213,20 +174,12 @@ def build_payload(
     `tool_choice` не отправляется вовсе: звать инструмент или ответить словами
     — решение модели, и принуждать её к вызову нам незачем.
     """
-    if session.provider == "compatible" and any(getattr(session, name) is not None for name in ("top_k", "min_p", "repetition_penalty")):
-        raise ValueError("Compatible standard chat API does not support top_k, min_p or repetition_penalty; clear these explicit settings")
-    payload: dict = {
-        "model": session.model,
-        "messages": messages or [],
-        "stream": True,
-        # Просим OpenRouter вернуть usage в финальном чанке: cost и reasoning_tokens
-        "usage": {"include": True},
-        "provider": {"require_parameters": True},
-        "plugins": [dict(NO_COMPRESSION_PLUGIN)],
-    }
+    if not session.model.strip():
+        raise ValueError("Выберите модель в настройках чата.")
+    payload: dict = {"model": session.model, "messages": messages or [], "stream": True}
     # Незаданный параметр не отправляется вовсе — ни как null, ни как ноль:
     # отправить 0 вместо «не отправлять» — это другой запрос, а с
-    # provider.require_parameters=true ещё и другой список провайдеров.
+    # Незаданные параметры остаются на стороне модели.
     for name in SAMPLING_FIELDS:
         value = getattr(session, name, None)
         if value is not None:
@@ -239,15 +192,9 @@ def build_payload(
     if tools:
         payload["tools"] = tools
 
-    for key, value in (session.extra_body or {}).items():
-        if key == "provider" and isinstance(value, dict):
-            payload["provider"] = {**payload["provider"], **value}
-        elif key == "plugins" and isinstance(value, list):
-            payload["plugins"] = merge_plugins(payload["plugins"], value)
-        else:
-            payload[key] = value
+    payload.update(session.extra_body or {})
     from .store import redact
-    return redact(generation_payload(payload, session.provider, reasoning_enabled=session.reasoning_enabled))
+    return redact(generation_payload(payload, reasoning_enabled=session.reasoning_enabled))
 
 
 _request_capture = ContextVar("request_capture", default=None)
@@ -311,19 +258,12 @@ async def stream_completion(
     объявил: без `tools` накопитель остаётся пустым и события не бывает вовсе.
     Перебирающие события обязаны переживать незнакомый тип молча.
     """
-    base_url = endpoint(session.provider)
-    router_key = api_key()  # Load the two allowed runtime keys at the application boundary.
-    key = router_key if session.provider == "openrouter" else provider_key(session.provider)
-    if not key and session.provider == "openrouter":
-        raise MissingKeyError(
-            "Серверный ключ выбранного провайдера не настроен."
-        )
-
+    base_url = endpoint()
+    key = model_key()
     payload = build_payload(session, prompt_override, tools=tools)
     headers = {
         **({"Authorization": f"Bearer {key}"} if key else {}),
         "Content-Type": "application/json",
-        **attribution_headers(),
     }
 
     metrics = Metrics(model=session.model, context_length=context_length or None)

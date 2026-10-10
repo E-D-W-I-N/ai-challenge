@@ -1574,23 +1574,21 @@ class Agent:
     # --- обмен ---------------------------------------------------------------
 
     async def ask(self, user_text: str, **options) -> AsyncIterator[dict]:
-        from shared_models import bind_compatible_url
-        from .model_settings import settings
-        from .config import api_key
-        api_key()
-        frozen_url = settings(self.store)["compatible_base_url"]
+        from shared_models import bind_connection
+        from .model_settings import current_connection
+        frozen_connection = current_connection(self.store)
         response = self._ask(user_text, **options)
         try:
             while True:
                 # Tokens cannot cross generator yields: consumers may resume in another task.
-                with bind_compatible_url(frozen_url):
+                with bind_connection(frozen_connection):
                     try:
                         event = await anext(response)
                     except StopAsyncIteration:
                         break
                 yield event
         finally:
-            with bind_compatible_url(frozen_url):
+            with bind_connection(frozen_connection):
                 await response.aclose()
 
     async def _ask(self, user_text: str, *, scheduled: dict | None = None,
@@ -1658,7 +1656,7 @@ class Agent:
                         if not cancel.is_set() and (can_run is None or await can_run()):
                             with capture_requests() as preparation_requests:
                                 rewrite_result = await rag_rewrite(user_text, used_history, spec.model,
-                                                                   stream_completion, cancel, provider=spec.provider, reasoning_enabled=spec.reasoning_enabled, working_memory=working)
+                                                                   stream_completion, cancel, reasoning_enabled=spec.reasoning_enabled, working_memory=working)
                             query = rewrite_result["query"]
                     if not cancel.is_set() and (can_run is None or await can_run()):
                         yield {"type": "retrieval", "stage": "search", "query": query}
@@ -2176,10 +2174,9 @@ def spec_as_dict(
         "id": agent_id,
         "label": spec.label,
         "model": spec.model,
-        "provider": spec.provider,
         "reasoning_enabled": spec.reasoning_enabled,
         "rag_enabled": spec.rag_enabled,
-        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model")},
+        **{name: getattr(spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_model")},
         "stop": spec.stop,
         "response_format": spec.response_format,
         "extra_body": spec.extra_body,
@@ -2225,8 +2222,7 @@ def spec_from_config(config: dict, *, fallback: AgentSpec) -> AgentSpec:
     версии, и падать на чужом поле — значит потерять сохранённый диалог.
     """
     known = {key: value for key, value in (config or {}).items() if key in _SPEC_FIELDS}
-    if not known.get("model"):
-        return fallback
+    known.setdefault("model", fallback.model)
     known.setdefault("label", fallback.label)
     # The single-K schema may have retained older two-K keys: its effective K wins.
     final_k = (config or {}).get("rag_top_k", known.get("rag_final_k", 3))

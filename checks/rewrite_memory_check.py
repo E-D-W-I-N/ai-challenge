@@ -39,7 +39,7 @@ def check_rewrite_memory():
         expected = [{"kind": "goal", "content": goal["content"]}, {"kind": "limit", "content": limit["content"]}]
         original_retrieve = Index.retrieve
         with httpx.Client(transport=httpx.MockTransport(http)) as client:
-            build_index(root, EmbeddingConfig("http://neutral.test/v1", "neutral-embedding", dimensions=2, provider="compatible"), "fixed", client=client)
+            build_index(root, EmbeddingConfig("http://neutral.test/v1", "neutral-embedding", dimensions=2, ), "fixed", client=client)
             def retrieve(index, query, **options):
                 return original_retrieve(index, query, client=client, **options)
             entered = asyncio.Event(); release = asyncio.Event()

@@ -169,7 +169,7 @@ def check_request_capture():
 
         async def scenario():
             async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-                with patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", llm.stream_completion):
+                with patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(agent, "stream_completion", llm.stream_completion):
                     events = [event async for event in chat.ask("question " + fake_key)]
                 assert events[-1]["committed"] and events[-1]["answer_index"] == 1
                 assert len(received) == 1

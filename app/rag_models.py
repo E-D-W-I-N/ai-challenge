@@ -2,47 +2,27 @@
 from __future__ import annotations
 
 import json
-import os
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
 
 from rag.semantic import SemanticConfig
-from . import catalog, config
+
 
 _MAX_BYTES = 2 * 1024 * 1024
 _MAX_MODELS = 5000
 
 
-async def models(provider: str, base_url: str, purpose: str = "generation") -> dict:
+async def models(connection, purpose: str = "generation") -> dict:
     if purpose not in {"generation", "embedding"}:
         raise HTTPException(422, "Неизвестное назначение модели.")
-    try:
-        from shared_models import endpoint
-        base_url = endpoint(provider, base_url)
-        SemanticConfig(base_url=base_url, model="catalogue", provider=provider)
-        parsed = urlparse(base_url)
-        if not parsed.hostname:
-            raise ValueError("Missing host")
-        parsed.port  # Validate range before any transport receives the URL.
-    except ValueError:
-        raise HTTPException(422, "URL сервера должен быть HTTP(S), без авторизации, параметров и фрагмента") from None
-    endpoint = base_url.rstrip("/")
-    if provider == "openrouter":
-        try:
-            rows = await catalog.fetch_models(purpose)
-        except Exception:
-            raise HTTPException(502, "Каталог OpenRouter недоступен. Попробуйте обновить список позже.") from None
-        return {"provider": provider, "base_url": endpoint, "models": rows, "total": len(rows)}
-
-    config.api_key()
-    from shared_models import key as model_key
-    key = model_key(provider)
+    endpoint = connection.base_url
+    key = connection.api_key
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         # OpenRouter follows the same proxy policy as chat; compatible servers bypasses it.
-        async with httpx.AsyncClient(timeout=15, trust_env=provider != "compatible", follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False) as client:
             async with client.stream("GET", f"{endpoint}/models", headers=headers) as response:
                 if not response.is_success:
                     raise HTTPException(502, f"Каталог моделей недоступен: сервер вернул HTTP {response.status_code}.")
@@ -55,8 +35,9 @@ async def models(provider: str, base_url: str, purpose: str = "generation") -> d
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or len(data) > _MAX_MODELS:
             raise ValueError("Invalid catalogue")
-        secrets = [value for value in (key, os.environ.get("RAG_EMBEDDING_API_KEY", ""), os.environ.get("OPENROUTER_API_KEY", "")) if value.strip()]
+        secrets = [key] if key else []
         identifiers = {}
+        metadata = {}
         for row in data:
             identifier = row.get("id") if isinstance(row, dict) else None
             if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 512:
@@ -72,13 +53,15 @@ async def models(provider: str, base_url: str, purpose: str = "generation") -> d
             if identifier in identifiers and identifiers[identifier] != model_type:
                 model_type = None
             identifiers[identifier] = model_type
+            from .catalog import normalize
+            metadata[identifier] = normalize(row)
         # Standard compatible API has no type metadata. Incomplete extension metadata is
         # insufficient to hide IDs; only filter a fully typed catalogue.
         typed = bool(identifiers) and all(value in {"embedding", "embeddings", "llm", "vlm", "reranker", "audio_stt", "audio_tts", "audio_sts"}
                                              for value in identifiers.values())
-        rows = [{"id": identifier} for identifier in sorted(identifiers)
+        rows = [metadata[identifier] for identifier in sorted(identifiers)
                 if not typed or identifiers[identifier] in ({"embedding", "embeddings"} if purpose == "embedding" else {"llm", "vlm"})]
-        return {"provider": provider, "base_url": endpoint, "models": rows, "total": len(rows)}
+        return {"base_url": endpoint, "revision": connection.revision, "models": rows, "total": len(rows)}
     except HTTPException:
         raise
     except httpx.InvalidURL:

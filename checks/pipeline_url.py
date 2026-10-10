@@ -106,7 +106,7 @@ def check_pipeline_http():
                         session = server.session
                         events = []
                         async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-                            with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value=fake_key), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", llm.stream_completion):
+                            with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "model_key", return_value=fake_key), patch.object(agent, "stream_completion", llm.stream_completion):
                                 stream = chat.ask("Find and save <script>question</script>")
                                 async for event in stream:
                                     events.append(event)

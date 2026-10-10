@@ -7,25 +7,21 @@ FastAPI обслуживает API и статический клиент без
 
 ## Промпт, контекст и метрики
 
-- OpenRouter вызов в `app/llm.py:build_payload` требует `provider.require_parameters`,
-  отключает `context-compression` и запрашивает `usage: {"include": true}`.
-  Совместимый провайдер получает стандартные поля и stream_options.include_usage.
-  Токены и стоимость сообщает провайдер; своих оценок нет.
+- Все вызовы используют один OpenAI-compatible URL и необязательный серверный ключ.
+  Chat Completions streaming запрашивает `stream_options.include_usage`; своих
+  оценок токенов, стоимости и длины контекста нет.
 - Общий selector всегда показывает «Рассуждения (если модель поддерживает)».
   `reasoning_enabled` — strict bool default false для чата (включая legacy),
   подготовки, семантического разбиения и embedding preference; rerank имеет
   отдельный `rag_rerank_reasoning_enabled`. Состояния не распространяются между
   сценариями или чатами; каталог/смена провайдера не сбрасывает локальный выбор.
   Rewrite наследует chat flag, compression копирует spec; прочие сервисы независимы.
-- `shared_models.generation_payload` применяет политику после extra_body:
-  OpenRouter OFF `{effort:none, enabled:false, exclude:false}`, ON
-  `{enabled:true, exclude:false}`, принудительный require_parameters=true;
-  compatible reasoning_effort none/medium. Известные top-level/nested aliases
-  очищаются с сохранением иных параметров; per-message reasoning overrides
-  при OFF отклоняются до HTTP. Поддержка параметров зависит от модели/сервера;
-  нет платных probing/retry/fallback. Reasoning output/positive reported tokens
-  при OFF дают фиксированную ошибку с фактическим usage; tools объявляются только
-  после terminal usage check. Отсутствие evidence не доказывает внутреннее OFF.
+- `shared_models.generation_payload` применяет `reasoning_effort: none|medium`
+  после extra_body. Известные aliases очищаются; per-message OFF overrides
+  отклоняются до HTTP. Явные дополнительные параметры сохраняются; upstream
+  может отказать без retry. Наблюдаемое reasoning/positive reported tokens при
+  OFF дают фиксированную ошибку с actual usage до исполнения инструментов.
+  Отсутствие reported evidence не доказывает внутреннее OFF сервера.
 - Preparation/Semantic config содержит независимый strict bool, поэтому изменение
   режима меняет private cache identity; CLI включает его только явным флагом.
   EmbeddingConfig сохраняет preference, но исключает его из fingerprint:
@@ -95,15 +91,19 @@ FastAPI обслуживает API и статический клиент без
   Врезки памяти не порождают отдельного вызова; их текст входит во входной
   промпт и может увеличивать его токены и цену.
 
-Runtime принимает только `OPENROUTER_API_KEY` и `RAG_EMBEDDING_API_KEY` из
-окружения/`.env`; dotenv allowlist не переносит другие имена и читает файл один
-раз при запуске приложения/доступе к ключу. Standalone `rag` не загружает `.env`.
-`shared_models` хранит общий dependency-free default generative model
-`openai/gpt-6-luna`; сохранённый model чата и явно выбранные модели сохраняются.
+Соединение хранится в приватном `data/model-connection.json` с правами 0600;
+атомарная замена записывает URL, optional API key и revision. GET отдаёт только
+base_url/has_api_key/revision. PATCH принимает base_url?/api_key?: отсутствие ключа
+сохраняет прежний, пустая строка удаляет. Приложение не загружает `.env` и не
+читает прежние env keys. Standalone `rag --connection-file PATH` использует тот
+же независимый shared_models без app import. Без файла URL = localhost:8005/v1,
+ключ отсутствует. Новые model IDs пусты до явного выбора; сохранённые ID чатов
+не меняются при смене соединения. Старые provider поля config игнорируются при
+чтении; новый save их не пишет. Исторические JSON и RAG snapshots не мигрируются.
 База приложения фиксирована в `data/agents.db`, MCP bootstrap — `mcp.json`,
 RAG — `data/rag`. Лимиты live agents (1000) и HTTP calls (16) фиксированы;
 сервисы принимают явные CLI пути/host/port. Стандартные системные переменные
-и proxy transport продолжают работать. Offline стенд отключает dotenv I/O,
+и proxy transport продолжают работать. Offline стенд задаёт временный connection path,
 внедряет временный Store до импорта registry и временные пути/конфиг явно;
 перезапуск и несколько процессов передают путь базы аргументом fixture CLI.
 
@@ -254,7 +254,7 @@ RAG — `data/rag`. Лимиты live agents (1000) и HTTP calls (16) фикс�
   «Настройки чата». Общего смешанного верхнего переключателя настроек нет.
   Возврат в чат явный. Разделение охватывает все существующие формы, не только RAG.
   Приложение: общий совместимый model URL, профиль, долговременная память,
-  инварианты, MCP connections и RAG pipeline. Чат: provider/model и параметры
+  инварианты, MCP connections и RAG pipeline. Чат: model и параметры
   генерации, системный промпт и управление контекстом агента, краткосрочная и
   рабочая память, RAG usage и напоминания текущего чата.
   В чате разделы названы «Модель», «Агент», «Память», условные «Напоминания», «Поиск RAG»;
@@ -379,7 +379,7 @@ RAG — `data/rag`. Лимиты live agents (1000) и HTTP calls (16) фикс�
   Disconnect/stop закрывает сессию, но не завершает внешний процесс.
 - Менеджер ведёт SDK `ClientSession` по Streamable HTTP; дочерний процесс
   `anyio.open_process` существует только для явно заданного legacy stdio
-  конфига. Его env — PATH/HOME/LANG, без ключа OpenRouter; stop завершает
+  конфига. Его env — PATH/HOME/LANG, без ключей модели; stop завершает
   только собственных stdio-детей. `manager.lease()` сериализует всю цепочку
   раундов модели, вызовы, смену конфига и disconnect. Private инструменты
   с `meta.host_only=true` остаются в текущем SDK-сеансе, но отсутствуют в
@@ -617,8 +617,8 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 - Подготовка документов независима от стратегии чанкинга: `programmatic` (default)
   сохраняет прежнюю эвристическую очистку; `llm` отправляет decoded исходный HTML,
   без предварительной normalize_html, в отдельный generative `/chat/completions`.
-  `PreparationConfig` выбирает provider/model независимо от semantic config;
-  совместимый URL общий для операции, OpenRouter использует фиксированный адрес.
+  `PreparationConfig` выбирает model независимо от semantic config;
+  URL и credential общие и заморожены на операцию.
   Prompt требует полный текст без суммаризации, с фактами, числами, списками и таблицами;
   модель возвращает JSON title и ordered blocks (text/kind/section). Заголовок и разделы
   должны быть содержательными и непустыми; при отсутствии исходного heading модель
@@ -673,18 +673,11 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   в неотрицательный report.size_splits, включая cache hit;
   повторного LLM-вызова нет. Последующим чанкам добавляется точный исходный
   overlap. Чанки — source slices, ошибочный JSON/IDs не заменяются fixed.
-  `SemanticConfig` хранит provider/endpoint/model/timeout/prompt_version; размер semantic
-  64–12000. OpenRouter использует `OPENROUTER_API_KEY.strip()` и фиксированный
-  адрес, совместимый сервер — общий URL и `RAG_EMBEDDING_API_KEY.strip()`.
-  Runtime ключ читается только HTTP-границей, standalone не загружает `.env`.
-  Provider входит в nonsecret config/cache identity, ротация ключа identity не меняет.
-  Архивное поле auth_mode принимается только строгой изолированной миграцией.
-  Отражённые raw/нормализованные runtime ключи отсекаются до записи trace.
-  OpenRouter наследует proxy environment; совместимый sync HTTP идёт
-  напрямую без proxy environment. HTTP-ошибка показывает status и ограниченные
-  error.code/message структурированного JSON, отсекая отражённые runtime ключи;
-  сырые тела/headers и HTML не попадают в сообщение. Ошибки JSON, незавершённой
-  генерации, usage и IDs различаются без автоматического платного повтора.
+  `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
+  64–12000. Runtime ключ берётся только из frozen connection на HTTP-границе,
+  не входит в nonsecret config/cache identity. Ротация ключа не меняет кэш.
+  Совместимый sync HTTP идёт напрямую без proxy environment. HTTP-ошибка
+  показывает безопасный status, без raw body/headers и отражённого ключа;
   `semantic-cache` хранит приватные проверенные per-document segmentation и
   request/response traces без auth headers; identity включает document/hash,
   config, prompt version, size/overlap, не ключ. Текущий report содержит actual
@@ -697,18 +690,14 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   исключён из chunks fingerprint: повторное разбиение сохраняет downstream
   vectors, если реальные chunks/параметры неизменны. UI показывает два варианта:
   fixed и semantic LLM, structural сохранён для CLI index/compare.
-- `EmbeddingConfig` фиксирует provider/endpoint/model/dimensions/revision; fingerprint
-  включает их все. У legacy config отсутствующий provider не добавляется в
-  fingerprint: сохранённая identity и кэш проверяются без переписывания. Оператор меняет revision при замене весов под прежним ID.
-  HTTP-сервер обслуживается отдельно, приложение не устанавливает/скачивает модели.
-  HTTP `/v1/embeddings` отправляет пакет текстов, принимает ровно соответствующие
-  count/index и конечные ненулевые векторы единой размерности. Векторы нормируются;
-  mismatch модели/конфига/размерности — ошибка. Совместимый embedding HTTP не наследует proxy
-  окружения, OpenRouter использует свой фиксированный адрес.
-  Необязательный совместимый `RAG_EMBEDDING_API_KEY` читается только на границе HTTP-запроса
-  и передаётся как Bearer, включая injected client. Пустое значение не добавляет
-  авторизацию. Ключ не входит в `EmbeddingConfig`, fingerprint, кэш, индекс,
-  progress/API или сообщения ошибок; ротация ключа не инвалидирует кэш.
+- `EmbeddingConfig` фиксирует endpoint/model/dimensions/revision; fingerprint
+  включает их все, кроме reasoning preference. Ключ не входит в config, индекс,
+  progress, trace, кэш или сообщения ошибок. HTTP /embeddings — стандартный
+  payload и optional Bearer, без reasoning. count/index/model/dimensions и
+  конечные ненулевые vectors проверяются. URL query использует current frozen
+  connection, сохраняя published model/revision/dims и исходную identity.
+  Старый индекс/стадии после удаления provider могут потребовать явной
+  пересборки; приложение их автоматически не удаляет и не мигрирует.
 - Кэш отдельный `embeddings-cache.sqlite`, ключ (полный fingerprint, text hash).
   Build один на каталог через OS flock: другой писатель получает отказ;
   lock освобождается при аварии. Создание индекса идёт в временной SQLite
@@ -779,27 +768,21 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   инспектор читает документы, чанки и векторы опубликованной SQLite, включая stale
   индекс; до публикации доступны текущие staged данные. Смена источника сбрасывает
   поколение preview и отсекает поздние ответы прежнего источника.
-- Чат, preparation, semantic, embeddings и rerank используют общий контракт
-  provider/model: `openrouter` или `compatible`. `shared_models` не импортирует app
-  и не загружает dotenv; в нём общие endpoint, key и generation payload правила.
-  OpenRouter всегда направляется на канонический URL и только ему передаются
-  routing/plugins/usage/reasoning расширения. Compatible получает стандартный
-  `/chat/completions`, stream_options.include_usage и необязательный общий ключ.
-  Нестандартные явные top_k/min_p/repetition_penalty отклоняются понятной ошибкой.
-- `/api/model-settings` хранит единственный compatible_base_url в Store.meta.
-  GET не выдаёт ключей, PATCH проверяет trusted browser origin до изменений.
-  Agent.ask фиксирует URL до rewrite/retrieval/compression и каждого MCP кадра;
-  binding устанавливается на каждый шаг генератора, не пересекает consumer yield.
-  Stage operation фиксирует URL перед запуском worker. CLI задаёт общий URL через
-  корневой --compatible-base-url и не использует app config или dotenv.
-- `/api/models?provider=...&purpose=generation|embedding` обслуживает все selectors.
-  OpenRouter использует `/models` или `/embeddings/models`, совместимый сервер
-  — `/models`. Runtime Bearer остаётся только на сервере; upstream тело ограничено,
-  ошибки не включают его содержимое или ключи. Без явных сведений каталог не
-  угадывает тип, context_length и цены. Точный сохранённый/ручной ID остаётся
-  доступным при отсутствии в каталоге; namespaces и похожие имена не заменяются.
-  Каталог обновляется явно, не при status poll; поздний ответ прежнего провайдера
-  не меняет новый выбор. Published embedding config не меняется автоматически.
+- Чат+rewrite, preparation, semantic, embeddings и rerank имеют независимые
+  model IDs и один connection. Provider selector и runtime branches отсутствуют.
+  `shared_models` не импортирует app и не загружает dotenv.
+- `/api/model-settings` читает и атомарно пишет private connection file.
+  PATCH проверяет trusted browser origin до доступа к credential. Agent.ask
+  замораживает URL и ключ до первого await; binding действует вокруг каждого
+  anext/aclose и не пересекает consumer yield. Stage worker получает тот же
+  frozen connection. Ротация действует со следующего обмена/операции.
+- `/api/models?purpose=generation|embedding` всегда читает общий /models,
+  возвращает models/total/base_url/revision. Credential только в Bearer HTTP
+  header. Bounded parsing/errors; неизвестные type/цены/context не угадываются.
+  Каталог не заменяет сохранённый/ручной ID и не вызывается перед каждым ask;
+  missing model даёт безопасный upstream отказ без paid retry/fallback.
+  URL/credential save инвалидирует все каталоги; stale responses не заменяют
+  новый выбор. Published embedding config не меняется автоматически.
 - GET каталога моделей и POST/DELETE операций RAG проверяют browser metadata
   до доступа к runtime ключу и до запуска писателя. Cross-site/same-site fetch,
   null/malformed/дублированный или несовпадающий Origin получают 403. Сравниваются
@@ -829,10 +812,10 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   Параллельный atomic rebuild не заменяет его identity или чанки. Начальная
   stale-проверка обязательна; начатый snapshot закреплён, следующий обмен читает
   актуальную публикацию. Fixed/structural/semantic strategy не ограничивает поиск.
-  Query embedding использует published model/dimensions/revision и provider;
-  compatible HTTP направляется на текущий общий URL, не на старый адрес metadata.
+  Query embedding использует published model/dimensions/revision;
+  HTTP направляется на текущий общий URL, не на старый адрес metadata.
   Адрес сам по себе не требует rebuild; fingerprint и returned snapshot остаются
-  исходными. OpenRouter направляется только на канонический URL;
+  исходными;
   mismatch, missing/deleted/stale/corrupt index и HTTP/векторная ошибка явны.
   При ON `extra_body.messages` отклоняется до retrieval/compression/LLM через
   error/done: оно заменило бы собранный RAG-контекст и исказило snapshot.
@@ -890,7 +873,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   схемы. Без top_k старые candidates/final сохраняются; полностью legacy default10/3.
   Отсутствующие rewrite/rerank false; миграция не запускает новый платный вызов.
   save_config пишет только новую схему, restart/fork не возвращают старый top_k.
-- При RAG ON rewrite использует текущие provider и model ID, отдельный `AgentSpec` и
+- При RAG ON rewrite использует текущий model ID, отдельный `AgentSpec` и
   constrained service prompt: исходный вопрос и последние три полные успешные пары
   до сжатия; с дня25 также frozen kind/content рабочей памяти чата. Инструкции
   чата, глобальная память, профиль, инварианты, task FSM, tools и extra_body не наследуются.
@@ -903,7 +886,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 - `Index.retrieve` закрепляет identity и все полные candidate hits в одном SQLite
   чтении. Один query embedding, поиск до candidates_k в cosine/id порядке.
   Предварительного cosine порога нет. Реранкинг получает ВСЕ найденные тексты,
-  использует отдельно выбранные provider/model и constrained JSON вызов timeout60s.
+  использует отдельно выбранный model и constrained JSON вызов timeout60s.
   Валидируется точная полная перестановка source_ids: без bool, дублей, пропусков,
   чужих IDs и выдуманных scores. Промпт явно задаёт фактическое N, допустимые ID
   и требует только JSON без пояснений, Markdown и текста вокруг объекта. Разбор
@@ -953,7 +936,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   legacy и effective API validation. Day22 pinned rebuild/HTTP lookup suite сохранён.
   Это проверка контрактов; качество живой модели на пользовательском корпусе не измеряется.
 
-- `checks/models_check.py` проверяет общие provider payload/auth правила, стандартный
+- `checks/models_check.py` проверяет общие payload/auth правила, стандартный
   usage-only streaming frame, frozen URL при правке в полёте, legacy embedding
   fingerprint с новым runtime адресом, mismatch dimensions, полный rerank permutation,
   actual request capture и одно начисление usage при успехе/ошибке/отмене.

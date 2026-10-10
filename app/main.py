@@ -22,10 +22,10 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import catalog, llm, mcp
+from . import model_settings, catalog, llm, mcp
 from .rag_api import router as rag_router
 from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
-from .config import has_key
+
 from .llm import MissingKeyError
 from .registry import REGISTRY, UnknownAgentError
 from .reminders import ReminderScheduler
@@ -78,8 +78,6 @@ def _next_branch_label() -> str:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    from .config import _load_dotenv
-    _load_dotenv()
     # MCP — до yield: к первому запросу список инструментов уже на руках.
     # Пустой менеджер (нет конфига) неотличим от дня 15.
     await mcp.MANAGER.start(REGISTRY.store)
@@ -125,7 +123,7 @@ async def _context_lengths() -> dict[str, int]:
         models = await catalog.fetch_models()
     except Exception:
         return {}
-    return {m["id"]: m["context_length"] for m in models}
+    return {m["id"]: m.get("context_length") for m in models}
 
 
 async def _pump(
@@ -200,8 +198,8 @@ _FLOAT_FIELDS = tuple(f for f in SAMPLING_FIELDS if f not in _INT_FIELDS)
 PATCHABLE = (
     "label",
     "rag_enabled", "rag_rewrite_enabled",
-    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model",
-    "provider", "reasoning_enabled",
+    "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_model",
+    "reasoning_enabled",
     "system",
     "model",
     "stop",
@@ -245,9 +243,8 @@ def _rag_settings(payload: dict, where: str = "") -> dict:
     if type(threshold) not in (int, float) or not -1 <= threshold <= 1:
         raise HTTPException(400, detail=f"{where}rag_similarity_threshold: number -1..1")
     values["rag_similarity_threshold"] = threshold
-    values["rag_rerank_provider"] = _choice_field(payload, "rag_rerank_provider", ("openrouter", "compatible"), "openrouter", where)
     model = payload.get("rag_rerank_model", DEFAULT_GENERATIVE_MODEL)
-    if not isinstance(model, str) or not model.strip():
+    if not isinstance(model, str):
         raise HTTPException(400, detail="rag_rerank_model: nonempty model ID")
     values["rag_rerank_model"] = model.strip()
     return values
@@ -288,12 +285,12 @@ def _choice_field(payload: dict, name: str, allowed: tuple, default: str, where:
 def _model_field(payload: dict, where: str = "") -> str:
     """id модели: непустая строка. Пусто — 400, а не падение внутри вызова."""
     value = payload.get("model")
-    if isinstance(value, str) and value.strip():
+    if isinstance(value, str):
         return value.strip()
     detail = (
-        f"{where}model: id модели OpenRouter непустой строкой"
+        f"{where}model: id модели непустой строкой"
         if where
-        else "model обязателен: id модели OpenRouter строкой"
+        else "model обязателен: id модели строкой"
     )
     raise HTTPException(status_code=400, detail=detail)
 
@@ -560,7 +557,6 @@ def _parse_spec(payload: dict, where: str) -> AgentSpec:
     return AgentSpec(
         label=str(payload.get("label") or _next_chat_label()),
         model=_model_field(payload, where),
-        provider=_choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter", where),
         rag_enabled=_rag_enabled(payload, where),
         reasoning_enabled=_reasoning_enabled(payload, where),
         **_rag_settings(payload, where),
@@ -597,7 +593,7 @@ async def list_agents() -> dict:
     нет и быть не может — наружу уходит только факт его наличия. Счётчики,
     которых список не касается, живут в /api/health."""
     return {
-        "has_key": has_key(),
+        "has_key": model_settings.settings(REGISTRY.store)["has_api_key"],
         "live": len(REGISTRY),
         "max_agents": REGISTRY.max_agents,
         # Список — по базе: чат, вытесненный из памяти по потолку, из него
@@ -638,11 +634,8 @@ async def create_agents(payload: dict = Body(default=None)) -> dict:
         else _parse_spec(item, f"agents[{i}].")
         for i, item in enumerate(raw)
     ]
-    context_lengths = await _context_lengths() if any(s.provider == "openrouter" for s in specs) else {}
+    context_lengths = await _context_lengths()
     agents = REGISTRY.create_many(specs, context_lengths=context_lengths)
-    for agent in agents:
-        if agent.spec.provider != "openrouter":
-            agent.context_length = None
     return {
         "created": len(agents),
         "spawn_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -682,7 +675,7 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
     sampling = _sampling_fields(payload)
     context = _context_fields(payload)
     rag_enabled = _rag_enabled(payload)
-    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_provider", "rag_rerank_model")}, **payload})
+    rag_settings = _rag_settings({**{name: getattr(agent.spec, name) for name in ("rag_rewrite_enabled", "rag_candidates_k", "rag_final_k", "rag_similarity_threshold", "rag_rerank_enabled", "rag_rerank_reasoning_enabled", "rag_rerank_model")}, **payload})
     # Validate the complete patch before mutating the live configuration.
     validated = {}
     for name, parser in (("model", _model_field), ("label", _label_field),
@@ -693,18 +686,11 @@ async def patch_agent(agent_id: str, payload: dict = Body(...)) -> dict:
         validated["system"] = _text_field(payload, "system")
     if "response_format" in payload:
         validated["response_format"] = _optional_field(payload, "response_format", (dict,), "объект или null")
-    if "provider" in payload:
-        validated["provider"] = _choice_field(payload, "provider", ("openrouter", "compatible"), "openrouter")
     if "reasoning_enabled" in payload:
         validated["reasoning_enabled"] = _reasoning_enabled(payload)
     updated_context_length = agent.context_length
-    if "model" in validated or "provider" in validated:
-        updated_context_length = (await _context_lengths()).get(validated.get("model", agent.spec.model)) if validated.get("provider", agent.spec.provider) == "openrouter" else None
-    if validated.get("provider", agent.spec.provider) == "compatible":
-        effective = {name: sampling.get(name, getattr(agent.spec, name)) if name in payload else getattr(agent.spec, name)
-                     for name in ("top_k", "min_p", "repetition_penalty")}
-        if any(value is not None for value in effective.values()):
-            raise HTTPException(400, "Compatible standard chat API: clear top_k, min_p and repetition_penalty")
+    if "model" in validated:
+        updated_context_length = (await _context_lengths()).get(validated["model"])
     for name, value in validated.items():
         setattr(agent.spec, name, value)
     agent.context_length = updated_context_length
@@ -1169,21 +1155,22 @@ async def get_model_settings() -> dict:
 async def patch_model_settings(request: Request, payload: dict = Body(...)) -> dict:
     from .request_security import trusted_rag_request
     trusted_rag_request(request)
-    if not isinstance(payload, dict) or set(payload) != {"compatible_base_url"}:
-        raise HTTPException(400, "Only compatible_base_url is accepted")
+    from .model_settings import save_settings
     try:
-        return REGISTRY.store.save_model_settings(payload)
-    except ValueError:
-        raise HTTPException(422, "Model URL must be HTTP(S) without credentials, query or fragment") from None
+        return save_settings(payload, REGISTRY.store)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+    except OSError:
+        raise HTTPException(503, "Could not save model connection") from None
 
 
 @app.get("/api/models")
-async def list_models(request: Request, provider: str = "openrouter", purpose: str = "generation") -> dict:
+async def list_models(request: Request, purpose: str = "generation") -> dict:
     from .request_security import trusted_rag_request
     from .rag_models import models
-    from .model_settings import settings
+    from .model_settings import current_connection
     trusted_rag_request(request)
-    return await models(provider, settings(REGISTRY.store)["compatible_base_url"], purpose)
+    return await models(current_connection(REGISTRY.store), purpose)
 
 
 # --- разговор -----------------------------------------------------------------
@@ -1218,14 +1205,6 @@ def _reserve(agent: Agent) -> None:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _require_key(provider="openrouter") -> None:
-    if provider == "openrouter" and not has_key():
-        raise HTTPException(
-            status_code=503,
-            detail="OPENROUTER_API_KEY не найден: скопируйте .env.example в .env и впишите ключ",
-        )
-
-
 @app.post("/api/agents/{agent_id}/messages")
 async def send_message(
     agent_id: str, request: Request, payload: dict = Body(...)
@@ -1233,7 +1212,6 @@ async def send_message(
     """Сообщение агенту. Тело — только текст: ленту диалога хранит агент."""
     agent = _agent(agent_id)
     text = _require_text(payload)
-    _require_key(agent.spec.provider)
     _reserve(agent)
     return _stream(lambda: _chat_events(agent, text), request, agent.release)
 
@@ -1247,7 +1225,6 @@ async def regenerate(agent_id: str, request: Request) -> StreamingResponse:
     неудачная попытка унесла бы и прошлый ответ, и вопрос.
     """
     agent = _agent(agent_id)
-    _require_key(agent.spec.provider)
     _reserve(agent)
     taken = agent.take_last_exchange()
     if taken is None:
@@ -1373,7 +1350,7 @@ async def cancel_scheduled_reminder(agent_id: str, server_name: str, reminder_id
 async def health() -> dict:
     """Что живо прямо сейчас: ключ, реестр, число сохранённых чатов."""
     return {
-        "has_key": has_key(),
+        "has_key": model_settings.settings(REGISTRY.store)["has_api_key"],
         "agents_live": len(REGISTRY),
         "agents_max": REGISTRY.max_agents,
         "agents_evicted": REGISTRY.evicted,

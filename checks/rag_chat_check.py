@@ -84,7 +84,7 @@ def check_rag_chat():
             real_retrieve = Index.retrieve
             def offline_retrieve(index, query, *args, **kwargs):
                 return real_retrieve(index, query, *args, client=embedding, **kwargs)
-            with patch("rag.index.storage_root", lambda: root), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key}), \
+            with patch("rag.index.storage_root", lambda: root), bind_connection(Connection(api_key=fake_key)), \
                  patch.object(Index, "retrieve", offline_retrieve), \
                  patch.object(agents, "stream_completion", _stub.make(grounded)):
                 store = Store(str(root / "chat.db")).init()
@@ -247,7 +247,7 @@ def check_rag_chat():
                         with patch.object(agents, "MANAGER", manager), patch.object(agents, "rag_lookup", lookup), \
                              patch.object(agents, "stream_completion", llm.stream_completion), \
                              patch.object(llm, "shared_client", return_value=provider_client), \
-                             patch.object(llm, "api_key", return_value="offline-provider-key"):
+                             patch.object(llm, "model_key", return_value="offline-provider-key"):
                             chat = agents.Agent(AgentSpec(label="tools", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False))
                             result = await drain(chat.ask("tool question"))
                             assert result[-1]["committed"] and len(received) == 2

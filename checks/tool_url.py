@@ -83,7 +83,7 @@ def check_git_exchange():
                     session = server.session
                     events = []
                     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-                        with patch.object(agent, "MANAGER", manager), patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", llm.stream_completion):
+                        with patch.object(agent, "MANAGER", manager), patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(agent, "stream_completion", llm.stream_completion):
                             exchange = chat.ask("Read this repository: <script>question</script> " + fake_key)
                             async for event in exchange:
                                 events.append(event)

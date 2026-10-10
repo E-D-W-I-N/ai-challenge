@@ -16,7 +16,7 @@
 проверки маршрутизации, объявленных инструментов и изоляции down-сервера.
 RAG — независимый пакет `rag` внутри проекта, не MCP и не отдельный сервис.
 CLI загружает явные HTML-входы, замораживает корпус и атомарно строит SQLite;
-эмбеддинги предоставляет выбранный OpenRouter или OpenAI-совместимый HTTP-сервер. Инспектор «Индекс RAG» читает
+эмбеддинги предоставляет общий OpenAI-совместимый HTTP-сервер. Инспектор «Индекс RAG» читает
 фактическое состояние CLI и документов/чанков/векторов. UI запускает отдельные
 этапы загрузки, разбиения, эмбеддингов и публикации; writer lock общий с CLI.
 Каталог `data/rag` (для standalone CLI также явный `--root`) содержит приватные снимки и отчёты:
@@ -74,12 +74,22 @@ Semantic разбиение использует отдельный generative H
 выбирает IDs границ исходных units; fixed и structural остаются детерминированными.
 Кэш/trace private; проверяем только offline fixtures, без живых LLM вызовов.
 Offline HTTP-эмбеддинги проверяются на нейтральном временном HTML, без инференса.
-Runtime поддерживает только OPENROUTER_API_KEY и RAG_EMBEDDING_API_KEY;
-.env loader принимает только их. Приложение использует data/agents.db, data/rag,
-mcp.json и optional data/rag/inputs.json. Проверки внедряют временные Store/пути
-явно до импорта реестра; прикладные env overrides удалены. Общая генеративная
-модель по умолчанию — openai/gpt-6-luna из независимого shared_models (rag/defaults.py реэкспортирует её).
-Общие provider/endpoint/key/payload правила находятся в shared_models.
+Соединение URL+optional API key хранится серверно в приватном
+`data/model-connection.json` (0600, atomic replace, /data ignored).
+GET model-settings отдаёт base_url/has_api_key/revision, PATCH api_key write-only;
+пустой ключ удаляет, отсутствие поля сохраняет. Нет dotenv/env key loader.
+Standalone CLI --connection-file независим от app. URL+ключ заморожены на
+обмен/операцию, секрет исключён из repr/config/cache/trace/HTTP errors.
+Модели пяти сценариев независимы; новые IDs пустые до явного выбора,
+смена URL не подменяет IDs. Общий /models не угадывает type/цены/context.
+Provider отсутствует в runtime/UI/new saves; legacy chat поля игнорируются.
+Старый RAG индекс/кэш можно пересобрать явно, без compatibility/migration.
+Исторические JSON и RAG snapshots не переписываются. Общий payload —
+Chat Completions reasoning_effort none/medium после extra_body, без
+автоматических OpenRouter plugins/require_parameters. Явные параметры
+сохраняются, unsupported upstream даёт отказ без retry/fallback.
+Приложение использует data/agents.db, data/rag, mcp.json и optional
+ data/rag/inputs.json; checks внедряют temp Store и connection path.
 Reasoning default OFF у пяти независимых селекторов; strictbool/API/persist/fork.
 Чат, сжатие и Rewrite используют chat reasoning_enabled; rerank отдельный флаг.
 Подготовка/чанкинг включают флаг в cache identity; embedding preference исключён
@@ -87,7 +97,7 @@ Reasoning default OFF у пяти независимых селекторов; s
 extra_body, известные aliases не обходят его; наблюдаемое reasoning при OFF —
 фиксированная ошибка с actual usage, без paid retry/fallback. Не обещайте соблюдение
 параметра любым совместимым сервером или внутренний reasoning без reported evidence. Совместимый
-URL единственный для приложения и замораживается на обмен; ключ остаётся runtime.
+URL единственный для приложения; URL и ключ замораживаются на обмен.
 Published embedding identity неизменна: query использует pinned model/revision/dims
 по текущему совместимому URL, смена адреса сама по себе не требует rebuild.
 Прямые зависимости
