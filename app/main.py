@@ -120,7 +120,10 @@ async def index() -> FileResponse:
 async def _context_lengths() -> dict[str, int]:
     """Длины контекста по моделям. Каталог недоступен — просто не покажем заполнение."""
     try:
-        models = await catalog.fetch_models()
+        frozen = model_settings.current_connection(REGISTRY.store)
+        models = await catalog.fetch_models(connection=frozen)
+        if model_settings.current_connection(REGISTRY.store).revision != frozen.revision:
+            return {}
     except Exception:
         return {}
     return {m["id"]: m.get("context_length") for m in models}
@@ -1157,7 +1160,12 @@ async def patch_model_settings(request: Request, payload: dict = Body(...)) -> d
     trusted_rag_request(request)
     from .model_settings import save_settings
     try:
-        return save_settings(payload, REGISTRY.store)
+        old_url = model_settings.settings(REGISTRY.store)["base_url"]
+        saved = save_settings(payload, REGISTRY.store)
+        if saved["base_url"] != old_url:
+            for agent in REGISTRY.list():
+                agent.context_length = None
+        return saved
     except ValueError as error:
         raise HTTPException(422, str(error)) from None
     except OSError:

@@ -49,7 +49,7 @@ def shared_client() -> httpx.AsyncClient:
     if client is None or client.is_closed:
         limit = max_concurrency()
         client = httpx.AsyncClient(
-            timeout=_TIMEOUT,
+            timeout=_TIMEOUT, trust_env=False,
             limits=httpx.Limits(
                 max_connections=max(10, limit * 2),
                 max_keepalive_connections=max(10, limit),

@@ -117,8 +117,7 @@ async def execution(config, git_root, restart_service):
         async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as offline_client:
             with patch.object(agent_module, "stream_completion", llm.stream_completion), \
                     patch.object(llm, "shared_client", return_value=offline_client), \
-                    patch.object(llm, "model_key", return_value="offline-fixture"), \
-                    patch.object(llm, "attribution_headers", return_value={}):
+                    patch.object(llm, "model_key", return_value="offline-fixture"):
                 [event async for event in capture_agent.ask("Через срок проверь пять коммитов")]
                 listing = await manager.reminder_protocol(remote, "reminders", {})
                 capture_job = next(i for i in listing["items"] if i["context_id"] == manager.context_for(capture_agent.id))
@@ -172,8 +171,7 @@ async def execution(config, git_root, restart_service):
                     patch.object(agent_module, "rag_lookup", timeout_lookup), \
                     patch.object(agent_module, "stream_completion", llm.stream_completion), \
                     patch.object(llm, "shared_client", return_value=offline_client), \
-                    patch.object(llm, "model_key", return_value="offline-fixture"), \
-                    patch.object(llm, "attribution_headers", return_value={}):
+                    patch.object(llm, "model_key", return_value="offline-fixture"):
                 [event async for event in timeout_agent.ask("schedule a timeout")]
                 assert timeout_agent.history[-1].rag["answer"] == {"status": "receipt", "citations": []}
                 await until(lambda: len(timeout_agent.history) == 4)

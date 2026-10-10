@@ -195,6 +195,7 @@ def check_rag():
                 except ValueError:
                     pass
             mode["value"] = "ok"
+            write_json(root / "connection.json", {"base_url": config.base_url, "api_key": ""})
             compare = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--connection-file", str(root / "connection.json"), "compare", "--model", config.model], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
             assert compare.returncode == 0, compare.stderr
             comparison = json.loads((root / "comparison.json").read_text())

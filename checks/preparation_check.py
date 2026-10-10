@@ -73,7 +73,7 @@ def check_preparation():
             if mode["value"] == "invalid":
                 result["blocks"][0]["section"] = ""
             if mode["value"] == "reflected":
-                result["title"] = os.environ["OPENROUTER_API_KEY"].strip()
+                result["title"] = "offline-local-key"
             response = {"model": "actual-neutral-model", "choices": [{"finish_reason": "length" if mode["value"] == "length" else "stop",
                         "message": {"content": json.dumps(result)}}], "usage": {"prompt_tokens": 100, "completion_tokens": 70, "total_tokens": 170, "cost": mode["cost"]}}
             status = 200

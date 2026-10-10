@@ -736,10 +736,6 @@ class Agent:
                 self.spec = spec_from_config(saved["config"], fallback=self.spec)
                 self.created_at = saved["created_at"]
                 self.last_used_at = saved["updated_at"]
-                if saved.get("context_length") is not None and context_length is None:
-                    # Метрикам нужен context_fill_pct, а каталог моделей —
-                    # сетевой запрос: восстановление не должно его ждать.
-                    self.context_length = saved["context_length"]
                 self.history = [
                     Turn(
                         role=m["role"],

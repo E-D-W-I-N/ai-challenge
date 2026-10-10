@@ -2,10 +2,10 @@
 import math
 
 
-async def fetch_models(purpose="generation"):
+async def fetch_models(purpose="generation", connection=None):
     from .model_settings import current_connection
     from .rag_models import models
-    return (await models(current_connection(), purpose))["models"]
+    return (await models(connection or current_connection(), purpose))["models"]
 
 
 def normalize(raw):

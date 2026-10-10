@@ -223,7 +223,7 @@ def install_offline(db_path: str | None = None) -> None:
     from pathlib import Path
     mcp.DEFAULT_CONFIG_PATH = Path(main.REGISTRY.store.path).parent / "fixture-no-mcp.json"
 
-    async def no_catalog(purpose="generation"):
+    async def no_catalog(purpose="generation", connection=None):
         return []
 
     if not hasattr(catalog, "_offline_original_fetch_models"):
