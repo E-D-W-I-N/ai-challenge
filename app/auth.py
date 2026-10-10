@@ -140,6 +140,9 @@ class Accounts:
         name, secret = username(name), password(secret)
         encoded = _hasher.hash(secret)
         with self.lock, self.db:
+            actor = current_principal.get(None)
+            if actor is not None and not self.valid(actor):
+                raise HTTPException(401, "Session expired; sign in again")
             if bootstrap and self.db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                 raise HTTPException(409, "Administrator already exists")
             try:
@@ -202,6 +205,9 @@ class Accounts:
         if "enabled" in values and type(values["enabled"]) is not bool:
             raise HTTPException(422, "enabled must be boolean")
         with self.lock, self.db:
+            actor = current_principal.get(None)
+            if actor is not None and not self.valid(actor):
+                raise HTTPException(401, "Session expired; sign in again")
             user = self.user(user_id)
             if user is None:
                 raise HTTPException(404, "User not found")
@@ -324,7 +330,9 @@ async def create_user(body: dict = Body(...)):
 
 @router.patch("/api/users/{user_id}")
 async def update_user(user_id: str, body: dict = Body(...)):
-    return await password_job(accounts().update, user_id, body)
+    if "password" in body:
+        return await password_job(accounts().update, user_id, body)
+    return accounts().update(user_id, body)
 
 
 def main():
