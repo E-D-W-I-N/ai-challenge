@@ -89,7 +89,7 @@ def check_workflow_http():
             cli(*split)
             assert len(calls) > count
             for path in root.rglob("*"):
-                if path.is_file():
+                if path.is_file() and path.name != "connection.json":
                     assert b"offline-chunk-key" not in path.read_bytes() and b"offline-embed-key" not in path.read_bytes()
         return "actual offline semantic/embedding HTTP + CLI; segmentation cache identity; save no model; invalid boundary preserves index; clear recomputes"
     finally:

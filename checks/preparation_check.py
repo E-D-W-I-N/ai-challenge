@@ -195,7 +195,7 @@ def check_preparation():
             mode["section"] = "New section"
             from app.rag_api import StageRequest, start
             from rag.index import Index
-            body = StageRequest(preparation_strategy="llm", preparation_model=config.model, preparation_provider="compatible")
+            body = StageRequest(preparation_strategy="llm", preparation_model=config.model)
             assert body.preparation_strategy == "llm" and body.strategy == "fixed"
             # Dispatch the actual API worker with an operator-owned neutral manifest.
             write_json(root / "inputs.json", inputs)

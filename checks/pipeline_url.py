@@ -74,6 +74,7 @@ def check_pipeline_http():
 
         path = str(Path(tmp) / "app.sqlite")
         store = Store(path).init()
+        store.save_model_settings({"api_key": fake_key})
         manager = mcp.McpManager()
         with service("services.pipeline", tmp, "--repo", str(repo), "--files-dir", str(output)) as (external, url):
             with patch.object(main.REGISTRY, "store", store), patch.object(mcp, "MANAGER", manager), patch.object(agent, "MANAGER", manager), patch.object(mcp, "DEFAULT_CONFIG_PATH", Path(tmp) / "missing.json"):
@@ -133,8 +134,8 @@ def check_pipeline_http():
                     for body in received:
                         assert body["temperature"] == .37 and body["max_tokens"] == 31 and body["seed"] == 42
                         assert {item["function"]["name"]: item["function"]["parameters"] for item in body["tools"]} == schemas
-                        assert body["stream"] is True and body["usage"] == {"include": True}
-                        assert body["provider"]["require_parameters"] is True
+                        assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+                        assert "provider" not in body
                     assert received[1]["messages"][-1] == {"role": "tool", "tool_call_id": "call_1", "content": expected_search}
                     assert json.loads(received[2]["messages"][-2]["tool_calls"][0]["function"]["arguments"]) == {"text": expected_search, "max_items": 3}
                     assert json.loads(received[3]["messages"][-2]["tool_calls"][0]["function"]["arguments"]) == {"name": name, "content": expected_summary}

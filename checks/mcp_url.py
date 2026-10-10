@@ -159,6 +159,7 @@ def check_request_capture():
         chat = agent.Agent(spec, store=store)
         received = []
         fake_key = "fixture-provider-secret-only"
+        store.save_model_settings({"api_key": fake_key})
 
         def provider(request):
             received.append(json.loads(request.content))

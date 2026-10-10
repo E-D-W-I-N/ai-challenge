@@ -11,7 +11,7 @@ import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from shared_models import Connection, bind_connection, key
+from shared_models import Connection, bind_connection, key as runtime_key
 from unittest.mock import patch
 
 import httpx
@@ -111,7 +111,7 @@ def check_rag():
             fake_keys = ("offline-auth-first", "offline-auth-rotated", "offline-auth-rejected")
             mode["key"] = fake_keys[0]
             with bind_connection(Connection(api_key=fake_keys[0])):
-                write_json(root / "connection.json", {"base_url": config.base_url, "api_key": key()})
+                write_json(root / "connection.json", {"base_url": config.base_url, "api_key": runtime_key()})
                 result = subprocess.run(command, capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
             assert result.returncode == 0, result.stderr
             assert authorization and set(authorization) == {f"Bearer {fake_keys[0]}"}
@@ -134,7 +134,7 @@ def check_rag():
             assert authorization[-2:] == [f"Bearer {key}" for key in fake_keys[:2]]
             old_bytes = (root / "index.sqlite").read_bytes()
             with bind_connection(Connection(api_key=fake_keys[2])):
-                write_json(root / "connection.json", {"base_url": config.base_url, "api_key": key()})
+                write_json(root / "connection.json", {"base_url": config.base_url, "api_key": runtime_key()})
                 denied = subprocess.run(command + ["--revision", "unauthorized"], capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
             assert denied.returncode == 1 and "401" in denied.stderr
             assert (root / "index.sqlite").read_bytes() == old_bytes

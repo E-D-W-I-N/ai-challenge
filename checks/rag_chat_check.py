@@ -11,6 +11,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from shared_models import Connection, bind_connection
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -88,6 +89,7 @@ def check_rag_chat():
                  patch.object(Index, "retrieve", offline_retrieve), \
                  patch.object(agents, "stream_completion", _stub.make(grounded)):
                 store = Store(str(root / "chat.db")).init()
+                store.save_model_settings({"api_key": fake_key})
                 agent = agents.Agent(AgentSpec(label="RAG", model="stub/model", rag_enabled=True, rag_rewrite_enabled=False), store=store)
                 _stub.reset(); count = len(calls)
                 events = asyncio.run(drain(agent.ask("neutral question")))

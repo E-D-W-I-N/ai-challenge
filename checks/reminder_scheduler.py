@@ -365,7 +365,7 @@ def clear_acceptance(config, directory):
     manager = mcp.McpManager()
 
     async def external_call(tool, args):
-        async with streamable_http_client(url) as (read, write, _):
+        async with httpx.AsyncClient(trust_env=False) as direct, streamable_http_client(url, http_client=direct) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 return await session.call_tool(tool, args)
