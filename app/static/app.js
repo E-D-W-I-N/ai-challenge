@@ -1234,6 +1234,7 @@ async function exchange(path, body, questionText) {
   let committed = false;
   let answerIndex = null;
   let terminalQuestion = null;
+  let waiting = false;
 
   try {
     await streamPost(
@@ -1242,18 +1243,21 @@ async function exchange(path, body, questionText) {
       (e) => {
         switch (e.event) {
           case "queued":
+            waiting = true;
             const queueStatus = "Ожидание в очереди" + (Number.isInteger(e.position) ? " · позиция " + e.position : "");
             if (!status) { status = cardStatus(queueStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = queueStatus;
             scrollFeed();
             break;
           case "retrieval":
+            waiting = false;
             const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
             if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = retrievalStatus;
             scrollFeed();
             break;
           case "compressing":
+            waiting = false;
             // Служебный вызов — отдельное обращение к модели ДО ответа:
             // пауза уже идёт, и карточка обязана сказать, из-за чего она
             // пустая. Событие приходит, только когда вызов правда будет, —
@@ -1277,6 +1281,7 @@ async function exchange(path, body, questionText) {
             }
             break;
           case "start":
+            waiting = false;
             // Поиск и служебные вызовы завершены: генерация началась.
             const answerStatus = e.generation === false ? "Подходящих фрагментов нет" : "Генерация";
             if (!status) { status = cardStatus(answerStatus); card.insertBefore(status, bodyEl); }
@@ -1364,6 +1369,7 @@ async function exchange(path, body, questionText) {
     );
   } catch (err) {
     if (err.name !== "AbortError") failure = String(err.message || err);
+    else if (waiting && questionText !== null && epoch === state.chatEpoch && state.current?.id === agent.id) terminalQuestion = questionText;
   }
 
   if (status) status.remove();
