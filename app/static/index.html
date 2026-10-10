@@ -14,7 +14,7 @@
           <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M7 33 20 7l13 26M13 25h14" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
           <span class="brand-text">
             <span class="brand-name">AI Challenge</span>
-            <span class="brand-sub">чат · день 26</span>
+            <span class="brand-sub">чат · день 27</span>
           </span>
         </div>
         <button class="icon-btn" id="sidebar-toggle" type="button"
@@ -219,8 +219,11 @@
           </details></div></div>
           <div id="model-app-settings" class="settings-group" hidden><span class="scope-badge">Для всего приложения</span>
           <div class="settings-card"><h3>OpenAI-совместимый сервер</h3>
-            <label class="field"><span class="field-label">URL сервера</span><input id="compatible-base-url" type="url" class="control" placeholder="http://127.0.0.1:8005/v1"></label>
-            <p class="hint">Один сервер для всех сценариев. Ключ задаётся на сервере приложения.</p>
+            <label class="field"><span class="field-label">URL сервера</span><input id="model-base-url" type="url" class="control" placeholder="http://127.0.0.1:8005/v1"></label>
+            <p class="hint">Один сервер для чата и всех этапов RAG. Ключ необязателен.</p>
+            <label class="field"><span class="field-label">API-ключ (необязательно)</span><input id="model-api-key" type="password" class="control" autocomplete="new-password" placeholder="Введите новый ключ"></label>
+            <p id="model-key-status" class="hint" role="status"></p>
+            <button id="model-key-clear" type="button" class="mcp-button">Удалить сохранённый ключ</button>
             <p id="model-settings-status" class="hint" role="status"></p>
           </div></div>
         </section>

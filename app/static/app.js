@@ -8,7 +8,6 @@
 
 const state = {
   agents: [],          // всё, что вернул GET /api/agents
-  hasKey: false,
   current: null,       // открытый агент (полный ответ GET /api/agents/{id})
   models: [],          // каталог моделей для дропдауна
   busy: false,
@@ -18,7 +17,6 @@ const state = {
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
   stick: true,         // лента примотана к низу — доматывать новые ответы
-  baseModel: "",       // модель, с которой чат открыли: с ней сверяем смену
   contextStale: false, // модель сменили — прежняя доля окна к новой не относится
   contextPast: false,  // доля окна осталась от прошлого обмена: последний упал
   statusTimer: null,   // таймер, гасящий строку состояния
@@ -91,10 +89,10 @@ const {
 
 const createSelectors = typeof module !== "undefined" ? require("./models.js") : globalThis.createModelSelectors;
 const modelSelectors = createSelectors({ $, el, api });
-const chatModelPicker = modelSelectors.create({host: $("#chat-model-picker"), modelId: "f-model", reasoningId: "f-reasoning_enabled", providerId: "f-provider",
+const chatModelPicker = modelSelectors.create({host: $("#chat-model-picker"), modelId: "f-model", reasoningId: "f-reasoning_enabled",
   refreshId: "chat-model-refresh", statusId: "chat-model-status", title: "Модель ответа", active: () => !!state.current && state.workspace === "settings" && state.settingsScope === "chat" && state.section === "model" && document.visibilityState !== "hidden",
   onCatalog: models => { state.models = models; renderWarnings(); }});
-const rerankModelPicker = modelSelectors.create({host: $("#rag-rerank-picker"), modelId: "f-rag_rerank_model", reasoningId: "f-rag_rerank_reasoning_enabled", providerId: "f-rag_rerank_provider",
+const rerankModelPicker = modelSelectors.create({host: $("#rag-rerank-picker"), modelId: "f-rag_rerank_model", reasoningId: "f-rag_rerank_reasoning_enabled",
   refreshId: "rag-rerank-model-refresh", statusId: "rag-rerank-model-status", title: "Модель ранжирования",
   active: () => !!state.current && state.workspace === "settings" && state.settingsScope === "chat" && state.section === "rag" && $("#f-rag_enabled").checked && $("#f-rag_rerank_enabled").checked && !$("#rag-current-chat").hidden});
 const createRag = typeof module !== "undefined" ? require("./rag.js") : globalThis.createRagInspector;
@@ -185,7 +183,7 @@ function totalField(name) {
 //
 // Сброс поднимает сама смена модели в панели (`state.contextStale`), а не
 // расхождение имён: провайдер вправе вернуть не то имя, которое просили, —
-// на `openrouter/auto` он так и делает **всегда**, — и сверка имён гасила бы
+// при alias сервер может вернуть другое имя — и сверка имён гасила бы
 // плитку после каждого ответа, навсегда.
 // Метрики упавшего обмена приходят с пустыми числами: заполнены `error`,
 // `model` и время, а `prompt_tokens`, `total_tokens`, `cost_usd`
@@ -319,7 +317,6 @@ async function loadAgents(selectId, navigationTicket = state.navigationRevision)
   const data = await api("/api/agents");
   if (request !== state.agentsRequest) return;
   state.agents = data.agents;
-  state.hasKey = data.has_key;
   renderList();
   if (navigationTicket !== state.navigationRevision) return;
   if (!state.agents.length) { clearChatSelection(); return; }
@@ -1019,7 +1016,7 @@ function autoGrow(input) {
 }
 
 function canCallModel() {
-  return !!state.current && ($("#f-provider").value === "compatible" || state.hasKey);
+  return !!state.current;
 }
 
 function setBusy(busy) {
@@ -1033,11 +1030,6 @@ function setBusy(busy) {
   send.disabled = !busy && !canCallModel();
   $("#input").disabled = busy;
   $("#chat-status").textContent = busy ? "Идёт ответ…" : "";
-  // Про ключ в интерфейсе не говорим и менять его отсюда нельзя: репозиторий
-  // публичный, ключ живёт в .env и остаётся делом того, кто поднял сервер.
-  const unavailable = "OpenRouter не настроен на сервере приложения.";
-  if (state.current && !canCallModel()) hint(unavailable, true);
-  else if ($("#composer-hint").textContent === unavailable) hint("");
 }
 
 function stopStream() {
@@ -1535,7 +1527,7 @@ function syncChatControls() {
   $("#mcp-chat-help").hidden = !chat;
   $("#mcp-heading").hidden = chat;
   ["model", "agent"].forEach(name => $("#tab-" + name).querySelectorAll(".control").forEach(field => {
-    if (field.id !== "compatible-base-url") field.disabled = !chat || noChat;
+    if (!["model-base-url", "model-api-key"].includes(field.id)) field.disabled = !chat || noChat;
   }));
   ragInspector.syncChatControls();
 }
@@ -1698,10 +1690,9 @@ function fillPanel(agent) {
   fillResponseFormat(agent.response_format);
   // Модель ставим сразу, не дожидаясь каталога: панель — источник правды,
   // и её пустоту нельзя пролить в агента.
-  chatModelPicker.set({provider: agent.provider, model: agent.model, reasoning_enabled: agent.reasoning_enabled});
-  rerankModelPicker.set({provider: agent.rag_rerank_provider, model: agent.rag_rerank_model || "openai/gpt-6-luna", reasoning_enabled: agent.rag_rerank_reasoning_enabled});
+  chatModelPicker.set({model: agent.model, reasoning_enabled: agent.reasoning_enabled});
+  rerankModelPicker.set({model: agent.rag_rerank_model || "", reasoning_enabled: agent.rag_rerank_reasoning_enabled});
   syncRagFields();
-  state.baseModel = agent.model;
   chatModelPicker.load().then(renderWarnings);
   saveStatus("");
 }
@@ -1769,10 +1760,11 @@ function syncResponseFormat() {
 }
 
 async function loadModelConnection() {
-  const input = $("#compatible-base-url"), status = $("#model-settings-status");
+  const input = $("#model-base-url"), status = $("#model-settings-status");
   try {
     const saved = await modelSelectors.connection();
-    if (!input.dataset.dirty) { input.value = saved.compatible_base_url; status.textContent = ""; }
+    if (!input.dataset.dirty) { input.value = saved.base_url; status.textContent = ""; }
+    $("#model-key-status").textContent = saved.has_api_key ? "Ключ сохранён" : "Ключ не задан";
   } catch (error) { status.textContent = error.message; }
 }
 
@@ -1806,7 +1798,6 @@ function saveStatus(text, isError) {
 function readPanel() {
   const patch = {
     system: $("#f-system").value,
-    provider: $("#f-provider").value,
     reasoning_enabled: $("#f-reasoning_enabled").checked,
     model: $("#f-model").value.trim(),
     stop: readStopLines($("#f-stop").value),
@@ -1819,7 +1810,6 @@ function readPanel() {
     rag_rewrite_enabled: $("#f-rag_rewrite_enabled").checked,
     rag_rerank_enabled: $("#f-rag_rerank_enabled").checked,
     rag_rerank_reasoning_enabled: $("#f-rag_rerank_reasoning_enabled").checked,
-    rag_rerank_provider: $("#f-rag_rerank_provider").value,
     rag_rerank_model: $("#f-rag_rerank_model").value.trim(),
   };
   PANEL_NUMBERS.forEach((name) => { patch[name] = readNumber(name); });
@@ -1844,9 +1834,7 @@ function renderWarnings() {
     const settings = readPanel();
     warnings = paramWarnings(
       state.models.find((m) => m.id === settings.model),
-      settings,
-      state.current && state.current.extra_body,
-      state.baseModel
+      settings
     );
   } catch (e) {
     warnings = [];   // поле не разобрать — про это скажет строка состояния
@@ -1906,7 +1894,7 @@ function applySettings() {
       state.panelDirty = false;
       // Модель сменили — плитка контекста гаснет сразу, а не после следующего
       // ответа: окно у новой модели другое. Правка температуры её не трогает.
-      if (updated.model !== before.model || (updated.provider || "openrouter") !== (before.provider || "openrouter")) state.contextStale = true;
+      if (updated.model !== before.model) state.contextStale = true;
       renderTiles();
       // Сравнивается не панель с панелью, а конфиг агента до и после:
       // сервер по дороге нормализует (пустой список стоп-строк становится
@@ -2073,15 +2061,34 @@ function init() {
   window.addEventListener?.("pagehide", stopChatPolling);
 
   $("#new-chat").onclick = () => newChat();
-  $("#compatible-base-url").oninput = () => { $("#compatible-base-url").dataset.dirty = "true"; $("#model-settings-status").textContent = "Изменения не сохранены"; };
   let connectionSave = 0;
-  $("#compatible-base-url").onchange = async () => {
-    const input = $("#compatible-base-url"), status = $("#model-settings-status"), draft = input.value, ticket = ++connectionSave;
+  for (const id of ["model-base-url", "model-api-key"]) {
+    const input = $("#" + id);
+    input.oninput = () => { input.dataset.dirty = "true"; $("#model-settings-status").textContent = "Изменения не сохранены"; };
+    input.onchange = async () => {
+      if (!input.dataset.dirty) return;
+      const status = $("#model-settings-status"), draft = input.value, ticket = ++connectionSave;
+      const patch = id === "model-base-url" ? {base_url: draft.trim()} : {api_key: draft};
+      try {
+        const saved = await modelSelectors.saveConnection(patch);
+        if (input.value === draft) {
+          input.value = id === "model-base-url" ? saved.base_url : "";
+          input.dataset.dirty = "";
+        }
+        if (ticket !== connectionSave) return;
+        $("#model-key-status").textContent = saved.has_api_key ? "Ключ сохранён" : "Ключ не задан";
+        status.textContent = input.dataset.dirty ? "Изменения не сохранены" : "Подключение сохранено";
+      } catch (error) { if (ticket === connectionSave && input.value === draft) status.textContent = error.message; }
+    };
+  }
+  $("#model-key-clear").onclick = async () => {
+    const status = $("#model-settings-status"), draft = $("#model-api-key").value, ticket = ++connectionSave;
     try {
-      const saved = await modelSelectors.saveConnection(draft);
-      if (ticket !== connectionSave || input.value !== draft) return;
-      input.value = saved.compatible_base_url; input.dataset.dirty = ""; status.textContent = "URL сохранён";
-    } catch (error) { if (ticket === connectionSave && input.value === draft) status.textContent = error.message; }
+      await modelSelectors.saveConnection({api_key: ""});
+      if (ticket !== connectionSave) return;
+      if ($("#model-api-key").value === draft) { $("#model-api-key").value = ""; $("#model-api-key").dataset.dirty = ""; }
+      $("#model-key-status").textContent = "Ключ не задан"; status.textContent = "Ключ удалён";
+    } catch (error) { if (ticket === connectionSave) status.textContent = error.message; }
   };
   loadModelConnection();
 
@@ -2102,7 +2109,6 @@ function init() {
     // конфига ходит на сервер, и ждать ответа, чтобы убрать с экрана поле,
     // которое уже ни на что не влияет, — значит снова обещать не то.
     if (id === "f-strategy") syncStrategyFields();
-    if (id === "f-provider") setBusy(state.busy);
     if (id === "f-rag_enabled" || id === "f-rag_rewrite_enabled" || id === "f-rag_rerank_enabled") syncRagFields();
     applySettings();
   });

@@ -12,6 +12,7 @@ import httpx
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from shared_models import Connection, bind_connection
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,15 +22,14 @@ from rag.index import Operation, stage_chunks, load_chunks
 from rag.__main__ import main
 
 
-@patch.dict(os.environ, {"OPENROUTER_API_KEY": " offline-chat-key ", "RAG_EMBEDDING_API_KEY": " offline-local-key ",
-                         "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
+@bind_connection(Connection(api_key=" offline-local-key "))
 def check_preparation():
     assert PreparationConfig().timeout_seconds == 600
     default = PreparationConfig()
-    assert default.model == "openai/gpt-6-luna"
-    assert _payload("<p>Neutral</p>", default)["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
+    assert default.model == ""
+    assert _payload("<p>Neutral</p>", default)["reasoning_effort"] == "none"
     assert default.payload_version == "preparation-reasoning-v2"
-    for alternate in (replace(default, model="unverified"), replace(default, provider="compatible"), replace(default, base_url="http://neutral.test/v1", provider="compatible")):
+    for alternate in (replace(default, model="unverified"), replace(default, ), replace(default, base_url="http://neutral.test/v1", )):
         assert _payload("<p>Neutral</p>", alternate).get("reasoning", {}).get("effort", _payload("<p>Neutral</p>", alternate).get("reasoning_effort")) == "none"
     for invalid in (True, False, 0, -1, 3601, float("nan"), float("inf"), "600"):
         try:
@@ -56,7 +56,7 @@ def check_preparation():
     def client_factory(*, timeout, trust_env):
         return real_client(transport=httpx.MockTransport(completion), timeout=timeout, trust_env=False)
     with tempfile.TemporaryDirectory() as directory, patch("rag.preparation.httpx.Client", client_factory):
-        preparer = Preparer(directory, PreparationConfig(timeout_seconds=3600))
+        preparer = Preparer(directory, PreparationConfig(model="neutral", timeout_seconds=3600))
         preparer.prepare("<p>Neutral text</p>", "neutral://timeout")
         assert timeouts == [{"connect": 3600, "read": 3600, "write": 3600, "pool": 3600}]
         assert preparer.report["config"]["timeout_seconds"] == 3600
@@ -73,7 +73,7 @@ def check_preparation():
             if mode["value"] == "invalid":
                 result["blocks"][0]["section"] = ""
             if mode["value"] == "reflected":
-                result["title"] = os.environ["OPENROUTER_API_KEY"].strip()
+                result["title"] = "offline-local-key"
             response = {"model": "actual-neutral-model", "choices": [{"finish_reason": "length" if mode["value"] == "length" else "stop",
                         "message": {"content": json.dumps(result)}}], "usage": {"prompt_tokens": 100, "completion_tokens": 70, "total_tokens": 170, "cost": mode["cost"]}}
             status = 200
@@ -93,7 +93,8 @@ def check_preparation():
             html = root / "neutral.html"
             html.write_text(raw)
             inputs = [{"path": str(html), "source": "neutral://temperature"}]
-            config = PreparationConfig(f"http://127.0.0.1:{server.server_port}/v1", "requested-neutral", provider="compatible")
+            write_json(root / "connection.json", {"base_url": f"http://127.0.0.1:{server.server_port}/v1", "api_key": "offline-local-key"})
+            config = PreparationConfig(f"http://127.0.0.1:{server.server_port}/v1", "requested-neutral", )
             ingest(inputs, root)
             assert not calls  # Default remains fully programmatic.
             legacy = load_corpus(root)
@@ -114,12 +115,12 @@ def check_preparation():
             assert doc["title"] == mode["title"] and all(doc["text"][b["start"]:b["end"]] == b["text"] for b in doc["blocks"])
             stage_chunks(root, "structural", 100, 0)
             assert load_chunks(root)[1]["chunks"][0]["title"] == mode["title"]
-            os.environ["OPENROUTER_API_KEY"] = " rotated-neutral-key "
+            # Runtime key is independent of cache identity.
             cached = ingest(inputs, root, preparation_strategy="llm", preparation_config=config)["preparation"]
             assert len(calls) == 1 and cached["cached"] == 1 and cached["cost_usd"] == 0 and cached["usage"] == {}
             # Rejection before HTTP reports no calls and no charged cost.
             credential_html = root / "credential.html"
-            credential_html.write_text("<p>rotated-neutral-key</p>")
+            credential_html.write_text("<p>offline-local-key</p>")
             try:
                 ingest([{"path": str(credential_html)}], root, preparation_strategy="llm", preparation_config=config)
             except ValueError:
@@ -166,20 +167,19 @@ def check_preparation():
                 pass
             else:
                 raise AssertionError("Metadata changes retained old chunks")
-            local = replace(config, provider="compatible", model="another-neutral")
+            local = replace(config, model="another-neutral")
             ingest(inputs, root, preparation_strategy="llm", preparation_config=local)
             assert calls[-1][1] == "Bearer offline-local-key"
             manifest = root / "manifest.json"
             write_json(manifest, inputs)
             with contextlib.redirect_stdout(io.StringIO()):
-                assert main(["--root", str(root), "--compatible-base-url", local.base_url, "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
-                             "--preparation-model", local.model,
-                             "--preparation-provider", "compatible"]) == 0
+                assert main(["--root", str(root), "--connection-file", str(root / "connection.json"), "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
+                             "--preparation-model", local.model]) == 0
             assert len(calls) == before + 2  # metadata call + compatible server; CLI is a cache hit.
             with contextlib.redirect_stdout(io.StringIO()):
-                assert main(["--root", str(root), "--compatible-base-url", local.base_url, "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
+                assert main(["--root", str(root), "--connection-file", str(root / "connection.json"), "ingest", "--manifest", str(manifest), "--preparation-strategy", "llm",
                              "--preparation-model", local.model,
-                             "--preparation-provider", "compatible", "--preparation-timeout", "1200"]) == 0
+                             "--preparation-timeout", "1200"]) == 0
             assert load_corpus(root)["preparation_config"]["timeout_seconds"] == 1200
             assert len(calls) == before + 3
             # Metadata bounds include sections, even when text itself would fit.
@@ -195,14 +195,14 @@ def check_preparation():
             mode["section"] = "New section"
             from app.rag_api import StageRequest, start
             from rag.index import Index
-            body = StageRequest(preparation_strategy="llm", preparation_model=config.model, preparation_provider="compatible")
+            body = StageRequest(preparation_strategy="llm", preparation_model=config.model)
             assert body.preparation_strategy == "llm" and body.strategy == "fixed"
             # Dispatch the actual API worker with an operator-owned neutral manifest.
             write_json(root / "inputs.json", inputs)
-            with patch("app.rag_api.Index", lambda: Index(root)), patch("app.model_settings.settings", return_value={"compatible_base_url": config.base_url}):
+            with patch("app.rag_api.Index", lambda: Index(root)), patch("app.model_settings.current_connection", return_value=Connection(config.base_url, "offline-local-key")):
                 before = len(calls)
                 acknowledgement = start("ingest", StageRequest(use_manifest=True, preparation_strategy="llm",
-                    preparation_model="api-neutral", preparation_provider="compatible",
+                    preparation_model="api-neutral",
                     preparation_timeout_seconds=1700))
                 assert acknowledgement["state"] == "running"
                 deadline = time.monotonic() + 5

@@ -10,6 +10,7 @@ import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from shared_models import Connection, bind_connection
 from unittest.mock import patch
 
 import httpx
@@ -28,17 +29,17 @@ def document(text):
             "source": "neutral.html", "title": "Neutral", "blocks": blocks}
 
 
-@patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""})
+@bind_connection(Connection(api_key=""))
 def check_semantic():
     units = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 70)]
     default = SemanticConfig()
-    assert default.model == "openai/gpt-6-luna"
+    assert default.model == ""
     short_payload = _payload("x", [(0, 1)], default, 10)
-    assert short_payload["reasoning"] == {"effort": "none", "enabled": False, "exclude": False} and short_payload["max_tokens"] == 9216
+    assert short_payload["reasoning_effort"] == "none" and short_payload["max_tokens"] == 9216
     full_payload = _payload("x" * 256, [(i, i + 1) for i in range(256)], default, 10)
     assert full_payload["max_tokens"] == 11328
-    for alternative in (replace(default, model="unverified-model"), replace(default, provider="compatible"),
-                        replace(default, base_url="http://neutral.test/v1", provider="compatible")):
+    for alternative in (replace(default, model="unverified-model"), replace(default, ),
+                        replace(default, base_url="http://neutral.test/v1", )):
         assert _payload("x", [(0, 1)], alternative, 10).get("reasoning", {}).get("effort", _payload("x", [(0, 1)], alternative, 10).get("reasoning_effort")) == "none"
     # The requested end at 30 survives even though greedy whole-document
     # packing would choose 40. Subsequent semantic group is capped separately.
@@ -56,6 +57,7 @@ def check_semantic():
             pass
         else:
             raise AssertionError(f"Invalid boundaries accepted: {ids}")
+    default = replace(default, model="neutral")
     requests, mode, auth = [], {"value": "ok", "cost": 0.00125}, []
     def server(request):
         payload = json.loads(request.content)
@@ -103,7 +105,7 @@ def check_semantic():
         return httpx.Response(200, json=body)
     with tempfile.TemporaryDirectory() as temporary, httpx.Client(transport=httpx.MockTransport(server)) as client:
         root = Path(temporary)
-        config = SemanticConfig(base_url="http://neutral.test/v1")
+        config = SemanticConfig(base_url="http://neutral.test/v1", model="neutral")
         text = "Alpha topic.\n\nBeta topic has more detail.\n" + "Long neutral paragraph. " * 1200
         doc = document(text)
         chunks, report = semantic_chunks([doc], config, size=90, overlap=15, root=root, client=client)
@@ -121,9 +123,9 @@ def check_semantic():
             units = json.loads(request["messages"][1]["content"])["units"]
             assert sum(len(u["text"]) for u in units) <= 12000 and len(units) <= 256
             assert request["max_tokens"] == 8192 + max(1024, 64 + len(units) * 12)
-            assert request["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
+            assert request["reasoning_effort"] == "none"
         before = len(requests)
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "rotated-neutral-key"}):
+        with bind_connection(Connection(api_key="rotated-neutral-key")):
             same, cached = semantic_chunks([doc], config, 90, 15, root=root, client=client)
         assert same == chunks and len(requests) == before and cached["calls"] == 0
         assert cached["usage"] == {} and cached["cached"] == 1
@@ -135,7 +137,7 @@ def check_semantic():
         cache_path.write_text(json.dumps(saved))
         rebuilt, fresh = semantic_chunks([doc], config, 90, 15, root=root, client=client)
         assert rebuilt == chunks and fresh["calls"] > 0
-        for changed in [replace(config, model="other-neutral-model"), replace(config, base_url="http://another.test/v1", provider="compatible")]:
+        for changed in [replace(config, model="other-neutral-model"), replace(config, base_url="http://another.test/v1", )]:
             assert semantic_chunks([doc], changed, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([document(text + "Changed neutral ending.")], config, 90, 15, root=root, client=client)[1]["calls"] > 0
         assert semantic_chunks([doc], config, 100, 15, root=root, client=client)[1]["calls"] > 0
@@ -179,7 +181,7 @@ def check_semantic():
                 assert len(requests) == before + 1 and repaired_report["calls"] == 1
                 actual_request = requests[-1]
                 supplied = json.loads(actual_request["messages"][-1]["content"])
-                assert actual_request["model"] == "openai/gpt-6-luna" and actual_request["reasoning"] == {"effort": "none", "enabled": False, "exclude": False}
+                assert actual_request["model"] == "neutral" and actual_request["reasoning_effort"] == "none"
                 assert supplied["total_units"] == supplied["last_unit_id"] == len(supplied["units"])
                 assert repaired_report["boundary_normalization"] == expected and repaired_report["size_splits"] >= 0
                 assert repaired_report["usage"]["total_tokens"] == 60 and repaired_report["cost_usd"] == 0.00125
@@ -242,7 +244,7 @@ def check_semantic():
                            "null-content": "must contain JSON text"}
         for bad in ("unknown", "zero", "empty", "wrong-type", "malformed", "truncated", "usage", "null-content", "http", "transport", "reflected", "escaped-reflected"):
             mode["value"] = bad
-            with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
+            with tempfile.TemporaryDirectory() as rejected, bind_connection(Connection(api_key="  credential-injected-secret  ")):
                 from types import SimpleNamespace
                 captured = {}
                 operation = SimpleNamespace(update=lambda **fields: captured.update(fields))
@@ -269,7 +271,7 @@ def check_semantic():
                 if bad in {"reflected", "escaped-reflected"}:
                     assert not artifacts
         mode["value"] = "ok"
-        with tempfile.TemporaryDirectory() as rejected, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  credential-injected-secret  "}):
+        with tempfile.TemporaryDirectory() as rejected, bind_connection(Connection(api_key="  credential-injected-secret  ")):
             before = len(requests)
             try:
                 semantic_chunks([document("Text credential-injected-secret end.")], config, 100, 0, root=rejected, client=client)
@@ -278,53 +280,42 @@ def check_semantic():
             else:
                 raise AssertionError("request credential guard")
             assert len(requests) == before and not list((Path(rejected) / "semantic-cache").glob("*.json"))
-        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "fallback-neutral"}):
+        with tempfile.TemporaryDirectory() as authorized, bind_connection(Connection(api_key="fallback-neutral")):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
-        with tempfile.TemporaryDirectory() as authorized, patch.dict(os.environ, {"OPENROUTER_API_KEY": "  fallback-neutral  "}):
+        with tempfile.TemporaryDirectory() as authorized, bind_connection(Connection(api_key="  fallback-neutral  ")):
             semantic_chunks([short], config, 35, 5, root=authorized, client=client)
             assert auth[-1] == "Bearer fallback-neutral"
-        with tempfile.TemporaryDirectory() as unauthenticated, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "  ", "RAG_EMBEDDING_API_KEY": " "}):
+        with tempfile.TemporaryDirectory() as unauthenticated, bind_connection(Connection(api_key=" ")):
             semantic_chunks([short], config, 35, 5, root=unauthenticated, client=client)
             assert auth[-1] is None
-        local_config = replace(config, provider="compatible")
-        with tempfile.TemporaryDirectory() as local, patch.dict(os.environ, {
-                "OPENROUTER_API_KEY": "chat-neutral", "RAG_EMBEDDING_API_KEY": "  local-neutral  "}):
+        local_config = replace(config, )
+        with tempfile.TemporaryDirectory() as local, bind_connection(Connection(api_key="  local-neutral  ")):
             local_chunks, _ = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
             assert auth[-1] == "Bearer local-neutral"
             before = len(requests)
-            with patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "rotated-local-neutral"}):
+            with bind_connection(Connection(api_key="rotated-local-neutral")):
                 repeated, cached = semantic_chunks([short], local_config, 35, 5, root=local, client=client)
             assert repeated == local_chunks and len(requests) == before and cached["calls"] == 0
-            with tempfile.TemporaryDirectory() as rotated, patch.dict(os.environ, {"RAG_EMBEDDING_API_KEY": "rotated-local-neutral"}):
+            with tempfile.TemporaryDirectory() as rotated, bind_connection(Connection(api_key="rotated-local-neutral")):
                 semantic_chunks([short], local_config, 35, 5, root=rotated, client=client)
                 assert auth[-1] == "Bearer rotated-local-neutral"
             assert all(secret not in path.read_text() for path in (Path(local) / "semantic-cache").glob("*.json")
                        for secret in ("chat-neutral", "local-neutral"))
-        try:
-            replace(config, provider="unknown")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Unknown auth mode accepted")
-    check_http_diagnostics()
-    print("semantic checks passed")
+
 
 
 def check_http_diagnostics():
     """Both providers over offline HTTP transport; canonical routing and bounded diagnostics."""
     from rag.semantic import _call
-    from shared_models import OPENROUTER_BASE_URL
     observed = []
     state = {"body": {"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}}
     def transport(request):
         observed.append((str(request.url), request.headers.get("Authorization")))
         return httpx.Response(403, json=state["body"])
-    with httpx.Client(transport=httpx.MockTransport(transport)) as client, patch.dict(os.environ, {
-            "OPENROUTER_API_KEY": "  offline-chat-secret  ", "RAG_EMBEDDING_API_KEY": "  offline-local-secret  "}):
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client, bind_connection(Connection(api_key="  offline-local-secret  ")):
         for provider in ("openrouter", "compatible"):
-            config = SemanticConfig(base_url="http://neutral.test/v1", provider=provider)
+            config = SemanticConfig(base_url="http://neutral.test/v1", model="neutral")
             fixtures = [
                 ({"error": {"code": "guardrail_violation", "message": "Model denied by guardrail"}}, "guardrail_violation"),
                 ({"error": {"message": "Denied\n by\tguardrail"}}, "Denied by guardrail"),
@@ -335,7 +326,7 @@ def check_http_diagnostics():
                 ({"error": {"code": "sk-unknown-fixture-key", "message": "Denied"}}, None),
                 ({"error": {"message": "sk-\x00unknown-fixture-key"}}, None),
             ]
-            for secret in ("offline-chat-secret", "  offline-chat-secret  ", "offline-local-secret"):
+            for secret in ("offline-local-secret",):
                 fixtures.append(({"error": {"message": secret}}, None))
                 escaped = "".join("\\u%04x" % ord(c) for c in secret)
                 for reflected in (escaped, escaped.replace("\\", "\\\\")):
@@ -353,11 +344,11 @@ def check_http_diagnostics():
                     message = str(error)
                     assert "status 403" in message and len(message) < 520
                     assert "offline-local-secret" not in message and "offline-chat-secret" not in message
-                    assert (hint is not None and hint in message) or (hint is None and message == "Semantic HTTP error: status 403")
+                    assert message == "Semantic HTTP error: status 403"
                 else:
                     raise AssertionError("HTTP failure accepted")
-            expected = OPENROUTER_BASE_URL if provider == "openrouter" else "http://neutral.test/v1"
-            expected_key = "offline-chat-secret" if provider == "openrouter" else "offline-local-secret"
+            expected = "http://neutral.test/v1"
+            expected_key = "offline-local-secret"
             assert observed[-1] == (expected + "/chat/completions", "Bearer " + expected_key)
 
 

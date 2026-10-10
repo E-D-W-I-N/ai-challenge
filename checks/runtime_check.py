@@ -30,12 +30,12 @@ def check_runtime():
         assert Path(store.shared_store().path).is_relative_to(Path(tempfile.gettempdir()))
         assert store.shared_store().path != store.DEFAULT_DB_PATH
         assert AgentRegistry(store=store.shared_store()).max_agents == DEFAULT_MAX_AGENTS
-        assert llm.max_concurrency() == 16 and config.attribution_headers() == {}
+        assert llm.max_concurrency() == 16
         assert mcp.McpManager().disabled is False
         assert storage_root() == Path(__file__).resolve().parent.parent / 'data/rag'
         assert reminders.db_path() == reminders.ROOT / 'data/reminders.db'
         assert pipeline.files_dir() == pipeline.ROOT / 'files'
-        assert main.NEW_CHAT_SPEC.model == cli._parse_args([]).model == DEFAULT_GENERATIVE_MODEL == 'openai/gpt-6-luna'
+        assert main.NEW_CHAT_SPEC.model == cli._parse_args([]).model == DEFAULT_GENERATIVE_MODEL == ''
         with tempfile.TemporaryDirectory() as directory, patch('rag.index.storage_root', lambda: Path(directory)):
             assert status()['manifest_available'] is False
             (Path(directory) / 'inputs.json').write_text('[]')
@@ -58,10 +58,10 @@ def read(path,*args,**kwargs):
     return original(path,*args,**kwargs)
 with patch.object(Path,'read_text',read):
     for _ in range(4):
-        assert config.api_key()=='neutral-runtime-key'
-    config._load_dotenv()
-assert len(reads)==1, reads
-assert os.environ['RAG_EMBEDDING_API_KEY']=='neutral-local-key'
+        from shared_models import key
+        assert key()==''
+assert len(reads)==0, reads
+assert 'RAG_EMBEDDING_API_KEY' not in os.environ
 assert os.environ['HTTP_PROXY']=='preserved-system-proxy'
 assert 'UNKNOWN_SETTING' not in os.environ and 'AGENT_DB_PATH' not in os.environ
 print(json.dumps({'reads':len(reads),'allowed':True}))
@@ -71,8 +71,8 @@ print(json.dumps({'reads':len(reads),'allowed':True}))
         result = subprocess.run([sys.executable, '-c', code, directory], cwd=Path(__file__).resolve().parent.parent,
                                 env=environment, text=True, capture_output=True)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert json.loads(result.stdout) == {'reads': 1, 'allowed': True}
-    return 'retired env ignored; explicit temporary stores; fixed paths/manifest; dotenv two-key allowlist/read-once; shared default'
+        assert json.loads(result.stdout) == {'reads': 0, 'allowed': True}
+    return 'retired env ignored; explicit temporary stores; fixed paths/manifest; dotenv/env keys ignored; shared default'
 
 
 if __name__ == '__main__':

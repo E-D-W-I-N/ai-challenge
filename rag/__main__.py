@@ -22,8 +22,8 @@ from .index import Index, Operation, build_index, stage_chunks, stage_embeddings
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=storage_root(), help="Snapshot directory (default data/rag)")
-    from shared_models import DEFAULT_COMPATIBLE_BASE_URL, endpoint, validate_url
-    parser.add_argument("--compatible-base-url", default=DEFAULT_COMPATIBLE_BASE_URL)
+    from shared_models import endpoint
+    parser.add_argument("--connection-file", type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
     load = commands.add_parser("ingest", help="Explicit URLs/local HTML, never crawl")
     load.add_argument("--url", action="append", default=[])
@@ -31,7 +31,7 @@ def main(argv=None):
     load.add_argument("--preparation-strategy", choices=("programmatic", "llm"), default="programmatic")
     load.add_argument("--preparation-reasoning", action="store_true")
     load.add_argument("--preparation-model", default=PreparationConfig.model)
-    load.add_argument("--preparation-provider", choices=("openrouter", "compatible"), default="openrouter")
+
     load.add_argument("--preparation-timeout", type=float, default=PreparationConfig.timeout_seconds)
     split = commands.add_parser("chunks")
     split.add_argument("--strategy", choices=(*STRATEGIES, "semantic"), default="fixed")
@@ -39,13 +39,13 @@ def main(argv=None):
     split.add_argument("--overlap", type=int, default=180)
     split.add_argument("--semantic-reasoning", action="store_true")
     split.add_argument("--semantic-model", default=SemanticConfig.model)
-    split.add_argument("--semantic-provider", choices=("openrouter", "compatible"), default="openrouter")
+
     commands.add_parser("save")
     clear_command = commands.add_parser("clear")
     clear_command.add_argument("stage", choices=("chunks", "embeddings", "index"))
     for name in ("index", "compare", "embed"):
         command = commands.add_parser(name)
-        command.add_argument("--provider", choices=("openrouter", "compatible"), default="compatible")
+
         command.add_argument("--reasoning", action="store_true", help="Remember this embedding preference; standard embeddings has no reasoning parameter")
         command.add_argument("--model", default=EmbeddingConfig.model)
         command.add_argument("--dimensions", type=int)
@@ -57,12 +57,17 @@ def main(argv=None):
             command.add_argument("--overlap", type=int, default=180)
             command.add_argument("--semantic-reasoning", action="store_true")
             command.add_argument("--semantic-model", default=SemanticConfig.model)
-            command.add_argument("--semantic-provider", choices=("openrouter", "compatible"), default="openrouter")
+
     commands.add_parser("status")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
-        validate_url(args.compatible_base_url)
+        from shared_models import load_connection, bind_connection
+        if args.connection_file is not None and not args.connection_file.is_file():
+            raise ValueError("Model connection file not found")
+        frozen = load_connection(args.connection_file)
+        binding = bind_connection(frozen)
+        binding.__enter__()
         if args.command == "ingest":
             inputs = [{"url": url} for url in args.url]
             if args.manifest:
@@ -77,21 +82,21 @@ def main(argv=None):
             if not inputs:
                 raise ValueError("Provide --url or --manifest")
             with Operation(root, "ingest") as operation:
-                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(endpoint(args.preparation_provider, args.compatible_base_url), args.preparation_model, args.preparation_timeout, provider=args.preparation_provider, reasoning_enabled=args.preparation_reasoning))
+                result = ingest(inputs, root, operation=operation, preparation_strategy=args.preparation_strategy, preparation_config=PreparationConfig(endpoint(), args.preparation_model, args.preparation_timeout, reasoning_enabled=args.preparation_reasoning) if args.preparation_strategy == "llm" else None)
                 operation.update(documents=result["documents"], words=result["words"], state="complete")
         elif args.command == "clear":
             with Operation(root, "delete_" + args.stage) as operation:
                 result = clear(root, args.stage, operation)
         elif args.command == "chunks":
-            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(endpoint(args.semantic_provider, args.compatible_base_url), args.semantic_model, provider=args.semantic_provider, reasoning_enabled=args.semantic_reasoning))
+            result = stage_chunks(root, args.strategy, args.size, args.overlap, semantic_config=SemanticConfig(endpoint(), args.semantic_model, reasoning_enabled=args.semantic_reasoning) if args.strategy == "semantic" else None)
         elif args.command == "save":
             result = save_index(root)
         elif args.command == "status":
             result = Index(root).status()
         else:
-            config = EmbeddingConfig(endpoint(args.provider, args.compatible_base_url), args.model, args.dimensions, args.revision, provider=args.provider, reasoning_enabled=args.reasoning)
+            config = EmbeddingConfig(endpoint(), args.model, args.dimensions, args.revision, reasoning_enabled=args.reasoning)
             if args.command == "index":
-                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(endpoint(args.semantic_provider, args.compatible_base_url), args.semantic_model, provider=args.semantic_provider, reasoning_enabled=args.semantic_reasoning))
+                result = build_index(root, config, args.strategy, args.batch_size, size=args.size, overlap=args.overlap, semantic_config=SemanticConfig(endpoint(), args.semantic_model, reasoning_enabled=args.semantic_reasoning) if args.strategy == "semantic" else None)
             elif args.command == "embed":
                 result = stage_embeddings(root, config, args.batch_size)
             else:
@@ -119,6 +124,10 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, sqlite3.Error, httpx.HTTPError) as error:
         print(str(error), file=sys.stderr)
         return 1
+
+    finally:
+        if "binding" in locals():
+            binding.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

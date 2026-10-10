@@ -1,7 +1,7 @@
 "use strict";
 
-// One catalogue/controller and one searchable provider/model field for every purpose.
-// Runtime credentials never enter the browser; the compatible endpoint is global.
+// One global server and one searchable model field for every purpose.
+// Credentials are submitted separately and never stored in this controller.
 function createModelSelectors({ $, el, api }) {
   const catalogues = new Map(), pickers = new Set();
   let settings = null, settingsRequest = null, saveRequest = null, connectionRevision = 0;
@@ -18,15 +18,16 @@ function createModelSelectors({ $, el, api }) {
     }
     return settingsRequest;
   }
-  async function saveConnection(baseUrl) {
+  async function saveConnection(patch) {
     const revision = ++connectionRevision, previous = saveRequest;
-    for (const picker of pickers) if (picker.value().provider === "compatible") picker.invalidate();
+    catalogues.clear();
+    for (const picker of pickers) picker.invalidate();
     const pending = (previous || Promise.resolve()).catch(() => {}).then(() => api("/api/model-settings", {
-      method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({compatible_base_url: baseUrl.trim()})
+      method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)
     })).then(saved => {
+      settings = saved;
       if (revision === connectionRevision) {
-        settings = saved;
-        for (const picker of pickers) if (picker.value().provider === "compatible") picker.load(true);
+        for (const picker of pickers) picker.load(true);
       }
       return saved;
     });
@@ -34,13 +35,8 @@ function createModelSelectors({ $, el, api }) {
     try { return await pending; }
     finally { if (saveRequest === pending) saveRequest = null; }
   }
-  function create({ host, modelId, providerId, refreshId, statusId, reasoningId = modelId + "-reasoning", title = "Модель", purpose = "generation",
+  function create({ host, modelId, refreshId, statusId, reasoningId = modelId + "-reasoning", title = "Модель", purpose = "generation",
     active = () => true, onCatalog = () => {}, onChange = () => {} }) {
-    const provider = el("select", "control"); provider.id = providerId;
-    for (const [value, label] of [["openrouter", "OpenRouter"], ["compatible", "OpenAI-совместимый"]]) {
-      const option = el("option", "", label); option.value = value; provider.append(option);
-    }
-    provider.value = "openrouter";
     const model = el("input", "control model-search"); model.id = modelId; model.type = "text";
     model.placeholder = "Найти модель или ввести ID"; model.autocomplete = "off";
     const list = el("datalist"); list.id = modelId + "-catalogue"; model.setAttribute("list", list.id);
@@ -49,14 +45,13 @@ function createModelSelectors({ $, el, api }) {
     const status = el("span", "hint model-status"); status.id = statusId; status.setAttribute("role", "status");
     model.setAttribute("aria-describedby", statusId);
     function field(label, input) { const node = el("label", "field"); node.append(el("span", "field-label", label), input); return node; }
-    const row = el("div", "model-selector-row"); row.append(field("Провайдер", provider), field(title, model), refresh);
+    const row = el("div", "model-selector-row"); row.append(field(title, model), refresh);
     const reasoning = el("input", "control"); reasoning.type = "checkbox"; reasoning.id = reasoningId;
     const toggle = el("label", "rag-toggle"); toggle.append(reasoning, el("span", "", "Рассуждения (если модель поддерживает)"));
     host.append(row, list, status, toggle); host.classList.add("model-selector");
     let modelsShown = [], catalogueNote = "";
-    let request = 0, controller = null, pending = null, previousProvider = "openrouter";
-    const drafts = new Map();
-    const value = () => ({provider: provider.value, model: model.value.trim(), reasoning_enabled: reasoning.checked});
+    let request = 0, controller = null, pending = null;
+    const value = () => ({model: model.value.trim(), reasoning_enabled: reasoning.checked});
     function stop() { if (pending) catalogues.delete(pending); request++; controller?.abort(); controller = null; pending = null; refresh.disabled = false; }
     function catalogue(models, message = "") {
       modelsShown = models; catalogueNote = message;
@@ -74,17 +69,21 @@ function createModelSelectors({ $, el, api }) {
     }
     async function load(force = false) {
       if (!active()) return;
-      const revision = connectionRevision, selectedProvider = provider.value, ticket = ++request;
+      const revision = connectionRevision, ticket = ++request;
       controller?.abort(); controller = null; pending = null;
       try {
         const config = await connection();
-        if (ticket !== request || revision !== connectionRevision || selectedProvider !== provider.value || !active()) return;
-        const base = selectedProvider === "openrouter" ? "https://openrouter.ai/api/v1" : config.compatible_base_url;
-        const identity = `${selectedProvider}:${base}:${purpose}`;
+        if (ticket !== request || revision !== connectionRevision || !active()) return;
+        const identity = `${config.base_url}:${config.revision}:${purpose}`;
         if (!force && catalogues.has(identity)) { catalogue(catalogues.get(identity)); return; }
         controller = new AbortController(); pending = identity; refresh.disabled = true; status.textContent = "Загрузка моделей…";
-        const data = await api(`/api/models?provider=${selectedProvider}&purpose=${purpose}`, {signal: controller.signal});
-        if (ticket !== request || revision !== connectionRevision || selectedProvider !== provider.value || !active()) return;
+        const data = await api(`/api/models?purpose=${purpose}`, {signal: controller.signal});
+        if (ticket !== request || revision !== connectionRevision || !active()) return;
+        if ((data.base_url != null && data.base_url !== config.base_url) ||
+            (data.revision != null && data.revision !== config.revision)) {
+          settings = null;
+          throw new Error("Каталог принадлежит другому подключению.");
+        }
         const models = data.models || []; catalogues.set(identity, models); catalogue(models);
       } catch (error) {
         if (error.name !== "AbortError" && ticket === request && active()) {
@@ -94,21 +93,14 @@ function createModelSelectors({ $, el, api }) {
     }
     function restore(config = {}) {
       if (!reasoning.dataset.dirty) reasoning.checked = config.reasoning_enabled === true;
-      if (provider.dataset.dirty || model.dataset.dirty) return;
-      stop(); provider.value = config.provider === "compatible" ? "compatible" : "openrouter";
-      model.value = config.model || ""; previousProvider = provider.value;
-      drafts.clear(); drafts.set(previousProvider, model.value); catalogue([], "Каталог ещё не загружен.");
+      if (model.dataset.dirty) return;
+      stop(); model.value = config.model || ""; catalogue([], "Каталог ещё не загружен.");
     }
     function set(config = {}) {
-      provider.dataset.dirty = ""; model.dataset.dirty = ""; reasoning.dataset.dirty = ""; restore(config);
+      model.dataset.dirty = ""; reasoning.dataset.dirty = ""; restore(config);
     }
-    provider.onchange = () => {
-      drafts.set(previousProvider, model.value); stop();
-      model.value = drafts.get(provider.value) ?? ""; previousProvider = provider.value;
-      provider.dataset.dirty = model.dataset.dirty = "true"; catalogue([], "Каталог ещё не загружен."); onChange(); load();
-    };
     model.oninput = () => { model.dataset.dirty = "true"; };
-    model.onchange = () => { model.dataset.dirty = "true"; drafts.set(provider.value, model.value); if (!controller) catalogue(modelsShown, catalogueNote); onChange(); };
+    model.onchange = () => { model.dataset.dirty = "true"; if (!controller) catalogue(modelsShown, catalogueNote); onChange(); };
     reasoning.onchange = () => { reasoning.dataset.dirty = "true"; onChange(); };
     refresh.onclick = () => load(true);
     const picker = {value, load, stop, cancel: stop, active, restore, set, invalidate: () => { stop(); catalogue([], "Сервер изменён. Каталог обновляется при открытии сценария."); }, pending: () => pending};

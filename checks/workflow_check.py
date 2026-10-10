@@ -10,6 +10,7 @@ import httpx
 from rag import workflow
 from rag.artifacts import clear, available
 from rag.documents import ingest, write_json
+from rag.semantic import SemanticConfig
 from rag.embeddings import EmbeddingConfig
 from rag.index import Index, Operation, stage_chunks, stage_embeddings, save_index
 
@@ -78,7 +79,7 @@ def check_workflow():
                 "content": json.dumps({"end_unit_ids": [item["id"] for item in units]})}}],
                 "model": "actual-offline-boundaries", "usage": {"total_tokens": 17, "cost": 0.002}})
         with httpx.Client(transport=httpx.MockTransport(semantic)) as client:
-            stage_chunks(root, "semantic", 400, 40, client=client)
+            stage_chunks(root, "semantic", 400, 40, client=client, semantic_config=SemanticConfig(model="offline-chunk"))
             cache_count = len(semantic_calls)
             durable = workflow.stages(root)["chunks"]["report"]
             assert durable["model"] == "actual-offline-boundaries" and durable["usage"]["total_tokens"] == 17 * cache_count
@@ -91,14 +92,14 @@ def check_workflow():
                 except OSError:
                     pass
                 try:
-                    stage_chunks(root, "semantic", 400, 40, client=client)
+                    stage_chunks(root, "semantic", 400, 40, client=client, semantic_config=SemanticConfig(model="offline-chunk"))
                     raise AssertionError("Revived deleted semantic cache after failed cleanup")
                 except OSError:
                     pass
             assert workflow.stages(root)["chunks"] is None
             assert not available(root, "semantic-cache") and (root / "semantic-cache").exists()
             assert len(semantic_calls) == cache_count
-            retry = stage_chunks(root, "semantic", 400, 40, client=client)
+            retry = stage_chunks(root, "semantic", 400, 40, client=client, semantic_config=SemanticConfig(model="offline-chunk"))
             assert available(root, "semantic-cache") and len(semantic_calls) > cache_count and retry["report"]["cached"] == 0
         # Failed initial progress must not retain the writer lock.
         with patch("rag.index.write_json", side_effect=OSError("offline progress denied")):

@@ -19,7 +19,7 @@ def check_reasoning():
     from rag.embeddings import EmbeddingConfig, Embeddings
     from rag.semantic import SemanticConfig, _payload as semantic_payload, _call
     from rag.preparation import PreparationConfig, _payload as preparation_payload
-    from shared_models import bind_compatible_url, generation_payload
+    from shared_models import Connection, bind_connection, generation_payload
 
     overrides = {"reasoning": {"enabled": True, "effort": "high", "exclude": True},
                  "reasoning_effort": "high", "include_reasoning": True, "thinking": {"type": "enabled"},
@@ -29,24 +29,20 @@ def check_reasoning():
                  "provider": {"require_parameters": False, "order": ["neutral"]}}
     for provider in ("openrouter", "compatible"):
         for enabled in (False, True):
-            spec = AgentSpec(label="neutral", model="neutral/model", provider=provider, reasoning_enabled=enabled, extra_body=overrides)
+            spec = AgentSpec(label="neutral", model="neutral/model", reasoning_enabled=enabled, extra_body=overrides)
             body = llm.build_payload(spec, [])
             assert body["seed"] == 8 and body["chat_template_kwargs"] == {"neutral": 42} and body["output_config"] == {"neutral": 7}
             assert not {"enable_thinking", "thinking_budget", "thinking"} & body.keys()
-            if provider == "openrouter":
-                assert body["reasoning"] == ({"enabled": True, "exclude": False} if enabled else {"effort": "none", "enabled": False, "exclude": False})
-                assert body["provider"]["require_parameters"] is True and "reasoning_effort" not in body
-            else:
-                assert body["reasoning_effort"] == ("medium" if enabled else "none") and "reasoning" not in body
-            assert generation_payload(body, provider, reasoning_enabled=enabled) == body
-            semantic = SemanticConfig(model="neutral/model", provider=provider, reasoning_enabled=enabled)
-            preparation = PreparationConfig(model="neutral/model", provider=provider, reasoning_enabled=enabled)
+            assert body["reasoning_effort"] == ("medium" if enabled else "none") and "reasoning" not in body
+            assert generation_payload(body, reasoning_enabled=enabled) == body
+            semantic = SemanticConfig(model="neutral/model", reasoning_enabled=enabled)
+            preparation = PreparationConfig(model="neutral/model", reasoning_enabled=enabled)
             for service in (semantic_payload("neutral", [(0, 7)], semantic, 64), preparation_payload("<p>neutral</p>", preparation)):
                 assert service.get("reasoning") == body.get("reasoning") and service.get("reasoning_effort") == body.get("reasoning_effort")
-        assert SemanticConfig(provider=provider).fingerprint() != SemanticConfig(provider=provider, reasoning_enabled=True).fingerprint()
+        assert SemanticConfig(model="neutral/model").fingerprint() != SemanticConfig(model="neutral/model", reasoning_enabled=True).fingerprint()
 
     for field, value in (("configuration_update", {"reasoning": {"enabled": True}}), ("output_config", {"effort": "high"})):
-        try: generation_payload({"messages": [{"role": "user", "content": "neutral", field: value}]}, "openrouter")
+        try: generation_payload({"messages": [{"role": "user", "content": "neutral", field: value}]})
         except ValueError: pass
         else: raise AssertionError("per-message override bypassed OFF")
     for cls in (SemanticConfig, PreparationConfig, EmbeddingConfig):
@@ -89,7 +85,7 @@ def check_reasoning():
         assert client.patch(route, json={"reasoning_enabled": False}).json()["rag_rerank_reasoning_enabled"] is True
         client.delete(route)
 
-    embedding = EmbeddingConfig(model="neutral/embed", provider="compatible")
+    embedding = EmbeddingConfig(model="neutral/embed", )
     assert embedding.fingerprint() == replace(embedding, reasoning_enabled=True).fingerprint()
     archived = asdict(embedding); archived.pop("reasoning_enabled")
     assert EmbeddingConfig(**archived).fingerprint() == embedding.fingerprint()
@@ -108,7 +104,7 @@ def check_reasoning():
         return httpx.Response(200, json={"choices": [{"message": {"content": '{"end_unit_ids":[1]}'}, "finish_reason": "stop"}],
             "usage": {"total_tokens": 5, "completion_tokens_details": {"reasoning_tokens": 2}}})
     with httpx.Client(transport=httpx.MockTransport(semantic_response)) as client:
-        config = SemanticConfig(model="neutral/model", provider="compatible")
+        config = SemanticConfig(model="neutral/model", )
         try: _call(client, config, semantic_payload("neutral", [(0, 7)], config, 64), traced.append)
         except ValueError as error: assert "reasoning while disabled" in str(error)
         else: raise AssertionError("synchronous reasoning bypassed OFF")
@@ -128,17 +124,17 @@ def check_reasoning():
                                "completion_tokens_details": {"reasoning_tokens": 1 if evidence is None else 0}}}]
                     return httpx.Response(200, text="".join("data: " + json.dumps(f) + "\n\n" for f in frames) + "data: [DONE]\n\n")
                 async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-                    with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value="neutral-test-key"), bind_compatible_url("http://neutral.test/v1"), llm.capture_requests() as requests:
-                        events = [event async for event in llm.stream_completion(AgentSpec(label="neutral", model="neutral/model", provider=provider), prompt_override=[])]
+                    with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "model_key", return_value="neutral-test-key"), bind_connection(Connection("http://neutral.test/v1")), llm.capture_requests() as requests:
+                        events = [event async for event in llm.stream_completion(AgentSpec(label="neutral", model="neutral/model", ), prompt_override=[])]
                 assert not any(event["type"] == "tool_calls" for event in events)
                 assert any(event["type"] == "error" for event in events) and events[-1]["metrics"]["error"]
                 assert events[-1]["text"] == "" and events[-1]["metrics"]["total_tokens"] == 5 and events[-1]["metrics"]["cost_usd"] == .001
                 assert requests == captured and len(captured) == 1
             # Chat rewrite inherits ON; independent rerank remains OFF.
             _stub.reset()
-            await rag.rewrite("neutral", [], "neutral/model", _stub.make('{"query":"neutral"}'), asyncio.Event(), provider=provider, reasoning_enabled=True)
+            await rag.rewrite("neutral", [], "neutral/model", _stub.make('{"query":"neutral"}'), asyncio.Event(), reasoning_enabled=True)
             snapshot = {"hits": [{"text": "neutral"}], "candidates": [{"text": "neutral"}]}
-            spec = AgentSpec(label="neutral", model="neutral/model", provider=provider, reasoning_enabled=True, rag_rerank_provider=provider)
+            spec = AgentSpec(label="neutral", model="neutral/model", reasoning_enabled=True, rag_rerank_model="neutral/ranker")
             await rag.rerank("neutral", snapshot, spec, _stub.make('{"source_ids":[1]}'), asyncio.Event())
             first, second = [call["payload"] for call in _stub.CALLS]
             assert first.get("reasoning", {}).get("enabled", first.get("reasoning_effort") == "medium")
@@ -146,7 +142,7 @@ def check_reasoning():
             for enabled in (False, True):
                 with tempfile.TemporaryDirectory(prefix="neutral-compression-") as temporary:
                     store = Store(Path(temporary) / "chat.sqlite").init()
-                    spec = AgentSpec(label="neutral", model="neutral/model", provider=provider, reasoning_enabled=enabled,
+                    spec = AgentSpec(label="neutral", model="neutral/model", reasoning_enabled=enabled,
                                      strategy="summary", keep_last=0, compress_every=2)
                     chat = agent.Agent(spec, store=store)
                     chat.history = [agent.Turn(role="user", content="neutral"), agent.Turn(role="assistant", content="neutral answer")]

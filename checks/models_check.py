@@ -20,17 +20,17 @@ def check_models():
     from app import agent as agents, main, llm, rag
     from app.schema import AgentSpec
     from app.store import Store
-    from shared_models import bind_compatible_url, endpoint, OPENROUTER_BASE_URL
+    from shared_models import Connection, bind_connection, endpoint
     from rag.documents import ingest
     from rag.embeddings import EmbeddingConfig
     from rag.index import Index, build_index
 
-    generic = AgentSpec(label="neutral", model="same-id", provider="compatible")
+    generic = AgentSpec(label="neutral", model="same-id", )
     payload = llm.build_payload(generic, [{"role": "user", "content": "neutral"}])
     assert not ({"provider", "plugins", "usage", "reasoning"} & set(payload))
     assert payload["stream_options"] == {"include_usage": True}
     router = llm.build_payload(AgentSpec(label="neutral", model="same-id"), [])
-    assert router["provider"] == {"require_parameters": True} and router["usage"] == {"include": True}
+    assert router["reasoning_effort"] == "none" and router["stream_options"] == {"include_usage": True}
     legacy = agents.spec_from_config({"model": "saved-exact-id", "rag_final_k": 7, "rag_candidates_k": 20}, fallback=generic)
     assert legacy.model == "saved-exact-id" and legacy.rag_final_k == 7 and legacy.rag_candidates_k == 20 and not legacy.rag_rerank_enabled
 
@@ -58,9 +58,9 @@ def check_models():
         def status(self): return copy.deepcopy(archived)
     with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=legacy_stages):
         restored = rag_api.status()
-    assert restored["stages"]["corpus"]["preparation_config"] == {"provider": "compatible", "model": "saved-prep"}
-    assert restored["stages"]["chunks"]["semantic_config"] == {"provider": "openrouter", "model": "saved-chunks"}
-    assert restored["embedding_defaults"]["provider"] == "compatible"
+    assert restored["stages"]["corpus"]["preparation_config"] == {"model": "saved-prep"}
+    assert restored["stages"]["chunks"]["semantic_config"] == {"model": "saved-chunks"}
+    assert "provider" not in restored["embedding_defaults"]
     assert restored["index"] == archived["index"] and legacy_stages == original
     restored["embedding_defaults"]["model"] = "editable"
     assert restored["stages"]["embeddings"]["embedding_config"]["model"] == "saved-vector"
@@ -68,10 +68,6 @@ def check_models():
     enabled_stages["embeddings"]["embedding_config"]["reasoning_enabled"] = True
     with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=enabled_stages):
         assert rag_api.status()["embedding_defaults"]["reasoning_enabled"] is True
-    invalid = copy.deepcopy(original); invalid["corpus"]["preparation_config"]["auth_mode"] = "unknown"
-    with patch.object(rag_api, "Index", StatusIndex), patch.object(rag_api.workflow, "stages", return_value=invalid):
-        assert "stage_error" in rag_api.status()
-
     async def collect(response):
         return [event async for event in response]
 
@@ -85,7 +81,7 @@ def check_models():
                       {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}]
             return httpx.Response(200, text="".join("data: " + json.dumps(f) + "\n\n" for f in frames) + "data: [DONE]\n\n")
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            with patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""}), bind_compatible_url("http://neutral.test/v1"):
+            with patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "RAG_EMBEDDING_API_KEY": ""}), bind_connection(Connection("http://neutral.test/v1")):
                 result = await collect(llm.stream_completion(generic, prompt_override=[]))
         assert result[-1]["text"] == "neutral" and result[-1]["metrics"]["total_tokens"] == 5
         assert result[-1]["metrics"]["cost_usd"] is None
@@ -96,7 +92,7 @@ def check_models():
     with tempfile.TemporaryDirectory(prefix="models-neutral-") as temp:
         root = Path(temp)
         store = Store(root / "chat.sqlite").init()
-        store.save_model_settings({"compatible_base_url": "http://new-neutral.test/v1"})
+        store.save_model_settings({"base_url": "http://new-neutral.test/v1"})
         reopened = Store(root / "chat.sqlite").init()
         assert reopened.load_model_settings() == store.load_model_settings()
         reopened.close()
@@ -139,9 +135,9 @@ def check_models():
             else: raise AssertionError("Wrong dimension accepted")
 
         async def pipeline():
-            spec = AgentSpec(label="rerank", model="saved-chat", provider="compatible", rag_enabled=True,
+            spec = AgentSpec(label="rerank", model="saved-chat", rag_enabled=True,
                              rag_candidates_k=10, rag_final_k=2, rag_rerank_enabled=True,
-                             rag_rerank_provider="compatible", rag_rerank_model="saved-ranking-model")
+                             rag_rerank_model="saved-ranking-model")
             chat = agents.Agent(spec, store=store)
             lookup_urls = []; round_urls = []
             def candidates(index, query, top_k, **options):
@@ -150,10 +146,10 @@ def check_models():
                     {"chunk_id": str(i), "source": "fixture:" + str(i), "text": "neutral text " + str(i), "score": score}
                     for i, score in enumerate((.9, .3, .1))][:top_k]}
             def reply(messages, index):
-                round_urls.append(endpoint("compatible"))
+                round_urls.append(endpoint())
                 if index == 0:
                     # User changes settings during an in-flight ask; this ask remains on its frozen URL.
-                    store.save_model_settings({"compatible_base_url": "http://later-neutral.test/v1"})
+                    store.save_model_settings({"base_url": "http://later-neutral.test/v1"})
                     return '{"query":"neutral rewritten"}'
                 return 'Neutral ranking explanation.\n{"source_ids":[3,1,2]}\nNeutral prose recommends one, two, three instead.' if index == 1 else json.dumps({"answer": "neutral final [1]", "citations": [{"source_id": 1, "quote": "neutral text 2"}]})
             _stub.reset()
@@ -224,13 +220,13 @@ def check_models():
             assert cancelled["cancelled"] and "source_ids" not in cancelled and cancelled["usage"]["total_tokens"] == 17
         asyncio.run(pipeline())
         store.close()
-    with TestClient(main.app) as client, patch.object(main, "has_key", return_value=False), patch.object(agents, "stream_completion", _stub.make()):
-        created = client.post("/api/agents", json={"agent": {"label": "compatible", "model": "neutral", "provider": "compatible"}}).json()["agents"][0]
+    with TestClient(main.app) as client, patch.object(agents, "stream_completion", _stub.make()):
+        created = client.post("/api/agents", json={"agent": {"label": "compatible", "model": "neutral"}}).json()["agents"][0]
         route = f'/api/agents/{created["id"]}'
-        assert created["provider"] == "compatible" and main.REGISTRY.require(created["id"]).context_length is None
+        assert "provider" not in created and main.REGISTRY.require(created["id"]).context_length is None
         assert client.post(route + "/messages", json={"text": "neutral"}).status_code == 200
         assert client.post(route + "/regenerate").status_code == 200
-        assert client.patch("/api/model-settings", json={"compatible_base_url": "http://user:secret@neutral.test"}).status_code == 422
-        assert client.patch("/api/model-settings", json={"compatible_base_url": "http://neutral.test/v1"}, headers={"Origin": "https://cross.test"}).status_code == 403
+        assert client.patch("/api/model-settings", json={"base_url": "http://user:secret@neutral.test"}).status_code == 422
+        assert client.patch("/api/model-settings", json={"base_url": "http://neutral.test/v1"}, headers={"Origin": "https://cross.test"}).status_code == 403
         client.delete(route)
-    return "provider payload/auth; optional compatible key; frozen shared URL; legacy embedding identity/current dispatch; full permutation/strict failure/paid usage"
+    return "common payload/auth; optional key; frozen connection; embedding identity/current dispatch; full permutation/strict failure/paid usage"
