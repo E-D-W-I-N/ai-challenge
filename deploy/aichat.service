@@ -1,7 +1,7 @@
 [Unit]
 Description=Private authenticated chat
 After=network-online.target aichat-ollama.service
-Requires=aichat-ollama.service
+Wants=aichat-ollama.service
 
 [Service]
 User=aichat

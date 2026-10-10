@@ -40,6 +40,7 @@ class Lease:
     token: str
     model_ids: tuple[str, ...]
     cancel: object = field(default=None, repr=False, compare=False)
+    base_url: str = ""
 
     def check(self):
         if self.cancel is not None and self.cancel():
@@ -50,6 +51,7 @@ class Lease:
 class _Ticket:
     model_ids: tuple[str, ...]
     cancel: object = None
+    base_url: str = ""
     lease: Lease | None = None
 
 
@@ -105,6 +107,8 @@ def cpu_capacity():
 
 def _profile():
     global _boot, _ceiling
+    if _policy_path() is None:
+        return {"ceiling": 16, "base_url": None, "models": {}}
     value = json.loads(_policy_path().read_text())
     if (value["base_url"] != "http://127.0.0.1:11434/v1"
             or any(type(value[name]) is not int or value[name] <= 0
@@ -138,23 +142,30 @@ def _ready(profile):
     return True
 
 
-def _status():
+def _status(local=True):
     global _ceiling
     result = {"ceiling": _ceiling, "active": len(_leases), "available_bytes": 0,
               "reserved_bytes": 0, "ready": False, "reason": "Inference capacity is not configured.",
               "context_limit": 4096, "output_limit": 512,
-              "queued": len(_waiting), "queue_limit": None}
+              "queued": len(_waiting), "queue_limit": None, "runners_ready": False}
     try:
         profile = _profile()
+        if _policy_path() is None:
+            _ceiling = 16
+            result.update(ceiling=16, ready=True, reason="", runners_ready=True,
+                          available_bytes=None, context_limit=None, output_limit=None, queue_limit=128)
+            return profile, result
         total, available = memory()
         reserve = max(profile["reserve_bytes"], GIB, total // 5)
         reserved = len(_leases) * profile["lease_bytes"]
         slots = max(len(_leases), len(_leases) + max(0, available - reserve - reserved) // profile["lease_bytes"])
         _ceiling = min(profile["ceiling"], slots)
         result.update(ceiling=_ceiling, available_bytes=available, reserved_bytes=reserved,
-                      context_limit=profile["context_limit"], output_limit=profile["output_limit"],
+                      context_limit=profile["context_limit"] if local else None,
+                      output_limit=profile["output_limit"] if local else None,
                       queued=len(_waiting), queue_limit=max(1, profile["ceiling"] * 8))
-        if not _ready(profile):
+        result["runners_ready"] = not local or _ready(profile)
+        if not result["runners_ready"]:
             result["reason"] = "Load both configured models explicitly before accepting requests."
         elif not _ceiling or available < reserve + reserved:
             result["reason"] = "Waiting for sufficient available RAM."
@@ -166,26 +177,25 @@ def _status():
 
 
 def limits():
-    if _policy_path() is None:
-        return {"ceiling": None, "active": 0, "available_bytes": None, "reserved_bytes": 0,
-                "ready": True, "reason": "", "context_limit": None, "output_limit": None,
-                "queued": 0, "queue_limit": None}
+    from . import endpoint
     with _lock:
-        return _status()[1]
+        return _status(local=endpoint() == "http://127.0.0.1:11434/v1")[1]
 
 
 def _enqueue(model_ids, cancel=None):
+    from . import endpoint
     with _lock:
         try:
             profile = _profile()
         except (OSError, ValueError, KeyError, TypeError, ResourceBusy):
             raise ResourceBusy("Inference capacity is not configured.") from None
+        base_url = endpoint()
         names = tuple(sorted(set(name for name in model_ids if name)))
-        if not names or any(name not in profile["models"] for name in names):
+        if not names or (base_url == profile["base_url"] and any(name not in profile["models"] for name in names)):
             raise ResourceBusy("The selected model is not in the deployed capacity profile.")
         if len(_waiting) >= profile["ceiling"] * 8:
             raise ResourceBusy("The inference queue is full; retry later.")
-        ticket = _Ticket(names, cancel)
+        ticket = _Ticket(names, cancel, base_url)
         _waiting.append(ticket)
         return ticket
 
@@ -197,17 +207,20 @@ def _try_start(ticket):
         position = _waiting.index(ticket) + 1
         if position != 1:
             return None, {"position": position, "reason": "Waiting in FIFO order."}
-        profile, status = _status()
+        local = _policy_path() is not None and ticket.base_url == "http://127.0.0.1:11434/v1"
+        profile, status = _status(local=local)
         if profile is None:
             raise ResourceBusy(status["reason"])
-        if any(name not in profile["models"] for name in ticket.model_ids):
+        if local and any(name not in profile["models"] for name in ticket.model_ids):
             raise ResourceBusy("The capacity profile no longer includes the selected model.")
+        if not status["runners_ready"]:
+            raise ResourceBusy(status["reason"])
         if not status["ready"] or len(_leases) >= _ceiling:
             return None, {"position": 1, "reason": status["reason"] or "Waiting for a free inference slot."}
-        for name in ticket.model_ids:
-            if sum(name in lease.model_ids for lease in _leases.values()) >= profile["models"][name]["slots"]:
+        for name in ticket.model_ids if local else ():
+            if sum(lease.base_url == ticket.base_url and name in lease.model_ids for lease in _leases.values()) >= profile["models"][name]["slots"]:
                 return None, {"position": 1, "reason": "Waiting for the selected model runner."}
-        ticket.lease = Lease(uuid.uuid4().hex, ticket.model_ids, ticket.cancel)
+        ticket.lease = Lease(uuid.uuid4().hex, ticket.model_ids, ticket.cancel, ticket.base_url)
         _leases[ticket.lease.token] = ticket.lease
         _waiting.remove(ticket)
         return ticket.lease, {"position": 0, "reason": ""}
@@ -223,8 +236,6 @@ def _withdraw(ticket):
 
 def acquire(model_ids: tuple[str, ...], purpose: str, *, cancel=None, on_queue=None) -> Lease:
     """Worker counterpart of acquire_async, sharing the same finite FIFO."""
-    if _policy_path() is None:
-        return Lease("local", tuple(model_ids), cancel)
     ticket = _enqueue(model_ids, cancel)
     previous = None
     try:
@@ -244,8 +255,6 @@ def acquire(model_ids: tuple[str, ...], purpose: str, *, cancel=None, on_queue=N
 
 
 async def acquire_async(model_ids: tuple[str, ...], purpose: str, *, cancel=None, on_queue=None) -> Lease:
-    if _policy_path() is None:
-        return Lease("local", tuple(model_ids), cancel)
     ticket = _enqueue(model_ids, cancel)
     previous = None
     try:
@@ -281,7 +290,8 @@ def slot(model_ids, purpose):
     lease = held or acquire(tuple(model_ids), purpose)
     try:
         lease.check()
-        if any(name not in lease.model_ids for name in model_ids):
+        if (_policy_path() is not None and lease.base_url == "http://127.0.0.1:11434/v1"
+                and any(name not in lease.model_ids for name in model_ids)):
             raise ResourceBusy("The current reservation does not cover this model.")
         with bind_lease(lease):
             yield lease
@@ -302,12 +312,14 @@ def validate_payload(payload):
         held.check()
     if _policy_path() is None:
         return
+    if endpoint() != "http://127.0.0.1:11434/v1":
+        return  # External endpoints share the bounded queue, not local runner policy.
     with _lock:
         try:
             profile = _profile()
         except (OSError, ValueError, KeyError, TypeError, ResourceBusy):
             raise ResourceBusy("Inference capacity is not configured.") from None
-    if endpoint() != profile["base_url"] or payload.get("model") not in profile["models"]:
+    if payload.get("model") not in profile["models"]:
         raise ResourceBusy("The selected connection/model is outside the deployed capacity profile.")
     if held is not None and payload.get("model") not in held.model_ids:
         raise ResourceBusy("This exchange has no reservation for the requested model.")
