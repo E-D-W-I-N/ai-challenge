@@ -1,5 +1,6 @@
 """LLM-selected boundaries over exact source slices, with a private per-document cache."""
 from __future__ import annotations
+from contextlib import nullcontext
 
 import json
 import math
@@ -343,7 +344,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                         actual_models.append(model)
                         report["model"] = " / ".join(actual_models)
                     trace_path = directory / ("round-" + uuid.uuid4().hex + ".json")
-                    write_json(trace_path, {"request": payload, "response": response})
+                    with operation.publication() if operation else nullcontext():
+                        write_json(trace_path, {"request": payload, "response": response})
                     report["trace_files"].append(str(trace_path.relative_to(root)))
                     usage = response.get("usage", {}) if isinstance(response, dict) else {}
                     if isinstance(usage, dict):
@@ -377,7 +379,8 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
                     operation.update(semantic_report=report.copy())
                 spans.extend(selected)
                 rounds.append({"request": payload, "response": response, "boundary_normalization": metadata})
-            write_json(path, {"identity": identity, "spans": spans, "rounds": rounds})
+            with operation.publication() if operation else nullcontext():
+                write_json(path, {"identity": identity, "spans": spans, "rounds": rounds})
             report["computed"] += 1
         report["trace_files"].append(str(path.relative_to(root)))
         for position, (core_start, end) in enumerate(spans):

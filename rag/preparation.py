@@ -1,5 +1,6 @@
 """Full HTML preparation by a generative endpoint, with validated private caching."""
 from __future__ import annotations
+from contextlib import nullcontext
 
 import json
 import math
@@ -167,7 +168,8 @@ class Preparer:
         else:
             body, response = _call(self.client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)
         document = _document(body, source, config)
-        write_json(path, {"identity": identity, "request": payload, "response": response})
+        with self.operation.publication() if self.operation else nullcontext():
+            write_json(path, {"identity": identity, "request": payload, "response": response})
         self.report["computed"] += 1
         self.publish()
         return document

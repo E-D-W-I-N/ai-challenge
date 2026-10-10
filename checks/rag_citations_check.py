@@ -275,7 +275,7 @@ def check_rag_citations():
         from app.reminders import ReminderScheduler
         server = SimpleNamespace(name="fixture", status="ok", timeout_s=1)
         manager = SimpleNamespace(servers=[server], reminder_protocol=AsyncMock(return_value=True))
-        scheduler = ReminderScheduler(manager, SimpleNamespace(store=store))
+        scheduler = ReminderScheduler(manager, SimpleNamespace(store=store, allow_tools=True))
         item = {"id": 4, "text": "neutral", "context_id": "neutral"}
         scheduler.claims[(server.name, item["id"])] = {}
         _stub.reset()

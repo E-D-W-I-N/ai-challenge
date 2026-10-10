@@ -131,6 +131,8 @@ def main() -> int:
     folder = tempfile.mkdtemp(prefix="concurrent-")
     db = os.path.join(folder, "agents.db")
     gate = os.path.join(folder, "gate")
+    from checks import _stub
+    _stub.use_temp_db(db)
 
     # --- 1. долгий процесс и второй рядом ------------------------------------
     long_process = _spawn("--long", "--db", db, "--folder", folder)

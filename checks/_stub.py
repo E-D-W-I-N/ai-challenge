@@ -212,7 +212,16 @@ def use_temp_db(path: str | None = None) -> str:
         auth._accounts = auth.Accounts(Path(path).parent / "accounts.db", Path(path).parent / "users")
         with auth._accounts.lock:
             existing = auth._accounts.db.execute("SELECT id FROM users WHERE username='offline-admin'").fetchone()
-        user = auth._accounts.user(existing["id"]) if existing else auth._accounts.create("offline-admin", "offline-password", role="admin")
+        if existing:
+            user = auth._accounts.user(existing["id"])
+        else:
+            try:
+                user = auth._accounts.create("offline-admin", "offline-password", role="admin")
+            except auth.HTTPException as error:
+                if error.status_code != 409:
+                    raise
+                with auth._accounts.lock:
+                    user = dict(auth._accounts.db.execute("SELECT * FROM users WHERE username='offline-admin'").fetchone())
         token, principal = auth._accounts.authenticate("offline-admin", "offline-password")
         fixture_registry = registry.AgentRegistry(store=store._STORE, allow_tools=True)
         auth._accounts.registries[user["id"]] = fixture_registry

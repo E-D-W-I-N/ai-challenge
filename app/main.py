@@ -29,6 +29,7 @@ from .agent import SAMPLING_FIELDS, Agent, AgentBusyError
 from .llm import MissingKeyError
 from .registry import current_registry, UnknownAgentError
 from . import auth
+from shared_models.admission import limits
 from .reminders import ReminderScheduler
 from .schema import (
     CONTEXT_FIELDS,
@@ -1271,7 +1272,7 @@ def _restore_and_release(agent: Agent, taken) -> Callable[[], None]:
     return close
 
 
-async def _regenerate_events(agent: Agent, taken, frozen) -> AsyncIterator[dict]:
+async def _regenerate_events(agent: Agent, taken, frozen=None) -> AsyncIterator[dict]:
     """Обмен перегенерации плюс возврат снятой пары, если ответа не случилось."""
     restored = False
     try:
@@ -1374,7 +1375,7 @@ async def health() -> dict:
         "agents_max": current_registry().max_agents,
         "agents_evicted": current_registry().evicted,
         "sessions_stored": current_registry().store.count_sessions(),
-        "llm_max_concurrency": llm.max_concurrency(),
+        "llm_max_concurrency": limits()["ceiling"],
     }
 
 

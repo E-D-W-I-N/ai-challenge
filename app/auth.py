@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import defaultdict, deque
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 import getpass
@@ -31,7 +31,8 @@ SESSION_SECONDS = 7 * 86400
 current_principal = ContextVar("principal", default=None)
 _hasher = PasswordHasher()
 _accounts = None
-_attempts = defaultdict(deque)
+_attempts = {}
+_cleanup_at = 0.0
 _rate_lock = threading.Lock()
 
 
@@ -47,15 +48,29 @@ class Principal:
 
 
 def rate_limit(key, count, seconds, *, record=True):
+    global _cleanup_at
     now = time.monotonic()
     with _rate_lock:
-        entries = _attempts[key]
-        while entries and entries[0] <= now - seconds:
-            entries.popleft()
-        if len(entries) >= count:
-            raise HTTPException(429, "Too many requests; try again later")
+        if now >= _cleanup_at:
+            for name in list(_attempts):
+                entries = _attempts[name]
+                while entries and entries[0] <= now:
+                    entries.popleft()
+                if not entries:
+                    del _attempts[name]
+            _cleanup_at = now + 60
+        entries = _attempts.get(key)
+        if entries is not None:
+            while entries and entries[0] <= now:
+                entries.popleft()
+            if len(entries) >= count:
+                raise HTTPException(429, "Too many requests; try again later")
         if record:
-            entries.append(now)
+            if entries is None:
+                if len(_attempts) >= 4096:
+                    raise HTTPException(429, "Too many requests; try again later")
+                entries = _attempts[key] = deque()
+            entries.append(now + seconds)
 
 
 def password(value):

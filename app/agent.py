@@ -1117,11 +1117,14 @@ class Agent:
         if not content.strip() or self._cancel.is_set() or (principal is not None and not accounts().valid(principal)):
             return
 
-        self.summaries.append(
-            {"upto": border, "content": content, "metrics": metrics, "at": time.time()}
-        )
-        if self.store is not None:
-            self.store.save_summaries(self.id, self.summaries)
+        with accounts().lock if principal is not None else contextlib.nullcontext():
+            if principal is not None and not accounts().valid(principal):
+                return
+            self.summaries.append(
+                {"upto": border, "content": content, "metrics": metrics, "at": time.time()}
+            )
+            if self.store is not None:
+                self.store.save_summaries(self.id, self.summaries)
 
     def service_plan(self, spec: AgentSpec) -> list[str]:
         """Какие служебные вызовы предстоят этому обмену: `summary` — сжатие.
@@ -1600,7 +1603,7 @@ class Agent:
             options["can_run"] = valid
         if not self.allow_tools and any(name in (self.spec.extra_body or {}) for name in ("tools", "tool_choice", "functions", "function_call")):
             raise ValueError("Tools are available only to administrators")
-        from shared_models.admission import acquire_async, release, bind_lease
+        from shared_models.admission import acquire_async, release, bind_lease, ResourceBusy
         if self._lock.locked():
             raise AgentBusyError(f"агент {self.id} уже занят")
         self._cancel = asyncio.Event()
@@ -1625,7 +1628,13 @@ class Agent:
                 if notice is None:
                     break
                 yield {"type": "queued", **notice}
-            lease = waiting.result()
+            try:
+                lease = waiting.result()
+            except ResourceBusy:
+                if stopped():
+                    yield {"type": "done", "committed": False, "cancelled": True, "question": user_text, "text": ""}
+                    return
+                raise
             if stopped():
                 yield {"type": "done", "committed": False, "cancelled": True, "question": user_text, "text": ""}
                 return
@@ -2044,7 +2053,7 @@ class Agent:
                 yield {"type": "error", "message": failure, "metrics": None}
             except asyncio.CancelledError:
                 # OFF preserves paid partial answers; RAG must not persist unchecked JSON.
-                if scheduled is None and rag_snapshot is None:
+                if scheduled is None and rag_snapshot is None and (can_run is None or await can_run()):
                     known = list(iteration_metrics)
                     if isinstance(final_metrics, dict) and (not known or known[-1] is not final_metrics):
                         known.append(final_metrics)
@@ -2176,16 +2185,21 @@ class Agent:
         if not answer.strip():
             return False
 
-        # Вопрос и ответ ложатся в базу парой, одной транзакцией: иначе,
-        # умри процесс между ними, в базе остался бы вопрос без ответа.
-        with self.store.tx() if self.store is not None else contextlib.nullcontext():
-            self.remember("user", user_text, persist=False)
-            # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
-            # следующий вопрос должен видеть, что предыдущий ответ неполный.
-            self.remember(
-                "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies, rag=rag
-            )
-        return True
+        from .auth import current_principal, accounts
+        principal = current_principal.get(None)
+        with accounts().lock if principal is not None else contextlib.nullcontext():
+            if principal is not None and not accounts().valid(principal):
+                return False
+            # Вопрос и ответ ложатся в базу парой, одной транзакцией: иначе,
+            # умри процесс между ними, в базе остался бы вопрос без ответа.
+            with self.store.tx() if self.store is not None else contextlib.nullcontext():
+                self.remember("user", user_text, persist=False)
+                # Ответ, оборванный на середине, всё равно часть диалога — но помечен:
+                # следующий вопрос должен видеть, что предыдущий ответ неполный.
+                self.remember(
+                    "assistant", answer, error=failure, reasoning=reasoning, metrics=metrics, request_bodies=request_bodies, rag=rag
+                )
+            return True
 
     def take_last_exchange(self) -> Exchange | None:
         """Снимает последнюю пару «вопрос — ответ»: перегенерация обязана
