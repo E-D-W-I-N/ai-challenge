@@ -890,3 +890,12 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .item-icon svg { width: 16px; height: 16px; }
 
 .panel.history-view { grid-template-columns: minmax(0, 1fr); }
+
+.login-screen { min-height: 100%; display: grid; place-items: center; padding: 24px; overflow: auto; }
+.login-card { width: min(100%, 380px); display: grid; gap: 16px; }
+.login-card h1, .login-card p { margin: 0; }
+.account-name { color: var(--muted); font-size: 12px; max-width: 150px; overflow-wrap: anywhere; }
+#password-form, #user-create-form { display: grid; gap: 14px; }
+.account-users { display: grid; gap: 18px; }
+.account-user { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.account-user .control { flex: 1; min-width: 170px; }

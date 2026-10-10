@@ -17,7 +17,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
   let vectorView = null, vectorVersion = 0, vectorFingerprint = null;
   let working = false, hasChunks = true, hasVectors = true, submitting = false, seeded = false, lastStatus = null;
   const workingQuery = () => working ? "&working=true" : "";
-  const visible = () => !historical && state.workspace === "settings" && state.settingsScope === "app" && state.section === "rag" && document.visibilityState !== "hidden";
+  const visible = () => state.user?.role === "admin" && !historical && state.workspace === "settings" && state.settingsScope === "app" && state.section === "rag" && document.visibilityState !== "hidden";
   const labels = { missing: "Индекс отсутствует", stale: "Корпус изменён — перестройте индекс", running: "Операция выполняется",
     ready: "Индекс готов", complete: "Операция завершена", interrupted: "Операция прервана", error: "Ошибка операции" };
   function stop() {
@@ -360,7 +360,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
   }
   function syncChatControls() {
     const unavailable = historical || state.settingsScope !== "chat" || !state.current;
-    $("#rag-workflow").hidden = historical || state.settingsScope !== "app";
+    $("#rag-workflow").hidden = historical || state.settingsScope !== "app" || state.user?.role !== "admin";
     $("#rag-current-chat").hidden = unavailable;
     $("#rag-current-chat").querySelectorAll(".control").forEach((field) => { field.disabled = unavailable; });
     if (state.section === "rag") {
@@ -373,6 +373,7 @@ function createRagInspector({ state, $, el, api, modelSelectors, onCurrentIndex 
     $("#rag-workflow").hidden = true;
     const target = $("#rag-answer-snapshot"); target.hidden = false;
     const back = button("К текущему индексу", onCurrentIndex || open);
+    back.hidden = state.user?.role !== "admin";
     // Presentation follows the immutable answer flags, never the current chat controls.
     const rewriteEnabled = snapshot.config?.rewrite_enabled ?? snapshot.rewrite?.enabled ?? false;
     const filterEnabled = snapshot.config?.filter_enabled === true;

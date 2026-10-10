@@ -6,7 +6,8 @@
 // Из сети не тянется ничего — ни шрифтов, ни библиотек, ни иконок: репозиторий
 // публичный и обязан работать без интернета.
 
-const state = {
+function freshState() { return {
+  user: null,
   agents: [],          // всё, что вернул GET /api/agents
   current: null,       // открытый агент (полный ответ GET /api/agents/{id})
   models: [],          // каталог моделей для дропдауна
@@ -54,7 +55,10 @@ const state = {
   mcpDraftVersion: 0,
   mcpMutation: false,
   mcpDisabled: false,
-};
+}; }
+const state = freshState();
+let sessionEpoch = 0, leavingSession = false;
+const isAdmin = () => state.user?.role === "admin";
 
 // Legacy SSE prompt fallback only. Exact outbound request bodies are carried
 // by assistant transcript rows from the server and survive page/app restart.
@@ -262,16 +266,23 @@ function contextIsPast() {
 // ─────────────────────────── сеть ─────────────────────────────
 
 async function api(path, options) {
+  const epoch = sessionEpoch;
   const res = await fetch(path, options);
+  if (epoch !== sessionEpoch) throw new DOMException("Сессия изменена", "AbortError");
+  if (res.status === 401 && path !== "/api/auth/login") leaveSession();
   if (!res.ok) throw new Error(await detail(res));
-  return res.json();
+  if (res.status === 204) return null;
+  const body = await res.json();
+  if (epoch !== sessionEpoch) throw new DOMException("Сессия изменена", "AbortError");
+  return body;
 }
 
 async function detail(res) {
   try {
     const body = await res.json();
     if (body && body.detail) {
-      return typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      const message = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      return [429, 503].includes(res.status) ? "Сервер занят или временно недоступен. " + message : message;
     }
   } catch (e) { /* тело не JSON — остаётся код статуса */ }
   return "HTTP " + res.status;
@@ -290,6 +301,7 @@ function json(method, body) {
 async function streamPost(path, body, onEvent, signal) {
   const options = body === null ? { method: "POST", signal } : { ...json("POST", body), signal };
   const res = await fetch(path, options);
+  if (res.status === 401) leaveSession();
   if (!res.ok) throw new Error(await detail(res));
 
   const reader = res.body.getReader();
@@ -1229,6 +1241,12 @@ async function exchange(path, body, questionText) {
       body,
       (e) => {
         switch (e.event) {
+          case "queued":
+            const queueStatus = "Ожидание в очереди" + (Number.isInteger(e.position) ? " · позиция " + e.position : "");
+            if (!status) { status = cardStatus(queueStatus); card.insertBefore(status, bodyEl); }
+            else status.querySelector(".card-status-text").textContent = queueStatus;
+            scrollFeed();
+            break;
           case "retrieval":
             const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
             if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
@@ -1480,14 +1498,16 @@ async function pollCurrentChat() {
 // Страницы панели. Переключение перечисляет их поимённо: страница, забытая
 // в списке, осталась бы на экране поверх открытой — и видно это только
 // глазами. Список здесь один на всех.
-const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp", "rag"];
+const PANEL_TABS = ["model", "agent", "memory", "profile", "invariants", "mcp", "rag", "account", "users"];
 
 const SETTINGS_PAGES = {
+  account: ["Аккаунт", "Ваш пароль и вход в приложение", "Для вашего аккаунта", "user"],
+  users: ["Пользователи", "Создание аккаунтов и управление доступом", "Только администратор", "user"],
   model: ["Модель", "Параметры ответа и генерации", "Для текущего чата", "bot"],
   agent: ["Агент", "Поведение и контекст помощника", "Для текущего чата", "user"],
   memory: ["Память", "Реплики, записи о задаче и сведения надолго", "Рабочая — этот чат · долговременная — все чаты", "memory"],
-  profile: ["Профиль", "Как ассистент отвечает вам", "Для всех чатов", "user"],
-  invariants: ["Инварианты", "Правила, которые задаёт человек", "Для всех чатов", "shield"],
+  profile: ["Профиль", "Как ассистент отвечает вам", "Для ваших чатов", "user"],
+  invariants: ["Инварианты", "Правила, которые задаёт человек", "Для ваших чатов", "shield"],
   rag: ["Работа RAG", "Документы, чанки и фактическая индексация", "Для всего приложения", "memory"],
   mcp: ["Инструменты", "Серверы MCP и доступные инструменты", "Для всего приложения", "tools"],
 };
@@ -1500,30 +1520,33 @@ function renderWorkspaceHead() {
   document.title = title + " — AI Challenge";
 }
 
-const SCOPE_TABS = {chat: ["model", "agent", "memory", "mcp", "rag"], app: ["model", "memory", "profile", "invariants", "mcp", "rag"], history: ["rag"]};
+const SCOPE_TABS = {chat: ["model", "agent", "memory", "mcp", "rag"], app: ["model", "memory", "profile", "invariants", "mcp", "rag", "account", "users"], history: ["rag"]};
 function allowedSettingsTabs(scope) {
-  return SCOPE_TABS[scope]?.filter(name => scope !== "chat" || name !== "mcp" || state.remindersAvailable) || [];
+  return SCOPE_TABS[scope]?.filter(name => {
+    if (scope === "app" && ["model", "mcp", "rag", "users"].includes(name)) return isAdmin();
+    return scope !== "chat" || name !== "mcp" || (isAdmin() && state.remindersAvailable);
+  }) || [];
 }
 function refreshSettingsAvailability() {
   if (state.workspace !== "settings" || state.settingsScope !== "chat") return;
-  if (state.section === "mcp" && !state.remindersAvailable) {
+  if (state.section === "mcp" && (!isAdmin() || !state.remindersAvailable)) {
     const focused = $("#tab-mcp").contains(document.activeElement) || document.activeElement === $("#tab-btn-mcp");
     showSettings("model");
     if (focused) $("#tab-btn-model").focus();
     return;
   }
-  $("#tab-btn-mcp").hidden = !state.remindersAvailable;
+  $("#tab-btn-mcp").hidden = !isAdmin() || !state.remindersAvailable;
 }
 function syncChatControls() {
   const chat = state.settingsScope === "chat", noChat = !state.current;
   $("#settings-no-chat").classList.toggle("hidden", !chat || !noChat);
   $("#save-status").classList.toggle("hidden", !chat || noChat || !["model", "agent", "rag"].includes(state.section));
   $("#model-chat-settings").hidden = !chat;
-  $("#model-app-settings").hidden = state.settingsScope !== "app";
+  $("#model-app-settings").hidden = state.settingsScope !== "app" || !isAdmin();
   $("#mem-short-layer").hidden = !chat;
   $("#mem-working-layer").hidden = !chat;
   $("#mem-long-layer").hidden = state.settingsScope !== "app";
-  $("#mcp-application-controls").hidden = state.settingsScope !== "app";
+  $("#mcp-application-controls").hidden = state.settingsScope !== "app" || !isAdmin();
   $("#mcp-chat-help").hidden = !chat;
   $("#mcp-heading").hidden = chat;
   ["model", "agent"].forEach(name => $("#tab-" + name).querySelectorAll(".control").forEach(field => {
@@ -1535,6 +1558,7 @@ function loadVisibleSettings() {
   if (state.workspace !== "settings" || state.settingsScope === "history") return;
   if (state.section === "memory") loadMemory();
   if (state.section === "profile") loadProfile();
+  if (state.section === "users" && isAdmin()) loadUsers();
   if (state.section === "invariants") loadInvariants();
   if (state.section === "mcp") loadMcp();
   if (state.section === "rag") {
@@ -1570,6 +1594,7 @@ function showWorkspace(which, load = true) {
   } else if (load) loadVisibleSettings();
 }
 function openApplicationSettings(which = state.scopeSections.app) {
+  if (!allowedSettingsTabs("app").includes(which)) which = "account";
   ++state.navigationRevision;
   showSettings(which, true, "app");
   scheduleChatPoll();
@@ -1603,7 +1628,7 @@ function showSettings(which, load = true, scope = state.settingsScope) {
   const [title, description] = SETTINGS_PAGES[which];
   $("#settings-title").textContent = which === "mcp" && scope === "chat" ? "Напоминания" : which === "rag" ? (scope === "chat" ? "Поиск RAG" : scope === "history" ? "Работа RAG — сохранённый ответ" : "Индекс RAG") : which === "model" && scope === "app" ? "Модели" : title;
   $("#settings-description").textContent = which === "memory" ? (scope === "app" ? "Долговременные сведения для всех чатов" : "История и рабочие записи этого чата") : which === "model" && scope === "app" ? "Подключение к совместимому серверу" : which === "rag" && scope === "chat" ? "Использование контекста в следующих ответах" : which === "mcp" && scope === "chat" ? "Состояние и отмена напоминаний этого чата" : description;
-  $("#settings-scope").textContent = scope === "app" ? "Для всего приложения" : scope === "history" ? "Для сохранённого ответа" : "Для текущего чата";
+  $("#settings-scope").textContent = scope === "app" ? (["memory", "profile", "invariants", "account"].includes(which) ? "Для вашего аккаунта" : "Для всего приложения") : scope === "history" ? "Для сохранённого ответа" : "Для текущего чата";
   $("#settings-scope").hidden = which === "rag" || which === "model";
   $("#panel-body").scrollTop = state.sectionScroll.get(scope + ":" + which) || 0;
   syncChatControls(); renderWorkspaceHead();
@@ -2038,9 +2063,98 @@ async function newChat() {
   }
 }
 
-// ─────────────────────────── старт ────────────────────────────
+// Authentication is cookie-based. A full reload discards every account-scoped cache.
+function leaveSession() {
+  if (leavingSession) return;
+  leavingSession = true; sessionEpoch++;
+  stopStream(); stopChatPolling(); stopMcpPolling(); ragInspector.stop();
+  chatModelPicker.stop(); rerankModelPicker.stop();
+  if (state.statusTimer) clearTimeout(state.statusTimer);
+  Object.assign(state, freshState());
+  $("#app").hidden = true; $("#login-screen").hidden = false;
+  $("#feed").replaceChildren(); $("#agent-list").replaceChildren();
+  $("#rag-answer-snapshot").replaceChildren(); $("#input").value = "";
+  for (const input of document.querySelectorAll('input[type="password"]')) input.value = "";
+  window.location.reload();
+}
+
+async function loadUsers() {
+  const status = $("#users-status");
+  try {
+    const data = await api("/api/users");
+    const list = $("#users-list"); list.replaceChildren();
+    for (const user of data.users) {
+      const row = el("form", "account-user");
+      row.append(el("strong", "", user.username), el("span", "hint", user.role === "admin" ? "Администратор" : "Пользователь"));
+      const enabled = el("input", ""); enabled.type = "checkbox"; enabled.checked = user.enabled;
+      const label = el("label", "rag-toggle"); label.append(enabled, el("span", "", "Доступ включён")); row.append(label);
+      enabled.onchange = async () => {
+        enabled.disabled = true;
+        try { const saved = await api("/api/users/" + encodeURIComponent(user.id), json("PATCH", {enabled: enabled.checked})); user.enabled = saved.enabled; status.textContent = "Доступ сохранён"; }
+        catch (error) { enabled.checked = user.enabled; status.textContent = error.message; }
+        finally { enabled.disabled = false; }
+      };
+      const password = el("input", "control"); password.type = "password"; password.autocomplete = "new-password"; password.placeholder = "Новый пароль";
+      password.required = true; password.setAttribute("aria-label", "Новый пароль для " + user.username);
+      const save = el("button", "mcp-button", "Сменить пароль"); save.type = "submit";
+      row.append(password, save);
+      row.onsubmit = async event => {
+        event.preventDefault(); if (!password.value) return; save.disabled = true;
+        try { await api("/api/users/" + encodeURIComponent(user.id), json("PATCH", {password: password.value})); password.value = ""; status.textContent = "Пароль изменён"; }
+        catch (error) { status.textContent = error.message; }
+        finally { save.disabled = false; }
+      };
+      list.append(row);
+    }
+  } catch (error) { status.textContent = error.message; }
+}
 
 function init() {
+  $("#login-form").onsubmit = async event => {
+    event.preventDefault(); const submit = $("#login-submit"); if (submit.disabled) return; submit.disabled = true;
+    try {
+      await api("/api/auth/login", json("POST", {username: $("#login-username").value.trim(), password: $("#login-password").value}));
+      $("#login-password").value = ""; leaveSession();
+    } catch (error) { $("#login-status").textContent = error.message; }
+    finally { submit.disabled = false; }
+  };
+  $("#account-logout").onclick = async () => {
+    try { await api("/api/auth/logout", {method: "POST"}); leaveSession(); }
+    catch (error) { hint(error.message, true); }
+  };
+  $("#password-form").onsubmit = async event => {
+    event.preventDefault(); const submit = $("#password-submit"); if (submit.disabled) return; submit.disabled = true;
+    try {
+      await api("/api/auth/password", json("POST", {current_password: $("#account-current-password").value, new_password: $("#account-new-password").value}));
+      leaveSession();
+    } catch (error) { $("#password-status").textContent = error.message; }
+    finally { submit.disabled = false; }
+  };
+  $("#user-create-form").onsubmit = async event => {
+    event.preventDefault(); const submit = $("#user-create-submit"); if (submit.disabled) return; submit.disabled = true;
+    try {
+      await api("/api/users", json("POST", {username: $("#user-create-username").value.trim(), password: $("#user-create-password").value}));
+      $("#user-create-password").value = ""; $("#user-create-username").value = "";
+      $("#users-status").textContent = "Пользователь создан"; await loadUsers();
+    } catch (error) { $("#users-status").textContent = error.message; }
+    finally { submit.disabled = false; }
+  };
+  (async () => {
+    try {
+      const res = await fetch("/api/auth/me");
+      if (res.status === 401) { $("#login-username").focus(); return; }
+      if (!res.ok) throw new Error(await detail(res));
+      state.user = await res.json();
+      $("#account-name").textContent = state.user.username;
+      $("#login-screen").hidden = true; $("#app").hidden = false;
+      initApp();
+    } catch (error) { $("#login-status").textContent = error.message; }
+  })();
+}
+
+// ─────────────────────────── старт ────────────────────────────
+
+function initApp() {
   $("#sidebar-toggle").appendChild(icon("panelLeft"));
   $("#restore-sidebar").appendChild(icon("panelLeft"));
   $("#sidebar-toggle").onclick = () => setCollapsed(true);
