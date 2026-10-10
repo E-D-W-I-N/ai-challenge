@@ -60,6 +60,7 @@ function buildServer(options = {}) {
       const answer = routes.get(key);
       return typeof answer === "function" ? answer(request) : json(answer);
     }
+    if (path === "/api/auth/me" && request.method === "GET") return json({id: 1, username: "fixture-admin", role: "admin"});
     if (path === "/api/model-settings" && request.method === "GET") return json({base_url: "http://127.0.0.1:8005/v1", has_api_key: false, revision: 0});
     if (path === "/api/model-settings" && request.method === "PATCH") return json({base_url: request.body.base_url || "http://127.0.0.1:8005/v1", has_api_key: false, revision: 1});
     if (path.startsWith("/api/models") && request.method === "GET") return json({ models: [
