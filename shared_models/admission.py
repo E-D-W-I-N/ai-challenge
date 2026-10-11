@@ -88,7 +88,14 @@ def memory():
               for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith(("MemTotal:", "MemAvailable:"))}
     total, available = fields["MemTotal"], fields["MemAvailable"]
     for group in _cgroups():
-        maximum = (group / "memory.max").read_text().strip()
+        try:
+            maximum = (group / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            # The host hierarchy root has no controller limit files.
+            # A namespaced root may have them, so read it when present.
+            if group != Path("/sys/fs/cgroup"):
+                raise
+            continue
         if maximum != "max":
             maximum = int(maximum)
             total = min(total, maximum)
@@ -99,7 +106,12 @@ def memory():
 def cpu_capacity():
     cores = len(os.sched_getaffinity(0))
     for group in _cgroups():
-        quota, period = (group / "cpu.max").read_text().split()
+        try:
+            quota, period = (group / "cpu.max").read_text().split()
+        except FileNotFoundError:
+            if group != Path("/sys/fs/cgroup"):
+                raise
+            continue
         if quota != "max":
             cores = min(cores, max(1, int(quota) // int(period)))
     return max(1, cores)
