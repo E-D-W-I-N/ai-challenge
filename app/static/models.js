@@ -20,12 +20,12 @@ function createModelSelectors({ $, el, api }) {
   }
   async function saveConnection(patch) {
     const revision = ++connectionRevision, previous = saveRequest;
-    catalogues.clear();
-    for (const picker of pickers) picker.invalidate();
     const pending = (previous || Promise.resolve()).catch(() => {}).then(() => api("/api/model-settings", {
       method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)
     })).then(saved => {
       settings = saved;
+      catalogues.clear();
+      for (const picker of pickers) picker.invalidate();
       if (revision === connectionRevision) {
         for (const picker of pickers) picker.load(true);
       }
