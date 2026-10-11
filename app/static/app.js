@@ -1794,7 +1794,7 @@ async function loadModelConnection() {
   const input = $("#model-base-url"), status = $("#model-settings-status");
   try {
     const saved = await modelSelectors.connection();
-    if (!input.dataset.dirty) { input.value = saved.base_url; status.textContent = ""; }
+    if (!input.dataset.dirty) input.value = saved.base_url;
     $("#model-key-status").textContent = saved.has_api_key ? "Ключ сохранён" : "Ключ не задан";
   } catch (error) { status.textContent = error.message; }
 }
@@ -2181,34 +2181,46 @@ function initApp() {
   window.addEventListener?.("pagehide", stopChatPolling);
 
   $("#new-chat").onclick = () => newChat();
-  let connectionSave = 0;
-  for (const id of ["model-base-url", "model-api-key"]) {
-    const input = $("#" + id);
-    input.oninput = () => { input.dataset.dirty = "true"; $("#model-settings-status").textContent = "Изменения не сохранены"; };
-    input.onchange = async () => {
-      if (!input.dataset.dirty) return;
-      const status = $("#model-settings-status"), draft = input.value, ticket = ++connectionSave;
-      const patch = id === "model-base-url" ? {base_url: draft.trim()} : {api_key: draft};
-      try {
-        const saved = await modelSelectors.saveConnection(patch);
-        if (input.value === draft) {
-          input.value = id === "model-base-url" ? saved.base_url : "";
-          input.dataset.dirty = "";
-        }
-        if (ticket !== connectionSave) return;
-        $("#model-key-status").textContent = saved.has_api_key ? "Ключ сохранён" : "Ключ не задан";
-        status.textContent = input.dataset.dirty ? "Изменения не сохранены" : "Подключение сохранено";
-      } catch (error) { if (ticket === connectionSave && input.value === draft) status.textContent = error.message; }
+  let connectionSave = 0, connectionDraft = 0;
+  const connectionUrl = $("#model-base-url"), connectionKey = $("#model-api-key");
+  const connectionStatus = $("#model-settings-status"), connectButton = $("#model-connect");
+  for (const input of [connectionUrl, connectionKey]) {
+    input.oninput = () => {
+      connectionDraft++;
+      input.dataset.dirty = "true";
+      connectionStatus.textContent = "Изменения не подключены";
     };
   }
+  $("#model-connection-form").onsubmit = async event => {
+    event.preventDefault();
+    if (connectButton.disabled) return;
+    const draft = connectionDraft, ticket = ++connectionSave;
+    const patch = {base_url: connectionUrl.value.trim()};
+    if (connectionKey.dataset.dirty) patch.api_key = connectionKey.value;
+    connectButton.disabled = true;
+    connectionStatus.textContent = "Подключение…";
+    try {
+      const saved = await modelSelectors.saveConnection(patch);
+      if (ticket !== connectionSave) return;
+      $("#model-key-status").textContent = saved.has_api_key ? "Ключ сохранён" : "Ключ не задан";
+      if (draft !== connectionDraft) return;
+      connectionUrl.value = saved.base_url; connectionUrl.dataset.dirty = "";
+      connectionKey.value = ""; connectionKey.dataset.dirty = "";
+      connectionStatus.textContent = `Подключено: моделей ${saved.total}`;
+    } catch (error) {
+      if (ticket === connectionSave && draft === connectionDraft) connectionStatus.textContent = error.message;
+    } finally { connectButton.disabled = false; }
+  };
   $("#model-key-clear").onclick = async () => {
-    const status = $("#model-settings-status"), draft = $("#model-api-key").value, ticket = ++connectionSave;
+    const draft = connectionDraft, ticket = ++connectionSave;
     try {
       await modelSelectors.saveConnection({api_key: ""});
       if (ticket !== connectionSave) return;
-      if ($("#model-api-key").value === draft) { $("#model-api-key").value = ""; $("#model-api-key").dataset.dirty = ""; }
-      $("#model-key-status").textContent = "Ключ не задан"; status.textContent = "Ключ удалён";
-    } catch (error) { if (ticket === connectionSave) status.textContent = error.message; }
+      $("#model-key-status").textContent = "Ключ не задан";
+      if (draft !== connectionDraft) return;
+      connectionKey.value = ""; connectionKey.dataset.dirty = "";
+      connectionStatus.textContent = connectionUrl.dataset.dirty ? "Изменения не подключены" : "Ключ удалён. Проверьте подключение.";
+    } catch (error) { if (ticket === connectionSave && draft === connectionDraft) connectionStatus.textContent = error.message; }
   };
   loadModelConnection();
 
