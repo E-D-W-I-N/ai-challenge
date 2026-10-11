@@ -15,6 +15,7 @@ import httpx
 
 from .documents import digest, write_json
 from shared_models import DEFAULT_GENERATIVE_MODEL, DEFAULT_COMPATIBLE_BASE_URL
+from shared_models.transport import client_options, create_client
 
 WINDOW_CHARS = 12000
 WINDOW_UNITS = 256
@@ -283,9 +284,7 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
         raise ValueError("Semantic size must be <= 12000; overlap must be nonnegative and smaller")
     config = config or SemanticConfig()
     if client is None:
-        # OpenRouter follows the chat transport's operator proxy settings;
-        # compatible transport must remain direct even when those settings are present.
-        with httpx.Client(timeout=config.timeout_seconds, trust_env=False) as local_client:
+        with create_client(httpx.Client, timeout=config.timeout_seconds, **client_options(config.base_url)) as local_client:
             return semantic_chunks(documents, config, size, overlap, root=root, client=local_client, operation=operation)
     started = time.monotonic()
     directory = Path(root) / "semantic-cache"
