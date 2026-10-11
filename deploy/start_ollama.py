@@ -58,7 +58,6 @@ def main():
     embedding.update(slots=1, context_length=2048)
     profile = {"boot": uuid.uuid4().hex, "base_url": "http://127.0.0.1:11434/v1",
                "ceiling": ceiling, "reserve_bytes": reserve, "lease_bytes": GIB // 16,
-               "context_limit": CONTEXT, "output_limit": 512,
                "models": {GENERATION: generation, EMBEDDING: embedding}}
     path = ROOT / "data" / "inference-capacity.json"
     path.parent.mkdir(parents=True, exist_ok=True)

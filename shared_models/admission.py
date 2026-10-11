@@ -124,7 +124,7 @@ def _profile():
     value = json.loads(_policy_path().read_text())
     if (value["base_url"] != "http://127.0.0.1:11434/v1"
             or any(type(value[name]) is not int or value[name] <= 0
-                   for name in ("ceiling", "reserve_bytes", "lease_bytes", "context_limit", "output_limit"))
+                   for name in ("ceiling", "reserve_bytes", "lease_bytes"))
             or not isinstance(value["models"], dict) or not value["models"]):
         raise ValueError()
     for item in value["models"].values():
@@ -147,9 +147,7 @@ def _ready(profile):
     loaded = {row["name"]: row for row in rows}
     for name, spec in profile["models"].items():
         row = loaded.get(name)
-        if (row is None or row.get("digest", "").removeprefix("sha256:") != spec["digest"]
-                or type(row.get("context_length")) is not int
-                or not spec["context_length"] <= row["context_length"] <= spec["context_length"] * spec["slots"]):
+        if row is None or row.get("digest", "").removeprefix("sha256:") != spec["digest"]:
             return False
     return True
 
@@ -158,14 +156,14 @@ def _status(local=True):
     global _ceiling
     result = {"ceiling": _ceiling, "active": len(_leases), "available_bytes": 0,
               "reserved_bytes": 0, "ready": False, "reason": "Inference capacity is not configured.",
-              "context_limit": 4096, "output_limit": 512,
+              "local_runners": _policy_path() is not None and local,
               "queued": len(_waiting), "queue_limit": None, "runners_ready": False}
     try:
         profile = _profile()
         if _policy_path() is None:
             _ceiling = 16
             result.update(ceiling=16, ready=True, reason="", runners_ready=True,
-                          available_bytes=None, context_limit=None, output_limit=None, queue_limit=128)
+                          available_bytes=None, queue_limit=128)
             return profile, result
         total, available = memory()
         reserve = max(profile["reserve_bytes"], GIB, total // 5)
@@ -173,8 +171,6 @@ def _status(local=True):
         slots = max(len(_leases), len(_leases) + max(0, available - reserve - reserved) // profile["lease_bytes"])
         _ceiling = min(profile["ceiling"], slots)
         result.update(ceiling=_ceiling, available_bytes=available, reserved_bytes=reserved,
-                      context_limit=profile["context_limit"] if local else None,
-                      output_limit=profile["output_limit"] if local else None,
                       queued=len(_waiting), queue_limit=max(1, profile["ceiling"] * 8))
         result["runners_ready"] = not local or _ready(profile)
         if not result["runners_ready"]:
@@ -313,12 +309,7 @@ def slot(model_ids, purpose):
 
 
 def validate_payload(payload):
-    """Conservative UTF-8 byte upper bound, including JSON/framing and output.
-
-    This is an admission estimate, not an exact tokenizer. Never truncate input
-    or change explicit user parameters to make a request fit. The local policy
-    materializes an omitted output limit in the outbound payload only.
-    """
+    """Check the local model reservation without changing request parameters."""
     from . import endpoint
     held = current_lease.get()
     if held is not None:
@@ -338,14 +329,3 @@ def validate_payload(payload):
         raise ResourceBusy("This exchange has no reservation for the requested model.")
     if payload.get("n", 1) != 1:
         raise PayloadLimitError("Only one completion is supported per reservation.")
-    if any(name in payload for name in ("options", "num_ctx", "num_predict", "context_window", "keep_alive", "max_completion_tokens")):
-        raise PayloadLimitError("Request overrides of the deployed context/output policy are not supported.")
-    output = 0 if "input" in payload else payload.get("max_tokens", profile["output_limit"])
-    if type(output) is not int or ("input" not in payload and not 1 <= output <= profile["output_limit"]):
-        raise PayloadLimitError("Requested max_tokens exceeds the deployed output limit.")
-    if "input" not in payload and "max_tokens" not in payload:
-        payload["max_tokens"] = output
-    estimated = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 256 + output
-    context = min(profile["context_limit"], profile["models"][payload["model"]]["context_length"])
-    if estimated > context:
-        raise PayloadLimitError("Full request exceeds the conservative context estimate; shorten it explicitly.")

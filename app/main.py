@@ -53,9 +53,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 from rag.defaults import DEFAULT_GENERATIVE_MODEL
 
-NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model=DEFAULT_GENERATIVE_MODEL)
-"""Что получает кнопка «Новый чат»: пусто всё, кроме модели — без неё запрос
-некуда отправить. Промпт задаёт пользователь. Имя выдаёт `_next_chat_label`."""
+NEW_CHAT_SPEC = AgentSpec(label="Новый чат", model=DEFAULT_GENERATIVE_MODEL, max_tokens=512)
+"""Кнопка «Новый чат» сохраняет видимый Max tokens 512. Модель и промпт
+задаёт пользователь; имя выдаёт `_next_chat_label`."""
 
 CHAT_NUMBER_KEY = "chat_number"
 """Ключ счётчика имён в таблице `meta`. Счётчик только растёт и номера

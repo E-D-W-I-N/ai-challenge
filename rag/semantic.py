@@ -33,9 +33,6 @@ class SemanticConfig:
     max_tokens: int | None = None
 
     def __post_init__(self):
-        from shared_models.admission import limits
-        if self.max_tokens is None and limits().get("output_limit"):
-            object.__setattr__(self, "max_tokens", limits()["output_limit"])
         if self.max_tokens is not None and (type(self.max_tokens) is not int or self.max_tokens <= 0):
             raise ValueError("max_tokens must be a positive integer")
         if type(self.reasoning_enabled) is not bool:

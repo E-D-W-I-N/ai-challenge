@@ -103,8 +103,10 @@ GET model-settings доступен авторизованным всем, PATCH
 Shared RAG retrieval доступен пользователям, исторические snapshots приватны.
 Общая FIFO inference очередь finite: queued SSE, cancel/logout/disconnect снимают ожидание;
 ресурсы резервируются только при запуске и держатся до конца HTTP/worker.
-VPS capacity policy задаёт предел контекста/служебного вывода явно; чат сверх лимита
-отклоняется без обрезки, retries и правки сохранённого конфига. Mac без policy сохраняет поведение.
+VPS capacity policy ведёт ресурсы и очередь без подстановок параметров генерации.
+Новый чат сохраняет видимый max_tokens=512; явные значения и null не меняются.
+Контекст 4096 — серверный default; VPS output cap и byte-context gate отсутствуют.
+Допустимость пользовательских параметров проверяет сервер модели без retries/fallback.
 Checks внедряют единую временную auth/Registry fixture и connection path.
 Reasoning default OFF у пяти независимых селекторов; strictbool/API/persist/fork.
 Чат, сжатие и Rewrite используют chat reasoning_enabled; rerank отдельный флаг.
