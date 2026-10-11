@@ -1127,6 +1127,9 @@ Admission общий для generation/embeddings и всех служебных
 до release. RAG worker имеет одну reservation на всю операцию. Невозможный model
 профиль или превышение resource policy — ошибка, не бесконечное ожидание.
 VPS policy задаёт context/output лимиты; служебные запросы используют её output_limit,
-пользовательский chat config не урезается. Без VPS policy поведение Mac сохраняется.
+пользовательский chat config не урезается. Для локальной генерации незаданный
+`max_tokens` дополняется `output_limit` в outbound payload до оценки контекста,
+захвата фактического JSON и HTTP; явный выход сверх лимита отклоняется.
+Сохранённый config не меняется. Без VPS policy и для внешнего URL поведение сохраняется.
 Offline checks используют checks/_stub с временными accounts/Store и настоящей
 фикстурной session cookie; production auth bypass отсутствует. Новых проверок нет.

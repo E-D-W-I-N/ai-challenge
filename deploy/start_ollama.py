@@ -16,7 +16,7 @@ from shared_models.admission import GIB, cpu_capacity, memory
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = Path("/var/lib/aichat/models")
 CONTEXT = 4096
-GENERATION = "private-qwen:latest"
+GENERATION = "qwen3:1.7b"
 EMBEDDING = "embeddinggemma:latest"
 
 
