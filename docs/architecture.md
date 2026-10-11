@@ -14,7 +14,7 @@ FastAPI обслуживает API и статический клиент без
   `reasoning_enabled` — strict bool default false для чата (включая legacy),
   подготовки, семантического разбиения и embedding preference; rerank имеет
   отдельный `rag_rerank_reasoning_enabled`. Состояния не распространяются между
-  сценариями или чатами; каталог/смена провайдера не сбрасывает локальный выбор.
+  сценариями или чатами; каталог/смена подключения не сбрасывает локальный выбор.
   Rewrite наследует chat flag, compression копирует spec; прочие сервисы независимы.
 - `shared_models.generation_payload` применяет `reasoning_effort: none|medium`
   после extra_body. Известные aliases очищаются; per-message OFF overrides
@@ -93,10 +93,15 @@ FastAPI обслуживает API и статический клиент без
 
 Соединение хранится в приватном `data/model-connection.json` с правами 0600;
 атомарная замена записывает URL, optional API key и revision. GET отдаёт только
-base_url/has_api_key/revision. PATCH принимает base_url?/api_key?: отсутствие ключа
+base_url/has_api_key/revision. PATCH принимает base_url?/api_key?: до сохранения
+проверяет свежий GET /models с общим deadline 15 секунд и bounded/schema
+валидацией каталога. Trusted origin проверяется до доступа к credentials.
+Неуспешный probe не заменяет рабочее подключение; CAS после await отклоняет
+устаревший результат. Удаление ключа — отдельный PATCH api_key="" без probe.
+Проверка каталога не обещает успешную генерацию. Отсутствие ключа
 сохраняет прежний, пустая строка удаляет. Приложение не загружает `.env` и не
 читает прежние env keys. Standalone `rag --connection-file PATH` использует тот
-же независимый shared_models без app import. Без файла URL = localhost:8005/v1,
+же независимый shared_models без app import. Без файла URL = 127.0.0.1:8005/v1,
 ключ отсутствует. Новые model IDs пусты до явного выбора; сохранённые ID чатов
 не меняются при смене соединения. Старые provider поля config игнорируются при
 чтении; новый save их не пишет. Исторические JSON и RAG snapshots не мигрируются.
@@ -1040,8 +1045,9 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
 README описывает запуск, каталог `GET /v1/models`, генерацию
 `POST /v1/chat/completions` и ручные три запроса разной сложности.
 Живой инференс и качество ответов подтверждает оператор. Чат уже поддерживает
-OpenAI-совместимый сервер; с дня 27 подключение и каталог общие
-для чата и всех этапов RAG.
+OpenAI-совместимый сервер с общими URL и необязательным ключом в UI
+для чата и всех этапов RAG. Явная кнопка «Подключиться» проверяет каталог API,
+не гарантирует генерацию.
 
 
 ## День 28: локальный RAG на существующем пайплайне
@@ -1093,6 +1099,10 @@ Agent.store передаётся явно. Профиль, память, инв�
 
 Model connection file общий `data/model-connection.json`, независимо от user Store.
 GET safe settings и каталог моделей доступны всем авторизованным, PATCH только admin.
+PATCH проверяет свежий каталог до сохранения; read-only GET /models не входит
+в admission queue. После await probe перед CAS/save повторно проверяются
+разрыв запроса и действительность admin-сессии. Проверка сессии и запись
+выполняются под accounts.lock без await; отзыв сессии исключает сохранение.
 MCP/reminders и RAG pipeline/инспектор корпуса admin-only также на runtime границе:
 обычный Agent не объявляет инструменты, не приобретает manager lease и не исполняет
 model tool_calls; extra_body tools/function aliases отклоняются. Scheduler получает

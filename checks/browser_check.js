@@ -790,15 +790,16 @@ async function main() {
     server.respond("PATCH", "/api/model-settings", request => { writes.push(request.body.base_url); return writes.length === 1 ? first.promise : writes.length === 2 ? second.promise : json(request.body); });
     client.init(); await settle(); click("application-settings");
     const input = $("#model-base-url"); check("Global server settings editable without selecting a chat", !input.disabled);
-    input.value = "http://127.0.0.1:9001/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
-    input.value = "http://127.0.0.1:9002/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
-    check("Overlapping URL saves are serialized", writes.length === 1);
-    first.resolve(json({base_url: writes[0]})); await settle();
+    input.value = "http://127.0.0.1:9001/v1"; input.dispatchEvent(new Evt("input")); $("#model-connection-form").dispatchEvent(new Evt("submit")); await settle();
+    input.value = "http://127.0.0.1:9002/v1"; input.dispatchEvent(new Evt("input")); $("#model-connection-form").dispatchEvent(new Evt("submit")); await settle();
+    check("Pending connection prevents overlapping submissions", writes.length === 1);
+    first.resolve(json({base_url: writes[0], total: 1})); await settle();
+    $("#model-connection-form").dispatchEvent(new Evt("submit")); await settle();
     input.value = "http://127.0.0.1:9003/v1"; input.dispatchEvent(new Evt("input"));
-    second.resolve(json({base_url: "http://127.0.0.1:9002/v1"})); await settle();
+    second.resolve(json({base_url: "http://127.0.0.1:9002/v1", total: 1})); await settle();
     initial.resolve(json({base_url: "http://127.0.0.1:8005/v1"})); await settle();
     check("Late GET and earlier saves cannot overwrite a newer unsaved URL", input.value === "http://127.0.0.1:9003/v1" && input.dataset.dirty === "true");
-    input.dispatchEvent(new Evt("change")); await settle();
+    $("#model-connection-form").dispatchEvent(new Evt("submit")); await settle();
     check("Global URL PATCH contains only nonsecret server address", same(requests("PATCH", "/api/model-settings").at(-1).body, {base_url: input.value}) && writes.length === 3);
     server.respond("GET", "/api/rag/status", {state: "missing", stages: {corpus: {fingerprint: "catalog-corpus", documents: 1, urls: []},
       chunks: {fingerprint: "catalog-chunks", chunks: 1, strategy: "semantic", size: 512, overlap: 64,
@@ -808,7 +809,7 @@ async function main() {
     click("tab-btn-rag"); await settle(); click("rag-step-chunks"); await settle();
     const model = $("#rag-semantic-model"); check("Saved semantic picker restores model without stage URL", model.value === "saved-generative" && $("#rag-size-label").textContent.includes("Максимальный"));
     server.respond("GET", route, {models: [{id: "new-host-model"}]});
-    input.value = "http://127.0.0.1:9004/v1"; input.dispatchEvent(new Evt("input")); input.dispatchEvent(new Evt("change")); await settle();
+    input.value = "http://127.0.0.1:9004/v1"; input.dispatchEvent(new Evt("input")); $("#model-connection-form").dispatchEvent(new Evt("submit")); await settle();
     late.resolve(json({models: [{id: "late-old-host"}]})); await settle();
     check("Global URL change cancels old catalogue without losing model", requests("GET", route)[0].signal.aborted && model.value === "saved-generative" && $("#rag-semantic-model-catalogue").children.some(n => n.value === "new-host-model") && !$("#rag-semantic-model-catalogue").children.some(n => n.value === "late-old-host"));
     const hidden = deferred(); server.respond("GET", route, () => hidden.promise); click("rag-model-refresh"); await settle(); click("rag-step-documents"); await settle();

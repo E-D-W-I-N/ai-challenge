@@ -2,12 +2,9 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
-
-from rag.semantic import SemanticConfig
 
 
 _MAX_BYTES = 2 * 1024 * 1024
@@ -15,15 +12,17 @@ _MAX_MODELS = 5000
 
 
 async def models(connection, purpose: str = "generation") -> dict:
-    if purpose not in {"generation", "embedding"}:
+    if purpose not in {"generation", "embedding", "all"}:
         raise HTTPException(422, "Неизвестное назначение модели.")
     endpoint = connection.base_url
     key = connection.api_key
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        # OpenRouter follows the same proxy policy as chat; compatible servers bypasses it.
+        # Use the same direct transport policy as generation.
         async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False) as client:
             async with client.stream("GET", f"{endpoint}/models", headers=headers) as response:
+                if response.status_code in {401, 403}:
+                    raise HTTPException(502, "Сервер отклонил авторизацию. Проверьте API-ключ.")
                 if not response.is_success:
                     raise HTTPException(502, f"Каталог моделей недоступен: сервер вернул HTTP {response.status_code}.")
                 content = bytearray()
@@ -60,7 +59,7 @@ async def models(connection, purpose: str = "generation") -> dict:
         typed = bool(identifiers) and all(value in {"embedding", "embeddings", "llm", "vlm", "reranker", "audio_stt", "audio_tts", "audio_sts"}
                                              for value in identifiers.values())
         rows = [metadata[identifier] for identifier in sorted(identifiers)
-                if not typed or identifiers[identifier] in ({"embedding", "embeddings"} if purpose == "embedding" else {"llm", "vlm"})]
+                if purpose == "all" or not typed or identifiers[identifier] in ({"embedding", "embeddings"} if purpose == "embedding" else {"llm", "vlm"})]
         return {"base_url": endpoint, "revision": connection.revision, "models": rows, "total": len(rows)}
     except HTTPException:
         raise
