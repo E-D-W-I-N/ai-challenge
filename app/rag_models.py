@@ -21,10 +21,12 @@ async def models(connection, purpose: str = "generation") -> dict:
         # Use the same direct transport policy as generation.
         async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False) as client:
             async with client.stream("GET", f"{endpoint}/models", headers=headers) as response:
-                if response.status_code in {401, 403}:
-                    raise HTTPException(502, "Сервер отклонил авторизацию. Проверьте API-ключ.")
+                if response.status_code == 401:
+                    raise HTTPException(502, "GET /models: сервер вернул HTTP 401 — авторизация отклонена. Проверьте API-ключ.")
+                if response.status_code == 403:
+                    raise HTTPException(502, "GET /models: сервер вернул HTTP 403 — доступ к каталогу моделей запрещён.")
                 if not response.is_success:
-                    raise HTTPException(502, f"Каталог моделей недоступен: сервер вернул HTTP {response.status_code}.")
+                    raise HTTPException(502, f"GET /models: каталог моделей недоступен — сервер вернул HTTP {response.status_code}.")
                 content = bytearray()
                 async for part in response.aiter_bytes(chunk_size=65536):
                     content.extend(part)
