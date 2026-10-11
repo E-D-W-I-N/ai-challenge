@@ -24,21 +24,22 @@
 
 Подготовлены учётные записи, личные чаты, общая конечная FIFO-очередь и
 конфигурации Linux-сервиса с HTTPS. Ниже — самостоятельное развёртывание на
-4 vCPU / 8 GB RAM / SSD от 40 GB. VPS и домен пока не предоставлены:
-развёртывание, живые ответы и стабильность под нагрузкой не проверялись.
+Debian 13 amd64, 4 vCPU / 16 GB RAM / SSD 100 GB с публичным IPv4 без домена.
+Живые ответы и стабильность под нагрузкой проверяет оператор.
 Дни 26–29 остаются локальной ручной работой на MacBook.
 
 ## Чистое развёртывание дня 30
 
-Используйте новый Ubuntu 24.04 с cgroup v2. Создайте DNS A/AAAA домена вместо
-`ai.example.com`; разрешите входящие SSH, TCP 80 и 443 в firewall провайдера.
+Используйте новый Debian 13 amd64 с cgroup v2. Разрешите входящие SSH, TCP 80
+и 443 в firewall провайдера и сервера. Домен и DNS-записи не требуются.
 Порты 8000 и 11434 наружу не открывайте. Клонируйте публичный репозиторий;
 не переносите с Mac `.env`, `data`, ключи, корпус, результаты или рабочий каталог.
 Новая база сохраняется на сервере между перезапусками.
+Начальные команды `apt` выполните в SSH-сессии root; далее служба работает от `aichat`.
 
 ```bash
-sudo apt update
-sudo apt install -y git make python3-venv curl gpg debian-keyring debian-archive-keyring apt-transport-https
+apt update
+apt install -y sudo git make python3-venv curl ca-certificates debian-archive-keyring
 sudo useradd --system --create-home --home-dir /var/lib/aichat --shell /usr/sbin/nologin aichat
 sudo git clone --branch day-30 https://github.com/E-D-W-I-N/ai-challenge.git /opt/aichat
 sudo chown -R aichat:aichat /opt/aichat
@@ -85,9 +86,9 @@ EmbeddingGemma — отдельная модель эмбеддингов с к�
 sudo cp deploy/aichat.slice deploy/aichat-ollama.service deploy/aichat.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now aichat-ollama.service
-# Явный прогрев оператором, а не приложением:
-curl -fsS http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"private-qwen:latest","keep_alive":-1}'
-curl -fsS http://127.0.0.1:11434/api/embed -H 'Content-Type: application/json' -d '{"model":"embeddinggemma:latest","input":"warmup","keep_alive":-1}'
+# Явная загрузка оператором без генерации текста или эмбеддингов:
+curl -fsS http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"private-qwen:latest","keep_alive":-1,"options":{"num_ctx":4096}}'
+curl -fsS http://127.0.0.1:11434/api/embed -H 'Content-Type: application/json' -d '{"model":"embeddinggemma:latest","input":"","keep_alive":-1,"options":{"num_ctx":2048}}'
 curl -fsS http://127.0.0.1:11434/api/ps
 sudo systemctl enable --now aichat.service
 ```
@@ -100,22 +101,42 @@ Launcher создаёт приватный `data/inference-capacity.json`, вы�
 заменяет очередь приложения. Параметры загрузки и параллельного контекста
 описаны в [Ollama FAQ](https://docs.ollama.com/faq).
 
-Установите [Caddy из официального репозитория](https://caddyserver.com/docs/install#debian-ubuntu-raspbian):
+Установите Caddy не ниже 2.11.2 из [Debian trixie-backports](https://backports.debian.org/Instructions/).
+Если backports уже подключён, используйте существующий источник вместо добавления второго:
 
 ```bash
-curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo tee /etc/apt/sources.list.d/debian-backports.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
 sudo apt update
-sudo apt install -y caddy
+sudo apt install -y -t trixie-backports caddy
+caddy version
 sudo cp /opt/aichat/deploy/Caddyfile /etc/caddy/Caddyfile
 sudoedit /etc/caddy/Caddyfile
-# Замените ai.example.com своим доменом, затем:
+# Замените 203.0.113.10 своим публичным IPv4, затем:
 sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
 sudo systemctl reload caddy
 ```
 
-Откройте `https://ваш-домен`, войдите новым администратором. Совместимый URL
-изначально `http://127.0.0.1:11434/v1`, ключ пустой. Выберите
+Адрес `203.0.113.10` — только пример, его нельзя использовать для выпуска.
+Явный [ACME issuer и профиль `shortlived`](https://caddyserver.com/docs/caddyfile/directives/tls#issuers)
+выбирают публичный сертификат Let's Encrypt вместо локального CA для IP.
+[IP-сертификаты действуют 160 часов](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability/);
+Caddy автоматически выпускает и продлевает их через HTTP-01. Сохраняйте TCP 80
+доступным и каталог `/var/lib/caddy` между перезапусками. HTTP перенаправляется на HTTPS;
+пароли вводите только после появления доверенного сертификата в браузере.
+Проверяйте журнал `journalctl -u caddy` и срок сертификата; не добавляйте IP,
+сертификаты или ключи в Git.
+
+Откройте `https://ваш-публичный-IPv4`, войдите новым администратором. При запуске
+через этот systemd unit начальный совместимый URL — `http://127.0.0.1:11434/v1`,
+ключ пустой; на Mac без deployment policy начальный URL — `http://127.0.0.1:8005/v1`.
+В «Настройках приложения → Модели» проверьте локальный URL через «Подключиться». Выберите
 `private-qwen:latest` для чата и генеративных этапов, `embeddinggemma:latest`
 для эмбеддингов. Reasoning оставьте OFF. Текущая совместимость Ollama
 [сопоставляет `reasoning_effort=none` с отключением thinking](https://github.com/ollama/ollama/blob/main/openai/openai.go);
