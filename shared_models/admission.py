@@ -316,7 +316,8 @@ def validate_payload(payload):
     """Conservative UTF-8 byte upper bound, including JSON/framing and output.
 
     This is an admission estimate, not an exact tokenizer. Never truncate input
-    or mutate user parameters to make a request fit.
+    or change explicit user parameters to make a request fit. The local policy
+    materializes an omitted output limit in the outbound payload only.
     """
     from . import endpoint
     held = current_lease.get()
@@ -342,6 +343,8 @@ def validate_payload(payload):
     output = 0 if "input" in payload else payload.get("max_tokens", profile["output_limit"])
     if type(output) is not int or ("input" not in payload and not 1 <= output <= profile["output_limit"]):
         raise PayloadLimitError("Requested max_tokens exceeds the deployed output limit.")
+    if "input" not in payload and "max_tokens" not in payload:
+        payload["max_tokens"] = output
     estimated = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 256 + output
     context = min(profile["context_limit"], profile["models"][payload["model"]]["context_length"])
     if estimated > context:

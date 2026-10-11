@@ -1,4 +1,0 @@
-FROM qwen3:1.7b
-PARAMETER num_ctx 4096
-PARAMETER num_predict 512
-PARAMETER num_batch 128

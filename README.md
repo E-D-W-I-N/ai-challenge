@@ -69,13 +69,12 @@ sudo -u aichat env OLLAMA_HOST=127.0.0.1:11434 OLLAMA_MODELS=/var/lib/aichat/mod
 ```
 
 Последняя команда занимает первый терминал. Во втором терминале загрузите
-только публичные веса и создайте явный локальный профиль:
+только публичные веса:
 
 ```bash
 cd /opt/aichat
 OLLAMA_HOST=127.0.0.1:11434 ollama pull qwen3:1.7b
 OLLAMA_HOST=127.0.0.1:11434 ollama pull embeddinggemma:latest
-OLLAMA_HOST=127.0.0.1:11434 ollama create private-qwen:latest -f deploy/Modelfile
 ```
 
 `qwen3:1.7b` — [Q4_K_M, около 1.4 GB](https://ollama.com/library/qwen3:1.7b),
@@ -87,7 +86,7 @@ sudo cp deploy/aichat.slice deploy/aichat-ollama.service deploy/aichat.service /
 sudo systemctl daemon-reload
 sudo systemctl enable --now aichat-ollama.service
 # Явная загрузка оператором без генерации текста или эмбеддингов:
-curl -fsS http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"private-qwen:latest","keep_alive":-1,"options":{"num_ctx":4096}}'
+curl -fsS http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"qwen3:1.7b","keep_alive":-1,"options":{"num_ctx":4096}}'
 curl -fsS http://127.0.0.1:11434/api/embed -H 'Content-Type: application/json' -d '{"model":"embeddinggemma:latest","input":"","keep_alive":-1,"options":{"num_ctx":2048}}'
 curl -fsS http://127.0.0.1:11434/api/ps
 sudo systemctl enable --now aichat.service
@@ -140,7 +139,7 @@ Caddy автоматически выпускает и продлевает их
 через этот systemd unit начальный совместимый URL — `http://127.0.0.1:11434/v1`,
 ключ пустой; на Mac без deployment policy начальный URL — `http://127.0.0.1:8005/v1`.
 В «Настройках приложения → Модели» проверьте локальный URL через «Подключиться». Выберите
-`private-qwen:latest` для чата и генеративных этапов, `embeddinggemma:latest`
+`qwen3:1.7b` для чата и генеративных этапов, `embeddinggemma:latest`
 для эмбеддингов. Reasoning оставьте OFF. Текущая совместимость Ollama
 [сопоставляет `reasoning_effort=none` с отключением thinking](https://github.com/ollama/ollama/blob/main/openai/openai.go);
 это не подтверждённый здесь живой результат. Если сервер всё же сообщает
@@ -181,8 +180,12 @@ runner в общей FIFO, включая блокирование следую�
 активный слот освобождается после фактического завершения работы. Ошибочные
 LLM-запросы не повторяются автоматически.
 
-Локальный профиль: контекст 4096, выход не более 512; служебные этапы используют
-этот выходной лимит явно. На HTTP-границе оценивается весь JSON в UTF-8 плюс
+Локальный профиль: контекст 4096 через `OLLAMA_CONTEXT_LENGTH`, выход не более 512;
+служебные этапы используют этот выходной лимит явно. Если Max tokens не задан,
+VPS policy добавляет `max_tokens=512` только в фактический локальный JSON-запрос,
+который сохраняет инспектор; настройки чата остаются прежними. Явный выход выше
+512 отклоняется. На Mac без policy и для внешнего URL это правило не применяется.
+На HTTP-границе оценивается весь JSON в UTF-8 плюс
 256 байт запаса и выходной бюджет: включая историю, память, tools и RAG.
 Это консервативная оценка, не tokenizer. Превышение отклоняется явно без
 обрезки; `context_window` в OpenAI payload не добавляется. Для первого RAG
