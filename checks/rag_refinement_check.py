@@ -61,7 +61,7 @@ def check_rag_refinement():
         assert bodies == [c["payload"] for c in _stub.CALLS]
         first = bodies[0]; last = bodies[-1]
         assert first["model"] == last["model"] == "openai/gpt-6-luna"
-        assert first["reasoning"] == {"effort": "none", "enabled": False, "exclude": False} and first["max_tokens"] == 9216
+        assert first["reasoning_effort"] == "none" and first["max_tokens"] == 9216
         assert "seed" not in first and "tools" not in first and first["messages"][0]["content"] != chat.spec.system
         used = json.loads(first["messages"][1]["content"])
         assert used["question"] == "current question 42"

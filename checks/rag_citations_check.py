@@ -180,9 +180,8 @@ def check_rag_citations():
 
         # Reordering assigns citation IDs from final context order for both providers.
         for provider in ("openrouter", "compatible"):
-            ranked = agents.Agent(AgentSpec(label="ranked citations", model="neutral-final", provider=provider,
-                rag_enabled=True, rag_rewrite_enabled=False,
-                reasoning_enabled=True, rag_rerank_enabled=True, rag_rerank_provider=provider, rag_rerank_model="neutral-ranker"), store=store)
+            ranked = agents.Agent(AgentSpec(label="ranked citations", model="neutral-final", rag_enabled=True, rag_rewrite_enabled=False,
+                reasoning_enabled=True, rag_rerank_enabled=True, rag_rerank_model="neutral-ranker"), store=store)
             # A discarded strong candidate cannot authorize the selected weak context.
             ranked.spec.rag_final_k = 1
             _stub.reset()
@@ -217,12 +216,11 @@ def check_rag_citations():
             assert saved.rag["context"] == _stub.CALLS[-1]["messages"][-2]["content"]
             assert saved.request_bodies == [call["payload"] for call in _stub.CALLS]
             assert len(saved.rag["hits"]) == 2 and saved.rag["rerank"]["source_ids"] == [2, 1]
-            assert ("provider" in saved.request_bodies[0]) == (provider == "openrouter")
+            assert "provider" not in saved.request_bodies[0]
 
         # Real transport + Agent: ON accepts grounded text; OFF violations never publish RAG.
         for provider in ("openrouter", "compatible"):
-            actual = agents.Agent(AgentSpec(label="actual reasoning citations", model="neutral/model", provider=provider,
-                reasoning_enabled=True, rag_enabled=True, rag_rewrite_enabled=False), store=store)
+            actual = agents.Agent(AgentSpec(label="actual reasoning citations", model="neutral/model", reasoning_enabled=True, rag_enabled=True, rag_rewrite_enabled=False), store=store)
             mode = {"value": "on"}; dispatched = []
             def respond(request):
                 dispatched.append(json.loads(request.content))
@@ -238,7 +236,7 @@ def check_rag_citations():
             declaration = [{"type": "function", "function": {"name": "neutral_tool", "description": "neutral fixture", "parameters": {"type": "object", "properties": {}}}}]
             never_run = AsyncMock(side_effect=AssertionError("OFF violation must not execute MCP"))
             async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-                with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value="neutral-fixture-key"), \
+                with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "model_key", return_value="neutral-fixture-key"), \
                      patch.object(agents, "stream_completion", llm.stream_completion), patch.object(rag.Index, "retrieve", retrieved), \
                      patch.object(agents, "declared_tools", return_value=declaration), patch.object(agents, "run_tool", never_run):
                     completed = await drain(actual.ask("neutral actual grounded request"))

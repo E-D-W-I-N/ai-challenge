@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .documents import digest, write_json
-from shared_models import DEFAULT_GENERATIVE_MODEL, OPENROUTER_BASE_URL
+from shared_models import DEFAULT_GENERATIVE_MODEL, DEFAULT_COMPATIBLE_BASE_URL
 
 WINDOW_CHARS = 12000
 WINDOW_UNITS = 256
@@ -22,31 +22,23 @@ WINDOW_UNITS = 256
 
 @dataclass(frozen=True)
 class SemanticConfig:
-    base_url: str = OPENROUTER_BASE_URL
+    base_url: str = DEFAULT_COMPATIBLE_BASE_URL
     model: str = DEFAULT_GENERATIVE_MODEL
     timeout_seconds: float = 60
     prompt_version: str = "boundary-v2"
-    provider: str = "openrouter"
     reasoning_enabled: bool = False
-    auth_mode: InitVar[str | None] = None
     payload_version: str = "boundary-normalization-v3"
 
-    def __post_init__(self, auth_mode):
+    def __post_init__(self):
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
-        from shared_models import provider, validate_url, endpoint
-        if auth_mode is not None:
-            from shared_models import legacy_provider
-            object.__setattr__(self, "provider", legacy_provider(auth_mode))
-        provider(self.provider)
+        from shared_models import validate_url
         validate_url(self.base_url)
-        if self.provider == "openrouter":
-            object.__setattr__(self, "base_url", endpoint("openrouter"))
         url = urlparse(self.base_url)
         if (url.scheme not in {"http", "https"} or not url.netloc or url.username or url.password
                 or url.query or url.fragment):
             raise ValueError("Semantic endpoint must be HTTP(S) without credentials/query/fragment")
-        if not isinstance(self.model, str) or not self.model.strip():
+        if not isinstance(self.model, str):
             raise ValueError("Semantic model must be nonempty")
         if self.payload_version != "boundary-normalization-v3":
             raise ValueError("Unsupported semantic payload version")
@@ -160,7 +152,7 @@ def _payload(text, units, config, limit):
                  "Adjacent units on the same topic should stay together within that limit."},
                 {"role": "user", "content": json.dumps({"total_units": len(units), "last_unit_id": len(units), "units": numbered}, ensure_ascii=False)}]}
     from shared_models import generation_payload
-    return generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
+    return generation_payload(payload, reasoning_enabled=getattr(config, "reasoning_enabled", False))
 
 
 def _contains_credential(value, credentials):
@@ -174,53 +166,22 @@ def _contains_credential(value, credentials):
     return False
 
 
-def _http_error(response, credentials, label="Semantic"):
-    """Expose only bounded structured provider diagnostics, never raw bodies."""
-    message = f"{label} HTTP error: status {response.status_code}"
-    if len(response.content) > 65536:
-        return message
-    try:
-        body = response.json()
-    except (ValueError, UnicodeError):
-        return message
-    if _contains_credential(body, credentials) or not isinstance(body, dict):
-        return message
-    error = body.get("error")
-    if not isinstance(error, dict):
-        return message
-    code = error.get("code")
-    detail = error.get("message")
-    # Escaped strings may contain reconstructable credentials even after the
-    # outer JSON was decoded. Fail closed rather than displaying nested escapes.
-    unsafe = r"[<>\\]|\bbearer\s+\S+|\bsk-[A-Za-z0-9_-]+"
-    if any(isinstance(value, str) and (re.search(unsafe, value, re.IGNORECASE)
-            or any(not c.isprintable() and c not in "\r\n\t" for c in value)) for value in (code, detail)):
-        return message
-    if isinstance(detail, str):
-        detail = " ".join(detail.split())
-        if _contains_credential(detail, credentials) or re.search(unsafe, detail, re.IGNORECASE):
-            return message
-    prefix = message
-    if (type(code) is int and abs(code) <= 999999999) or (isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code)):
-        message += f"; code {code}"
-    if isinstance(detail, str):
-        if detail:
-            message += ": " + detail[:400]
-    # Validate the actual rendered string too: normalization, concatenation and
-    # bounding must never produce an unchecked reconstructable runtime key.
-    return prefix if _contains_credential(message, credentials) else message
+def _http_error(response, credentials, label):
+    return f"{label} HTTP error: status {response.status_code}"
 
 
 def _runtime_credentials():
-    runtime_secrets = [os.environ.get(name, "") for name in
-                       ("OPENROUTER_API_KEY", "RAG_EMBEDDING_API_KEY")]
-    return tuple(secret for raw in runtime_secrets if raw.strip() for secret in (raw, raw.strip()))
+    from shared_models import key
+    secret = key()
+    return (secret,) if secret else ()
 
 
 def _call(client, config, payload, trace=None, *, label="Semantic", before_send=None, response_limit=None):
     from shared_models import key as model_key, generation_payload
-    key = model_key(config.provider)
-    payload = generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
+    if not config.model.strip():
+        raise ValueError("Choose a model before running this stage")
+    key = model_key()
+    payload = generation_payload(payload, reasoning_enabled=getattr(config, "reasoning_enabled", False))
     credentials = _runtime_credentials()
     if _contains_credential(payload, credentials):
         raise ValueError(f"{label} request contains a runtime credential")
@@ -324,7 +285,7 @@ def semantic_chunks(documents, config=None, size=1200, overlap=180, *, root, cli
     if client is None:
         # OpenRouter follows the chat transport's operator proxy settings;
         # compatible transport must remain direct even when those settings are present.
-        with httpx.Client(timeout=config.timeout_seconds, trust_env=config.provider == "openrouter") as local_client:
+        with httpx.Client(timeout=config.timeout_seconds, trust_env=False) as local_client:
             return semantic_chunks(documents, config, size, overlap, root=root, client=local_client, operation=operation)
     started = time.monotonic()
     directory = Path(root) / "semantic-cache"

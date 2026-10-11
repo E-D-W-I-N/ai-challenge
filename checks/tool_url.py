@@ -38,6 +38,7 @@ def check_git_exchange():
         chat = agent.Agent(spec, store=store)
         received = []
         fake_key = "fixture-provider-secret-only"
+        store.save_model_settings({"api_key": fake_key})
 
         def provider(request):
             received.append(json.loads(request.content))
@@ -83,7 +84,7 @@ def check_git_exchange():
                     session = server.session
                     events = []
                     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-                        with patch.object(agent, "MANAGER", manager), patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(llm, "attribution_headers", return_value={}), patch.object(agent, "stream_completion", llm.stream_completion):
+                        with patch.object(agent, "MANAGER", manager), patch.object(llm, "shared_client", return_value=client), patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_key, "RAG_EMBEDDING_API_KEY": ""}), patch.object(agent, "stream_completion", llm.stream_completion):
                             exchange = chat.ask("Read this repository: <script>question</script> " + fake_key)
                             async for event in exchange:
                                 events.append(event)
@@ -106,10 +107,10 @@ def check_git_exchange():
                     assert len(received) == 3 and chat.history[-1].request_bodies == received
                     for body in received:
                         assert body["temperature"] == .37 and body["max_tokens"] == 17 and body["seed"] == 42
-                        assert body["provider"] == {"require_parameters": True, "order": ["fixture"]}
+                        assert body["provider"] == {"order": ["fixture"]}
                         assert {tool["function"]["name"] for tool in body["tools"]} == set(schemas)
-                        assert body["usage"] == {"include": True} and body["stream"] is True
-                        assert body["plugins"] == [{"id": "context-compression", "enabled": False}]
+                        assert body["stream_options"] == {"include_usage": True} and body["stream"] is True
+                        assert "plugins" not in body
                     assert not any(message["role"] == "tool" for message in received[0]["messages"])
                     assert received[1]["messages"][-2]["tool_calls"][0]["function"] == {"name": "git_log", "arguments": '{"n":1}'}
                     assert received[1]["messages"][-1] == {"role": "tool", "tool_call_id": "call_0", "content": expected_log}

@@ -21,21 +21,17 @@ class EmbeddingConfig:
     # Change revision when replacing weights behind the same server/model name.
     revision: str = "1"
     # None is archived compatible identity: do not change its serialized fingerprint.
-    provider: str | None = None
     reasoning_enabled: bool = False
 
     def __post_init__(self):
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
-        from shared_models import provider, validate_url, endpoint
-        provider(self.provider or "compatible")
+        from shared_models import validate_url
         validate_url(self.base_url)
-        if self.provider == "openrouter":
-            object.__setattr__(self, "base_url", endpoint("openrouter"))
         url = urlparse(self.base_url)
         if url.scheme not in {"http", "https"} or not url.netloc or url.username or url.password:
             raise ValueError("Embedding endpoint must be HTTP(S) without embedded credentials")
-        if not self.model.strip() or not self.revision.strip():
+        if not isinstance(self.model, str) or not self.revision.strip():
             raise ValueError("Embedding model/revision must be nonempty")
         if self.dimensions is not None and (type(self.dimensions) is not int or self.dimensions <= 0):
             raise ValueError("Embedding dimensions must be a positive integer")
@@ -43,8 +39,6 @@ class EmbeddingConfig:
     def fingerprint(self):
         identity = asdict(self)
         identity.pop("reasoning_enabled")
-        if self.provider is None:
-            identity.pop("provider")
         return digest(json.dumps(identity, sort_keys=True, separators=(",", ":")))
 
 
@@ -64,6 +58,8 @@ class Embeddings:
         self.config, self.client = config, client
 
     def embed(self, texts):
+        if not self.config.model.strip():
+            raise ValueError("Choose an embedding model before running this stage")
         if not texts:
             return []
         payload = {"model": self.config.model, "input": texts, "encoding_format": "float"}
@@ -72,7 +68,7 @@ class Embeddings:
         def call(client):
             # Runtime credential only: never part of config, cache identity or state.
             from shared_models import key as model_key
-            key = model_key(self.config.provider or "compatible")
+            key = model_key()
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             try:
                 response = client.post(self.config.base_url.rstrip("/") + "/embeddings", json=payload, headers=headers)
@@ -104,5 +100,5 @@ class Embeddings:
             return vectors
         if self.client is not None:
             return call(self.client)
-        with httpx.Client(timeout=120, trust_env=self.config.provider == "openrouter", follow_redirects=False) as client:
+        with httpx.Client(timeout=120, trust_env=False, follow_redirects=False) as client:
             return call(client)

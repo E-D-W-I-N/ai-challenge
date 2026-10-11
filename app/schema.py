@@ -14,16 +14,14 @@ from dataclasses import dataclass, field
 class AgentSpec:
     label: str
     model: str
-    """id модели OpenRouter, например "meta-llama/llama-3.1-8b-instruct"."""
+    """Точный ID модели общего сервера."""
 
-    provider: str = "openrouter"
 
     system: str = ""
     """Системный промпт. Дом у него ровно один — это поле."""
 
     # Параметры сэмплирования. None значит «не отправлять параметр», а не
-    # «отправить ноль»: с provider.require_parameters=true каждый заданный
-    # параметр сужает список провайдеров, готовых обслужить вызов.
+    # «отправить ноль»: явно выбранные значения передаются серверу.
     temperature: float | None = None
     max_tokens: int | None = None
     top_p: float | None = None
@@ -63,10 +61,7 @@ class AgentSpec:
     накопилось столько. None — сжатие не запускается никогда."""
 
     extra_body: dict = field(default_factory=dict)
-    """Дополнительные поля запроса (seed, provider.order и т.п.). Мержится
-    поверх тела; `provider.require_parameters` уже стоит в app/llm.py, там же
-    `plugins` мержатся по `id`: выключенный `context-compression` уцелеет
-    рядом с вашим, а названный тем же `id` — победит."""
+    """Явные поля запроса поверх общего payload; reasoning policy применяется последней."""
     rag_rewrite_enabled: bool = True
     reasoning_enabled: bool = False
     rag_candidates_k: int = 10
@@ -74,8 +69,7 @@ class AgentSpec:
     rag_similarity_threshold: float = 0.3
     rag_rerank_enabled: bool = False
     rag_rerank_reasoning_enabled: bool = False
-    rag_rerank_provider: str = "openrouter"
-    rag_rerank_model: str = "openai/gpt-6-luna"
+    rag_rerank_model: str = ""
     rag_enabled: bool = False
     """Mandatory published-index retrieval for this chat; legacy chats default OFF."""
 

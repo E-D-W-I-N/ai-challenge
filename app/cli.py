@@ -18,7 +18,7 @@ import sys
 
 from . import llm, store
 from .agent import Agent, AgentBusyError
-from .config import has_key
+
 from .registry import REGISTRY
 from .schema import AgentSpec
 from .store import StoreBusyError
@@ -156,8 +156,6 @@ async def repl(agent: Agent, *, once: bool = False, out=sys.stdout) -> int:
         )
     else:
         out.write(f"[новая сессия] продолжить её потом: --session {agent.id}\n")
-    if not has_key():
-        out.write("[нет ключа] OPENROUTER_API_KEY не найден — вызова не будет.\n")
     if not once:
         out.write("Команды: /выход, /история, /забыть, /агенты, /сессии\n")
 

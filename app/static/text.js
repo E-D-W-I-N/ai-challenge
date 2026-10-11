@@ -195,29 +195,11 @@ function parseResponseFormat(kind, raw) {
   return parsed;
 }
 
-// Параметры панели в терминах OpenRouter. Наши поля — `system` и `model` —
-// параметрами не уходят и по `supported_parameters` не проверяются.
-const PROVIDER_PARAMS = [...NUMBER_FIELDS, "stop", "response_format"];
+// Предупреждения используют только метаданные каталога сервера.
+const MODEL_PARAMS = [...NUMBER_FIELDS, "stop", "response_format"];
 
-// Чем заданные параметры не сойдутся с выбранной моделью. Предупреждать надо
-// **до** отправки: на каждом вызове стоит provider.require_parameters=true,
-// и параметр, которого модель не заявляет, выкашивает провайдеров — вместо
-// ответа придёт ошибка, по которой не понять, что виноват один переключатель.
-// Отдельной функцией без DOM — решение проверяется без браузера.
-function paramWarnings(model, settings, extraBody, baseModel) {
+function paramWarnings(model, settings) {
   const warnings = [];
-
-  // Чат, привязанный к одному поставщику, на чужой модели ответа не получит.
-  // Говорим об этом ровно в тот момент, когда модель меняют: постоянная
-  // надпись про настройку, которой не видно, только сбивает с толку.
-  const pinned = ((extraBody || {}).provider || {}).order;
-  if (Array.isArray(pinned) && pinned.length && baseModel && settings.model !== baseModel) {
-    warnings.push(
-      `Этот чат привязан к одному поставщику моделей — ${pinned.join(", ")}. ` +
-        `Если у него нет «${settings.model}», ответа не будет: вернётся ошибка. ` +
-        `Раньше здесь стояла «${baseModel}».`
-    );
-  }
 
   // Каталог не загрузился или модель в нём не нашлась — про параметры молчим:
   // пугать предупреждением, которого не на чем основать, хуже.
@@ -225,14 +207,13 @@ function paramWarnings(model, settings, extraBody, baseModel) {
 
   const declared = model.supported_parameters || [];
   if (declared.length) {
-    const missing = PROVIDER_PARAMS.filter(
+    const missing = MODEL_PARAMS.filter(
       (name) => settings[name] !== null && settings[name] !== undefined && !declared.includes(name)
     );
     if (missing.length) {
       warnings.push(
         `«${model.id}» не заявляет ${missing.join(", ")}. ` +
-          "Запрос уходит с provider.require_parameters, поэтому подходящего " +
-          "провайдера может не найтись — вместо ответа придёт ошибка."
+          "Сервер может отклонить неподдерживаемые параметры."
       );
     }
   }

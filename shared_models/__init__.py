@@ -2,16 +2,16 @@
 from __future__ import annotations
 
 import contextlib
-import os
+import json
+from pathlib import Path
+from dataclasses import dataclass, field
 from contextvars import ContextVar
 from urllib.parse import urlparse
 
-PROVIDERS = ("openrouter", "compatible")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_COMPATIBLE_BASE_URL = "http://127.0.0.1:8005/v1"
-DEFAULT_GENERATIVE_MODEL = "openai/gpt-6-luna"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-_bound_url = ContextVar("compatible_model_url", default=DEFAULT_COMPATIBLE_BASE_URL)
+DEFAULT_GENERATIVE_MODEL = ""
+DEFAULT_EMBEDDING_MODEL = ""
+_bound_connection = ContextVar("model_connection", default=None)
 
 
 def validate_url(value: str) -> str:
@@ -25,38 +25,59 @@ def validate_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def provider(value: str) -> str:
-    if value not in PROVIDERS:
-        raise ValueError("Provider must be openrouter or compatible")
-    return value
+@dataclass(frozen=True)
+class Connection:
+    base_url: str = DEFAULT_COMPATIBLE_BASE_URL
+    api_key: str = field(default="", repr=False)
+    revision: int = 0
+
+    def __post_init__(self):
+        object.__setattr__(self, "base_url", validate_url(self.base_url))
+        object.__setattr__(self, "api_key", self.api_key.strip())
+
+    def public(self):
+        return {"base_url": self.base_url, "has_api_key": bool(self.api_key), "revision": self.revision}
 
 
-def legacy_provider(value: str) -> str:
-    # Only archived auth_mode configurations call this migration.
-    if value == "omlx":
-        return "compatible"
-    return provider(value)
+def load_connection(path=None):
+    if path is None or not Path(path).exists():
+        return Connection()
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        secret = value.get("api_key", "")
+        revision = value.get("revision", 0)
+        if not isinstance(secret, str) or len(secret) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in secret):
+            raise ValueError()
+        if type(revision) is not int or revision < 0:
+            raise ValueError()
+        return Connection(validate_url(value["base_url"]), secret.strip(), revision)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise ValueError("Invalid model connection file") from None
 
 
-def endpoint(value: str, compatible_base_url: str | None = None) -> str:
-    return OPENROUTER_BASE_URL if provider(value) == "openrouter" else validate_url(compatible_base_url or _bound_url.get())
+def connection():
+    return _bound_connection.get() or Connection()
 
 
-def key(value: str) -> str:
-    return os.environ.get("OPENROUTER_API_KEY" if provider(value) == "openrouter" else "RAG_EMBEDDING_API_KEY", "").strip()
+def endpoint():
+    return connection().base_url
+
+
+def key():
+    return connection().api_key
 
 
 @contextlib.contextmanager
-def bind_compatible_url(value: str):
-    token = _bound_url.set(validate_url(value))
+def bind_connection(value):
+    token = _bound_connection.set(value)
     try:
         yield
     finally:
-        _bound_url.reset(token)
+        _bound_connection.reset(token)
 
 
-def generation_payload(payload: dict, value: str, *, reasoning_enabled: bool = False) -> dict:
-    """Only OpenRouter receives routing/accounting extensions."""
+def generation_payload(payload: dict, *, reasoning_enabled: bool = False) -> dict:
+    """Apply common reasoning controls after explicit request fields."""
     if type(reasoning_enabled) is not bool:
         raise ValueError("reasoning_enabled must be boolean")
     result = dict(payload)
@@ -74,17 +95,9 @@ def generation_payload(payload: dict, value: str, *, reasoning_enabled: bool = F
                 result[name] = cleaned
             else:
                 result.pop(name)
-    if provider(value) == "openrouter":
-        result["provider"] = {**(result.get("provider") or {}), "require_parameters": True}
-        result["reasoning"] = {"enabled": True, "exclude": False} if reasoning_enabled else {"effort": "none", "enabled": False, "exclude": False}
-        result.setdefault("usage", {"include": True})
-        result.setdefault("plugins", [{"id": "context-compression", "enabled": False}])
-    else:
-        result["reasoning_effort"] = "medium" if reasoning_enabled else "none"
-        for name in ("provider", "plugins", "usage", "reasoning", "transforms", "route", "models"):
-            result.pop(name, None)
-        if result.get("stream"):
-            result["stream_options"] = {**(result.get("stream_options") or {}), "include_usage": True}
+    result["reasoning_effort"] = "medium" if reasoning_enabled else "none"
+    if result.get("stream"):
+        result["stream_options"] = {**(result.get("stream_options") or {}), "include_usage": True}
     return result
 
 

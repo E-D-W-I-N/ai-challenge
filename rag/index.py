@@ -82,9 +82,9 @@ def stage_chunks(root, strategy="fixed", size=SIZE, overlap=OVERLAP, *, operatio
     root = Path(root)
     corpus = load_corpus(root)
     operation.update(stage="chunks", documents=len(corpus["documents"]), strategy=strategy, size=size, overlap=overlap)
-    semantic_config = semantic_config or SemanticConfig()
     report = None
     if strategy == "semantic":
+        semantic_config = semantic_config or SemanticConfig()
         # A tombstoned cache may survive interrupted physical cleanup.
         if not available(root, "semantic-cache"):
             import shutil
@@ -331,11 +331,14 @@ class Index:
             if any(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] != metadata[table]
                    for table in ("documents", "chunks")):
                 raise ValueError("Index row counts differ from committed metadata")
-            config = config or EmbeddingConfig(**metadata["embedding_config"])
+            try:
+                config = config or EmbeddingConfig(**metadata["embedding_config"])
+            except TypeError:
+                raise ValueError("Embedding configuration changed; rebuild the RAG index") from None
             if config.fingerprint() != metadata["embedding_fingerprint"]:
                 raise ValueError("Query/index embedding configuration mismatch")
             dispatch_config = config
-            if expected_base_url is not None and (config.provider or "compatible") == "compatible":
+            if expected_base_url is not None:
                 from dataclasses import replace
                 dispatch_config = replace(config, base_url=expected_base_url)
             corpus = read_json(self.root / "corpus.json")
