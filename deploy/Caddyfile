@@ -1,4 +1,12 @@
-ai.example.com {
+# Replace this documentation-only address with the server's public IPv4.
+# Requires Caddy >= 2.11.2; TCP 80 stays open for issuance and renewal.
+https://203.0.113.10 {
+    tls {
+        issuer acme https://acme-v02.api.letsencrypt.org/directory {
+            profile shortlived
+            disable_tlsalpn_challenge
+        }
+    }
     request_body {
         max_size 256KB
     }
