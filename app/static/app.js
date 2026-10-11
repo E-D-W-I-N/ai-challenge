@@ -13,7 +13,7 @@ function freshState() { return {
   models: [],          // каталог моделей для дропдауна
   busy: false,
   commanding: false,   // команда режима задачи в полёте — второй Enter не проводит ход дважды
-  abort: null,         // AbortController активного потока
+  chats: new Map(),    // потоки и черновики этой вкладки, отдельно для каждого чата
   lastMetrics: null,   // метрики последнего ответа — из них плитка «Контекст»
   applying: null,      // незавершённое применение настроек панели
   panelDirty: false,   // правка панели не доехала до агента
@@ -216,14 +216,14 @@ function mergeMetrics(held, fresh) {
 // Снимает её теперь **пришедшая доля окна**, а не сам факт вызова: после
 // слияния пустые метрики упавшего обмена несут прежний процент, и снятие
 // «по любым метрикам» выпустило бы на экран долю окна прошлой модели.
-function keepMetrics(metrics) {
-  state.lastMetrics = mergeMetrics(state.lastMetrics, metrics);
+function keepMetrics(metrics, target = state) {
+  target.lastMetrics = mergeMetrics(target.lastMetrics, metrics);
   if (metrics && has(metrics.context_fill_pct)) {
-    state.contextStale = false;
-    state.contextPast = false;
+    target.contextStale = false;
+    target.contextPast = false;
   } else if (metrics && metrics.error) {
     // Обмен упал, а число на экране осталось прежним — плитка об этом скажет.
-    state.contextPast = !!(state.lastMetrics && has(state.lastMetrics.context_fill_pct));
+    target.contextPast = !!(target.lastMetrics && has(target.lastMetrics.context_fill_pct));
   }
 }
 
@@ -347,7 +347,7 @@ function renderList() {
 }
 
 function clearChatSelection() {
-  stopStream(); stopChatPolling(); stopMcpPolling();
+  saveChatDraft(); stopChatPolling(); stopMcpPolling();
   state.current = null; state.memory = null; state.memoryNote = "";
   state.lastMetrics = null; state.contextPast = false; state.contextStale = false;
   state.panelDirty = false; state.settingsRevision += 1;
@@ -394,6 +394,8 @@ function listItem(agent) {
   text.appendChild(el("span", "item-title", agent.label));
   const note = branchNote(agent);
   if (note) text.appendChild(el("span", "item-branch", note));
+  const stream = state.chats.get(agent.id)?.stream;
+  if (stream) text.appendChild(el("span", "item-branch", stream.label));
   open.append(ico, text);
   open.title = agent.label + "\n" + agent.model + (note ? "\n" + note : "");
   open.onclick = async () => {
@@ -472,7 +474,9 @@ function askDelete(agent) {
         hint(String(err.message || err), true);
         return;
       }
+      stopStream(agent.id);
       if (state.current?.id === agent.id) clearChatSelection();
+      state.chats.delete(agent.id);
       // Чата нет — и промптам его обменов держаться не за что.
       [...state.prompts.keys()]
         .filter((key) => key.startsWith(agent.id + ":"))
@@ -502,16 +506,23 @@ async function openAgent(agentId, navigationTicket = state.navigationRevision) {
   stopMcpPolling();
   stopChatPolling();
   const epoch = state.chatEpoch;
-  stopStream();
+  saveChatDraft();
+  const revision = state.chats.get(agentId)?.revision || 0;
   let agent;
   try {
     agent = await api("/api/agents/" + agentId);
+    // Обмен мог завершиться, пока летел снимок прежней истории.
+    if (revision !== (state.chats.get(agentId)?.revision || 0)) {
+      if (epoch !== state.chatEpoch || navigationTicket !== state.navigationRevision) return false;
+      agent = await api("/api/agents/" + agentId);
+    }
   } catch (err) {
     // Агента вытеснили или стёрли перезапуском — обновляем список.
     if (navigationTicket === state.navigationRevision) return loadAgents();
     return false;
   }
   if (epoch !== state.chatEpoch || navigationTicket !== state.navigationRevision) return false;
+  saveChatDraft();
   ragInspector.clearSnapshot();
   state.current = agent;
   state.settingsRevision += 1;
@@ -531,7 +542,11 @@ async function openAgent(agentId, navigationTicket = state.navigationRevision) {
   resetMetrics(agent);
   renderList();
   renderTaskHead();
-  renderFeed(agent);
+  const chat = chatState(agent.id);
+  if (chat.stream) {
+    $("#feed").replaceChildren(...chat.stream.nodes);
+    Object.assign(state, chat.stream.metrics);
+  } else renderFeed(agent);
   fillPanel(agent);
   syncChatControls();
   renderTiles();
@@ -549,10 +564,12 @@ async function openAgent(agentId, navigationTicket = state.navigationRevision) {
   else renderMemory();
 
   const input = $("#input");
-  input.value = "";
+  input.value = chat.draft;
   autoGrow(input);
-  setBusy(false);
-  hint("");
+  setBusy(!!chat.stream);
+  if (chat.stream) $("#chat-status").textContent = chat.stream.label;
+  hint(chat.hint, chat.isError);
+  if (chat.diagnostics) $("#composer-hint").append(chat.diagnostics);
   return true;
 }
 
@@ -734,9 +751,8 @@ function ragSources(snapshot, index) {
 // `index` — номер реплики-ответа в истории, значит унести надо `index + 1`
 // сообщений: карточка входит в ветку целиком, вместе со своим вопросом.
 //
-// Пока идёт ответ, уходить из чата нельзя: поток оборвался бы на середине,
-// а история родителя дописывается только в конце обмена — ветка унесла бы
-// разговор без него.
+// Ветка создаётся только после завершения ответа: история родителя
+// дописывается в конце обмена. Переключение чатов поток не останавливает.
 async function forkFrom(agent, index) {
   if (state.busy) return;
   const ticket = ++state.navigationRevision;
@@ -748,7 +764,6 @@ async function forkFrom(agent, index) {
     hint(String(err.message || err), true);
     return;
   }
-  if (ticket === state.navigationRevision) state.current = null;
   await loadAgents(created.agents[0].id, ticket);
   if (ticket !== state.navigationRevision) return;
   showWorkspace("chat");
@@ -1044,12 +1059,21 @@ function setBusy(busy) {
   $("#chat-status").textContent = busy ? "Идёт ответ…" : "";
 }
 
-function stopStream() {
-  if (state.abort) {
-    state.abort.abort();
-    state.abort = null;
-  }
-  setBusy(false);
+function chatState(id) {
+  if (!state.chats.has(id)) state.chats.set(id, {revision: 0, draft: "", hint: "", isError: false, diagnostics: null, stream: null});
+  return state.chats.get(id);
+}
+
+function saveChatDraft() {
+  if (state.current) chatState(state.current.id).draft = $("#input").value;
+}
+
+function stopStream(id = state.current?.id) {
+  state.chats.get(id)?.stream?.controller.abort();
+}
+
+function stopAllStreams() {
+  for (const chat of state.chats.values()) chat.stream?.controller.abort();
 }
 
 // ─────────────────── команды режима задачи ────────────────────
@@ -1182,16 +1206,24 @@ async function regenerate() {
 async function exchange(path, body, questionText) {
   const feed = $("#feed");
   const agent = state.current;
+  if (!agent || state.busy) return false;
+  const navigation = state.navigationRevision, session = sessionEpoch;
 
   // Инвариант живёт здесь, а не у вызывающих: через `exchange` проходит
   // всякая отправка, и третий путь к нему не сможет его обойти.
   if (state.applying) await state.applying;
-  if (!(await ensurePanelApplied())) {
+  if (session !== sessionEpoch || state.current?.id !== agent.id || navigation !== state.navigationRevision) return false;
+  const applied = await ensurePanelApplied();
+  if (session !== sessionEpoch || state.current?.id !== agent.id || navigation !== state.navigationRevision || state.busy) return false;
+  if (!applied) {
     hint("Настройки панели не применились — сообщение не отправлено.", true);
     return false;
   }
+  const chat = chatState(agent.id);
+  chat.draft = ""; chat.hint = ""; chat.isError = false; chat.diagnostics = null;
   // Текст забираем из поля только теперь: до этой строки отправка могла
   // не состояться.
+  let questionBubble = null;
   if (questionText !== null) {
     const input = $("#input");
     input.value = "";
@@ -1202,7 +1234,8 @@ async function exchange(path, body, questionText) {
   state.stick = true;
   if (questionText !== null) {
     if (feed.querySelector(".empty")) feed.innerHTML = "";
-    feed.appendChild(userBubble(questionText));
+    questionBubble = userBubble(questionText);
+    feed.appendChild(questionBubble);
   } else {
     // Перегенерация заменяет последний ответ: карточку убираем с экрана,
     // а на сервере пара снимается с истории тем же запросом.
@@ -1218,11 +1251,20 @@ async function exchange(path, body, questionText) {
 
   setBusy(true);
   stopChatPolling();
-  const epoch = state.chatEpoch;
   hint("");
 
   const controller = new AbortController();
-  state.abort = controller;
+  const stream = {controller, nodes: [...feed.childNodes], label: "Идёт ответ…",
+    metrics: {lastMetrics: state.lastMetrics, contextPast: state.contextPast, contextStale: state.contextStale}};
+  chat.stream = stream;
+  const alive = () => session === sessionEpoch && state.chats.get(agent.id) === chat && chat.stream === stream;
+  const selected = () => alive() && state.current?.id === agent.id;
+  const repaintMetrics = (metrics) => {
+    keepMetrics(metrics, stream.metrics);
+    if (selected()) { Object.assign(state, stream.metrics); renderTiles(); }
+  };
+  const scroll = () => { if (selected()) scrollFeed(); };
+  renderList();
   let answer = "";
   let reasoning = "";
   let thinking = null;
@@ -1241,20 +1283,27 @@ async function exchange(path, body, questionText) {
       path,
       body,
       (e) => {
+        if (!alive()) return;
         switch (e.event) {
           case "queued":
             waiting = true;
             const queueStatus = "Ожидание в очереди" + (Number.isInteger(e.position) ? " · позиция " + e.position : "");
+            stream.label = queueStatus;
+            renderList();
+            if (selected()) $("#chat-status").textContent = queueStatus;
             if (!status) { status = cardStatus(queueStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = queueStatus;
-            scrollFeed();
+            scroll();
             break;
           case "retrieval":
             waiting = false;
             const retrievalStatus = {rewrite: "Переформулирование запроса", search: "Поиск контекста", rerank: "Ранжирование фрагментов"}[e.stage] || "Поиск контекста";
+            stream.label = retrievalStatus;
+            renderList();
+            if (selected()) $("#chat-status").textContent = retrievalStatus;
             if (!status) { status = cardStatus(retrievalStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = retrievalStatus;
-            scrollFeed();
+            scroll();
             break;
           case "compressing":
             waiting = false;
@@ -1277,13 +1326,19 @@ async function exchange(path, body, questionText) {
                 status.querySelector(".card-status-text").textContent =
                   SERVICE_CALLS[e.strategy].status;
               }
-              scrollFeed();
+              stream.label = SERVICE_CALLS[e.strategy].status;
+              renderList();
+              if (selected()) $("#chat-status").textContent = stream.label;
+              scroll();
             }
             break;
           case "start":
             waiting = false;
             // Поиск и служебные вызовы завершены: генерация началась.
             const answerStatus = e.generation === false ? "Подходящих фрагментов нет" : "Генерация";
+            stream.label = answerStatus;
+            renderList();
+            if (selected()) $("#chat-status").textContent = answerStatus;
             if (!status) { status = cardStatus(answerStatus); card.insertBefore(status, bodyEl); }
             else status.querySelector(".card-status-text").textContent = answerStatus;
             // Промпт держим у каждого обмена, а не только у того, где есть
@@ -1315,19 +1370,18 @@ async function exchange(path, body, questionText) {
               card.insertBefore(thinking, bodyEl);
             }
             thinking.querySelector(".think-body").textContent = reasoning;
-            scrollFeed();
+            scroll();
             break;
           case "delta":
             if (status) { status.remove(); status = null; }
             answer += e.text;
             bodyEl.innerHTML = renderMarkdown(answer);
-            if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
-            scrollFeed();
+            if (e.metrics) repaintMetrics(e.metrics);
+            scroll();
             break;
           case "metrics":
             // Ответ на новой модели пришёл — контексту снова есть что показать.
-            keepMetrics(e.metrics);
-            renderTiles();
+            repaintMetrics(e.metrics);
             break;
           case "tool_call":
             // Агент исполнил вызов инструмента: бейдж встаёт сразу, не
@@ -1338,7 +1392,7 @@ async function exchange(path, body, questionText) {
               card.appendChild(toolBox);
             }
             toolBox.appendChild(toolBadge(e));
-            scrollFeed();
+            scroll();
             break;
           case "error":
             failure = e.message;
@@ -1346,7 +1400,7 @@ async function exchange(path, body, questionText) {
             // Перерисовка здесь не лишняя: метрики упавшего обмена меняют
             // показанное (пометкой «из прошлого обмена», а на частичных
             // числах — и значением), а `done` после ошибки приходит не всегда.
-            if (e.metrics) { keepMetrics(e.metrics); renderTiles(); }
+            if (e.metrics) repaintMetrics(e.metrics);
             break;
           case "done":
             // Записался ли обмен в историю — знает агент, и говорит прямо.
@@ -1359,9 +1413,9 @@ async function exchange(path, body, questionText) {
             answerIndex = e.answer_index ?? null;
             if (e.text) answer = e.text;
             if (e.reasoning) reasoning = e.reasoning;
-            if (e.metrics) keepMetrics(e.metrics);
+            if (e.metrics) repaintMetrics(e.metrics);
             bodyEl.innerHTML = renderMarkdown(answer);
-            renderTiles();
+            if (selected()) renderTiles();
             break;
         }
       },
@@ -1369,31 +1423,33 @@ async function exchange(path, body, questionText) {
     );
   } catch (err) {
     if (err.name !== "AbortError") failure = String(err.message || err);
-    else if (waiting && questionText !== null && epoch === state.chatEpoch && state.current?.id === agent.id) terminalQuestion = questionText;
+    else if (waiting && questionText !== null) terminalQuestion = questionText;
   }
 
+  if (!alive()) return;
+  chat.revision += 1;
   if (status) status.remove();
   card.classList.remove("busy");
-  state.abort = null;
-  setBusy(false);
 
   if (failure) {
     card.classList.add("failed");
     card.appendChild(el("div", "card-error", failure));
-    hint(failure, true);
+    chat.hint = failure; chat.isError = true;
+    if (selected()) hint(failure, true);
     if (!answer && questionText !== null) {
       // Обмена не было: агент вопрос не запомнил, и в ленте его быть не должно.
       // Текст возвращается в поле ввода, чтобы можно было повторить.
-      const bubbles = feed.querySelectorAll(".msg-user");
-      if (bubbles.length) bubbles[bubbles.length - 1].remove();
+      questionBubble?.remove();
       card.remove();
-      const input = $("#input");
-      if (!input.value) { input.value = questionText; autoGrow(input); }
+      stream.nodes = stream.nodes.filter((node) => node !== questionBubble && node !== card);
+      terminalQuestion = questionText;
     }
   }
 
-  if (!committed && terminalQuestion !== null && !$("#input").value) {
-    $("#input").value = terminalQuestion; autoGrow($("#input"));
+  if (selected()) chat.draft = $("#input").value;
+  if (!committed && terminalQuestion !== null && !chat.draft) {
+    chat.draft = terminalQuestion;
+    if (selected()) { $("#input").value = chat.draft; autoGrow($("#input")); }
   }
 
   // Лента и список слева перерисовываются по серверу: на экране должно быть
@@ -1404,8 +1460,9 @@ async function exchange(path, body, questionText) {
   // своим промптом и своей сводкой. Привяжи его по длине истории, и он лёг бы
   // под ключ **прошлого** ответа: кнопка под давней карточкой показала бы
   // чужой запрос, внутри которого лежит сам этот ответ.
-  await refreshCurrent(committed ? prompt : null, answerIndex, agent.id, epoch);
-  if (!committed && failureDiagnostics && epoch === state.chatEpoch && state.current?.id === agent.id) {
+  await refreshCurrent(committed ? prompt : null, answerIndex, agent.id, session, stream);
+  if (!alive()) return;
+  if (!committed && failureDiagnostics) {
     const diagnostics = el("details", "failed-request-info");
     diagnostics.append(el("summary", "", "Информация о неудачном запросе"));
     const usage = usageLine({metrics: failureDiagnostics.metrics});
@@ -1414,17 +1471,21 @@ async function exchange(path, body, questionText) {
     for (const [i, payload] of failureDiagnostics.request_bodies.entries()) {
       diagnostics.append(el("div", "", `JSON запроса · ${i + 1}`), el("pre", "prompt-json", JSON.stringify(payload, null, 2)));
     }
-    $("#composer-hint").append(diagnostics);
+    chat.diagnostics = diagnostics;
+    if (selected()) $("#composer-hint").append(diagnostics);
   }
+  chat.stream = null;
+  if (state.current?.id === agent.id) setBusy(false);
+  renderList();
   scheduleChatPoll();
 }
 
-async function refreshCurrent(prompt, answerIndex = null, id = state.current?.id, epoch = state.chatEpoch) {
-  if (!state.current) return;
+async function refreshCurrent(prompt, answerIndex = null, id = state.current?.id, session = sessionEpoch, stream = null) {
+  if (!id) return;
+  const chat = state.chats.get(id);
   try {
     const fresh = await api("/api/agents/" + id);
-    if (epoch !== state.chatEpoch || state.current?.id !== id) return;
-    state.current = fresh;
+    if (session !== sessionEpoch || state.chats.get(id) !== chat || (stream && chat?.stream !== stream)) return;
     // Промпт привязываем к реплике до перерисовки: номер ответа в истории
     // известен только теперь, а рисовать карточку с кнопкой уже пора. Сюда он
     // доезжает, только если обмен записался, — значит последняя реплика
@@ -1435,6 +1496,8 @@ async function refreshCurrent(prompt, answerIndex = null, id = state.current?.id
     const listed = state.agents.find((a) => a.id === fresh.id);
     if (listed) { listed.history_len = fresh.history_len; listed.label = fresh.label; }
     renderList();
+    if (state.current?.id !== id) return;
+    state.current = fresh;
     renderTaskHead();
     renderFeed(fresh);
     // Итог по чату и число сообщений приехали вместе с агентом: плитки
@@ -1446,7 +1509,7 @@ async function refreshCurrent(prompt, answerIndex = null, id = state.current?.id
   // Обмен меняет краткосрочный слой: история выросла, а со сворачиванием
   // могла добавиться и сводка. Это событие, а не отрисовка, и при закрытой
   // вкладке оно молчит.
-  if (memoryTabOpen() && state.settingsScope === "chat") loadMemory(true);
+  if (session === sessionEpoch && state.current?.id === id && memoryTabOpen() && state.settingsScope === "chat") loadMemory(true);
 }
 
 // Due results arrive without a send or a Tools visit. One visible-page request
@@ -2054,11 +2117,9 @@ function confirmBox(title, text, confirmLabel, onYes) {
 async function newChat() {
   const ticket = ++state.navigationRevision;
   state.creationRevision += 1;
-  stopStream();
   try {
     const created = await api("/api/agents", json("POST", {}));
     state.chatCreationError = "";
-    if (ticket === state.navigationRevision) state.current = null;
     await loadAgents(created.agents[0].id, ticket);
     if (ticket !== state.navigationRevision) return;
     showWorkspace("chat"); $("#input").focus();
@@ -2073,7 +2134,7 @@ async function newChat() {
 function leaveSession() {
   if (leavingSession) return;
   leavingSession = true; sessionEpoch++;
-  stopStream(); stopChatPolling(); stopMcpPolling(); ragInspector.stop();
+  stopAllStreams(); stopChatPolling(); stopMcpPolling(); ragInspector.stop();
   chatModelPicker.stop(); rerankModelPicker.stop();
   if (state.statusTimer) clearTimeout(state.statusTimer);
   Object.assign(state, freshState());
@@ -2179,6 +2240,7 @@ function initApp() {
   });
   window.addEventListener?.("pagehide", stopMcpPolling);
   window.addEventListener?.("pagehide", stopChatPolling);
+  window.addEventListener?.("pagehide", stopAllStreams);
 
   $("#new-chat").onclick = () => newChat();
   let connectionSave = 0, connectionDraft = 0;
