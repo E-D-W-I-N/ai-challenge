@@ -124,10 +124,10 @@ def history_pairs(history) -> list[dict]:
     return redact(pairs[-3:])
 
 
-async def rewrite(question, history, model, stream, cancel, *, provider="openrouter", reasoning_enabled=False, working_memory=None) -> dict:
+async def rewrite(question, history, model, stream, cancel, *, reasoning_enabled=False, working_memory=None) -> dict:
     """One constrained call, with cancellation and no retry or fallback."""
     started = time.monotonic()
-    spec = AgentSpec(label="RAG query rewrite", model=model, provider=provider, reasoning_enabled=reasoning_enabled, max_tokens=9216,
+    spec = AgentSpec(label="RAG query rewrite", model=model, reasoning_enabled=reasoning_enabled, max_tokens=9216,
                      response_format={"type": "json_object"})
     prompt = [{"role": "system", "content": _REWRITE_PROMPT},
               {"role": "user", "content": json.dumps(redact({"history": history, "question": question, "working_memory": [{"kind": item["kind"], "content": item["content"]} for item in (working_memory or [])]}), ensure_ascii=False)}]
@@ -153,7 +153,7 @@ async def rewrite(question, history, model, stream, cancel, *, provider="openrou
             raise RewriteError("Некорректный JSON переформулировки RAG-запроса", usage) from None
         if not isinstance(data, dict) or set(data) != {"query"} or not isinstance(data["query"], str) or not data["query"].strip() or len(data["query"]) > 8000:
             raise RewriteError("Некорректная переформулировка RAG-запроса", usage)
-        return {"enabled": True, "query": redact(data["query"].strip()), "model": model, "provider": provider,
+        return {"enabled": True, "query": redact(data["query"].strip()), "model": model,
                 "usage": redact(final.get("metrics")),
                 "duration_seconds": round(time.monotonic() - started, 3)}
     task = asyncio.create_task(collect())
@@ -179,7 +179,7 @@ def retrieve(query: str, *, original_query=None, history_used=None, spec=None, r
     started = time.monotonic()
     spec = spec or AgentSpec(label="legacy retrieval", model="", rag_rewrite_enabled=False)
     from shared_models import endpoint
-    result = redact(Index().retrieve(query, top_k=spec.rag_candidates_k, expected_base_url=endpoint("compatible")))
+    result = redact(Index().retrieve(query, top_k=spec.rag_candidates_k, expected_base_url=endpoint()))
     candidates = [{**hit, "original_rank": i} for i, hit in enumerate(result["hits"], 1)]
     duration = round(time.monotonic() - started, 3)
     snapshot = {"version": 3, **result, "top_k": spec.rag_candidates_k,
@@ -258,7 +258,7 @@ async def rerank(question, snapshot, spec, stream, cancel):
     """One isolated generative call returns a full permutation, never scores/subsets."""
     started = time.monotonic()
     config = AgentSpec(label="RAG rerank", model=spec.rag_rerank_model,
-                       provider=spec.rag_rerank_provider, reasoning_enabled=spec.rag_rerank_reasoning_enabled, max_tokens=9216,
+                       reasoning_enabled=spec.rag_rerank_reasoning_enabled, max_tokens=9216,
                        response_format={"type": "json_object"})
     hits = snapshot.get("candidates", snapshot["hits"])
     allowed_ids = list(range(1, len(hits) + 1))
@@ -292,7 +292,7 @@ async def rerank(question, snapshot, spec, stream, cancel):
         if not final or (final.get("metrics") or {}).get("finish_reason") != "stop" or (final.get("metrics") or {}).get("error") or final.get("error"):
             raise RewriteError("RAG rerank не завершён успешно", usage)
         ids = _rerank_ids(final.get("text", ""), len(hits), usage)
-        return {"enabled": True, "provider": spec.rag_rerank_provider, "model": spec.rag_rerank_model,
+        return {"enabled": True, "model": spec.rag_rerank_model,
                 "source_ids": ids, "usage": redact(final.get("metrics")),
                 "duration_seconds": round(time.monotonic() - started, 3)}
     task = asyncio.create_task(collect())
@@ -301,7 +301,7 @@ async def rerank(question, snapshot, spec, stream, cancel):
         done, _ = await asyncio.wait({task, cancellation}, timeout=REWRITE_TIMEOUT,
                                     return_when=asyncio.FIRST_COMPLETED)
         if cancellation in done:
-            return {"enabled": True, "provider": spec.rag_rerank_provider, "model": spec.rag_rerank_model,
+            return {"enabled": True, "model": spec.rag_rerank_model,
                     "cancelled": True, "usage": redact(usage),
                     "duration_seconds": round(time.monotonic() - started, 3)}
         if task not in done:

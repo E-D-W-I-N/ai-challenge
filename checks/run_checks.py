@@ -51,6 +51,7 @@ from app.schema import (  # noqa: E402
     TRANSITIONS,
     AgentSpec,
 )
+from shared_models import Connection, bind_connection
 from app.store import Store, StoreBusyError  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -345,13 +346,10 @@ def _body_rules(payload) -> list[str]:
     два места из трёх, и третий путь уедет к провайдеру без правила, ничего
     не уронив. Утверждение осталось в проверках, здесь только его текст."""
     broken = []
-    provider = payload.get("provider")
-    if not (provider and provider.get("require_parameters") is True):
-        broken.append(f"нет provider.require_parameters: {provider!r}")
-    if {"id": "context-compression", "enabled": False} not in (payload.get("plugins") or []):
-        broken.append(f"сжатие контекста отдано провайдеру: {payload.get('plugins')!r}")
-    if payload.get("usage") != {"include": True}:
-        broken.append(f"нет просьбы о usage: {payload.get('usage')!r}")
+    if payload.get("reasoning_effort") not in {"none", "medium"}:
+        broken.append("reasoning effort missing")
+    if payload.get("stream_options") != {"include_usage": True}:
+        broken.append("stream usage missing")
     return broken
 
 
@@ -3095,7 +3093,7 @@ def check_call_body_invariants():
     assert not _body_rules(payload), f"вызов напрямую: {_body_rules(payload)}"
     # И плагин тут **единственный**: у чата без своих плагинов наш встаёт
     # один, а не дописывается к чужому списку из ниоткуда.
-    assert payload["plugins"] == [{"id": "context-compression", "enabled": False}], payload
+    assert "plugins" not in payload, payload
     return "4 вызова через ручки и один напрямую — все три правила на каждом"
 
 
@@ -3152,7 +3150,7 @@ def _parsed_metrics(lines, **kwargs) -> dict:
 
     gap = kwargs.pop("gap", None)
     with patch.object(llm, "shared_client", lambda: _FakeClient(_FakeResponse(lines, gap_after=gap))), \
-            patch.object(llm, "api_key", lambda: "sk-or-проверочный"):
+            patch.object(llm, "model_key", lambda: "sk-or-проверочный"):
         spec = AgentSpec(label="разбор", model="stub/thinking", reasoning_enabled=True)
         events = asyncio.run(drain(llm.stream_completion(spec, prompt_override=[], **kwargs)))
     return next(e for e in events if e["type"] == "done")["metrics"]
@@ -3180,7 +3178,7 @@ def _streamed(lines, *, spec=None, **kwargs) -> tuple[list[dict], dict]:
             return super().stream(*args, **call_kwargs)
 
     with patch.object(llm, "shared_client", lambda: _Recorder(_FakeResponse(lines))), \
-            patch.object(llm, "api_key", lambda: "sk-or-проверочный"):
+            patch.object(llm, "model_key", lambda: "sk-or-проверочный"):
         target = spec if spec is not None else AgentSpec(label="вызовы", model="stub/tools")
         events = asyncio.run(drain(llm.stream_completion(target, prompt_override=[], **kwargs)))
     return events, sent[-1]
@@ -4265,8 +4263,8 @@ def check_no_key_leak():
     # не вылезет ли она в ответах ручек. Настоящий ключ проверке не нужен.
     import app.config as config
 
-    lure = lambda: "sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА-ДЛЯ-ПРОВЕРКИ"  # noqa: E731
-    with patch.object(config, "api_key", lure), TestClient(main.app) as client:
+    lure = lambda *args: Connection(api_key="sk-or-v1-ЭТО-НЕ-КЛЮЧ-А-ПРИМАНКА-ДЛЯ-ПРОВЕРКИ")  # noqa: E731
+    with patch.object(main.model_settings, "current_connection", lure), TestClient(main.app) as client:
         agent_id = client.post("/api/agents", json={}).json()["agents"][0]["id"]
         bodies = [
             client.get("/api/agents").text,
@@ -4286,7 +4284,7 @@ def check_no_key_in_db():
     key = "sk-or-v1-ТЕСТОВЫЙ-КЛЮЧ-КОТОРЫЙ-НЕ-ДОЛЖЕН-УТЕЧЬ"
     path = _temp_db("secret")
     store = Store(path).init()
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": key}):
+    with bind_connection(Connection(api_key=key)):
         agent = Agent(
             AgentSpec(
                 label=f"утечка {key}",
@@ -4411,7 +4409,7 @@ def check_every_write_path_redacts():
     # на внимательности автора каждого метода.
     key = "sk-or-v1-" + "e" * 64
     with contextlib.closing(Store(store_module.MEMORY).init()) as store, \
-            patch.dict(os.environ, {"OPENROUTER_API_KEY": key}):
+            bind_connection(Connection(api_key=key)):
         with store.tx() as conn:
             assert not isinstance(conn, sqlite3.Connection), (
                 "tx() отдаёт голое соединение — redact() перестал быть по построению"

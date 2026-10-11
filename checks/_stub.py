@@ -188,13 +188,14 @@ def use_temp_db(path: str | None = None) -> str:
     """
     import os
     import tempfile
+    from pathlib import Path
 
     requested_path = path
     if path is None:
         path = os.path.join(tempfile.mkdtemp(prefix="checks-db-"), "agents.db")
     # Config import performs no I/O; prevent fixture key reads from the user's .env.
-    import app.config as config
-    config._load_dotenv = lambda: None
+    import app.model_settings as model_settings
+    model_settings.DEFAULT_CONNECTION_PATH = Path(path).parent / "model-connection.json"
     import app.store as store
     if store._STORE is None:
         store._STORE = store.Store(path).init()
@@ -222,10 +223,9 @@ def install_offline(db_path: str | None = None) -> None:
     from pathlib import Path
     mcp.DEFAULT_CONFIG_PATH = Path(main.REGISTRY.store.path).parent / "fixture-no-mcp.json"
 
-    async def no_catalog(purpose="generation"):
+    async def no_catalog(purpose="generation", connection=None):
         return []
 
     if not hasattr(catalog, "_offline_original_fetch_models"):
         catalog._offline_original_fetch_models = catalog.fetch_models
     catalog.fetch_models = no_catalog
-    main.has_key = lambda: True

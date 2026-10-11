@@ -38,7 +38,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import ROOT, api_key
+from .config import ROOT
 
 DEFAULT_DB_PATH = ROOT / "data" / "agents.db"
 """Фиксированный путь базы приложения. Каталог в .gitignore вместе
@@ -377,25 +377,32 @@ def _working_row(row: sqlite3.Row) -> dict:
 MIN_SECRET_LENGTH = 16
 """Короче этого значение ключом не считается и не вырезается: редакция работает
 подстрокой и чистит **любой** строковый параметр, а с ключом в один символ
-изрезала бы `ag_00001` в `ag_***0000***`. Настоящий ключ OpenRouter — 73 символа."""
+изрезала бы `ag_00001` в `ag_***0000***`. Короткие значения чистятся только как точное значение или Bearer, чтобы не портить текст."""
 
 
 def redact(value):
-    """Вырезает ключ OpenRouter из всего, что уезжает в базу: в конфиг он
+    """Вырезает известный ключ соединения из всего, что уезжает в базу: в конфиг он
     не попадает по построению, но `extra_body` приходит от клиента, да и
     в реплику его можно вставить, перепутав окно. Репозиторий публичный."""
-    api_key()
     from shared_models import key as model_key
-    keys = [key for key in (model_key("openrouter"), model_key("compatible")) if len(key) >= MIN_SECRET_LENGTH]
-    if isinstance(value, str):
-        for key in keys:
-            value = value.replace(key, "***")
-        return value
-    if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v) for v in value]
-    return value
+    from .model_settings import current_connection
+    keys = {item for item in (model_key(), current_connection().api_key) if item}
+    def clean(item):
+        if isinstance(item, str):
+            for secret in keys:
+                if len(secret) >= MIN_SECRET_LENGTH:
+                    item = item.replace(secret, "***")
+                elif item == secret:
+                    item = "***"
+                else:
+                    item = item.replace("Bearer " + secret, "Bearer ***")
+            return item
+        if isinstance(item, dict):
+            return {clean(k): clean(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [clean(v) for v in item]
+        return item
+    return clean(value)
 
 
 class StoreBusyError(RuntimeError):
@@ -1228,17 +1235,12 @@ class Store:
     # --- meta: счётчики, общие на всю базу -----------------------------------
 
     def load_model_settings(self) -> dict:
-        from shared_models import DEFAULT_COMPATIBLE_BASE_URL
-        with self.reading() as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key='model_settings'").fetchone()
-        return _loads(row["value"], None) if row else {"compatible_base_url": DEFAULT_COMPATIBLE_BASE_URL}
+        from .model_settings import settings
+        return settings(self)
 
     def save_model_settings(self, value: dict) -> dict:
-        from shared_models import validate_url
-        saved = {"compatible_base_url": validate_url(value["compatible_base_url"])}
-        with self.tx() as conn:
-            conn.execute("INSERT INTO meta(key,value) VALUES ('model_settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_dumps(saved),))
-        return saved
+        from .model_settings import save_settings
+        return save_settings(value, self)
 
     def load_mcp_config(self) -> dict:
         with self.reading() as conn:

@@ -844,7 +844,7 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .rag-chat-numbers .field { width: 155px; }
 .model-selector { min-width: 0; }
 #rag-preparation-picker { margin-bottom: 12px; }
-.model-selector-row { display: grid; grid-template-columns: minmax(170px, 200px) minmax(160px, 1fr) 36px; gap: 10px; align-items: end; }
+.model-selector-row { display: grid; grid-template-columns: minmax(0, 1fr) 36px; gap: 10px; align-items: end; }
 .model-refresh { width: 36px; height: 36px; min-width: 36px; padding: 0; font-size: 19px; }
 .model-status { display: block; font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }
 .model-parameters > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
@@ -864,11 +864,6 @@ summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
   .panel { grid-template-columns: 150px minmax(0, 1fr); }
   .panel-body { padding: 20px; }
   .settings-card, .mem-layer { padding: 16px; }
-  .model-selector-row { grid-template-columns: 200px minmax(130px, 1fr) 36px; }
-}
-@media (max-width: 900px) {
-  .model-selector-row { grid-template-columns: minmax(0, 1fr) 36px; }
-  .model-selector-row > .field:first-child { grid-column: 1 / -1; }
 }
 :root { --sidebar-w: 280px; }
 #rag-rerank-fields { min-width: 0; }

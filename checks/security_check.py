@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from shared_models import Connection, bind_connection
 from unittest.mock import patch
 
 import httpx
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def check_security():
-    from app import llm, rag_api, rag_models
+    from app import llm, rag_api, rag_models, model_settings
     from app.schema import AgentSpec
 
     keys = ["offline-selected-private", "offline-unused-local", "offline-unused-legacy"]
@@ -39,11 +40,11 @@ def check_security():
                 raise exception(upstream_text, request=request)
             return httpx.Response(status, stream=Body())
         async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
-            with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "api_key", return_value=keys[0]):
+            with patch.object(llm, "shared_client", return_value=client), patch.object(llm, "model_key", return_value=keys[0]):
                 events = [event async for event in llm.stream_completion(selected, prompt_override=[])]
         return events, sent, consumed
 
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "  " + keys[0] + "  ", "RAG_EMBEDDING_API_KEY": keys[1], "RAG_CHUNKING_API_KEY": keys[2]}):
+    with bind_connection(Connection(api_key=keys[1])):
         for code, hint in [(401, "авторизацию"), (403, "доступ"), (429, "лимит"), (503, "недоступен")]:
             events, sent, consumed = asyncio.run(failure_events(status=code))
             assert sent == ["Bearer " + keys[0]] and consumed == []
@@ -69,8 +70,8 @@ def check_security():
         from app import main
         app = FastAPI(); app.include_router(rag_api.router)
         app.add_api_route("/api/models", main.list_models, methods=["GET"])
-        main.REGISTRY.store.save_model_settings({"compatible_base_url": "https://neutral-upstream.test/v1"})
-        params = {"provider": "compatible"}
+        main.REGISTRY.store.save_model_settings({"base_url": "https://neutral-upstream.test/v1"})
+        params = {}
         denied = [
             {"Origin": "https://unrelated.test", "Sec-Fetch-Site": "cross-site"},
             {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
@@ -81,7 +82,7 @@ def check_security():
             {"Origin": "http://testserver", "Sec-Fetch-Site": "cross-site"},
             [("Origin", "http://testserver"), ("Origin", "https://unrelated.test")],
         ]
-        with patch.object(rag_models.httpx, "AsyncClient", client_with_fixture), patch.object(rag_models.config, "api_key", return_value=keys[0]) as key_reader, \
+        with patch.object(rag_models.httpx, "AsyncClient", client_with_fixture), patch.object(model_settings, "current_connection", return_value=Connection("https://neutral-upstream.test/v1", keys[1])) as key_reader, \
                 patch.object(rag_api, "Index") as index, patch.object(rag_api, "Operation") as operation, TestClient(app) as api:
             for headers in denied:
                 response = api.get("/api/models", params=params, headers=headers)

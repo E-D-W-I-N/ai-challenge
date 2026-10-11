@@ -19,20 +19,17 @@ class PreparationConfig:
     model: str = SemanticConfig.model
     timeout_seconds: float = 600
     prompt_version: str = "preparation-v1"
-    provider: str = "openrouter"
     reasoning_enabled: bool = False
-    auth_mode: InitVar[str | None] = None
     max_html_characters: int = 200000
     max_output_characters: int = 200000
     max_tokens: int = 32768
     payload_version: str = "preparation-reasoning-v2"
 
-    def __post_init__(self, auth_mode):
+    def __post_init__(self):
         if type(self.reasoning_enabled) is not bool:
             raise ValueError("reasoning_enabled must be boolean")
         # Reuse endpoint/model/auth validation, with an independent preparation timeout.
-        checked = SemanticConfig(self.base_url, self.model, provider=self.provider, auth_mode=auth_mode)
-        object.__setattr__(self, "provider", checked.provider)
+        checked = SemanticConfig(self.base_url, self.model)
         object.__setattr__(self, "base_url", checked.base_url)
         if (type(self.timeout_seconds) not in (int, float) or not math.isfinite(self.timeout_seconds)
                 or not 1 <= self.timeout_seconds <= 3600):
@@ -61,7 +58,7 @@ def _payload(html, config):
                 {"role": "user", "content": json.dumps({"html": html}, ensure_ascii=False)}]}
 
     from shared_models import generation_payload
-    return generation_payload(payload, config.provider, reasoning_enabled=getattr(config, "reasoning_enabled", False))
+    return generation_payload(payload, reasoning_enabled=getattr(config, "reasoning_enabled", False))
 
 
 def _document(body, source, config):
@@ -162,7 +159,7 @@ class Preparer:
             self.publish()
 
         if self.client is None:
-            with httpx.Client(timeout=config.timeout_seconds, trust_env=config.provider == "openrouter") as client:
+            with httpx.Client(timeout=config.timeout_seconds, trust_env=False) as client:
                 body, response = _call(client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)
         else:
             body, response = _call(self.client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)

@@ -45,15 +45,16 @@ def check_workflow_http():
             source.write_text('<article><h1>Neutral</h1><p>' + 'Neutral sample text. ' * 100 + '</p><p>Next neutral topic.</p></article>', encoding="utf-8")
             ingest([{"path": str(source), "source": "https://example.test/neutral"}], root)
             base = f"http://127.0.0.1:{server.server_port}/v1"
+            (root / "connection.json").write_text(json.dumps({"base_url": base, "api_key": "offline-embed-key"}))
             def cli(*args, success=True):
-                result = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", base, *args], capture_output=True, text=True,
+                result = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--connection-file", str(root / "connection.json"), *args], capture_output=True, text=True,
                                         cwd=Path(__file__).resolve().parent.parent)
                 assert result.returncode == (0 if success else 1), result.stderr
                 assert "offline-chunk-key" not in result.stdout + result.stderr and "offline-embed-key" not in result.stdout + result.stderr
                 return json.loads(result.stdout) if success else result.stderr
-            split = ("chunks", "--strategy", "semantic", "--size", "400", "--overlap", "40", "--semantic-provider", "compatible")
+            split = ("chunks", "--strategy", "semantic", "--size", "400", "--overlap", "40", "--semantic-model", "offline-chunk")
             with Operation(root, "chunks"):
-                blocked = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--compatible-base-url", base, *split], capture_output=True, text=True,
+                blocked = subprocess.run([sys.executable, "-m", "rag", "--root", str(root), "--connection-file", str(root / "connection.json"), *split], capture_output=True, text=True,
                                          cwd=Path(__file__).resolve().parent.parent, timeout=5)
                 assert blocked.returncode == 1 and "Another RAG operation" in blocked.stderr and not calls
             first = cli(*split)
@@ -63,7 +64,7 @@ def check_workflow_http():
             cached = cli(*split)
             assert len(calls) == count and cached["report"]["calls"] == 0 and cached["report"]["usage"] == {}
             assert cached["fingerprint"] == first["fingerprint"]
-            cli("embed", "--provider", "compatible", "--model", "offline-test")
+            cli("embed", "--model", "offline-test")
             assert not (root / "index.sqlite").exists()
             count = len(calls)
             cli("save")
@@ -88,7 +89,7 @@ def check_workflow_http():
             cli(*split)
             assert len(calls) > count
             for path in root.rglob("*"):
-                if path.is_file():
+                if path.is_file() and path.name != "connection.json":
                     assert b"offline-chunk-key" not in path.read_bytes() and b"offline-embed-key" not in path.read_bytes()
         return "actual offline semantic/embedding HTTP + CLI; segmentation cache identity; save no model; invalid boundary preserves index; clear recomputes"
     finally:
