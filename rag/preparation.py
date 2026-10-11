@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, InitVar
 from pathlib import Path
 
 import httpx
+from shared_models.transport import client_options, create_client
 
 from .documents import digest, now, write_json
 from .semantic import SemanticConfig, _call, _decode_response, _contains_credential, _runtime_credentials, _reasoning_options
@@ -159,7 +160,7 @@ class Preparer:
             self.publish()
 
         if self.client is None:
-            with httpx.Client(timeout=config.timeout_seconds, trust_env=False) as client:
+            with create_client(httpx.Client, timeout=config.timeout_seconds, **client_options(config.base_url)) as client:
                 body, response = _call(client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)
         else:
             body, response = _call(self.client, config, payload, account, label="Preparation", before_send=before_send, response_limit=config.max_output_characters * 12 + 65536)
