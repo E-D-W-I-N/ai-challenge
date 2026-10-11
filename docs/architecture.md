@@ -96,6 +96,8 @@ FastAPI обслуживает API и статический клиент без
 base_url/has_api_key/revision. PATCH принимает base_url?/api_key?: до сохранения
 проверяет свежий GET /models с общим deadline 15 секунд и bounded/schema
 валидацией каталога. Trusted origin проверяется до доступа к credentials.
+Отказ каталога сообщает GET /models и исходный HTTP-статус: 401 — отказ
+авторизации, 403 — запрет доступа; приложение возвращает 502 без тела отказа.
 Неуспешный probe не заменяет рабочее подключение; CAS после await отклоняет
 устаревший результат. Удаление ключа — отдельный PATCH api_key="" без probe.
 Проверка каталога не обещает успешную генерацию. Отсутствие ключа
@@ -108,7 +110,15 @@ base_url/has_api_key/revision. PATCH принимает base_url?/api_key?: до
 База приложения фиксирована в `data/agents.db`, MCP bootstrap — `mcp.json`,
 RAG — `data/rag`. Лимиты live agents (1000) и HTTP calls (16) фиксированы;
 сервисы принимают явные CLI пути/host/port. Стандартные системные переменные
-и proxy transport продолжают работать. Offline стенд задаёт временный connection path,
+и proxy transport продолжают работать. Общий `shared_models.transport` выбирает
+маршрут по URL через stdlib getproxies/proxy_bypass: macOS System Configuration
+HTTP/HTTPS и исключения либо стандартные proxy/NO_PROXY переменные. Loopback
+localhost/127.0.0.0/8/::1 всегда direct; SOCKS5 доступен через proxy URL,
+PAC и системный SOCKS macOS stdlib не обнаруживает. Некорректный proxy даёт
+безопасную ошибку без direct fallback и публикации proxy URL/credentials.
+Каталог, чат/сжатие/Rewrite/реранкинг и sync RAG используют один helper;
+чат фиксирует маршрут до await, pool разделён по event loop и proxy/auth,
+остановка закрывает все его клиенты. Offline стенд задаёт временный connection path,
 внедряет временный Store до импорта registry и временные пути/конфиг явно;
 перезапуск и несколько процессов передают путь базы аргументом fixture CLI.
 
@@ -681,7 +691,7 @@ Agent/LLM stream с offline HTTP провайдером. Все четыре ф�
   `SemanticConfig` хранит endpoint/model/timeout/prompt_version; размер semantic
   64–12000. Runtime ключ берётся только из frozen connection на HTTP-границе,
   не входит в nonsecret config/cache identity. Ротация ключа не меняет кэш.
-  Совместимый sync HTTP идёт напрямую без proxy environment. HTTP-ошибка
+  Sync HTTP использует общий выбор системного proxy с прямым loopback. HTTP-ошибка
   показывает безопасный status, без raw body/headers и отражённого ключа;
   `semantic-cache` хранит приватные проверенные per-document segmentation и
   request/response traces без auth headers; identity включает document/hash,

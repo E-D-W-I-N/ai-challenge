@@ -11,6 +11,7 @@ import httpx
 
 from .documents import digest
 from shared_models import DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_EMBEDDING_MODEL
+from shared_models.transport import client_options, create_client
 
 
 @dataclass(frozen=True)
@@ -103,5 +104,5 @@ class Embeddings:
             return vectors
         if self.client is not None:
             return call(self.client)
-        with httpx.Client(timeout=120, trust_env=False, follow_redirects=False) as client:
+        with create_client(httpx.Client, timeout=120, follow_redirects=False, **client_options(self.config.base_url)) as client:
             return call(client)

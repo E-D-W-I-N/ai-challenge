@@ -17,6 +17,7 @@ import httpx
 
 
 from shared_models import endpoint, key as model_key, generation_payload
+from shared_models.transport import client_options, create_client
 from .schema import AgentSpec
 
 _SPEED_WINDOW_SECONDS = 5.0
@@ -25,30 +26,34 @@ _TIMEOUT = httpx.Timeout(180.0, connect=20.0)
 
 # HTTP clients belong to their event loop. Admission is shared across loops/threads.
 # Ключ — сам цикл, слабой ссылкой, чтобы завершённый цикл не держался в памяти.
-_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
+_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple, httpx.AsyncClient]]" = (
     weakref.WeakKeyDictionary()
 )
-def shared_client() -> httpx.AsyncClient:
+def shared_client(base_url: str | None = None) -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
-    client = _clients.get(loop)
+    options = client_options(base_url or endpoint())
+    proxy = options.get("proxy")
+    # Route identity stays private and includes proxy authentication.
+    route = (str(proxy.url), proxy.auth) if proxy is not None else (None, None)
+    clients = _clients.setdefault(loop, {})
+    client = clients.get(route)
     if client is None or client.is_closed:
-        client = httpx.AsyncClient(
-            timeout=_TIMEOUT, trust_env=False,
+        client = create_client(httpx.AsyncClient,
+            timeout=_TIMEOUT, **options,
             limits=httpx.Limits(
                 max_connections=None,
                 max_keepalive_connections=10,
             ),
         )
-        _clients[loop] = client
+        clients[route] = client
     return client
 
 
 async def aclose() -> None:
-    """Закрывает общий клиент текущего цикла. Зовётся на остановке приложения."""
+    """Закрывает клиенты всех маршрутов текущего цикла при остановке приложения."""
     loop = asyncio.get_running_loop()
-    client = _clients.pop(loop, None)
-    if client is not None and not client.is_closed:
-        await client.aclose()
+    clients = _clients.pop(loop, {})
+    await asyncio.gather(*(client.aclose() for client in clients.values() if not client.is_closed))
 
 
 @dataclass
@@ -253,8 +258,8 @@ async def stream_completion(
     try:
         from shared_models.admission import validate_payload
         validate_payload(payload)
+        client = shared_client(base_url)
         with contextlib.nullcontext():
-            client = shared_client()
             record_request(payload)
             async with client.stream(
                 "POST",
