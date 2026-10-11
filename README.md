@@ -98,7 +98,10 @@ sudo systemctl enable --now aichat.service
 Launcher создаёт приватный `data/inference-capacity.json`, вычисляет
 `OLLAMA_NUM_PARALLEL`, задаёт `OLLAMA_MAX_LOADED_MODELS=2`,
 `OLLAMA_MAX_QUEUE=0` и `OLLAMA_KEEP_ALIVE=-1`. Внутреннюю очередь Ollama
-заменяет очередь приложения. Параметры загрузки и параллельного контекста
+заменяет очередь приложения. Launcher предпочитает manifest v2 (`manifests-v2/ollama.com`);
+если его нет, читает прежний `manifests/registry.ollama.ai`. Digest считается
+по выбранному manifest; проверки семейства модели и квантования сохраняются.
+Параметры загрузки и параллельного контекста
 описаны в [Ollama FAQ](https://docs.ollama.com/faq).
 
 Установите Caddy не ниже 2.11.2 из [Debian trixie-backports](https://backports.debian.org/Instructions/).

@@ -22,8 +22,12 @@ EMBEDDING = "embeddinggemma:latest"
 
 def manifest(name):
     model, tag = name.split(":")
-    path = MODELS / "manifests" / "registry.ollama.ai" / "library" / model / tag
-    raw = path.read_bytes()
+    path = MODELS / "manifests-v2" / "ollama.com" / "library" / model / tag
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        path = MODELS / "manifests" / "registry.ollama.ai" / "library" / model / tag
+        raw = path.read_bytes()
     value = json.loads(raw)
     config = json.loads((MODELS / "blobs" / value["config"]["digest"].replace(":", "-")).read_text())
     weights = sum(layer["size"] for layer in value["layers"] if layer["mediaType"] == "application/vnd.ollama.image.model")
