@@ -1093,8 +1093,7 @@ class Agent:
         # {"type": "json_object"} вернул бы вместо пересказа объект, а
         # стоп-строка оборвала бы пересказ на середине. Модель и параметры
         # сэмплирования — те же: вторая модель развалила бы счёт на две цены.
-        from shared_models.admission import limits
-        folding = replace(spec, response_format=None, stop=None, max_tokens=limits().get("output_limit") or spec.max_tokens)
+        folding = replace(spec, response_format=None, stop=None)
         prompt = build_compress_prompt(chunk, self.summaries[-1]["content"] if covered else None)
 
         content = ""
@@ -1581,7 +1580,7 @@ class Agent:
         spec = spec or self.spec
         models = [spec.extra_body.get("model", spec.model)]
         from shared_models.admission import limits
-        if spec.rag_enabled and limits().get("context_limit"):
+        if spec.rag_enabled and limits().get("local_runners"):
             from .rag import Index
             models.append(Index().metadata()["embedding_config"]["model"])
             if spec.rag_rerank_enabled:

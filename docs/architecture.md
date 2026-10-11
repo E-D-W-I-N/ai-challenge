@@ -1126,10 +1126,15 @@ Admission общий для generation/embeddings и всех служебных
 со скрытым ожиданием. Отмена retrieval ждёт фактического завершения sync HTTP worker
 до release. RAG worker имеет одну reservation на всю операцию. Невозможный model
 профиль или превышение resource policy — ошибка, не бесконечное ожидание.
-VPS policy задаёт context/output лимиты; служебные запросы используют её output_limit,
-пользовательский chat config не урезается. Для локальной генерации незаданный
-`max_tokens` дополняется `output_limit` в outbound payload до оценки контекста,
-захвата фактического JSON и HTTP; явный выход сверх лимита отклоняется.
-Сохранённый config не меняется. Без VPS policy и для внешнего URL поведение сохраняется.
+VPS policy ограничивает ресурсы, очередь и локальные ID моделей с рассчитанными
+весами. Новый пустой чат сохраняет видимый `max_tokens=512`; явный config,
+включая null, не переписывается. Payload сохраняет заданные параметры и отсутствие
+пустого `max_tokens`, без output cap, byte-context gate и запрета пользовательских
+context/output overrides. Контекст 4096 — default Ollama, а не дополнительный
+фильтр приложения. Readiness проверяет присутствие и digest обеих моделей,
+без допуска по размеру контекста. Служебные вызовы используют обычные параметры
+без VPS-подстановок; RAG reservation использует независимый флаг `local_runners`.
+Ошибки сервера возвращаются без retries/fallback. Один completion на reservation
+остаётся явной границей учёта ресурсов.
 Offline checks используют checks/_stub с временными accounts/Store и настоящей
 фикстурной session cookie; production auth bypass отсутствует. Новых проверок нет.
