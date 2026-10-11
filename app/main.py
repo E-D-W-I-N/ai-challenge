@@ -1158,10 +1158,11 @@ async def get_model_settings() -> dict:
 async def patch_model_settings(request: Request, payload: dict = Body(...)) -> dict:
     from .request_security import trusted_rag_request
     trusted_rag_request(request)
-    from .model_settings import save_settings
+    from .model_settings import connect_settings, save_settings
     try:
         old_url = model_settings.settings(REGISTRY.store)["base_url"]
-        saved = save_settings(payload, REGISTRY.store)
+        saved = (save_settings(payload, REGISTRY.store) if payload == {"api_key": ""}
+                 else await connect_settings(payload, REGISTRY.store))
         if saved["base_url"] != old_url:
             for agent in REGISTRY.list():
                 agent.context_length = None
