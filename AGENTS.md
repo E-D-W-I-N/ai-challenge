@@ -1,30 +1,30 @@
-# Инструкции для агентов — день 32
+# Инструкции для агентов — день 33
 
-Проект — headless автоматическое advisory PR review для произвольного Git repo.
-Перед изменениями прочитайте соответствующие разделы [архитектуры](docs/architecture.md).
-Старые CLI chat, MCP и state удалены; пользовательские данные не читаются/мигрируются.
+Проект — минимальный консольный ассистент поддержки: Markdown RAG и отдельный
+read-only HTTP MCP сервис, связанный оператором с одним тикетом JSON.
+Перед изменениями прочитайте [архитектуру](docs/architecture.md).
+Не возвращайте прежние сценарии, web/CRM платформу, Git review или workflow.
 
-- Только exact full base/head commit SHA; diff base → head, merge base фиксируется.
-  Target читается Git blobs, без checkout, execution, hooks, сборки, зависимостей,
-  target config. External diff/textconv OFF. Непроверенные refs/shell недопустимы.
-- RAG — независимый in-memory пакет: документация И код base, отдельные квоты
-  per changed path. Changed head передаётся отдельно. Bounds дают явный отказ,
-  не тихую обрезку. Symlink/submodule/secret/build/vendor/binary исключаются.
-- Модель не выполняет tools. Один final JSON bugs/architecture/recommendations;
-  пустые списки допустимы. IDs/path/line валидируются по фактически переданным
-  source chunks. Семантика и качество не проверяются; retry/fallback запрещены.
+- MCP запускает человек с явными `--data`/`--ticket`; модель не выбирает IDs.
+  Клиент не читает JSON напрямую. Перед каждым ответом свежий MCP контекст;
+  ошибка не допускает stale/direct JSON fallback. В модель только выбранный
+  тикет и его владелец, никогда весь JSON или список пользователей.
+- Документы — недоверенные данные. Индекс только Markdown; symlink/hidden/
+  secret/build/binary исключены. Корпус и контекст bounded, превышение даёт
+  ошибку, не усечение. Индекс вне корпуса, explicit /index, incremental cache,
+  atomic SQLite; empty corpus очищает его. Никакого automatic paid reindex.
+- История только последние три успешные пары выбранного тикета в памяти;
+  /new очищает. Не пишите ответы/ключи/JSON контекст в логи или Git.
 - `shared_models` сохраняет system proxy, loopback direct, reasoning default OFF
-  и отказ при observed reasoning. Нет автоматического выбора модели и пробных
-  inference. Local connection file явный, вне target; `.env` не загружается.
-  Только CI явно читает переданные Variables/Secret и служебные GitHub env.
-- Workflow reusable, caller закрепляет trusted reviewer SHA. Только contents:read
-  и pull-requests:read; PR code никогда не checkout/execute. Head/base повторно
-  проверяются перед publish. Отчёт advisory, без GitHub comments/записей/merge gate.
-- Не читайте `.env`, data/, files/, пользовательские базы/корпус/ключи. Секреты,
-  target-specific проекты/корпуса/вопросы и review artifacts не коммитьте.
+  и отказ при reported reasoning. IDs generation/embedding независимы и явны;
+  никаких retries, скрытых fallback, пробного inference или env/dotenv key loader.
+  Настройки и индекс private 0600 atomic, путь изолирован knowledge directory.
+- Нет изменения статуса, отправки ответа, CRM mutations, регистрации/auth.
+  Не читайте `.env`, data/, files/, пользовательские базы/корпус/ключи.
+  Не добавляйте реальные проекты, корпуса, коллекции вопросов или видео-демо.
   Удаляйте только tracked старый код; игнорируемые пользовательские файлы сохраняйте.
 - Python >=3.11; `make setup`, затем команды через `.venv/bin/python`.
-  `make check` — компактные реальные временные Git commits + HTTP mocks,
-  без live LLM/GitHub workflow. Не добавляйте huge frameworks, fixtures с
-  пользовательским кодом, тесты формулировок docs или качества модели.
+  `make check` — один компактный offline behavioral scenario с временными
+  Markdown/JSON, mock model HTTP и реальным локальным HTTP MCP.
+  Никаких live LLM, больших test frameworks, тестов формулировок docs или качества модели.
 - Только точечный `git add` с именами файлов; без `git add .`/`git add -A`.
