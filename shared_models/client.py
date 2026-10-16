@@ -14,7 +14,8 @@ class ModelError(ValueError):
 class Models:
     def __init__(self, settings):
         self.settings = settings
-        self.connection = Connection(**settings['connection'])
+        self.connection = settings['connection']
+        self.usage = []
 
     def request(self, method, endpoint, payload=None):
         try:
@@ -30,25 +31,17 @@ class Models:
                         if len(raw) > 16 * 1024 * 1024: raise ModelError('Model response exceeds limit')
             value = json.loads(raw)
             if not isinstance(value, dict): raise ValueError()
+            usage = value.get('usage')
+            allowed = {'prompt_tokens', 'completion_tokens', 'total_tokens', 'input_tokens', 'output_tokens'}
+            self.usage.append({'endpoint': endpoint, 'tokens': {k: v for k, v in (usage.items() if isinstance(usage, dict) else []) if k in allowed and type(v) is int and v >= 0}})
             return value
         except ModelError:
             raise
         except (httpx.HTTPError, OSError, ValueError, TypeError):
             raise ModelError('Model transport or response error; check connection, proxy and model') from None
 
-    def catalog(self):
-        body = self.request('GET', '/models')
-        try:
-            rows = body['data']
-            if not isinstance(rows, list): raise ValueError()
-            ids = [row['id'] for row in rows]
-            if any(not isinstance(x, str) or not x or len(x)>256 or any(ord(c)<32 for c in x) for x in ids): raise ValueError()
-            return ids
-        except (KeyError, TypeError, ValueError):
-            raise ModelError('Invalid /models catalog') from None
-
     def embed(self, texts, model):
-        if not model: raise ModelError('Choose an embedding model in /settings')
+        if not model: raise ModelError('Explicit embedding model is required')
         body = self.request('POST', '/embeddings', {'model': model, 'input': texts})
         try:
             rows = sorted(body['data'], key=lambda row: row['index'])
@@ -57,12 +50,12 @@ class Models:
             dims = len(vectors[0])
             if not dims or any(len(v)!=dims or any(type(x) not in (int,float) or not math.isfinite(x) for x in v) or not any(v) for v in vectors): raise ValueError()
             return vectors
-        except (KeyError, TypeError, ValueError, IndexError):
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
             raise ModelError('Invalid embedding vectors') from None
 
     def answer(self, messages):
         s = self.settings
-        if not s['chat_model']: raise ModelError('Choose a generation model in /settings')
+        if not s['chat_model']: raise ModelError('Explicit chat model is required')
         payload = generation_payload(dict(model=s['chat_model'], messages=messages,
             temperature=s['temperature'], max_tokens=s['max_tokens']), reasoning_enabled=s['reasoning_enabled'])
         body = self.request('POST', '/chat/completions', payload)

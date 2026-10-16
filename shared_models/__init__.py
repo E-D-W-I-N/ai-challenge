@@ -1,17 +1,12 @@
 """Compatible model connection and reasoning contracts; no dotenv imports."""
 from __future__ import annotations
 
-import contextlib
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
-from contextvars import ContextVar
 from urllib.parse import urlparse
 
 DEFAULT_COMPATIBLE_BASE_URL = "http://127.0.0.1:8005/v1"
-DEFAULT_GENERATIVE_MODEL = ""
-DEFAULT_EMBEDDING_MODEL = ""
-_bound_connection = ContextVar("model_connection", default=None)
 
 
 def validate_url(value: str) -> str:
@@ -40,8 +35,6 @@ class Connection:
 
 
 def load_connection(path=None):
-    if path is None or not Path(path).exists():
-        return Connection()
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         secret = value.get("api_key", "")
@@ -53,27 +46,6 @@ def load_connection(path=None):
         return Connection(validate_url(value["base_url"]), secret.strip(), revision)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         raise ValueError("Invalid model connection file") from None
-
-
-def connection():
-    return _bound_connection.get() or Connection()
-
-
-def endpoint():
-    return connection().base_url
-
-
-def key():
-    return connection().api_key
-
-
-@contextlib.contextmanager
-def bind_connection(value):
-    token = _bound_connection.set(value)
-    try:
-        yield
-    finally:
-        _bound_connection.reset(token)
 
 
 def generation_payload(payload: dict, *, reasoning_enabled: bool = False) -> dict:
