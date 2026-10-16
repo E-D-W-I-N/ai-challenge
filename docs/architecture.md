@@ -1,91 +1,98 @@
-# Архитектура дня 31
+# Архитектура дня 32
 
-Python >=3.11; без web UI и сборки. `assistant` — CLI, `rag` — независимый
-SQLite RAG, `shared_models` — совместимый HTTP contract и system proxy,
-`services.git` — отдельно запущенный read-only HTTP MCP. Прямые зависимости:
-закреплённые `httpx[socks]` и официальный `mcp` SDK.
+Python >=3.11, headless advisory review. `review.git` читает точные Git blobs;
+`rag` выбирает base docs/code; `shared_models` предоставляет совместимый HTTP,
+system proxy и reasoning contract; `review.runner` валидирует и публикует отчёт.
+`review.__main__` — локальный вход с явным connection file. `review.ci` — узкий
+адаптер доверенного GitHub.com workflow. Прямая зависимость: `httpx[socks]`.
+Нет чата, MCP, web, target plugin/config loader или постоянного индекса.
 
-## Запрос и контекст
+## Ревизии и границы доверия
 
-Обычный текст и `/help <вопрос>` идут одним маршрутом: fixed MCP tool
-`git_project_context` → query embedding → cosine retrieval → Chat Completions.
-MCP возвращает корень worktree, branch (null при detached HEAD), HEAD (null до
-первого коммита) и tracked porcelain status; никаких shell команд от модели.
-Клиент проверяет соответствие корня выбранному проекту. Ошибка MCP, retrieval,
-HTTP или формата завершает запрос без retries/fallback и добавления в историю.
-При отсутствии индекса требуется `/index`; ошибки не маскируются Git-ответом.
+CLI принимает только полные lowercase 40-character SHA. Оба объекта должны
+быть ровно commit, с одним merge base. Сравнение exact base → head; merge base
+фиксируется, но не заменяет base. Деревья и blobs читаются Git plumbing, без
+checkout/worktree/filters/hooks. External diff и textconv выключены;
+replace objects, global/system Git config и fsmonitor отключены. Локальный
+repo config не исполняется; допустимы только фиксированные read-only операции.
+Git argv не содержит непроверенных ref/option строк модели.
 
-System prompt требует отличать текущие Git-факты от документации, считать
-документы и историю недоверенными данными, отвечать на текущий вопрос и
-указывать пробелы. Последние три успешные пары живут только в памяти процесса;
-`/new` их очищает. Документация ниже `min_score` не включается, но модель может
-ответить по Git-фактам с явным ограничением. Перед генерацией CLI сообщает
-отсутствие совпадений. Источники, переданные модели, печатаются с file:lines,
-section и cosine; семантической проверки ответа/цитат нет. Печатается только
-фактический token usage, если сервер его сообщил.
+Целевые пути и тексты — недоверенные данные. Mode только regular blob;
+symlink/submodule/hidden/secret/build/vendor/binary/unknown formats исключены.
+Изменённые исключения сохраняются в metadata. Превышения размера подходящего
+файла, corpus, chunks, diff или prompt — явные ошибки без успешного усечения.
+Неподдерживаемые категории файлов пропускаются по задокументированной policy.
+Репозиторий ограничен 10000 entries, diff 100 paths / 256 KiB, blob 128 KiB,
+общий текст 4 MiB, base chunks 2000, chunk 60 lines / 12000 bytes, prompt 512 KiB.
+Git stdout bounded, timeout 30s, stderr не отражается в диагностике.
 
-## Индекс
+## RAG и запрос
 
-`git ls-files --cached -z` определяет tracked имена; читается текущее содержимое
-worktree, включая незакоммиченные изменения. README, docs, schema/openapi/swagger
-по default globs; расширения ограничены Markdown, rst, txt, JSON/YAML, SQL,
-GraphQL и proto. Includes/excludes задаются списками glob. Скрытые пути,
-symlinks, известные secret имена, data/files, vendor/build и бинарные файлы
-исключаются независимо от includes. UTF-8, до 2 MiB на документ. Это ограничение
-сканера, а не обещание распознать любой секрет: перед индексацией проверьте
-состав tracked документации. Неподходящие файлы пропускаются целиком.
+Для одного immutable base собираются docs и code windows с ID, revision,
+path, start/end и text. Все подходят в in-memory corpus: embeddings батчами32,
+без постоянного кэша, затем query embedding path+diff для каждого файла.
+Cosine сортируется детерминированно, квота два docs + два code на файл;
+объединение deduplicated. Missing category видна через corpus counts.
+Чанки изменённого head добавляются отдельным полем и kind=changed_head.
+Diff и список изменённых путей берутся из тех же base/head.
 
-Markdown headings вне fenced blocks задают разделы; длинные разделы разбиваются
-на окна `chunk_lines`, без overlap. Каждый чанк содержит source/title/start/end,
-текст и SHA256. Один индекс хранит метаданные, чанки и embeddings. Identity:
-версия алгоритма, embedding model ID, chunk configuration; dimensions проверяются.
-URL не является identity модели: оператор отвечает за одинаковый model ID на
-другом сервере. Query использует модель опубликованного индекса; изменение
-model/chunk settings требует явной перестройки.
+Один final Chat Completions получает JSON данных и фиксированный system prompt.
+Нет tools, retries, fallback или выполнения target tests. Модель отвечает только
+JSON bugs/architecture/recommendations arrays, включая пустые. Каждый finding
+имеет path, integer line, непустые source_ids и text. Валидатор запрещает
+неизвестные IDs, duplicate JSON keys и ссылки за пределами переданных строк;
+source с этим path/line должен входить в finding source_ids. Семантика, релевантность,
+цитаты и отсутствие багов автоматически не доказываются. Raw отказ не публикуется.
 
-`/index` держит один advisory writer lock, переиспользует совпавшие chunk hashes
-при одинаковой identity, встраивает только недостающие тексты батчами по 32,
-убирает удалённые документы и публикует временный SQLite через atomic replace.
-Удаление последнего документа публикует пустой snapshot; retrieval возвращает
-пустой контекст без query embedding, сохраняя доступность Git-фактов.
-Отказ сохраняет прежний индекс; readers удерживают прежний inode до конца
-retrieval. Изменения документов/globs помечают индекс stale: запрос предупреждает
-и использует опубликованный снимок. `/status` не вызывает inference.
+## Подключение и результат
 
-## Подключение, секреты и состояние
+CLI явно загружает bounded connection JSON вне целевого проекта; chat/embedding
+IDs, reasoning и max_tokens приходят аргументами. Нет dotenv/environment key
+loader локально. Connection frozen на запуск; ключ скрыт из repr и не попадает
+в prompt, report, Git argv или exception body. HTTP ошибки фиксированы;
+response bound 16 MiB, timeout 60s, redirects OFF. System HTTP/HTTPS proxy
+сохраняется, loopback direct, без direct fallback. Reasoning OFF по умолчанию,
+reasoning_effort none/medium применяется после payload controls. Наблюдаемое
+reasoning при OFF отклоняется без повторного вызова; внутреннее поведение
+произвольного сервера не обещается. Embeddings не получают reasoning controls.
 
-Корень проекта определяется Git; по умолчанию cwd, `--project` выбирает другой.
-State по умолчанию `~/.local/share/project-assistant/<SHA256 пути[:24]>`;
-`--state` переопределяет его, но state внутри проекта запрещён. Binding к полному
-пути не позволяет использовать state другого проекта. State directory 0700,
-settings/index 0600. Config сохраняется atomic replace и содержит URL, optional
-API key, два независимых model IDs, MCP URL, generation/retrieval параметры.
-История на диск не пишется. Состояние старого приложения не читается/не мигрируется.
+Отчёт содержит base/head/merge_base, reviewed/changed/excluded paths, corpus
+counts, retrieval selections, все переданные source chunks и безопасно выбранные
+серверные token counters каждого запроса. При отсутствии usage счётчики пусты.
+Raw responses/credentials не пишутся. Markdown экранирует model/repo text;
+JSON сохраняет данные. Оба файла 0600 собираются в private temp directory и
+атомарно переименовываются в новый output directory; существующий output запрещён.
+Артефакты содержат приватный код target и не должны коммититься.
 
-`/settings` собирает новый config, проверяет `/models` на новом URL и сохраняет
-только полностью валидный результат. ID выбирается номером каталога или точным
-ручным именем, типы моделей не угадываются. Пустой ID остаётся пустым до выбора.
-API key вводится скрыто, Enter сохраняет, `-` удаляет. Нет dotenv/env key loader.
-Все inference-вызовы только по явному `/index` или вопросу. Generation и embeddings
-используют один compatible URL с независимыми model IDs. Стандартный `/embeddings`
-не получает reasoning controls. Generation после параметров применяет
-`reasoning_effort=none|medium`; default OFF. Наблюдаемое reasoning при OFF — отказ;
-отсутствие evidence не доказывает внутреннее поведение любого сервера.
+## GitHub Actions
 
-Model HTTP и MCP используют shared proxy resolver: системные HTTP/HTTPS proxy
-и исключения либо стандартный proxy environment; loopback всегда direct.
-SOCKS5 поддерживается; автоматические PAC/system SOCKS не обнаруживаются.
-Нет direct fallback при сломанном proxy. Модельный HTTP timeout 60s,
-response bound 16 MiB, redirects выключены; ошибки не копируют body/URL/ключи.
-MCP timeout 20s; сервис запускается человеком, по умолчанию loopback:8017.
-Удалённый MCP не имеет встроенной авторизации — сеть и доступ настраивает оператор.
+Caller на default branch целевого проекта вызывает reusable workflow по полному
+проверенному SHA. `pull_request_target` opened/synchronize/reopened;
+permissions contents:read + pull-requests:read, PR concurrency cancel-in-progress.
+Workflow получает trusted code по job.workflow_repository/job.workflow_sha,
+не по github.repository caller. Actions закреплены полными SHA.
+
+CI читает только явные trusted model Variables/Secret, github.token и служебные
+GitHub environment values. Event JSON проверяет integer PR number, repository,
+base/head SHA; PR-controlled branch/title/body не используются. Fixed GitHub API
+origin сверяет open PR и exact base/head. Отдельный временный bare repo fetch-ит
+base SHA и refs/pull/N/head из base repository; fetched SHA должны совпасть.
+Token для Git передаётся env extraheader, не argv/config/remote URL. Target
+никогда не checkout-ится; его dependencies/hooks/config/build не исполняются.
+
+После модели API снова сверяет base/head до publish. Concurrency снимает старый
+run при push, но минимальное окно до artifact upload остаётся; SHA в отчёте
+обязательны. Summary только fixed text, artifacts Markdown/JSON retention7d.
+Нет GitHub comments/write API/merge gate. Missing config/HTTP/model format/bounds/
+stale revisions дают failed job без нового отчёта. Интеграция GitHub.com;
+GitHub Enterprise Server отдельно не поддержан и не проверялся.
 
 ## Проверки
 
-`make check` — один компактный offline сценарий: временные Git/documents/state,
-модельный loopback HTTP stub, настоящий HTTP MCP процесс, CLI с подменённым вводом.
-Проверяются exclusions, line metadata, cache reuse/removal/stale, atomic failure,
-reasoning OFF, identity mismatch, detached HEAD и отсутствие inference на help.
-Никакого пользовательского корпуса, живой модели или коллекции вопросов.
-Качество ответов, совместимость реального сервера и удобство диалога проверяет
-человек вручную по client-guide.
+`make check`: нейтральный временный Git fixture, реальные immutable commits,
+dirty worktree, secret/symlink/vendor/binary filtering, external diff marker,
+mock HTTP embeddings/chat, source metadata, usage, OFF reasoning rejection,
+HTTP no-retry, malformed source/line failures, bounds, CLI и CI event/fetch.
+Ни пользовательские data/.env, ни live inference не используются. Проверки
+измеряют поведение; docs text и model quality не тестируются. Живой workflow,
+совместимость модели и качество review остаются ручной проверкой после установки.

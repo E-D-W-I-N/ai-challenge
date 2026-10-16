@@ -1,1 +1,0 @@
-"""Independent Git MCP service."""

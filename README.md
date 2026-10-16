@@ -1,116 +1,193 @@
-# День 31. Ассистент разработчика
+# День 32. Автоматизация ревью кода
 
 ```text
-🔥 День 31. Ассистент разработчика
+🔥 День 32. Автоматизация ревью кода
 
-Используйте RAG для подключения к документации вашего проекта:
+Настройте пайплайн, в котором ассистент анализирует новый PR.
 
-👉 README
-👉 project/docs
-👉 схемы данных или API-описания
+Ассистент должен:
 
-Через MCP подключите ассистента к проекту:
-
-👉 минимум — получение текущей git-ветки
-👉 по желанию — список файлов или diff
-
-Реализуйте команду:
-
-👉 /help — ассистент отвечает на вопросы о проекте
-👉 использует документацию и контекст проекта
+👉 получать diff и изменённые файлы
+👉 использовать RAG (документация + код)
+👉 выдавать текст ревью
 
 Минимальный результат:
 
-👉 README + папка docs в RAG
-👉 MCP — хотя бы git branch
-👉 /help отвечает на вопросы о структуре проекта
+👉 пайплайн (например GitHub Action) запускается на PR
+👉 ассистент получает diff
+👉 возвращает:
+
+- потенциальные баги
+- архитектурные проблемы
+- рекомендации
 
 Результат:
 
-Ассистент разработчика, понимающий проект
+Автоматическое AI-ревью кода
 ```
 
 ## Вывод
 
-Консольный ассистент для произвольного Git-проекта. Каждый вопрос получает
-документацию из RAG и свежие branch/HEAD/status через отдельно запущенный
-HTTP MCP. Показываются источники с путями/строками, стадии и доступный token usage.
-Индекс обновляется явно, повторно использует embeddings неизменившихся чанков.
-Веб-сервис предыдущего дня удалён; его локальные приватные данные не используются.
+Headless Python-команда и reusable GitHub Actions workflow для произвольного
+репозитория. Ассистент получает точный diff base → head, изменённые файлы,
+отдельные чанки изменённого head и RAG-контекст документации **и кода base**.
+Выдаёт Markdown с потенциальными багами, архитектурными проблемами и
+рекомендациями; пустые списки допустимы. JSON-артефакт сохраняет точные ревизии,
+merge base, переданные источники с путями/строками, выбор retrieval и доступный usage.
+Результат рекомендательный: findings не блокируют merge, комментарии и другие
+записи в GitHub не создаются. Ошибка инфраструктуры может сделать job красным;
+не назначайте его обязательным status check.
+
+Старые чат CLI, интерактивные `/settings`, MCP и их зависимости удалены.
+Приватные данные предыдущих дней не читаются и не мигрируются.
 
 ## Установка
 
-Нужны Python >=3.11, Git и OpenAI-compatible сервер с Chat Completions,
-embeddings и `/models`. Совместимость и качество реальной модели проверяются
-вручную; автоматические проверки используют только offline fixtures.
+Нужны Python >=3.11, Git и OpenAI-compatible HTTP endpoint с Chat Completions
+и embeddings. Generation и embedding model IDs задаются независимо, без
+угадывания по каталогу. Качество и совместимость живой модели проверяет человек.
 
 ```sh
 make setup
-# При необходимости: make setup PYTHON=/path/to/python
+# Или: make setup PYTHON=/path/to/python
 make check
 ```
 
-После установки все Python-команды выполняются через `.venv/bin/python`.
-Ключи из `.env`/environment не загружаются. System HTTP/HTTPS proxy сохраняется;
-loopback всегда direct. Прямые зависимости закреплены в requirements.txt.
+После setup используйте `.venv/bin/python`. Прямые зависимости закреплены.
+System HTTP/HTTPS proxy сохраняется, loopback direct; нет direct fallback при
+ошибке proxy. Нет retries или скрытых пробных inference-вызовов.
 
-## Использование
+## Локальный запуск
 
-В отдельном терминале, из каталога ассистента:
+Создайте приватный connection JSON **вне репозитория** и ограничьте права 0600:
+
+```json
+{"base_url":"https://MODEL_HOST/v1","api_key":"OPTIONAL_API_KEY"}
+```
+
+Ключ можно опустить. JSON не коммитьте. Локальный CLI не читает `.env`, environment
+keys или настройки целевого проекта. Модельная конфигурация явная:
 
 ```sh
-.venv/bin/python -m services.git --repo /path/to/project
+.venv/bin/python -m review \
+  --repo /path/to/project \
+  --base FULL_40_CHARACTER_BASE_COMMIT_SHA \
+  --head FULL_40_CHARACTER_HEAD_COMMIT_SHA \
+  --connection-file /private/path/model-connection.json \
+  --chat-model YOUR_CHAT_MODEL \
+  --embedding-model YOUR_EMBEDDING_MODEL \
+  --output /private/path/new-review-output
 ```
 
-Сервис по умолчанию слушает `http://127.0.0.1:8017/mcp`; `--host` и `--port`
-задаются явно. Он исполняет только фиксированные read-only Git-команды.
+Обе ревизии должны существовать локально; символические refs не принимаются.
+Сравнение именно `base..head`, а не triple-dot. Единственный merge base записывается
+отдельно. Каталог output должен быть новым: `review.md` и `review.json` публикуются
+одновременно через переименование подготовленного каталога. Артефакты содержат
+фрагменты целевого кода и требуют такого же уровня доступа, как исходники.
 
-```sh
-.venv/bin/python -m assistant --project /path/to/project
-# Без --project используется текущий Git worktree.
-# Другой приватный state: --state /path/outside/project
+Reasoning default OFF; `--reasoning-enabled` явно включает его. `--max-tokens`
+по умолчанию 4096, допустимо 1..32768. HTTP timeout 60s, ответ до 16 MiB.
+Наблюдаемое reasoning при OFF — ошибка без повторного платного вызова.
+Отсутствие reported evidence не доказывает внутреннее поведение сервера.
+
+## Автоматический PR pipeline
+
+Reusable workflow — [.github/workflows/review.yml](.github/workflows/review.yml).
+Он рассчитан на **GitHub.com**, использует `job.workflow_repository` и
+`job.workflow_sha`, чтобы получить код самого закреплённого reviewer, даже когда
+`github.repository` относится к вызывающему проекту. Эти поля описаны в
+[официальной документации GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#example-usage-of-job-context-workflow-identity).
+
+Сначала разместите этот reviewer в доступном Actions репозитории, включите
+использование reusable workflow другими проектами при необходимости и сохраните
+доверенный commit на default branch. В целевом проекте создайте caller ниже
+**на default branch до открытия PR**. Замените `OWNER/REVIEWER` и `FULL_REVIEWER_COMMIT_SHA`
+реальным репозиторием reviewer и полным проверенным commit SHA. Не указывайте
+ветку или код из PR. Target может быть другим проектом; его структура и конфиги
+не должны совпадать с этим репозиторием.
+
+```yaml
+name: Advisory AI PR review
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: ai-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  review:
+    uses: OWNER/REVIEWER/.github/workflows/review.yml@FULL_REVIEWER_COMMIT_SHA
+    with:
+      model_url: ${{ vars.REVIEW_MODEL_URL }}
+      chat_model: ${{ vars.REVIEW_CHAT_MODEL }}
+      embedding_model: ${{ vars.REVIEW_EMBEDDING_MODEL }}
+    secrets:
+      model_api_key: ${{ secrets.REVIEW_MODEL_API_KEY }}
 ```
 
-В CLI выполните `/settings`: введите compatible URL, optional скрытый API key,
-выберите отдельные generation и embedding model IDs номером из каталога или
-точным именем; подтвердите MCP URL и параметры. Enter сохраняет значение,
-`-` в поле ключа удаляет его. Новые model IDs пустые; автоматического выбора нет.
-Проверка соединения вызывает только `/models`. Reasoning default OFF.
+В repository Actions Variables целевого проекта задайте `REVIEW_MODEL_URL`,
+`REVIEW_CHAT_MODEL`, `REVIEW_EMBEDDING_MODEL`; optional ключ — в Actions Secret
+`REVIEW_MODEL_API_KEY`. Только CI adapter явно читает эти environment values,
+переданные workflow, и read-only `github.token`. Ключ не передаётся модели в prompt,
+Git command line, отчёты или config blobs. Отсутствующая конфигурация даёт явную
+ошибку job; автоматического выбора модели или fallback нет.
 
-```text
-/index
-/status
-/help Как устроен проект и где описан API?
-Какая ветка сейчас открыта?
-/new
-/help
-/exit
-```
+`pull_request_target` получает секреты доверенного base workflow, в том числе для
+fork PR: разрешайте это только с закреплённым проверенным reviewer. PR title,
+branch names, bodies и целевые конфиги не подставляются в shell. Целевой проект
+fetch-ится в отдельный bare Git repository по base SHA и `refs/pull/N/head`;
+полученный head обязан совпасть с event SHA. Ничего из PR не checkout-ится и не
+запускается: ни код, ни hooks, ни сборка, ни установка зависимостей. Устанавливаются
+только зависимости доверенного reviewer. Модель получает недоверенные данные,
+без tools; prompt injection и правильность выводов всё равно требуют оценки человеком.
 
-`/help` без вопроса показывает команды. Обычный текст работает так же, как
-`/help <вопрос>`. Перед первым вопросом нужен `/index`; без индекса выдаётся
-явная инструкция. История — последние три успешные пары в памяти процесса.
+Новый head отменяет старый job через concurrency. Read-only API повторно сверяет
+base/head непосредственно перед публикацией отчёта; изменение закрывает старый
+run ошибкой. Малое окно между последней проверкой и upload остаётся; артефакт
+всегда содержит точные SHA и привязан к конкретному run. Summary содержит только
+сообщение о готовности; Markdown и JSON доступны как artifact, retention 7 дней.
+Для private target нужны доступ checkout к reviewer и права чтения target.
+Не давайте этому job permissions `write`.
 
-По умолчанию индексируются tracked README, docs и текстовые schema/openapi/swagger
-файлы текущего worktree. `includes`/`excludes` в `/settings` — JSON-массивы glob.
-Скрытые пути, известные secret имена, data/files, build/vendor, symlinks,
-бинарные и слишком большие документы исключаются. Просмотрите состав документации
-перед отправкой внешнему серверу: автоматический фильтр не распознаёт все секреты.
+## Контекст и границы
 
-`/index` показывает documents/chunks/embedded/reused. Новые тексты отправляются
-выбранной embedding-модели. Изменённая документация помечает индекс stale;
-вопрос использует опубликованный снимок с предупреждением до явного `/index`.
-Смена embedding model или chunk_lines требует перестройки. Удалённые документы
-исчезают при следующем `/index`. При ошибке старый индекс сохраняется.
+Каждый запуск заново строит in-memory индекс закреплённого base, отправляет
+его подходящие docs/code чанки embedding-модели батчами по 32, затем по одному
+query embedding на изменённый файл. Постоянного кэша нет: повторный run оплачивает
+эти embeddings снова. Для каждого файла независимо выбираются до двух docs и
+двух code chunks по cosine; объединение дедуплицируется. Порог отсечения не
+используется. JSON фиксирует corpus counts и выбранные источники: отсутствие
+категории видно, модель получает только доступный контекст. Это выборка, а не
+обещание проанализировать весь проект.
 
-Config и SQLite находятся вне проекта в
-`~/.local/share/project-assistant/<hash абсолютного пути>/`, state directory 0700,
-config/index 0600. `--state` внутри проекта запрещён. Ключ не печатается в
-ошибках, тело отказа HTTP не выводится. Нет retries и скрытого inference.
+Git blobs читаются без worktree, external diff и textconv. Индексируются UTF-8
+документы и распространённые текстовые языки/форматы; docs/README и документация
+в `docs/` отделяются от кода. Symlinks, submodules, hidden paths, data/files,
+известные secret/key имена, lock-файлы, build/vendor, бинарные и неизвестные
+форматы исключены. Изменённые исключённые пути перечисляются в отчёте; если
+все изменения исключены, run завершается ошибкой. Фильтр не распознаёт любой
+секрет в обычном исходнике: оператор отвечает за допустимость отправки кода
+выбранному endpoint.
 
-При низкой релевантности документации ассистент сообщает о пробеле и использует
-доступные Git-факты. Источники под ответом — фрагменты, переданные модели;
-достоверность ответа и цитат автоматически не проверяется. Удалённый MCP
-защищается на уровне сети оператором; по умолчанию доступ только с loopback.
+Явные границы: 10000 tree entries на ревизию, 100 изменённых путей, 128 KiB на
+подходящий blob, 4 MiB текста снимков суммарно, 256 KiB diff, 2000 base chunks,
+окно до 60 строк / 12000 bytes, final prompt до 512 KiB. Превышение любой границы
+— ошибка, а не обрезанный успешный анализ. Git read/fetch timeout 30s; job 20 минут.
+Finding обязан ссылаться на переданный source ID и существующий path/line внутри
+него. Проверяется структура и адрес источника, **не** смысл или правильность
+вывода; ошибочный JSON не исправляется и не повторяется.
 
-[Архитектура](docs/architecture.md) · [Карта и ручная проверка](docs/client-guide.md)
+## Проверки
+
+`make check` использует только временный Git-репозиторий и HTTP mocks. Проверяет
+immutable snapshots при грязном worktree, RAG docs/code base и отдельный head,
+exclusions, отсутствие исполнения diff/hooks, bounds, HTTP failure без retries,
+reasoning OFF, evidence validation, CLI, event identity и stale fetched head.
+Ни реальная модель, ни живой GitHub Actions запуск здесь не проверялись.
+После установки caller проверьте вручную тестовый PR и новый push: artifacts,
+отмену старого run, SHA, источники и качество рекомендаций.
+
+[Архитектура](docs/architecture.md)

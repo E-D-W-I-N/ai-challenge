@@ -1,156 +1,43 @@
-"""Tracked documentation, structural chunks and atomic incremental SQLite index."""
-import fnmatch
-import hashlib
-import json
+"""In-memory RAG over one exact base revision; docs and code have separate quotas."""
 import math
-import os
-from pathlib import Path
-import sqlite3
-import subprocess
-import tempfile
-import fcntl
-from contextlib import contextmanager
-
-DENIED = {'.git', 'data', 'files', 'node_modules', 'vendor', 'build', 'dist', '.venv', 'venv', '__pycache__', '.cache', 'secrets', 'credentials'}
-SUFFIXES = {'.md', '.markdown', '.rst', '.txt', '.json', '.yaml', '.yml', '.sql', '.graphql', '.gql', '.proto'}
 
 
-def digest(value):
-    return hashlib.sha256(value.encode()).hexdigest()
+def chunks(path, text, revision, kind):
+    # Git line numbers count LF only; Unicode separators remain source text.
+    lines = text.split('\n')
+    if lines[-1] == '':
+        lines.pop()
+    for offset in range(0, len(lines), 60):
+        body = '\n'.join(lines[offset:offset+60])
+        if len(body.encode()) > 12000:
+            raise ValueError('Chunk exceeds 12000 bytes; split long lines before review')
+        if body.strip():
+            yield dict(id=f'{revision}:{path}:{offset+1}', path=path, revision=revision,
+                       kind=kind, start=offset+1, end=min(offset+60, len(lines)), text=body)
 
 
-def documents(project, settings):
-    try:
-        raw = subprocess.run(['git', 'ls-files', '-z', '--cached'], cwd=project,
-            capture_output=True, check=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        raise ValueError('Cannot enumerate tracked project documents') from None
-    docs = []
-    for name in sorted(set(os.fsdecode(p) for p in raw.split(b'\0') if p)):
-        relative = Path(name)
-        if relative.is_absolute() or '..' in relative.parts: continue
-        if any(part.lower() in DENIED or part.startswith('.') for part in relative.parts): continue
-        if any(word in relative.name.lower() for word in ('secret', 'credential', 'token', 'private', 'password')): continue
-        if relative.suffix.lower() not in SUFFIXES and not relative.name.upper().startswith('README'): continue
-        if not any(fnmatch.fnmatchcase(name, p) for p in settings['includes']): continue
-        if any(fnmatch.fnmatchcase(name, p) for p in settings['excludes']): continue
-        path = project / relative
-        if any(p.is_symlink() for p in [path, *path.parents] if p != project.parent): continue
-        try:
-            if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024: continue
-            text = path.read_text(encoding='utf-8')
-        except (FileNotFoundError, UnicodeError):
-            continue
-        except OSError:
-            raise ValueError('Cannot read a selected project document') from None
-        if '\0' in text: continue
-        docs.append(dict(source=name, text=text, hash=digest(text)))
-    return docs
+def cosine(a, b):
+    if len(a) != len(b):
+        raise ValueError('Embedding dimensions differ')
+    return sum(x*y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a)*sum(y*y for y in b))
 
 
-def chunks(doc, window):
-    lines = doc['text'].splitlines()
-    title = doc['source']
-    start = 0
-    fence = None
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith(('```', '~~~')):
-            marker = stripped[:3]
-            fence = None if fence == marker else marker if fence is None else fence
-        heading = fence is None and line.startswith('#') and line.lstrip('#').startswith(' ')
-        if heading or i - start >= window:
-            if i > start:
-                text = '\n'.join(lines[start:i])
-                if text.strip(): yield dict(source=doc['source'], title=title, start=start+1, end=i, text=text, hash=digest(text))
-            start = i
-            if heading: title = line.lstrip('#').strip()
-    if start < len(lines):
-        text = '\n'.join(lines[start:])
-        if text.strip(): yield dict(source=doc['source'], title=title, start=start+1, end=len(lines), text=text, hash=digest(text))
-
-
-def identity(settings):
-    return dict(version=1, model=settings['embedding_model'], chunk_lines=settings['chunk_lines'])
-
-
-def manifest(docs, settings):
-    return digest(json.dumps(dict(files=[(d['source'], d['hash']) for d in docs],
-        includes=settings['includes'], excludes=settings['excludes'], identity=identity(settings)), sort_keys=True))
-
-
-@contextmanager
-def reading(state):
-    path = state / 'index.sqlite'
-    if not path.exists(): raise ValueError('No index. Choose models in /settings, then run /index')
-    db = sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)
-    try:
-        yield db, json.loads(db.execute('select value from metadata').fetchone()[0])
-    finally:
-        db.close()
-
-
-def status(project, state, settings):
-    docs = documents(project, settings)
-    with reading(state) as (db, meta):
-        return dict(documents=len(docs), chunks=db.execute('select count(*) from chunks').fetchone()[0],
-                    stale=manifest(docs, settings) != meta['manifest'], model=meta['identity']['model'])
-
-
-def build(project, state, settings, models):
-    lock = open(state / 'index.lock', 'a')
-    os.chmod(state / 'index.lock', 0o600)
-    try:
-        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError: raise ValueError('Another /index operation is running') from None
-        docs = documents(project, settings)
-        rows = [c for d in docs for c in chunks(d, settings['chunk_lines'])]
-        cached = {}
-        if (state / 'index.sqlite').exists():
-            with reading(state) as (db, meta):
-                if meta['identity'] == identity(settings):
-                    cached = dict(db.execute('select hash, vector from chunks'))
-        missing = list(dict.fromkeys(c['hash'] for c in rows if c['hash'] not in cached))
-        by_hash = {c['hash']: c['text'] for c in rows}
-        for offset in range(0, len(missing), 32):
-            batch = missing[offset:offset+32]
-            vectors = models.embed([by_hash[h] for h in batch], settings['embedding_model'])
-            cached.update(zip(batch, map(json.dumps, vectors)))
-        dims = {len(json.loads(cached[c['hash']])) for c in rows}
-        if len(dims)>1: raise ValueError('Embedding dimensions changed; select a distinct model ID and rebuild')
-        meta = dict(identity=identity(settings), manifest=manifest(docs, settings), dimensions=dims.pop() if dims else 0)
-        fd, temp = tempfile.mkstemp(prefix='.index-', dir=state)
-        os.close(fd)
-        try:
-            with sqlite3.connect(temp) as db:
-                db.executescript('create table metadata(value text); create table chunks(source text,title text,start integer,end integer,text text,hash text,vector text);')
-                db.execute('insert into metadata values (?)', (json.dumps(meta),))
-                db.executemany('insert into chunks values (?,?,?,?,?,?,?)',
-                    [(c['source'],c['title'],c['start'],c['end'],c['text'],c['hash'],cached[c['hash']]) for c in rows])
-            with open(temp, 'rb') as file: os.fsync(file.fileno())
-            os.replace(temp, state / 'index.sqlite')
-        finally:
-            if os.path.exists(temp): os.unlink(temp)
-        return dict(documents=len(docs), chunks=len(rows), embedded=len(missing), reused=len(rows)-sum(c['hash'] in missing for c in rows))
-    finally:
-        lock.close()
-
-
-def retrieve(project, state, settings, models, question):
-    docs = documents(project, settings)
-    with reading(state) as (db, meta):
-        if meta['identity'] != identity(settings):
-            raise ValueError('Index model/chunk settings changed. Run /index')
-        stale = meta['manifest'] != manifest(docs, settings)
-        if not db.execute('select 1 from chunks limit 1').fetchone(): return [], stale
-        query = models.embed([question], meta['identity']['model'])[0]
-        if len(query)!=meta['dimensions']: raise ValueError('Query embedding dimensions differ; rebuild index')
-        norm = math.sqrt(sum(x*x for x in query))
-        hits = []
-        for source,title,start,end,text,vector in db.execute('select source,title,start,end,text,vector from chunks'):
-            vector = json.loads(vector)
-            score = sum(a*b for a,b in zip(query,vector)) / (norm * math.sqrt(sum(x*x for x in vector)))
-            if score >= settings['min_score']:
-                hits.append(dict(source=source,title=title,start=start,end=end,text=text,score=score))
-        hits.sort(key=lambda h:(-h['score'], h['source'], h['start']))
-        return hits[:settings['top_k']], stale
+def retrieve(corpus, diffs, models, embedding_model):
+    if len(corpus) > 2000:
+        raise ValueError('Base corpus exceeds 2000 chunks')
+    vectors = []
+    for offset in range(0, len(corpus), 32):
+        vectors.extend(models.embed([c['text'] for c in corpus[offset:offset+32]], embedding_model))
+    queries = models.embed([d['path'] + '\n' + d['patch'] for d in diffs], embedding_model)
+    selected = {}
+    selections = []
+    for diff, query in zip(diffs, queries):
+        ids = []
+        for category in ('docs', 'code'):
+            ranked = sorted(((cosine(query, vector), chunk) for chunk, vector in zip(corpus, vectors)
+                             if chunk['kind'] == category), key=lambda pair: (-pair[0], pair[1]['id']))
+            for score, chunk in ranked[:2]:
+                selected[chunk['id']] = chunk
+                ids.append(dict(id=chunk['id'], score=score))
+        selections.append(dict(path=diff['path'], sources=ids))
+    return list(selected.values()), selections

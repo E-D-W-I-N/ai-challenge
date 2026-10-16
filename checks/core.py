@@ -1,143 +1,185 @@
-"""Compact offline checks: temporary project, stub HTTP, real read-only MCP."""
-import asyncio
-from contextlib import contextmanager
+"""Small behavioral checks: temporary Git revisions + mocked HTTP, no live inference."""
+import contextlib
 import io
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import tempfile
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from assistant.settings import defaults, project_root, state_root, save, load
-from assistant.models import Models, ModelError
-from assistant.mcp import context
-from assistant.cli import main, ask
-from rag.index import build, status, retrieve
-from services.git.__main__ import project_context
+import httpx
+
+from rag.index import chunks
+from review.__main__ import main, settings
+from review.ci import event_identity, fetch
+from review.git import revision, snapshot
+from review.runner import publish, run, validate
+from shared_models import Connection
+from shared_models.client import Models, ModelError
 
 
-class Stub(BaseHTTPRequestHandler):
-    calls=[]
-    fail=False
-    reasoning=False
-    def log_message(self,*args): pass
-    def do_GET(self): self.respond({'data':[{'id':'generate'},{'id':'embed'}]})
-    def do_POST(self):
-        body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        self.calls.append((self.path,body))
-        if self.fail:
-            self.send_response(401); self.end_headers(); self.wfile.write(b'never-print-this-secret'); return
-        if self.path.endswith('/embeddings'):
-            self.respond({'data':[{'index':i,'embedding':[1.0,0.1]} for i,_ in enumerate(body['input'])]})
-        else:
-            self.respond({'choices':[{'message':{'content':'Documentation says: entry point [1]'}}],
-                'usage':{'prompt_tokens':8,'completion_tokens':4,'total_tokens':12,
-                'completion_tokens_details':{'reasoning_tokens':int(self.reasoning)}}})
-    def respond(self,body):
-        raw=json.dumps(body).encode(); self.send_response(200); self.end_headers(); self.wfile.write(raw)
+def command(repo, *args):
+    return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.DEVNULL).decode().strip()
 
 
-def git(repo,*args):
-    return subprocess.run(['git',*args],cwd=repo,check=True,capture_output=True,text=True).stdout.strip()
-
-
-@contextmanager
-def mcp_service(repo):
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
-    proc=subprocess.Popen([os.sys.executable,'-m','services.git','--repo',str(repo),'--port',str(port)],
-                          stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def fails(call, message):
     try:
-        deadline=time.monotonic()+10
-        while time.monotonic()<deadline:
-            try:
-                with socket.create_connection(('127.0.0.1',port),timeout=.1): break
-            except OSError: time.sleep(.05)
-        else: raise AssertionError('MCP service did not start')
-        yield f'http://127.0.0.1:{port}/mcp'
-    finally:
-        proc.terminate(); proc.wait(timeout=10)
+        call()
+    except (ValueError, ModelError):
+        return
+    raise AssertionError(message)
 
 
-def check():
-    with tempfile.TemporaryDirectory() as temp:
-        parent=Path(temp).resolve(); repo=parent/'project'; repo.mkdir()
-        git(repo,'init','-q'); git(repo,'config','user.email','offline@example.invalid'); git(repo,'config','user.name','Offline')
-        (repo/'docs').mkdir(); (repo/'README.md').write_text('# Project\nEntry point lives in src.\n')
-        (repo/'docs/api.md').write_text('# API\nA documented endpoint.\n')
-        (repo/'docs/secret.md').write_text('do not read')
-        (repo/'docs/link.md').symlink_to(parent/'outside.md'); (parent/'outside.md').write_text('not documentation')
-        (repo/'docs/binary.md').write_bytes(b'\x00binary')
-        (repo/'untracked.md').write_text('not tracked')
-        git(repo,'add','README.md','docs'); git(repo,'commit','-qm','fixture')
-        assert project_root(repo/'docs')==repo.resolve()
-        try: state_root(repo,repo/'cache')
-        except ValueError: pass
-        else: raise AssertionError('state inside project accepted')
-        state=state_root(repo,parent/'state?copy#fixture'); config=defaults()
-        server=ThreadingHTTPServer(('127.0.0.1',0),Stub)
-        worker=threading.Thread(target=server.serve_forever,daemon=True); worker.start()
-        try:
-            config['connection'].update(base_url=f'http://127.0.0.1:{server.server_port}/v1',api_key='never-print-this-secret')
-            config.update(chat_model='generate',embedding_model='embed')
-            save(state,config); assert load(state)==config
-            assert (state/'settings.json').stat().st_mode & 0o777 == 0o600
-            models=Models(config); assert models.catalog()==['generate','embed']; assert not Stub.calls
-            first=build(repo,state,config,models); assert first==dict(documents=2,chunks=2,embedded=2,reused=0),first
-            count=len(Stub.calls); assert build(repo,state,config,models)['embedded']==0; assert len(Stub.calls)==count
-            (repo/'docs/api.md').write_text('# API\nUpdated endpoint.\n')
-            assert status(repo,state,config)['stale']
-            assert build(repo,state,config,models)['embedded']==1
-            (repo/'docs/api.md').unlink(); assert build(repo,state,config,models)['chunks']==1
-            hits,stale=retrieve(repo,state,config,models,'entry point'); assert len(hits)==1 and not stale
-            snapshot=(state/'index.sqlite').read_bytes()
-            (repo/'README.md').write_text('# Project\nChanged documentation.\n')
-            Stub.fail=True
-            try: build(repo,state,config,models)
-            except ModelError as error: assert 'never-print' not in str(error)
-            else: raise AssertionError('failed embedding accepted')
-            assert snapshot==(state/'index.sqlite').read_bytes()
-            Stub.fail=False
-            with mcp_service(repo) as url:
-                config['mcp_url']=url
-                facts=asyncio.run(context(url,repo)); assert facts['head']==git(repo,'rev-parse','HEAD')
-                assert facts['branch']==git(repo,'branch','--show-current'); assert ' M README.md' in facts['status'].splitlines()
-                try: asyncio.run(context(url,parent))
-                except ValueError: pass
-                else: raise AssertionError('wrong repository accepted')
-                history=[]
-                with patch('sys.stdout',new_callable=io.StringIO) as out:
-                    ask(repo,state,config,history,'Where is the entry point?')
-                assert len(history)==2 and 'README.md:1-2' in out.getvalue() and 'stale' in out.getvalue()
-                assert Stub.calls[-1][1]['reasoning_effort']=='none'
-                Stub.reasoning=True
-                try: models.answer([{'role':'user','content':'question'}])
-                except ModelError: pass
-                else: raise AssertionError('reasoning OFF violation accepted')
-                Stub.reasoning=False
-                git(repo,'rm','-f','README.md')
-                before_empty=len(Stub.calls)
-                assert build(repo,state,config,models)==dict(documents=0,chunks=0,embedded=0,reused=0)
-                assert retrieve(repo,state,config,models,'current branch')==([],False)
-                assert len(Stub.calls)==before_empty
-                with patch('sys.stdout',new_callable=io.StringIO):
-                    ask(repo,state,config,history,'Which branch is open?')
-                assert [path for path,_ in Stub.calls[before_empty:]]==['/v1/chat/completions']
-                prompt=Stub.calls[-1][1]['messages'][-1]['content']
-                assert '"documentation": []' in prompt and '"branch":' in prompt
-            before=len(Stub.calls)
-            with patch('builtins.input',side_effect=['/help','/new','/exit']), patch('sys.stdout',new_callable=io.StringIO):
-                assert main(['--project',str(repo),'--state',str(state)])==0
-            assert len(Stub.calls)==before
-            git(repo,'checkout','--detach','-q'); assert project_context(repo)['branch'] is None
-        finally:
-            server.shutdown(); server.server_close(); worker.join()
-    print('Offline checks passed: safe scan, incremental/atomic index, HTTP contracts, MCP identity and CLI')
+class Stub:
+    def __init__(self):
+        self.calls = []
+        self.reasoning = False
+        self.bad_source = False
+        self.http_failure = False
+
+    def handle(self, request):
+        value = json.loads(request.content)
+        self.calls.append((request.url.path, value))
+        assert request.headers['Authorization'] == 'Bearer fixture-secret'
+        if self.http_failure:
+            return httpx.Response(401, text='fixture-secret')
+        if request.url.path.endswith('/embeddings'):
+            return httpx.Response(200, json={'data': [{'index': i, 'embedding': [1, 1 if 'docs' in text else 2]}
+                                                      for i, text in enumerate(value['input'])], 'usage': {'total_tokens': len(value['input'])}})
+        assert value['reasoning_effort'] == 'none'
+        prompt = json.loads(value['messages'][1]['content'])
+        source = next(s for s in prompt['changed_head'] if s['path'] == 'app.py')
+        findings = {'bugs': [{'path': 'app.py', 'line': 1, 'source_ids': ['invented' if self.bad_source else source['id']],
+                             'text': 'Potential behavior change; inspect the return value.'}],
+                    'architecture': [], 'recommendations': []}
+        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(findings)}}],
+                                        'usage': {'total_tokens': 12, 'completion_tokens_details': {'reasoning_tokens': int(self.reasoning)}}})
+
+    def client(self, client_type, **options):
+        options.pop('proxy', None)
+        return client_type(**options, transport=httpx.MockTransport(self.handle))
 
 
-if __name__=='__main__': check()
+def main_checks():
+    # Unicode separators are characters within one physical Git line, not line breaks.
+    unicode_line = 'const message = "hello\u2028world\u0085again\u2029end";'
+    source = list(chunks('app.js', unicode_line + '\n', 'a' * 40, 'code'))
+    assert len(source) == 1 and source[0]['start'] == source[0]['end'] == 1
+    assert source[0]['text'] == unicode_line
+    finding = {'bugs': [{'path': 'app.js', 'line': 2, 'source_ids': [source[0]['id']], 'text': 'Invalid physical line.'}],
+               'architecture': [], 'recommendations': []}
+    fails(lambda: validate(finding, source), 'Unicode separator invented a Git line')
+    assert not list(chunks('empty.js', '', 'a' * 40, 'code'))
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        repo = root / 'target'
+        repo.mkdir()
+        command(repo, 'init', '-q')
+        command(repo, 'config', 'user.name', 'Offline Fixture')
+        command(repo, 'config', 'user.email', 'fixture@example.invalid')
+        (repo / 'docs').mkdir()
+        (repo / 'docs' / 'architecture.md').write_text('# Base docs\nArchitecture docs contract.\n')
+        (repo / 'app.py').write_text('def value():\n    return 1\n')
+        (repo / 'secret.json').write_text('SECRET-CONTENT-NEVER-SEND')
+        (repo / 'binary.py').write_bytes(b'\0binary')
+        (repo / 'node_modules').mkdir()
+        (repo / 'node_modules' / 'vendor.js').write_text('VENDOR-NEVER-SEND')
+        (repo / 'alias.py').symlink_to('app.py')
+        command(repo, 'add', 'docs/architecture.md', 'app.py', 'secret.json', 'binary.py', 'node_modules/vendor.js', 'alias.py')
+        command(repo, 'commit', '-qm', 'base')
+        base = command(repo, 'rev-parse', 'HEAD')
+        (repo / 'app.py').write_text('def value():\n    return 2\n')
+        (repo / 'docs' / 'architecture.md').write_text('# Head docs\nHEAD-DOCS-NOT-BASE-RAG\n')
+        command(repo, 'add', 'app.py', 'docs/architecture.md')
+        command(repo, 'commit', '-qm', 'head')
+        head = command(repo, 'rev-parse', 'HEAD')
+        # Neither worktree content, target config, hooks nor external diff may be used.
+        (repo / 'app.py').write_text('WORKTREE-CONTENT-NEVER-SEND')
+        (repo / 'docs' / 'architecture.md').write_text('WORKTREE-DOCS-NEVER-SEND')
+        marker = root / 'executed'
+        hook = root / 'hook'
+        hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
+        hook.chmod(0o700)
+        command(repo, 'config', 'diff.external', str(hook))
+        command(repo, 'config', 'core.hooksPath', str(root))
+        snap = snapshot(repo, base, head)
+        # Untracked worktree attributes cannot hide an already verified text blob's patch.
+        original_diffs = snap['diffs']
+        (repo / '.gitattributes').write_text('*.py binary\n')
+        command(repo, 'config', 'diff.algorithm', 'histogram')
+        command(repo, 'config', 'diff.noprefix', 'true')
+        assert snapshot(repo, base, head)['diffs'] == original_diffs
+        assert '-    return 1' in original_diffs[0]['patch'] and '+    return 2' in original_diffs[0]['patch']
+        assert snap['merge_base'] == base
+        assert 'return 2' in snap['texts'][(head, 'app.py')]
+        assert 'Base docs' in snap['texts'][(base, 'docs/architecture.md')]
+        assert all(p not in {'alias.py', 'secret.json', 'binary.py', 'node_modules/vendor.js'} for _, p in snap['texts'])
+        fails(lambda: revision('HEAD'), 'symbolic ref accepted')
+        fails(lambda: revision('--upload-pack=bad'), 'option accepted as revision')
+        stub = Stub()
+        config = settings(Connection('https://models.example.invalid/v1', 'fixture-secret'), 'chat', 'embed')
+        with patch('shared_models.client.create_client', stub.client):
+            report = run(repo, base, head, Models(config))
+            assert report['base_corpus']['docs'] and report['base_corpus']['code']
+            assert report['usage'] and all(row['tokens'] for row in report['usage'])
+            assert all(s['revision'] == base for s in report['sources'] if s['kind'] != 'changed_head')
+            assert all(s['revision'] == head for s in report['sources'] if s['kind'] == 'changed_head')
+            assert all({s['id']: s for s in report['sources']}[r['id']]['kind'] in {'docs', 'code'}
+                       for selection in report['retrieval'] for r in selection['sources'])
+            serialized = json.dumps(stub.calls)
+            for forbidden in ('WORKTREE', 'SECRET-CONTENT', 'VENDOR-NEVER', 'fixture-secret'):
+                assert forbidden not in serialized
+            publish(report, root / 'output')
+            assert 'fixture-secret' not in (root / 'output' / 'review.json').read_text()
+            assert 'Potential bugs' in (root / 'output' / 'review.md').read_text()
+            fails(lambda: publish(report, root / 'output'), 'existing output overwritten')
+            validate({'bugs': [], 'architecture': [], 'recommendations': []}, report['sources'])
+            bad = json.loads(json.dumps(report['findings']))
+            bad['bugs'][0]['line'] = 999999
+            fails(lambda: validate(bad, report['sources']), 'unchecked line accepted')
+            stub.bad_source = True
+            fails(lambda: run(repo, base, head, Models(config)), 'invented source accepted')
+            stub.bad_source = False
+            stub.reasoning = True
+            fails(lambda: run(repo, base, head, Models(config)), 'reasoning OFF violation accepted')
+            stub.reasoning = False
+            stub.http_failure = True
+            before = len(stub.calls)
+            fails(lambda: run(repo, base, head, Models(config)), 'HTTP failure accepted')
+            assert len(stub.calls) == before + 1, 'paid retry happened'
+        assert not marker.exists(), 'target executable ran'
+        event = {'number': 3, 'action': 'synchronize', 'repository': {'full_name': 'owner/project'},
+                 'pull_request': {'number': 3, 'base': {'repo': {'full_name': 'owner/project'}, 'sha': base}, 'head': {'sha': head}}}
+        assert event_identity(event, 'owner/project') == ('owner/project', 3, base, head)
+        event['number'] = '3; bad'
+        fails(lambda: event_identity(event, 'owner/project'), 'untrusted PR number accepted')
+        # Fetch credentials never appear in argv; mismatch rejects a moved PR head.
+        calls = []
+        def fake_git(directory, *args):
+            calls.append(args)
+            if args[:1] == ('rev-parse',):
+                return ((base if args[1].endswith('base') else 'f'*40) + '\n').encode()
+            return b''
+        with patch('review.ci.git', fake_git):
+            fails(lambda: fetch('owner/project', 3, base, head, 'fixture-secret', root), 'moved PR head accepted')
+        assert 'fixture-secret' not in repr(calls)
+        assert 'GIT_CONFIG_VALUE_0' not in os.environ
+        connection = root / 'connection.json'
+        connection.write_text(json.dumps({'base_url': 'https://models.example.invalid/v1', 'api_key': 'fixture-secret'}))
+        argv = ['review', '--repo', str(repo), '--base', base, '--head', head,
+                '--connection-file', str(connection), '--chat-model', 'chat', '--embedding-model', 'embed', '--output', str(root/'cli-output')]
+        stub.http_failure = False
+        with patch('sys.argv', argv), patch('shared_models.client.create_client', stub.client), contextlib.redirect_stdout(io.StringIO()):
+            assert main() == 0
+        # Bounds reject a snapshot instead of silently truncating eligible source code.
+        (repo / 'large.py').write_text('x' * (128 * 1024 + 1))
+        command(repo, 'add', 'large.py')
+        command(repo, 'commit', '-qm', 'oversized')
+        large_head = command(repo, 'rev-parse', 'HEAD')
+        fails(lambda: snapshot(repo, base, large_head), 'oversized eligible source silently omitted')
+    print('Offline Git, RAG, HTTP, validation, CLI and CI boundary checks passed.')
+
+
+if __name__ == '__main__':
+    main_checks()
