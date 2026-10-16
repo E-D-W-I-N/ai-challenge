@@ -18,7 +18,7 @@ from shared_models.client import Models, ModelError
 from shared_models.transport import client_options
 from support.assistant import Assistant
 from support.context import fetch_context, selected_context
-from support.settings import load, save, state_directory
+from support.settings import configure, load, save, state_directory
 from rag.index import build, read_index, scan, status
 
 
@@ -80,6 +80,8 @@ async def scenario(directory, base_url, calls, mode):
     (root/'alpha.md').write_text('# Alpha\nAlpha documentation.\u2028Still first source line.\n')
     (root/'beta.md').write_text('# Beta\nBeta documentation.\n')
     (root/'secret.md').write_text('Never embed')
+    for name in ('credentials', 'passwords'):
+        (root/name).mkdir(); (root/name/'README.md').write_text('Never embed directory secrets')
     (root/'binary.md').write_bytes(b'\x00binary')
     (root/'not-doc.py').write_text('Never embed code')
     (root/'build').mkdir(); (root/'build'/'generated.md').write_text('Never embed')
@@ -94,10 +96,38 @@ async def scenario(directory, base_url, calls, mode):
     save(settings_path, settings)
     assert settings_path.stat().st_mode & 0o777 == 0o600
     assert load(settings_path) == settings
+    settings_path.write_text('null')
+    fails(lambda: load(settings_path))
+    save(settings_path, settings)
+    # Upper generation limits belong to the model server; null explicitly omits max_tokens.
+    uncapped = dict(settings, temperature=3.5, max_tokens=100000)
+    save(settings_path, uncapped)
+    assert load(settings_path) == uncapped
+    with patch('builtins.input', side_effect=['', '', '3.5', 'null']), patch('support.settings.getpass.getpass', return_value=''), patch('support.settings.choose_models', side_effect=lambda s:s):
+        uncapped = configure(settings)
+    assert uncapped['max_tokens'] is None
+    save(settings_path, uncapped)
+    assert load(settings_path)['max_tokens'] is None
+    Models(uncapped).answer([{'role':'user','content':'fixture'}])
+    assert calls[-1][1]['temperature'] == 3.5 and 'max_tokens' not in calls[-1][1]
+    calls.clear()
+    save(settings_path, settings)
     models = Models(settings)
     assert models.request('GET', '/models')['data'][0]['id'] == 'generation'
     assert build(root, index, models, 'embedding') == (2, 2)
     assert index.stat().st_mode & 0o777 == 0o600
+    # An inaccessible subtree must fail instead of publishing a partial corpus.
+    (root/'blocked').mkdir(); (root/'blocked'/'guide.md').write_text('Unreachable document')
+    published = index.read_bytes()
+    scandir = os.scandir
+    def denied(path):
+        if Path(path).name == 'blocked': raise PermissionError('fixture denied subtree')
+        return scandir(path)
+    before = len(calls)
+    with patch('rag.index.os.scandir', side_effect=denied):
+        fails(lambda: build(root,index,models,'embedding'), PermissionError)
+    assert index.read_bytes() == published and len(calls) == before
+    (root/'blocked'/'guide.md').unlink(); (root/'blocked').rmdir()
     before = len(calls)
     assert build(root, index, models, 'embedding') == (2, 0) and len(calls) == before
     (root/'beta.md').write_text('# Beta\nBeta updated documentation.\n')

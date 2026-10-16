@@ -24,14 +24,15 @@ JSON может обновляться извне; один ответ испо�
 ## Индекс и RAG
 
 Сканер без Git читает только Markdown из явной knowledge directory, исключая
-hidden/symlink, известные secret/build/vendor/data/files имена и бинарные файлы.
+hidden/symlink, известные secret/build/vendor/data/files имена во всех компонентах пути и бинарные файлы.
 Текст LF делится окнами40 с path/start/end/text/hash; Unicode separators остаются
 в строках. Фильтр не заменяет выбор безопасной папки оператором. Превышения
 документа128KiB/corpus4MiB/files10000/chunks2000/chunk12000bytes — явные ошибки.
 
 /index явно сканирует корпус, использует vectors кэша неизменившихся hash при
 совпадении absolute root/model, отправляет новые тексты batches32, строит новую
-SQLite и атомарно заменяет индекс (0600). Старый индекс сохраняется при ошибке.
+SQLite и атомарно заменяет индекс (0600). Старый индекс сохраняется при ошибке, включая недоступное поддерево: os.walk
+onerror поднимает ошибку чтения вместо молчаливого пропуска.
 Пустой корпус публикует пустой индекс, никакие прежние чанки не остаются.
 SQLite URI строится через Path.as_uri. Индекс вне корпуса, проверяется root/model;
 автоматического платного reindex нет. Отсутствующий индекс даёт понятную ошибку,
@@ -50,7 +51,10 @@ documentation/history от инструкций. Просит ссылки [n], 
 ## Подключение и состояние
 
 Settings JSON — private atomic0600; defaults: compatible loopback URL, empty
-chat/embedding IDs, reasoning OFF, temperature.2/max_tokens1024. /settings использует
+chat/embedding IDs, reasoning OFF, temperature.2/max_tokens1024. Температура
+конечная неотрицательная, max_tokens положительное целое либо null; null исключает
+поле из HTTP payload. Верхних caps нет, совместимость проверяет модельный сервер.
+Settings верхнего уровня обязаны быть mapping; null/другие типы дают безопасный отказ. /settings использует
 getpass, blank сохраняет ключ, '-' удаляет; /models лишь каталог, без inference
 или угадывания типов. Новая URL не подменяет IDs. CLI не читает env/dotenv/старые
 базы. State по умолчанию под home/.local/state/support-assistant/hash(root),

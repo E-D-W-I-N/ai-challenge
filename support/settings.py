@@ -2,6 +2,7 @@
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -20,12 +21,21 @@ def state_directory(root, explicit=None):
     return base
 
 
+def validate_generation(settings):
+    temperature, tokens = settings['temperature'], settings['max_tokens']
+    if type(temperature) not in (int, float) or (type(temperature) is float and not math.isfinite(temperature)) or temperature < 0:
+        raise ValueError('temperature must be finite and nonnegative')
+    if tokens is not None and (type(tokens) is not int or tokens < 1):
+        raise ValueError('max_tokens must be a positive integer or null')
+
+
 def load(path):
     if not path.exists():
         return dict(connection=Connection(), chat_model='', embedding_model='', temperature=0.2, max_tokens=1024, reasoning_enabled=False)
     try:
         if path.stat().st_size > 16384: raise ValueError()
         data = json.loads(path.read_text())
+        if not isinstance(data, dict): raise ValueError()
         config = data.pop('connection')
         if not isinstance(config, dict) or set(config) != {'base_url', 'api_key'}:
             raise ValueError()
@@ -34,8 +44,8 @@ def load(path):
         connection = Connection(**config)
         if set(data) != {'chat_model', 'embedding_model', 'temperature', 'max_tokens', 'reasoning_enabled'}: raise ValueError()
         if any(not isinstance(data[k], str) for k in ('chat_model', 'embedding_model')): raise ValueError()
-        if type(data['reasoning_enabled']) is not bool or type(data['max_tokens']) is not int or not 1 <= data['max_tokens'] <= 32768: raise ValueError()
-        if type(data['temperature']) not in (int, float) or not 0 <= data['temperature'] <= 2: raise ValueError()
+        if type(data['reasoning_enabled']) is not bool: raise ValueError()
+        validate_generation(data)
         return dict(data, connection=connection)
     except (OSError, ValueError, TypeError, KeyError):
         raise ValueError('Invalid private settings') from None
@@ -83,10 +93,10 @@ def configure(settings):
     if reasoning not in ('', 'n', 'y'): raise ValueError('Expected y or n')
     updated['reasoning_enabled'] = reasoning == 'y'
     for key, cast in [('temperature', float), ('max_tokens', int)]:
-        value = input(f'{key} [{updated[key]}]: ').strip()
+        hint = '; null omits parameter' if key == 'max_tokens' else ''
+        value = input(f'{key} [{updated[key]}]{hint}: ').strip()
         if value:
-            try: updated[key] = cast(value)
+            try: updated[key] = None if key == 'max_tokens' and value.lower() == 'null' else cast(value)
             except ValueError: raise ValueError('Invalid generation parameter') from None
-    if not 0 <= updated['temperature'] <= 2 or not 1 <= updated['max_tokens'] <= 32768:
-        raise ValueError('temperature must be 0..2; max_tokens 1..32768')
+    validate_generation(updated)
     return updated

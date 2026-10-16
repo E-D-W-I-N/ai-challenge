@@ -10,20 +10,28 @@ import tempfile
 EXCLUDED = {'data', 'files', 'node_modules', 'vendor', 'build', 'dist', 'venv', '__pycache__', 'secrets'}
 
 
+def secret_name(name):
+    return any(word in name.lower() for word in ('secret', 'credential', 'password', 'private-key'))
+
+
+def walk_error(error):
+    raise error
+
+
 def scan(root):
     root = Path(root).resolve(strict=True)
     if not root.is_dir():
         raise ValueError('Knowledge path must be a directory')
     corpus = []
     total = entries = 0
-    for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.lower() not in EXCLUDED and not (Path(directory) / d).is_symlink())
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.lower() not in EXCLUDED and not secret_name(d) and not (Path(directory) / d).is_symlink())
         for name in sorted(files):
             entries += 1
             if entries > 10000:
                 raise ValueError('Knowledge directory exceeds 10000 files')
             path = Path(directory) / name
-            if path.is_symlink() or name.startswith('.') or path.suffix.lower() != '.md' or any(s in name.lower() for s in ('secret', 'credential', 'password', 'private-key')):
+            if path.is_symlink() or name.startswith('.') or path.suffix.lower() != '.md' or any(secret_name(part) for part in path.relative_to(root).parts):
                 continue
             if path.stat().st_size > 128 * 1024:
                 raise ValueError('Markdown file exceeds 128 KiB')
