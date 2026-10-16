@@ -50,12 +50,16 @@ class Models:
         if not s['reasoning_enabled'] and reports_reasoning(body):
             raise ModelError('Server reported reasoning while disabled; response rejected')
         try:
-            message = body['choices'][0]['message']
+            choice = body['choices'][0]
+            message = choice['message']
+            finish = choice['finish_reason']
             if not isinstance(message, dict) or message.get('role', 'assistant') != 'assistant': raise ValueError()
             content, calls = message.get('content'), message.get('tool_calls')
             if content is not None and not isinstance(content, str): raise ValueError()
             if not calls and (not isinstance(content, str) or not content.strip()): raise ValueError()
             if calls is not None and (not isinstance(calls, list) or len(calls) > 12): raise ValueError()
+            if finish != ('tool_calls' if calls else 'stop'):
+                raise ModelError('Incomplete or unsupported generation finish reason; response rejected')
             return dict(role='assistant', content=content, **({'tool_calls': calls} if calls else {}))
         except (KeyError, TypeError, IndexError, ValueError):
             raise ModelError('Invalid generation response') from None

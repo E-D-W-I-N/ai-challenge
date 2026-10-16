@@ -15,7 +15,9 @@ System prompt задаёт операции и границы доверия. Ro
 качество анализа остаются ограничениями модели.
 
 Запрос содержит стандартные function schemas и `tool_choice=auto`. Каждый frame
-полностью валидируется до первого исполнения: объявленные имена, unique IDs,
+полностью валидируется до первого исполнения: finish_reason=stop только для
+финального текста, tool_calls только для непустых tools; length/content_filter/
+неизвестный/отсутствующий или противоречивый finish_reason отклоняется. Затем: объявленные имена, unique IDs,
 точные строковые аргументы, тип function. Вызовы исполняются в порядке модели,
 ответы возвращаются role=tool/tool_call_id. Tool trace показывает имя, параметры
 (полное replacement text видно в diff) и фактический результат либо явную ошибку.
@@ -100,5 +102,6 @@ loopback direct, без hidden direct fallback. Поддержка параме�
 проверены tool replies, overlay reads/search, diff до apply, disk unchanged до human
 apply, восстановление0600, all-file conflict/new collision, permissions, protected
 paths/symlinks/binary, interruption incomplete, OFF rejection before mutation,
+truncated/filtered finish reasons с pending draft и запретом apply/tools,
 null/uncapped generation, key redaction/proxy и настоящий CLI subprocess.
 Все данные временные, никаких live LLM или чтения приватных проектов.

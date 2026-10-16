@@ -46,11 +46,11 @@ def model_server():
     finally: server.shutdown(); server.server_close(); worker.join()
 
 
-def frame(content=None, calls=None, reasoning=False):
+def frame(content=None, calls=None, reasoning=False, finish=None):
     message = {'role':'assistant', 'content':content}
     if calls: message['tool_calls'] = calls
     if reasoning: message['reasoning_content'] = 'reported'
-    return {'choices':[{'message':message}], 'usage':{'total_tokens':12}}
+    return {'choices':[{'message':message, 'finish_reason':finish or ('tool_calls' if calls else 'stop')}], 'usage':{'total_tokens':12}}
 
 
 def scenario(base, url, calls, replies):
@@ -114,6 +114,21 @@ def scenario(base, url, calls, replies):
     before_calls = len(calls); fails(lambda: agent.ask('Inspect the project'),ModelError)
     assert len(calls) == before_calls+1 and not ws.edits and not (root/'bad.md').exists()
     assert ws.incomplete
+    # Truncated/filtered/unknown or inconsistent frames cannot complete a pending draft
+    # or execute even syntactically valid mutation tools. Only one HTTP call per refusal.
+    ws.stage('README.md', '# Pending documentation\n', False)
+    pending = dict(ws.edits)
+    for finish, tool_calls in [('length', None), ('length', [tool('create',path='bad.md',text='bad')]),
+                               ('content_filter', None), ('unknown', None),
+                               ('stop', [tool('create',path='bad.md',text='bad')]), ('tool_calls', None)]:
+        replies.append(frame('Incomplete but nonempty answer', calls=tool_calls, finish=finish))
+        before_calls, before_trace = len(calls), len(trace)
+        fails(lambda: agent.ask('Continue documentation'), ModelError)
+        restored = Workspace(root, state)
+        assert len(calls) == before_calls+1 and len(trace) == before_trace
+        assert restored.edits == pending and restored.incomplete and not (root/'bad.md').exists()
+        fails(restored.apply)
+    ws.discard()
     # Ctrl-C leaves a persisted incomplete draft; no automatic apply.
     with patch.object(models,'answer', side_effect=[{'role':'assistant','content':None,'tool_calls':[tool('create',path='draft.md',text='pending')]}, KeyboardInterrupt]):
         fails(lambda: agent.ask('Prepare a note'),KeyboardInterrupt)
