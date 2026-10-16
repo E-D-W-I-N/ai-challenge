@@ -1,25 +1,20 @@
-"""One temporary support fixture, HTTP model mock and real HTTP MCP services."""
-import asyncio
+"""Neutral temporary project and actual compatible HTTP mock; no live model calls."""
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from unittest.mock import patch
 
-from shared_models import Connection, generation_payload
+from file_agent.agent import Agent
+from file_agent.settings import load, save, state_directory
+from file_agent.workspace import Workspace
+from shared_models import Connection
 from shared_models.client import Models, ModelError
 from shared_models.transport import client_options
-from support.assistant import Assistant
-from support.context import fetch_context, selected_context
-from support.settings import configure, load, save, state_directory
-from rag.index import build, read_index, scan, status
 
 
 def fails(call, error=ValueError):
@@ -28,180 +23,132 @@ def fails(call, error=ValueError):
     raise AssertionError('Expected explicit failure')
 
 
+def tool(name, **args):
+    return {'id':'call-'+name, 'type':'function', 'function':{'name':name, 'arguments':json.dumps(args)}}
+
+
 @contextmanager
 def model_server():
-    calls = []
-    mode = {'error': False, 'reasoning': False}
+    calls, replies = [], []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
         def do_GET(self):
             self.send_response(200); self.end_headers()
-            self.wfile.write(json.dumps({'data': [{'id':'generation'}, {'id':'embedding'}]}).encode())
+            self.wfile.write(b'{"data":[{"id":"chat"}]}')
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            calls.append((self.path, body, self.headers.get('Authorization')))
-            if mode['error']:
-                self.send_response(503); self.end_headers(); self.wfile.write(b'SECRET-UPSTREAM'); return
-            if self.path == '/v1/embeddings':
-                # Query uses selected ticket context; neutral question alone has no category.
-                def vector(text): return [1, 0] if 'alpha' in text.lower() else [0, 1]
-                value = {'data': [{'index':i, 'embedding':vector(t)} for i,t in enumerate(body['input'])]}
-            else:
-                value = {'choices':[{'message':{'content':'Use the documented steps [1]. Ticket context is reported separately.'}}], 'usage':{'total_tokens':12}}
-                if mode['reasoning']: value['choices'][0]['message']['reasoning_content'] = 'reported'
-            self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(value).encode())
+            calls.append((body, self.headers.get('Authorization')))
+            reply = replies.pop(0)
+            self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(reply).encode())
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
-    try: yield f'http://127.0.0.1:{server.server_port}/v1', calls, mode
+    try: yield f'http://127.0.0.1:{server.server_port}/v1', calls, replies
     finally: server.shutdown(); server.server_close(); worker.join()
 
 
-@contextmanager
-def mcp_server(data, ticket):
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]
-    process = subprocess.Popen([sys.executable, '-m', 'support.context', '--data', str(data), '--ticket', ticket, '--port', str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        for _ in range(100):
-            if process.poll() is not None: raise AssertionError('MCP process exited')
-            try:
-                with socket.create_connection(('127.0.0.1', port), timeout=.1): break
-            except OSError: time.sleep(.05)
-        else: raise AssertionError('MCP process did not start')
-        yield f'http://127.0.0.1:{port}/mcp'
-    finally:
-        process.terminate()
-        try: process.wait(timeout=5)
-        except subprocess.TimeoutExpired: process.kill(); process.wait()
+def frame(content=None, calls=None, reasoning=False, finish=None):
+    message = {'role':'assistant', 'content':content}
+    if calls: message['tool_calls'] = calls
+    if reasoning: message['reasoning_content'] = 'reported'
+    return {'choices':[{'message':message, 'finish_reason':finish or ('tool_calls' if calls else 'stop')}], 'usage':{'total_tokens':12}}
 
 
-async def scenario(directory, base_url, calls, mode):
-    root = directory / 'knowledge'; root.mkdir()
-    (root/'alpha.md').write_text('# Alpha\nAlpha documentation.\u2028Still first source line.\n')
-    (root/'beta.md').write_text('# Beta\nBeta documentation.\n')
-    (root/'secret.md').write_text('Never embed')
-    for name in ('credentials', 'passwords'):
-        (root/name).mkdir(); (root/name/'README.md').write_text('Never embed directory secrets')
-    (root/'binary.md').write_bytes(b'\x00binary')
-    (root/'not-doc.py').write_text('Never embed code')
-    (root/'build').mkdir(); (root/'build'/'generated.md').write_text('Never embed')
-    (root/'link.md').symlink_to(root/'alpha.md')
-    corpus = scan(root)
-    assert {c['path'] for c in corpus} == {'alpha.md', 'beta.md'}
-    assert corpus[0]['end'] == 2 and '\u2028' in corpus[0]['text']
-    state = state_directory(root, directory / 'state?#')
-    settings_path = state/'settings.json'; index = state/'index.sqlite'
-    settings = dict(connection=Connection(base_url, 'PRIVATE-KEY'), chat_model='generation', embedding_model='embedding', temperature=.2, max_tokens=1024, reasoning_enabled=False)
+def scenario(base, url, calls, replies):
+    root = base/'project'; root.mkdir()
+    (root/'api.py').write_text('def render(): return "ok"\n')
+    (root/'main.py').write_text('from api import render\nrender()\n')
+    (root/'README.md').write_text('# Neutral project\n')
+    (root/'api.py').chmod(0o640)
+    (root/'.env').write_text('SECRET-FIXTURE')
+    outside = base/'outside'; outside.mkdir(); (outside/'private.txt').write_text('OUTSIDE')
+    (root/'linked').symlink_to(outside, target_is_directory=True)
+    (root/'binary.bin').write_bytes(b'\0binary')
+    state = state_directory(root, base/'state')
+    settings = dict(connection=Connection(url, 'PRIVATE-KEY'), chat_model='chat', temperature=.2, max_tokens=1024, reasoning_enabled=False)
+    save(state/'settings.json', settings)
+    assert load(state/'settings.json') == settings and (state/'settings.json').stat().st_mode & 0o777 == 0o600
     assert 'PRIVATE-KEY' not in repr(settings['connection'])
-    save(settings_path, settings)
-    assert settings_path.stat().st_mode & 0o777 == 0o600
-    assert load(settings_path) == settings
-    settings_path.write_text('null')
-    fails(lambda: load(settings_path))
-    save(settings_path, settings)
-    # Upper generation limits belong to the model server; null explicitly omits max_tokens.
-    uncapped = dict(settings, temperature=3.5, max_tokens=100000)
-    save(settings_path, uncapped)
-    assert load(settings_path) == uncapped
-    with patch('builtins.input', side_effect=['', '', '3.5', 'null']), patch('support.settings.getpass.getpass', return_value=''), patch('support.settings.choose_models', side_effect=lambda s:s):
-        uncapped = configure(settings)
-    assert uncapped['max_tokens'] is None
-    save(settings_path, uncapped)
-    assert load(settings_path)['max_tokens'] is None
-    Models(uncapped).answer([{'role':'user','content':'fixture'}])
-    assert calls[-1][1]['temperature'] == 3.5 and 'max_tokens' not in calls[-1][1]
-    calls.clear()
-    save(settings_path, settings)
-    models = Models(settings)
-    assert models.request('GET', '/models')['data'][0]['id'] == 'generation'
-    assert build(root, index, models, 'embedding') == (2, 2)
-    assert index.stat().st_mode & 0o777 == 0o600
-    # An inaccessible subtree must fail instead of publishing a partial corpus.
-    (root/'blocked').mkdir(); (root/'blocked'/'guide.md').write_text('Unreachable document')
-    published = index.read_bytes()
-    scandir = os.scandir
-    def denied(path):
-        if Path(path).name == 'blocked': raise PermissionError('fixture denied subtree')
-        return scandir(path)
-    before = len(calls)
-    with patch('rag.index.os.scandir', side_effect=denied):
-        fails(lambda: build(root,index,models,'embedding'), PermissionError)
-    assert index.read_bytes() == published and len(calls) == before
-    (root/'blocked'/'guide.md').unlink(); (root/'blocked').rmdir()
-    before = len(calls)
-    assert build(root, index, models, 'embedding') == (2, 0) and len(calls) == before
-    (root/'beta.md').write_text('# Beta\nBeta updated documentation.\n')
-    assert status(root,index,'embedding')[0].startswith('STALE')
-    assert build(root,index,models,'embedding') == (2,1)
-    fails(lambda: status(root,index,'wrong'))
-    fails(lambda: read_index(state/'missing'))
+    uncapped = dict(settings, temperature=3.5, max_tokens=None)
+    save(state/'settings.json', uncapped); assert load(state/'settings.json') == uncapped
+    models = Models(uncapped)
+    assert models.request('GET', '/models')['data'][0]['id'] == 'chat'
+    ws = Workspace(root, state); trace = []
+    agent = Agent(ws, models, trace.append)
+    replies.extend([frame(calls=[tool('list'), tool('search',query='render')]),
+                    frame(calls=[tool('read',path='api.py')]), frame('API used in api.py:1 and main.py:1-2.')])
+    assert 'main.py' in agent.ask('Find uses of the public API and report them.')
+    search_results = calls[-1][0]['messages']
+    assert any(m['role']=='tool' and 'main.py' in m['content'] for m in search_results)
+    assert not ws.edits
+    replies.extend([frame(calls=[tool('read',path='main.py')]),
+                    frame(calls=[tool('edit',path='README.md',text='# Neutral project\nCall render() from api.\n'), tool('create',path='docs/API.md',text='# API\nrender() returns ok.\n')]),
+                    frame(calls=[tool('diff')]), frame('Documentation staged; inspect /diff and use /apply.')])
+    before = (root/'README.md').read_text()
+    agent.ask('Update the documentation using the implementation and caller.')
+    assert (root/'README.md').read_text() == before and not (root/'docs').exists()
+    assert 'Call render' in ws.read('README.md') and 'docs/API.md' in ws.files()
+    assert 'render' in ws.diff() and ws.draft_path.stat().st_mode & 0o777 == 0o600
+    restored = Workspace(root, state); assert restored.edits == ws.edits
+    # All-file conflict preflight: neither first edit nor colliding new file overwritten.
+    (root/'docs').mkdir(); (root/'docs/API.md').write_text('external')
+    fails(restored.apply)
+    assert (root/'README.md').read_text() == before and (root/'docs/API.md').read_text() == 'external'
+    (root/'docs/API.md').unlink()
+    assert len(restored.apply()) == 2
+    assert 'Call render' in (root/'README.md').read_text()
+    for path in ('../outside/private.txt', '/etc/passwd', 'linked/private.txt', '.env', '.git/config', 'build/a', 'x/../../a'):
+        fails(lambda: ws.read(path), (ValueError, OSError))
+        fails(lambda: ws.stage(path, 'new', True), (ValueError, OSError))
+    fails(lambda: Workspace(root/'linked', state))
+    fails(lambda: ws.read('binary.bin'))
+    assert all('linked/' not in x and '.env' not in x for x in ws.files())
+    # Staging sees staged text and preserves permissions; conflict on changed originals.
+    ws = Workspace(root,state); ws.stage('api.py','def render(): return "new"\n',False)
+    assert ws.search('"new"')[0]['path'] == 'api.py'
+    (root/'api.py').write_text('external change\n'); fails(ws.apply)
+    (root/'api.py').write_text('def render(): return "ok"\n'); ws.apply()
+    assert (root/'api.py').stat().st_mode & 0o777 == 0o640
+    # OFF response rejected before ANY advertised mutation tool executes.
+    agent = Agent(ws,models,trace.append)
+    replies.append(frame(calls=[tool('create',path='bad.md',text='bad')],reasoning=True))
+    before_calls = len(calls); fails(lambda: agent.ask('Inspect the project'),ModelError)
+    assert len(calls) == before_calls+1 and not ws.edits and not (root/'bad.md').exists()
+    assert ws.incomplete
+    # Truncated/filtered/unknown or inconsistent frames cannot complete a pending draft
+    # or execute even syntactically valid mutation tools. Only one HTTP call per refusal.
+    ws.stage('README.md', '# Pending documentation\n', False)
+    pending = dict(ws.edits)
+    for finish, tool_calls in [('length', None), ('length', [tool('create',path='bad.md',text='bad')]),
+                               ('content_filter', None), ('unknown', None),
+                               ('stop', [tool('create',path='bad.md',text='bad')]), ('tool_calls', None)]:
+        replies.append(frame('Incomplete but nonempty answer', calls=tool_calls, finish=finish))
+        before_calls, before_trace = len(calls), len(trace)
+        fails(lambda: agent.ask('Continue documentation'), ModelError)
+        restored = Workspace(root, state)
+        assert len(calls) == before_calls+1 and len(trace) == before_trace
+        assert restored.edits == pending and restored.incomplete and not (root/'bad.md').exists()
+        fails(restored.apply)
+    ws.discard()
+    # Ctrl-C leaves a persisted incomplete draft; no automatic apply.
+    with patch.object(models,'answer', side_effect=[{'role':'assistant','content':None,'tool_calls':[tool('create',path='draft.md',text='pending')]}, KeyboardInterrupt]):
+        fails(lambda: agent.ask('Prepare a note'),KeyboardInterrupt)
+    assert Workspace(root,state).incomplete and not (root/'draft.md').exists()
+    fails(ws.apply); ws.discard()
+    assert all(body['reasoning_effort']=='none' and 'max_tokens' not in body and body['temperature']==3.5 and auth=='Bearer PRIVATE-KEY' for body,auth in calls)
+    assert all('SECRET-FIXTURE' not in json.dumps(body) and 'OUTSIDE' not in json.dumps(body) and 'PRIVATE-KEY' not in json.dumps(body) for body,_ in calls)
+    cli = subprocess.run([sys.executable,'-m','file_agent','--project',str(root),'--state',str(state)],input='/status\n/new\n/diff\n/exit\n',text=True,capture_output=True,timeout=10)
+    assert cli.returncode == 0 and 'Conversation cleared' in cli.stdout and 'PRIVATE-KEY' not in cli.stdout+cli.stderr
     fails(lambda: state_directory(root, root/'state'))
-    data = directory/'support.json'
-    def ticket(name): return dict(id=name, user_id=name+'-owner', title=name, description=name+' request', status='open', messages=[dict(author='user',text=name+' details')])
-    document = dict(users=[dict(id=x+'-owner',context=x+' user context') for x in ['alpha','beta']], tickets=[ticket(x) for x in ['alpha','beta']])
-    data.write_text(json.dumps(document))
-    fails(lambda: selected_context(data,'unknown'))
-    with mcp_server(data,'alpha') as alpha_url, mcp_server(data,'beta') as beta_url:
-        alpha = Assistant(root,index,'alpha',alpha_url,models)
-        beta = Assistant(root,index,'beta',beta_url,models)
-        _, ahits, _ = await alpha.ask('What are the next steps?')
-        _, bhits, _ = await beta.ask('What are the next steps?')
-        assert ahits[0]['path'] == 'alpha.md' and bhits[0]['path'] == 'beta.md'
-        prompts = [json.loads(b['messages'][1]['content']) for p,b,_ in calls if p.endswith('/chat/completions')]
-        assert prompts[0]['context']['ticket']['id'] == 'alpha'
-        assert 'beta-owner' not in json.dumps(prompts[0]) and 'alpha-owner' not in json.dumps(prompts[1])
-        assert all(b['reasoning_effort'] == 'none' for p,b,_ in calls if p.endswith('/chat/completions'))
-        assert all(auth == 'Bearer PRIVATE-KEY' and 'PRIVATE-KEY' not in json.dumps(b) for _,b,auth in calls)
-        try: await fetch_context(alpha_url,'beta')
-        except ValueError: pass
-        else: raise AssertionError('Mismatched ticket accepted')
-        document['tickets'][0]['status'] = 'pending'; data.write_text(json.dumps(document))
-        assert (await fetch_context(alpha_url,'alpha'))['ticket']['status'] == 'pending'
-        history = list(alpha.history)
-        data.write_text('{malformed')
-        before = len(calls)
-        try: await alpha.ask('Continue')
-        except ValueError: pass
-        else: raise AssertionError('Malformed context accepted')
-        assert len(calls) == before and alpha.history == history
-        document['tickets'][0]['user_id']='unknown'; data.write_text(json.dumps(document))
-        fails(lambda: selected_context(data,'alpha'))
-        document['tickets'][0]['user_id']='alpha-owner'; data.write_text(json.dumps(document))
-        mode['reasoning'] = True
-        try: await alpha.ask('Continue')
-        except ModelError: pass
-        else: raise AssertionError('Reasoning accepted')
-        assert alpha.history == history
-        mode['reasoning'] = False
-        mode['error'] = True; before = len(calls)
-        try: models.embed(['test'], 'embedding')
-        except ModelError as exc: assert 'SECRET-UPSTREAM' not in str(exc) and 'PRIVATE-KEY' not in str(exc)
-        else: raise AssertionError('HTTP error accepted')
-        assert len(calls) == before+1
-        mode['error'] = False
-        alpha.history.clear(); assert not alpha.history
-        (root/'alpha.md').unlink(); (root/'beta.md').unlink()
-        assert build(root,index,models,'embedding') == (0,0)
-        before = len([1 for p,_,_ in calls if p.endswith('/embeddings')])
-        _, hits, _ = await alpha.ask('Any instructions?')
-        assert not hits and len([1 for p,_,_ in calls if p.endswith('/embeddings')]) == before
-        settings['embedding_model']=''
-        save(settings_path, settings)
-        # Real CLI startup and /new /status /exit; stdin contains no model request.
-        cli = subprocess.run([sys.executable,'-m','support','--knowledge',str(root),'--state',str(state),'--ticket','alpha','--mcp-url',alpha_url], input='/new\n/status\n/exit\n', text=True, capture_output=True, timeout=20)
-        assert cli.returncode == 0 and 'Conversation cleared' in cli.stdout
-        assert 'PRIVATE-KEY' not in cli.stdout + cli.stderr
-    fails(lambda: scan(directory/'missing'), OSError)
-    assert client_options('http://127.0.0.1:8010') == {'trust_env':False}
-    with patch('shared_models.transport.proxy_bypass', return_value=False), patch('shared_models.transport.getproxies', return_value={'https':'http://proxy.invalid:8080'}):
+    assert client_options('http://localhost:8005') == {'trust_env':False}
+    with patch('shared_models.transport.proxy_bypass',return_value=False), patch('shared_models.transport.getproxies',return_value={'https':'http://proxy.invalid:8080'}):
         assert 'proxy' in client_options('https://model.invalid/v1')
-    assert generation_payload({'reasoning_effort':'high'})['reasoning_effort'] == 'none'
+    assert trace and any('tool → search' in item for item in trace)
 
 
 def main():
-    with tempfile.TemporaryDirectory() as directory, model_server() as (url,calls,mode):
-        asyncio.run(scenario(Path(directory), url,calls,mode))
-    print('OK: offline support, RAG cache, isolation, actual HTTP MCP and model transport')
+    with tempfile.TemporaryDirectory() as directory, model_server() as (url,calls,replies):
+        scenario(Path(directory),url,calls,replies)
+    print('OK: offline HTTP tool rounds, multi-file analysis/docs, overlay, explicit apply, conflicts, paths, interruption, reasoning and CLI')
 
 
 if __name__ == '__main__': main()

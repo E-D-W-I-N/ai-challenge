@@ -1,78 +1,107 @@
-# Архитектура дня 33
+# Архитектура дня 34
 
-`support.__main__` — консоль одной сессии выбранного тикета. `support.context` —
-отдельно запущенный оператором read-only MCP и его клиент; `support.assistant`
-связывает свежий контекст, docs RAG и generation. `rag.index` — независимый
-Markdown scanner/SQLite индекс. `shared_models` сохраняет совместимый HTTP,
-system proxy и reasoning contract. Нет web, Git интеграции, CRM мутаций или auth.
+`file_agent.__main__` — одна интерактивная сессия явного `--project`.
+`agent` — bounded Chat Completions tool loop, `workspace` — безопасные текстовые
+операции и persistent overlay; `settings` — приватное подключение.
+`shared_models` — HTTP transport, system proxy, reasoning contract.
+Зависимость только закреплённый httpx[socks]; RAG/MCP/support удалены.
 
-## Контекст и границы доверия
+## Цель и цикл инструментов
 
-MCP слушает loopback, принимает явный JSON path и один ticket ID от оператора.
-Единственный tool `selected_context` без аргументов возвращает только связанный
-тикет/владельца. На старте и каждом вызове JSON читается заново и проверяются
-типизированные users/tickets, уникальные IDs, связи владельцев и размер.
-Неизвестный тикет или ошибка файла/схемы — отказ. Модель не получает весь JSON,
-другие записи, путь или инструмент произвольного выбора пользователя.
+Обычный текст пользователя становится целью без шаблонов/роутинга по ключевым словам.
+System prompt задаёт операции и границы доверия. Root AGENTS.md читается перед
+обменом как ограниченные правила, подчинённые системным ограничениям и цели.
+Содержимое проекта и tool results — недоверенные данные; prompt injection и
+качество анализа остаются ограничениями модели.
 
-Клиент сверяет привязку при старте и перед каждым ответом через MCP. Прямого
-чтения JSON/старого контекста при ошибке нет. Другой тикет требует нового MCP
-binding и нового CLI процесса; /new очищает историю текущего тикета. Это trusted
-operator selection, не access control для многопользовательского сервиса.
-JSON может обновляться извне; один ответ использует один прочитанный контекст.
+Запрос содержит стандартные function schemas и `tool_choice=auto`. Каждый frame
+полностью валидируется до первого исполнения: finish_reason=stop только для
+финального текста, tool_calls только для непустых tools; length/content_filter/
+неизвестный/отсутствующий или противоречивый finish_reason отклоняется. Затем: объявленные имена, unique IDs,
+точные строковые аргументы, тип function. Вызовы исполняются в порядке модели,
+ответы возвращаются role=tool/tool_call_id. Tool trace показывает имя, параметры
+(полное replacement text видно в diff) и фактический результат либо явную ошибку.
+Ошибку инструмента модель может учесть следующим обычным раундом; автоматических
+повторов HTTP/платного fallback нет. Максимум 8 модельных раундов, 24 tool calls
+и 12 calls/frame. Превышение оставляет incomplete draft.
 
-## Индекс и RAG
+Инструменты: list — пути, search — literal query с LF строками, read — полный UTF-8,
+create/edit — полный новый текст в overlay, diff — unified diff. Read/search/list
+видят staged изменения. У модели нет apply/shell/tests/delete/Git/подагентов.
+Успешный финальный ответ добавляет только пару goal/answer в историю последних
+трёх успешных пар. Tool transcript не сохраняется; trace виден в терминале.
+`/new` очищает историю только после разрешения pending edits.
 
-Сканер без Git читает только Markdown из явной knowledge directory, исключая
-hidden/symlink, известные secret/build/vendor/data/files имена во всех компонентах пути и бинарные файлы.
-Текст LF делится окнами40 с path/start/end/text/hash; Unicode separators остаются
-в строках. Фильтр не заменяет выбор безопасной папки оператором. Превышения
-документа128KiB/corpus4MiB/files10000/chunks2000/chunk12000bytes — явные ошибки.
+## Пути, чтение и лимиты
 
-/index явно сканирует корпус, использует vectors кэша неизменившихся hash при
-совпадении absolute root/model, отправляет новые тексты batches32, строит новую
-SQLite и атомарно заменяет индекс (0600). Старый индекс сохраняется при ошибке, включая недоступное поддерево: os.walk
-onerror поднимает ошибку чтения вместо молчаливого пропуска.
-Пустой корпус публикует пустой индекс, никакие прежние чанки не остаются.
-SQLite URI строится через Path.as_uri. Индекс вне корпуса, проверяется root/model;
-автоматического платного reindex нет. Отсутствующий индекс даёт понятную ошибку,
-изменившийся корпус — предупреждение STALE с использованием опубликованного снимка.
+Root directory задаёт человек; symlink root отклоняется. Инструменты принимают
+строго относительные POSIX paths, запрещают absolute, dot/dotdot, пустые
+компоненты, backslash и управляющие символы. Hidden components (включая .git/.env),
+известные secret/password/credential имена, key/database extensions, data/files,
+build/dist/vendor/node_modules/target/venv исключаются. Это фильтр известных имён,
+не универсальное обнаружение секретов. Binary/NUL и не-UTF8 чтение запрещено;
+search пропускает такие файлы. List показывает разрешённые имена обычных файлов,
+содержимое бинарных не читает. Symlinks исключены из обхода и прямого доступа.
 
-Перед ответом: fresh MCP → check index → query embedding(question, selected
-context, last3 successful pairs) → top3 cosine docs → один Chat Completions.
-Пустой индекс пропускает embeddings и передаёт пустую документацию. Весь контекст
-ограничен явно; silent truncation нет. Prompt отделяет недоверенные ticket/user,
-documentation/history от инструкций. Просит ссылки [n], различение ticket facts
-и документальных фактов, признание пробелов и уточнение. Семантической проверки
-ответа/цитат нет; рядом печатаются фактически переданные path/line/hash sources.
-История добавляет пару только после успешной генерации/проверки размера; errors
-её не меняют. Последние3 пары — явный rolling conversation limit, /new очищает.
+Directory traversal выполняется через directory descriptors с O_NOFOLLOW;
+обычные чтения тоже nofollow и только regular file, NONBLOCK не допускает
+зависание на FIFO. Новый родитель создаётся исключительно при human apply через
+тот же directory walk. No-follow защищает от symlink swaps; это локальный trusted
+operator CLI, не sandbox для враждебного процесса, способного одновременно
+переименовать корень/директории или изменить целевой файл между check/replace.
 
-## Подключение и состояние
+Лимиты: файл 128KiB; цель 8000 bytes; результат инструмента/frame/diff 256KiB;
+search читает максимум 4MiB текста; обход максимум10000 entries (включая каталоги), список максимум10000 файлов; overlay2MiB,
+загружаемый draft4MiB; messages в одном HTTP запросе1MiB. Превышение — явная ошибка,
+без обрезки. Большой проект требует более узких read вместо полного search.
 
-Settings JSON — private atomic0600; defaults: compatible loopback URL, empty
-chat/embedding IDs, reasoning OFF, temperature.2/max_tokens1024. Температура
-конечная неотрицательная, max_tokens положительное целое либо null; null исключает
-поле из HTTP payload. Верхних caps нет, совместимость проверяет модельный сервер.
-Settings верхнего уровня обязаны быть mapping; null/другие типы дают безопасный отказ. /settings использует
-getpass, blank сохраняет ключ, '-' удаляет; /models лишь каталог, без inference
-или угадывания типов. Новая URL не подменяет IDs. CLI не читает env/dotenv/старые
-базы. State по умолчанию под home/.local/state/support-assistant/hash(root),
-явный --state вне корпуса поддержан; SQLite проверяет принадлежность root/model.
-Ключ скрыт из repr, безопасного status, prompt, exception bodies. Чаты и MCP
-контексты не сохраняются. Индекс/настройки содержат приватные данные.
+## Черновик и применение
 
-URL/key/settings зафиксированы Models instance на обмен. HTTP redirects OFF,
-timeout60s/response16MiB, system proxy retained и loopback direct, без direct
-fallback/retries. MCP timeout15s. Generation reasoning_effort none/medium применяется
-после controls; reported reasoning при OFF — ошибка без retries. Embeddings не
-получают reasoning fields. Внутреннее поведение arbitrary endpoint не обещается.
+State вне project: default `~/.local/state/file-assistant/hash(root)` или `--state`.
+Новый каталог0700; settings/draft создаются tempfile0600 + atomic replace.
+Draft содержит root, исходный текст (из него SHA256), replacement, permission mode
+и incomplete. Root принадлежность проверяется при восстановлении. Чаты на диск
+не пишутся. Ключ и исходные тексты делают state приватным; не коммитить.
+
+Первое edit фиксирует original; последующие edits сохраняют его и заменяют только
+текст overlay. Create требует absent, edit — existing/overlay. Перед модельным
+обменом incomplete=true; только успешный final меняет его на false. Ошибка/Ctrl-C
+сохраняет incomplete; завершение успешной цели или явный /discard разрешает его.
+`/exit`/EOF сохраняет pending draft; startup сообщает восстановление. /settings
+и /models сохраняют draft и очищают историю. /new при pending отказывает.
+
+Human `/apply` печатает diff и проверяет SHA256 ВСЕХ originals и отсутствие новых
+коллизий до первой записи. Конфликт preflight не меняет проект. Затем каждый файл
+повторно проверяется, пишется во временный sibling, получает исходные permission
+bits (новый0644) и атомарно заменяется. Нет общей транзакции: ошибка в середине
+может оставить уже применённые файлы, их число явно сообщается, оставшийся draft
+помечается incomplete. Не обещается устойчивость к power loss. /discard убирает
+только draft, не удаляет файлы проекта. Модель никогда не применяет изменения.
+
+## HTTP и настройки
+
+Один explicit chat ID, изначально пустой. /models делает GET каталога, /settings
+меняет URL/key через getpass и выбирает ID явно. Смена URL не угадывает ID.
+Reasoning defaultOFF, temperature.2/max_tokens1024; finite nonnegative temperature,
+positive integer/null tokens без верхних caps, null исключает поле. `.env` и
+переменные окружения с ключами не читаются. Подключение/настройки фиксирует Models
+instance на один синхронный обмен. Ключ исключён из repr/status/prompt/errors.
+
+Reasoning none/medium применяется после controls; reported reasoning при OFF
+отклоняет весь frame ДО tool execution, без retries. Отсутствие reported evidence
+не доказывает отсутствие внутреннего reasoning произвольного endpoint.
+HTTP timeout60s, response16MiB, redirectsOFF; upstream errors показывают только
+безопасную диагностику/status code. System HTTP/HTTPS/SOCKS proxy сохранён,
+loopback direct, без hidden direct fallback. Поддержка параметров/tools сервером
+и качество живой модели остаются ручной проверкой.
 
 ## Проверки
 
-Один `checks.core`: временный нейтральный Markdown/JSON, HTTP model mock и реальные
-HTTP MCP процессы двух выбранных тикетов. Измеряет изоляцию контекста, retrieval,
-индекс/cache/empty publication, JSON validation, LF/URI, key redaction, отсутствие
-retries, OFF rejection и CLI startup. Не читает private corpus или .env, не вызывает
-живую модель. Quality, реальная совместимость endpoint и ручной workflow остаются
-проверкой человека; evaluation questions и пользовательские fixtures вне Git.
+`make check` — один компактный neutral fixture c api.py/main.py/README и HTTP mock:
+модель сама выбирает standard tool rounds для multi-file API report и документации;
+проверены tool replies, overlay reads/search, diff до apply, disk unchanged до human
+apply, восстановление0600, all-file conflict/new collision, permissions, protected
+paths/symlinks/binary, interruption incomplete, OFF rejection before mutation,
+truncated/filtered finish reasons с pending draft и запретом apply/tools,
+null/uncapped generation, key redaction/proxy и настоящий CLI subprocess.
+Все данные временные, никаких live LLM или чтения приватных проектов.

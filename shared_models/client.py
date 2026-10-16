@@ -1,9 +1,8 @@
 """Bounded compatible HTTP operations with explicit failures and no retries."""
 import json
-import math
 
 import httpx
-from shared_models import Connection, generation_payload, reports_reasoning
+from shared_models import generation_payload, reports_reasoning
 from shared_models.transport import client_options, create_client
 
 
@@ -40,23 +39,10 @@ class Models:
         except (httpx.HTTPError, OSError, ValueError, TypeError):
             raise ModelError('Model transport or response error; check connection, proxy and model') from None
 
-    def embed(self, texts, model):
-        if not model: raise ModelError('Explicit embedding model is required')
-        body = self.request('POST', '/embeddings', {'model': model, 'input': texts})
-        try:
-            rows = sorted(body['data'], key=lambda row: row['index'])
-            if [row['index'] for row in rows] != list(range(len(texts))): raise ValueError()
-            vectors = [row['embedding'] for row in rows]
-            dims = len(vectors[0])
-            if not dims or any(len(v)!=dims or any(type(x) not in (int,float) or not math.isfinite(x) for x in v) or not any(v) for v in vectors): raise ValueError()
-            return vectors
-        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
-            raise ModelError('Invalid embedding vectors') from None
-
-    def answer(self, messages):
+    def answer(self, messages, tools):
         s = self.settings
         if not s['chat_model']: raise ModelError('Explicit chat model is required')
-        controls = dict(model=s['chat_model'], messages=messages, temperature=s['temperature'])
+        controls = dict(model=s['chat_model'], messages=messages, temperature=s['temperature'], tools=tools, tool_choice='auto')
         if s['max_tokens'] is not None:
             controls['max_tokens'] = s['max_tokens']
         payload = generation_payload(controls, reasoning_enabled=s['reasoning_enabled'])
@@ -64,8 +50,16 @@ class Models:
         if not s['reasoning_enabled'] and reports_reasoning(body):
             raise ModelError('Server reported reasoning while disabled; response rejected')
         try:
-            answer = body['choices'][0]['message']['content']
-            if not isinstance(answer, str) or not answer.strip(): raise ValueError()
-            return answer, body.get('usage')
+            choice = body['choices'][0]
+            message = choice['message']
+            finish = choice['finish_reason']
+            if not isinstance(message, dict) or message.get('role', 'assistant') != 'assistant': raise ValueError()
+            content, calls = message.get('content'), message.get('tool_calls')
+            if content is not None and not isinstance(content, str): raise ValueError()
+            if not calls and (not isinstance(content, str) or not content.strip()): raise ValueError()
+            if calls is not None and (not isinstance(calls, list) or len(calls) > 12): raise ValueError()
+            if finish != ('tool_calls' if calls else 'stop'):
+                raise ModelError('Incomplete or unsupported generation finish reason; response rejected')
+            return dict(role='assistant', content=content, **({'tool_calls': calls} if calls else {}))
         except (KeyError, TypeError, IndexError, ValueError):
             raise ModelError('Invalid generation response') from None

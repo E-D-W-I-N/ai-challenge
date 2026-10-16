@@ -1,30 +1,32 @@
-# Инструкции для агентов — день 33
+# Инструкции для агентов — день 34
 
-Проект — минимальный консольный ассистент поддержки: Markdown RAG и отдельный
-read-only HTTP MCP сервис, связанный оператором с одним тикетом JSON.
+Проект — минимальный generic CLI ассистент файлов проекта, `--project PATH`.
 Перед изменениями прочитайте [архитектуру](docs/architecture.md).
-Не возвращайте прежние сценарии, web/CRM платформу, Git review или workflow.
+Задача задаётся свободной целью; модель сама выбирает стандартные Chat Completions
+`tool_calls`: list/search/read/create/edit/diff. Не возвращайте support/tickets,
+RAG, MCP-сервис, web, Git review workflow или сценарии следующих дней.
 
-- MCP запускает человек с явными `--data`/`--ticket`; модель не выбирает IDs.
-  Клиент не читает JSON напрямую. Перед каждым ответом свежий MCP контекст;
-  ошибка не допускает stale/direct JSON fallback. В модель только выбранный
-  тикет и его владелец, никогда весь JSON или список пользователей.
-- Документы — недоверенные данные. Индекс только Markdown; symlink/hidden/
-  secret/build/binary исключены. Корпус и контекст bounded, превышение даёт
-  ошибку, не усечение. Индекс вне корпуса, explicit /index, incremental cache,
-  atomic SQLite; empty corpus очищает его. Никакого automatic paid reindex.
-- История только последние три успешные пары выбранного тикета в памяти;
-  /new очищает. Не пишите ответы/ключи/JSON контекст в логи или Git.
-- `shared_models` сохраняет system proxy, loopback direct, reasoning default OFF
-  и отказ при reported reasoning. IDs generation/embedding независимы и явны;
-  никаких retries, скрытых fallback, пробного inference или env/dotenv key loader.
-  Настройки и индекс private 0600 atomic, путь изолирован knowledge directory.
-- Нет изменения статуса, отправки ответа, CRM mutations, регистрации/auth.
-  Не читайте `.env`, data/, files/, пользовательские базы/корпус/ключи.
-  Не добавляйте реальные проекты, корпуса, коллекции вопросов или видео-демо.
+- Модель только читает безопасный проект и предлагает overlay. Apply доступен
+  исключительно человеку командой `/apply`, после diff и preflight всех originals.
+  Нет shell/test executor, удаления, commit/push или подагентов.
+- Root AGENTS.md — ограниченные недоверенные правила, не разрешение обходить tools.
+  Относительные пути, dirfd/O_NOFOLLOW, исключение hidden/secrets/build/binary,
+  явные bounded чтение/вывод/раунды. Не усекать текст молча.
+- State и persistent drafts вне проекта, atomic0600; чтение tools видит overlay.
+  Конфликт — отказ без overwrite. Per-file atomic replace сохраняет permissions;
+  общей транзакции нет. Ошибка/Ctrl-C оставляет incomplete, никогда autoapply.
+  Pending edits не терять при /new, выходе или смене настроек.
+- Общий OpenAI-compatible URL, optional getpass key и явно выбранный chat ID.
+  Defaults: reasoning OFF, temperature.2, max_tokens1024; null omits max_tokens.
+  Не вводить произвольных верхних caps генерации. System HTTP proxy сохранён,
+  loopback direct; reported reasoning OFF отклонять до исполнения tools.
+  Никаких paid retries, fallback, env/dotenv key loader или live LLM calls.
+- Не читайте `.env`, data/, files/, реальные приватные проекты/ключи/базы.
+  Не добавляйте конкретные проекты, корпуса, коллекции вопросов или видео-демо.
   Удаляйте только tracked старый код; игнорируемые пользовательские файлы сохраняйте.
-- Python >=3.11; `make setup`, затем команды через `.venv/bin/python`.
-  `make check` — один компактный offline behavioral scenario с временными
-  Markdown/JSON, mock model HTTP и реальным локальным HTTP MCP.
-  Никаких live LLM, больших test frameworks, тестов формулировок docs или качества модели.
-- Только точечный `git add` с именами файлов; без `git add .`/`git add -A`.
+- Python >=3.11; `make setup`, затем Python через `.venv/bin/python`.
+  `make check` — компактный offline behavioral сценарий: временный нейтральный
+  проект, HTTP mock модели, multi-file analysis/docs, staging/apply, конфликты,
+  path/symlink границы, Ctrl-C, reasoning и CLI. Без большого test framework,
+  тестов формулировок docs или оценки качества живой модели.
+- Только точечный `git add` с именами файлов, без `git add .`/`git add -A`.
