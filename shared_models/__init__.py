@@ -1,4 +1,4 @@
-"""Provider contracts shared by app and standalone RAG; no app or dotenv imports."""
+"""Compatible model connection and reasoning contracts; no dotenv imports."""
 from __future__ import annotations
 
 import contextlib

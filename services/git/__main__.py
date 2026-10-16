@@ -1,62 +1,50 @@
-"""Read-only Git tools over MCP; repository selected by the service operator."""
-from __future__ import annotations
-
+"""A manually launched MCP endpoint with one fixed read-only Git operation."""
 import argparse
-import subprocess
 from pathlib import Path
-
+import subprocess
 from mcp.server.fastmcp import FastMCP
 
-TIMEOUT_S = 15
+
+def git(repo, *args, allow_failure=False):
+    try:
+        result = subprocess.run(['git', '--no-optional-locks', *args], cwd=repo,
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError('Git operation unavailable') from None
+    if result.returncode:
+        if allow_failure: return None
+        raise ValueError('Git operation failed')
+    if len(result.stdout)>1024*1024: raise ValueError('Git context exceeds size limit')
+    return result.stdout.rstrip('\n')
 
 
-def create_server(repository: Path, *, host="127.0.0.1", port=8017):
-    server = FastMCP("git", host=host, port=port)
+def project_context(repo):
+    root = Path(git(repo, 'rev-parse', '--show-toplevel')).resolve()
+    return dict(project=str(root), branch=git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD', allow_failure=True),
+        head=git(root, 'rev-parse', '--verify', 'HEAD', allow_failure=True),
+        status=git(root, 'status', '--porcelain=v1', '--untracked-files=no'))
 
-    def git(*args: str) -> str:
-        try:
-            result = subprocess.run(
-                ["git", *args], cwd=repository, capture_output=True,
-                text=True, timeout=TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired:
-            return f"git {args[0]} не ответил за {TIMEOUT_S} с"
-        if result.returncode:
-            return result.stderr.strip() or f"git {args[0]} завершился с кодом {result.returncode}"
-        return result.stdout.strip()
 
-    @server.tool(description="Последние n коммитов: короткий хэш, дата, первая строка")
-    def git_log(n: int = 10) -> str:
-        if isinstance(n, bool) or not 1 <= n <= 100:
-            raise ValueError("n: от 1 до 100")
-        return git("log", f"-{n}", "--format=%h %ad %s", "--date=short")
+def create_server(repository, *, host='127.0.0.1', port=8017):
+    project_context(repository)
+    server = FastMCP('project-git', host=host, port=port)
 
-    @server.tool(description="Короткий статус рабочего дерева (porcelain), как есть")
-    def git_status() -> str:
-        return git("status", "--porcelain")
-
-    @server.tool(description="Сводка изменений по ref: git diff --stat <ref>")
-    def git_diff_stat(ref: str = "HEAD~1") -> str:
-        if not ref or ref.startswith("-") or any(ord(c) < 32 for c in ref):
-            raise ValueError("ref: непустая ревизия Git, без опций команды")
-        return git("diff", "--stat", ref, "--")
-
+    @server.tool(description='Current repository identity, branch, HEAD and tracked working tree status')
+    def git_project_context() -> dict:
+        return project_context(repository)
     return server
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Independent Git MCP service")
-    parser.add_argument("--repo", required=True, help="Repository path, independent of the chat app")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8017)
-    parser.add_argument("--stdio", action="store_true", help="Explicit legacy fixture mode")
-    args = parser.parse_args(argv)
-    repository = Path(args.repo).expanduser().resolve()
-    if not repository.is_dir():
-        parser.error("--repo: directory does not exist")
-    server = create_server(repository, host=args.host, port=args.port)
-    server.run(transport="stdio" if args.stdio else "streamable-http")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', required=True)
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8017)
+    args = parser.parse_args()
+    try:
+        server = create_server(Path(args.repo).expanduser().resolve(), host=args.host, port=args.port)
+    except ValueError as error: parser.error(str(error))
+    server.run(transport='streamable-http')
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__': main()
