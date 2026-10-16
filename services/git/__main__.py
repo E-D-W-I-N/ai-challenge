@@ -15,7 +15,7 @@ def git(repo, *args, allow_failure=False):
         if allow_failure: return None
         raise ValueError('Git operation failed')
     if len(result.stdout)>1024*1024: raise ValueError('Git context exceeds size limit')
-    return result.stdout.strip()
+    return result.stdout.rstrip('\n')
 
 
 def project_context(repo):

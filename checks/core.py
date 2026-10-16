@@ -79,7 +79,7 @@ def check():
         try: state_root(repo,repo/'cache')
         except ValueError: pass
         else: raise AssertionError('state inside project accepted')
-        state=state_root(repo,parent/'state'); config=defaults()
+        state=state_root(repo,parent/'state?copy#fixture'); config=defaults()
         server=ThreadingHTTPServer(('127.0.0.1',0),Stub)
         worker=threading.Thread(target=server.serve_forever,daemon=True); worker.start()
         try:
@@ -106,7 +106,7 @@ def check():
             with mcp_service(repo) as url:
                 config['mcp_url']=url
                 facts=asyncio.run(context(url,repo)); assert facts['head']==git(repo,'rev-parse','HEAD')
-                assert facts['branch']==git(repo,'branch','--show-current'); assert 'README.md' in facts['status']
+                assert facts['branch']==git(repo,'branch','--show-current'); assert ' M README.md' in facts['status'].splitlines()
                 try: asyncio.run(context(url,parent))
                 except ValueError: pass
                 else: raise AssertionError('wrong repository accepted')
@@ -120,6 +120,16 @@ def check():
                 except ModelError: pass
                 else: raise AssertionError('reasoning OFF violation accepted')
                 Stub.reasoning=False
+                git(repo,'rm','-f','README.md')
+                before_empty=len(Stub.calls)
+                assert build(repo,state,config,models)==dict(documents=0,chunks=0,embedded=0,reused=0)
+                assert retrieve(repo,state,config,models,'current branch')==([],False)
+                assert len(Stub.calls)==before_empty
+                with patch('sys.stdout',new_callable=io.StringIO):
+                    ask(repo,state,config,history,'Which branch is open?')
+                assert [path for path,_ in Stub.calls[before_empty:]]==['/v1/chat/completions']
+                prompt=Stub.calls[-1][1]['messages'][-1]['content']
+                assert '"documentation": []' in prompt and '"branch":' in prompt
             before=len(Stub.calls)
             with patch('builtins.input',side_effect=['/help','/new','/exit']), patch('sys.stdout',new_callable=io.StringIO):
                 assert main(['--project',str(repo),'--state',str(state)])==0

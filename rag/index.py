@@ -83,7 +83,7 @@ def manifest(docs, settings):
 def reading(state):
     path = state / 'index.sqlite'
     if not path.exists(): raise ValueError('No index. Choose models in /settings, then run /index')
-    db = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+    db = sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)
     try:
         yield db, json.loads(db.execute('select value from metadata').fetchone()[0])
     finally:
@@ -104,9 +104,7 @@ def build(project, state, settings, models):
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise ValueError('Another /index operation is running') from None
         docs = documents(project, settings)
-        if not docs: raise ValueError('No eligible tracked documents; check /settings include/exclude patterns')
         rows = [c for d in docs for c in chunks(d, settings['chunk_lines'])]
-        if not rows: raise ValueError('Selected documents are empty')
         cached = {}
         if (state / 'index.sqlite').exists():
             with reading(state) as (db, meta):
@@ -119,8 +117,8 @@ def build(project, state, settings, models):
             vectors = models.embed([by_hash[h] for h in batch], settings['embedding_model'])
             cached.update(zip(batch, map(json.dumps, vectors)))
         dims = {len(json.loads(cached[c['hash']])) for c in rows}
-        if len(dims)!=1: raise ValueError('Embedding dimensions changed; select a distinct model ID and rebuild')
-        meta = dict(identity=identity(settings), manifest=manifest(docs, settings), dimensions=dims.pop())
+        if len(dims)>1: raise ValueError('Embedding dimensions changed; select a distinct model ID and rebuild')
+        meta = dict(identity=identity(settings), manifest=manifest(docs, settings), dimensions=dims.pop() if dims else 0)
         fd, temp = tempfile.mkstemp(prefix='.index-', dir=state)
         os.close(fd)
         try:
@@ -144,6 +142,7 @@ def retrieve(project, state, settings, models, question):
         if meta['identity'] != identity(settings):
             raise ValueError('Index model/chunk settings changed. Run /index')
         stale = meta['manifest'] != manifest(docs, settings)
+        if not db.execute('select 1 from chunks limit 1').fetchone(): return [], stale
         query = models.embed([question], meta['identity']['model'])[0]
         if len(query)!=meta['dimensions']: raise ValueError('Query embedding dimensions differ; rebuild index')
         norm = math.sqrt(sum(x*x for x in query))
