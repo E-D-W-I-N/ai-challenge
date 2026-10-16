@@ -137,7 +137,10 @@ def snapshot(repo, base, head):
             continue
         if not any((c, path) in texts for c in (base, head)):
             continue
-        patch = git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3',
+        patch = git(repo, '-c', 'core.quotePath=true', '-c', 'diff.suppressBlankEmpty=false',
+                    'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--text', '--no-color',
+                    '--no-relative', '--diff-algorithm=myers', '--no-indent-heuristic', '--inter-hunk-context=0',
+                    '--src-prefix=a/', '--dst-prefix=b/', '--line-prefix=', '--unified=3',
                     base, head, '--', ':(literal)' + path, limit=MAX_DIFF).decode('utf-8')
         size += len(patch.encode())
         if size > MAX_DIFF:

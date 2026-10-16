@@ -3,7 +3,10 @@ import math
 
 
 def chunks(path, text, revision, kind):
-    lines = text.splitlines()
+    # Git line numbers count LF only; Unicode separators remain source text.
+    lines = text.split('\n')
+    if lines[-1] == '':
+        lines.pop()
     for offset in range(0, len(lines), 60):
         body = '\n'.join(lines[offset:offset+60])
         if len(body.encode()) > 12000:

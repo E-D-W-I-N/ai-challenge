@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import httpx
 
+from rag.index import chunks
 from review.__main__ import main, settings
 from review.ci import event_identity, fetch
 from review.git import revision, snapshot
@@ -61,6 +62,15 @@ class Stub:
 
 
 def main_checks():
+    # Unicode separators are characters within one physical Git line, not line breaks.
+    unicode_line = 'const message = "hello\u2028world\u0085again\u2029end";'
+    source = list(chunks('app.js', unicode_line + '\n', 'a' * 40, 'code'))
+    assert len(source) == 1 and source[0]['start'] == source[0]['end'] == 1
+    assert source[0]['text'] == unicode_line
+    finding = {'bugs': [{'path': 'app.js', 'line': 2, 'source_ids': [source[0]['id']], 'text': 'Invalid physical line.'}],
+               'architecture': [], 'recommendations': []}
+    fails(lambda: validate(finding, source), 'Unicode separator invented a Git line')
+    assert not list(chunks('empty.js', '', 'a' * 40, 'code'))
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         repo = root / 'target'
@@ -94,6 +104,13 @@ def main_checks():
         command(repo, 'config', 'diff.external', str(hook))
         command(repo, 'config', 'core.hooksPath', str(root))
         snap = snapshot(repo, base, head)
+        # Untracked worktree attributes cannot hide an already verified text blob's patch.
+        original_diffs = snap['diffs']
+        (repo / '.gitattributes').write_text('*.py binary\n')
+        command(repo, 'config', 'diff.algorithm', 'histogram')
+        command(repo, 'config', 'diff.noprefix', 'true')
+        assert snapshot(repo, base, head)['diffs'] == original_diffs
+        assert '-    return 1' in original_diffs[0]['patch'] and '+    return 2' in original_diffs[0]['patch']
         assert snap['merge_base'] == base
         assert 'return 2' in snap['texts'][(head, 'app.py')]
         assert 'Base docs' in snap['texts'][(base, 'docs/architecture.md')]
