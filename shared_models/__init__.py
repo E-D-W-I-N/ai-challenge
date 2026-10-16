@@ -16,7 +16,10 @@ def validate_url(value: str) -> str:
     if (url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password
             or url.query or url.fragment or any(ord(c) <= 32 or ord(c) == 127 for c in value)):
         raise ValueError("Model URL must be HTTP(S) without credentials, query or fragment")
-    url.port
+    try:
+        url.port
+    except ValueError:
+        raise ValueError("Model URL has an invalid port") from None
     return value.rstrip("/")
 
 

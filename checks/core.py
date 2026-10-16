@@ -1,185 +1,207 @@
-"""Small behavioral checks: temporary Git revisions + mocked HTTP, no live inference."""
-import contextlib
-import io
+"""One temporary support fixture, HTTP model mock and real HTTP MCP services."""
+import asyncio
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from unittest.mock import patch
 
-import httpx
-
-from rag.index import chunks
-from review.__main__ import main, settings
-from review.ci import event_identity, fetch
-from review.git import revision, snapshot
-from review.runner import publish, run, validate
-from shared_models import Connection
+from shared_models import Connection, generation_payload
 from shared_models.client import Models, ModelError
+from shared_models.transport import client_options
+from support.assistant import Assistant
+from support.context import fetch_context, selected_context
+from support.settings import configure, load, save, state_directory
+from rag.index import build, read_index, scan, status
 
 
-def command(repo, *args):
-    return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.DEVNULL).decode().strip()
+def fails(call, error=ValueError):
+    try: call()
+    except error: return
+    raise AssertionError('Expected explicit failure')
 
 
-def fails(call, message):
+@contextmanager
+def model_server():
+    calls = []
+    mode = {'error': False, 'reasoning': False}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(json.dumps({'data': [{'id':'generation'}, {'id':'embedding'}]}).encode())
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            calls.append((self.path, body, self.headers.get('Authorization')))
+            if mode['error']:
+                self.send_response(503); self.end_headers(); self.wfile.write(b'SECRET-UPSTREAM'); return
+            if self.path == '/v1/embeddings':
+                # Query uses selected ticket context; neutral question alone has no category.
+                def vector(text): return [1, 0] if 'alpha' in text.lower() else [0, 1]
+                value = {'data': [{'index':i, 'embedding':vector(t)} for i,t in enumerate(body['input'])]}
+            else:
+                value = {'choices':[{'message':{'content':'Use the documented steps [1]. Ticket context is reported separately.'}}], 'usage':{'total_tokens':12}}
+                if mode['reasoning']: value['choices'][0]['message']['reasoning_content'] = 'reported'
+            self.send_response(200); self.end_headers(); self.wfile.write(json.dumps(value).encode())
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+    try: yield f'http://127.0.0.1:{server.server_port}/v1', calls, mode
+    finally: server.shutdown(); server.server_close(); worker.join()
+
+
+@contextmanager
+def mcp_server(data, ticket):
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]
+    process = subprocess.Popen([sys.executable, '-m', 'support.context', '--data', str(data), '--ticket', ticket, '--port', str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        call()
-    except (ValueError, ModelError):
-        return
-    raise AssertionError(message)
+        for _ in range(100):
+            if process.poll() is not None: raise AssertionError('MCP process exited')
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+            except OSError: time.sleep(.05)
+        else: raise AssertionError('MCP process did not start')
+        yield f'http://127.0.0.1:{port}/mcp'
+    finally:
+        process.terminate()
+        try: process.wait(timeout=5)
+        except subprocess.TimeoutExpired: process.kill(); process.wait()
 
 
-class Stub:
-    def __init__(self):
-        self.calls = []
-        self.reasoning = False
-        self.bad_source = False
-        self.http_failure = False
-
-    def handle(self, request):
-        value = json.loads(request.content)
-        self.calls.append((request.url.path, value))
-        assert request.headers['Authorization'] == 'Bearer fixture-secret'
-        if self.http_failure:
-            return httpx.Response(401, text='fixture-secret')
-        if request.url.path.endswith('/embeddings'):
-            return httpx.Response(200, json={'data': [{'index': i, 'embedding': [1, 1 if 'docs' in text else 2]}
-                                                      for i, text in enumerate(value['input'])], 'usage': {'total_tokens': len(value['input'])}})
-        assert value['reasoning_effort'] == 'none'
-        prompt = json.loads(value['messages'][1]['content'])
-        source = next(s for s in prompt['changed_head'] if s['path'] == 'app.py')
-        findings = {'bugs': [{'path': 'app.py', 'line': 1, 'source_ids': ['invented' if self.bad_source else source['id']],
-                             'text': 'Potential behavior change; inspect the return value.'}],
-                    'architecture': [], 'recommendations': []}
-        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(findings)}}],
-                                        'usage': {'total_tokens': 12, 'completion_tokens_details': {'reasoning_tokens': int(self.reasoning)}}})
-
-    def client(self, client_type, **options):
-        options.pop('proxy', None)
-        return client_type(**options, transport=httpx.MockTransport(self.handle))
-
-
-def main_checks():
-    # Unicode separators are characters within one physical Git line, not line breaks.
-    unicode_line = 'const message = "hello\u2028world\u0085again\u2029end";'
-    source = list(chunks('app.js', unicode_line + '\n', 'a' * 40, 'code'))
-    assert len(source) == 1 and source[0]['start'] == source[0]['end'] == 1
-    assert source[0]['text'] == unicode_line
-    finding = {'bugs': [{'path': 'app.js', 'line': 2, 'source_ids': [source[0]['id']], 'text': 'Invalid physical line.'}],
-               'architecture': [], 'recommendations': []}
-    fails(lambda: validate(finding, source), 'Unicode separator invented a Git line')
-    assert not list(chunks('empty.js', '', 'a' * 40, 'code'))
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        repo = root / 'target'
-        repo.mkdir()
-        command(repo, 'init', '-q')
-        command(repo, 'config', 'user.name', 'Offline Fixture')
-        command(repo, 'config', 'user.email', 'fixture@example.invalid')
-        (repo / 'docs').mkdir()
-        (repo / 'docs' / 'architecture.md').write_text('# Base docs\nArchitecture docs contract.\n')
-        (repo / 'app.py').write_text('def value():\n    return 1\n')
-        (repo / 'secret.json').write_text('SECRET-CONTENT-NEVER-SEND')
-        (repo / 'binary.py').write_bytes(b'\0binary')
-        (repo / 'node_modules').mkdir()
-        (repo / 'node_modules' / 'vendor.js').write_text('VENDOR-NEVER-SEND')
-        (repo / 'alias.py').symlink_to('app.py')
-        command(repo, 'add', 'docs/architecture.md', 'app.py', 'secret.json', 'binary.py', 'node_modules/vendor.js', 'alias.py')
-        command(repo, 'commit', '-qm', 'base')
-        base = command(repo, 'rev-parse', 'HEAD')
-        (repo / 'app.py').write_text('def value():\n    return 2\n')
-        (repo / 'docs' / 'architecture.md').write_text('# Head docs\nHEAD-DOCS-NOT-BASE-RAG\n')
-        command(repo, 'add', 'app.py', 'docs/architecture.md')
-        command(repo, 'commit', '-qm', 'head')
-        head = command(repo, 'rev-parse', 'HEAD')
-        # Neither worktree content, target config, hooks nor external diff may be used.
-        (repo / 'app.py').write_text('WORKTREE-CONTENT-NEVER-SEND')
-        (repo / 'docs' / 'architecture.md').write_text('WORKTREE-DOCS-NEVER-SEND')
-        marker = root / 'executed'
-        hook = root / 'hook'
-        hook.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\n')
-        hook.chmod(0o700)
-        command(repo, 'config', 'diff.external', str(hook))
-        command(repo, 'config', 'core.hooksPath', str(root))
-        snap = snapshot(repo, base, head)
-        # Untracked worktree attributes cannot hide an already verified text blob's patch.
-        original_diffs = snap['diffs']
-        (repo / '.gitattributes').write_text('*.py binary\n')
-        command(repo, 'config', 'diff.algorithm', 'histogram')
-        command(repo, 'config', 'diff.noprefix', 'true')
-        assert snapshot(repo, base, head)['diffs'] == original_diffs
-        assert '-    return 1' in original_diffs[0]['patch'] and '+    return 2' in original_diffs[0]['patch']
-        assert snap['merge_base'] == base
-        assert 'return 2' in snap['texts'][(head, 'app.py')]
-        assert 'Base docs' in snap['texts'][(base, 'docs/architecture.md')]
-        assert all(p not in {'alias.py', 'secret.json', 'binary.py', 'node_modules/vendor.js'} for _, p in snap['texts'])
-        fails(lambda: revision('HEAD'), 'symbolic ref accepted')
-        fails(lambda: revision('--upload-pack=bad'), 'option accepted as revision')
-        stub = Stub()
-        config = settings(Connection('https://models.example.invalid/v1', 'fixture-secret'), 'chat', 'embed')
-        with patch('shared_models.client.create_client', stub.client):
-            report = run(repo, base, head, Models(config))
-            assert report['base_corpus']['docs'] and report['base_corpus']['code']
-            assert report['usage'] and all(row['tokens'] for row in report['usage'])
-            assert all(s['revision'] == base for s in report['sources'] if s['kind'] != 'changed_head')
-            assert all(s['revision'] == head for s in report['sources'] if s['kind'] == 'changed_head')
-            assert all({s['id']: s for s in report['sources']}[r['id']]['kind'] in {'docs', 'code'}
-                       for selection in report['retrieval'] for r in selection['sources'])
-            serialized = json.dumps(stub.calls)
-            for forbidden in ('WORKTREE', 'SECRET-CONTENT', 'VENDOR-NEVER', 'fixture-secret'):
-                assert forbidden not in serialized
-            publish(report, root / 'output')
-            assert 'fixture-secret' not in (root / 'output' / 'review.json').read_text()
-            assert 'Potential bugs' in (root / 'output' / 'review.md').read_text()
-            fails(lambda: publish(report, root / 'output'), 'existing output overwritten')
-            validate({'bugs': [], 'architecture': [], 'recommendations': []}, report['sources'])
-            bad = json.loads(json.dumps(report['findings']))
-            bad['bugs'][0]['line'] = 999999
-            fails(lambda: validate(bad, report['sources']), 'unchecked line accepted')
-            stub.bad_source = True
-            fails(lambda: run(repo, base, head, Models(config)), 'invented source accepted')
-            stub.bad_source = False
-            stub.reasoning = True
-            fails(lambda: run(repo, base, head, Models(config)), 'reasoning OFF violation accepted')
-            stub.reasoning = False
-            stub.http_failure = True
-            before = len(stub.calls)
-            fails(lambda: run(repo, base, head, Models(config)), 'HTTP failure accepted')
-            assert len(stub.calls) == before + 1, 'paid retry happened'
-        assert not marker.exists(), 'target executable ran'
-        event = {'number': 3, 'action': 'synchronize', 'repository': {'full_name': 'owner/project'},
-                 'pull_request': {'number': 3, 'base': {'repo': {'full_name': 'owner/project'}, 'sha': base}, 'head': {'sha': head}}}
-        assert event_identity(event, 'owner/project') == ('owner/project', 3, base, head)
-        event['number'] = '3; bad'
-        fails(lambda: event_identity(event, 'owner/project'), 'untrusted PR number accepted')
-        # Fetch credentials never appear in argv; mismatch rejects a moved PR head.
-        calls = []
-        def fake_git(directory, *args):
-            calls.append(args)
-            if args[:1] == ('rev-parse',):
-                return ((base if args[1].endswith('base') else 'f'*40) + '\n').encode()
-            return b''
-        with patch('review.ci.git', fake_git):
-            fails(lambda: fetch('owner/project', 3, base, head, 'fixture-secret', root), 'moved PR head accepted')
-        assert 'fixture-secret' not in repr(calls)
-        assert 'GIT_CONFIG_VALUE_0' not in os.environ
-        connection = root / 'connection.json'
-        connection.write_text(json.dumps({'base_url': 'https://models.example.invalid/v1', 'api_key': 'fixture-secret'}))
-        argv = ['review', '--repo', str(repo), '--base', base, '--head', head,
-                '--connection-file', str(connection), '--chat-model', 'chat', '--embedding-model', 'embed', '--output', str(root/'cli-output')]
-        stub.http_failure = False
-        with patch('sys.argv', argv), patch('shared_models.client.create_client', stub.client), contextlib.redirect_stdout(io.StringIO()):
-            assert main() == 0
-        # Bounds reject a snapshot instead of silently truncating eligible source code.
-        (repo / 'large.py').write_text('x' * (128 * 1024 + 1))
-        command(repo, 'add', 'large.py')
-        command(repo, 'commit', '-qm', 'oversized')
-        large_head = command(repo, 'rev-parse', 'HEAD')
-        fails(lambda: snapshot(repo, base, large_head), 'oversized eligible source silently omitted')
-    print('Offline Git, RAG, HTTP, validation, CLI and CI boundary checks passed.')
+async def scenario(directory, base_url, calls, mode):
+    root = directory / 'knowledge'; root.mkdir()
+    (root/'alpha.md').write_text('# Alpha\nAlpha documentation.\u2028Still first source line.\n')
+    (root/'beta.md').write_text('# Beta\nBeta documentation.\n')
+    (root/'secret.md').write_text('Never embed')
+    for name in ('credentials', 'passwords'):
+        (root/name).mkdir(); (root/name/'README.md').write_text('Never embed directory secrets')
+    (root/'binary.md').write_bytes(b'\x00binary')
+    (root/'not-doc.py').write_text('Never embed code')
+    (root/'build').mkdir(); (root/'build'/'generated.md').write_text('Never embed')
+    (root/'link.md').symlink_to(root/'alpha.md')
+    corpus = scan(root)
+    assert {c['path'] for c in corpus} == {'alpha.md', 'beta.md'}
+    assert corpus[0]['end'] == 2 and '\u2028' in corpus[0]['text']
+    state = state_directory(root, directory / 'state?#')
+    settings_path = state/'settings.json'; index = state/'index.sqlite'
+    settings = dict(connection=Connection(base_url, 'PRIVATE-KEY'), chat_model='generation', embedding_model='embedding', temperature=.2, max_tokens=1024, reasoning_enabled=False)
+    assert 'PRIVATE-KEY' not in repr(settings['connection'])
+    save(settings_path, settings)
+    assert settings_path.stat().st_mode & 0o777 == 0o600
+    assert load(settings_path) == settings
+    settings_path.write_text('null')
+    fails(lambda: load(settings_path))
+    save(settings_path, settings)
+    # Upper generation limits belong to the model server; null explicitly omits max_tokens.
+    uncapped = dict(settings, temperature=3.5, max_tokens=100000)
+    save(settings_path, uncapped)
+    assert load(settings_path) == uncapped
+    with patch('builtins.input', side_effect=['', '', '3.5', 'null']), patch('support.settings.getpass.getpass', return_value=''), patch('support.settings.choose_models', side_effect=lambda s:s):
+        uncapped = configure(settings)
+    assert uncapped['max_tokens'] is None
+    save(settings_path, uncapped)
+    assert load(settings_path)['max_tokens'] is None
+    Models(uncapped).answer([{'role':'user','content':'fixture'}])
+    assert calls[-1][1]['temperature'] == 3.5 and 'max_tokens' not in calls[-1][1]
+    calls.clear()
+    save(settings_path, settings)
+    models = Models(settings)
+    assert models.request('GET', '/models')['data'][0]['id'] == 'generation'
+    assert build(root, index, models, 'embedding') == (2, 2)
+    assert index.stat().st_mode & 0o777 == 0o600
+    # An inaccessible subtree must fail instead of publishing a partial corpus.
+    (root/'blocked').mkdir(); (root/'blocked'/'guide.md').write_text('Unreachable document')
+    published = index.read_bytes()
+    scandir = os.scandir
+    def denied(path):
+        if Path(path).name == 'blocked': raise PermissionError('fixture denied subtree')
+        return scandir(path)
+    before = len(calls)
+    with patch('rag.index.os.scandir', side_effect=denied):
+        fails(lambda: build(root,index,models,'embedding'), PermissionError)
+    assert index.read_bytes() == published and len(calls) == before
+    (root/'blocked'/'guide.md').unlink(); (root/'blocked').rmdir()
+    before = len(calls)
+    assert build(root, index, models, 'embedding') == (2, 0) and len(calls) == before
+    (root/'beta.md').write_text('# Beta\nBeta updated documentation.\n')
+    assert status(root,index,'embedding')[0].startswith('STALE')
+    assert build(root,index,models,'embedding') == (2,1)
+    fails(lambda: status(root,index,'wrong'))
+    fails(lambda: read_index(state/'missing'))
+    fails(lambda: state_directory(root, root/'state'))
+    data = directory/'support.json'
+    def ticket(name): return dict(id=name, user_id=name+'-owner', title=name, description=name+' request', status='open', messages=[dict(author='user',text=name+' details')])
+    document = dict(users=[dict(id=x+'-owner',context=x+' user context') for x in ['alpha','beta']], tickets=[ticket(x) for x in ['alpha','beta']])
+    data.write_text(json.dumps(document))
+    fails(lambda: selected_context(data,'unknown'))
+    with mcp_server(data,'alpha') as alpha_url, mcp_server(data,'beta') as beta_url:
+        alpha = Assistant(root,index,'alpha',alpha_url,models)
+        beta = Assistant(root,index,'beta',beta_url,models)
+        _, ahits, _ = await alpha.ask('What are the next steps?')
+        _, bhits, _ = await beta.ask('What are the next steps?')
+        assert ahits[0]['path'] == 'alpha.md' and bhits[0]['path'] == 'beta.md'
+        prompts = [json.loads(b['messages'][1]['content']) for p,b,_ in calls if p.endswith('/chat/completions')]
+        assert prompts[0]['context']['ticket']['id'] == 'alpha'
+        assert 'beta-owner' not in json.dumps(prompts[0]) and 'alpha-owner' not in json.dumps(prompts[1])
+        assert all(b['reasoning_effort'] == 'none' for p,b,_ in calls if p.endswith('/chat/completions'))
+        assert all(auth == 'Bearer PRIVATE-KEY' and 'PRIVATE-KEY' not in json.dumps(b) for _,b,auth in calls)
+        try: await fetch_context(alpha_url,'beta')
+        except ValueError: pass
+        else: raise AssertionError('Mismatched ticket accepted')
+        document['tickets'][0]['status'] = 'pending'; data.write_text(json.dumps(document))
+        assert (await fetch_context(alpha_url,'alpha'))['ticket']['status'] == 'pending'
+        history = list(alpha.history)
+        data.write_text('{malformed')
+        before = len(calls)
+        try: await alpha.ask('Continue')
+        except ValueError: pass
+        else: raise AssertionError('Malformed context accepted')
+        assert len(calls) == before and alpha.history == history
+        document['tickets'][0]['user_id']='unknown'; data.write_text(json.dumps(document))
+        fails(lambda: selected_context(data,'alpha'))
+        document['tickets'][0]['user_id']='alpha-owner'; data.write_text(json.dumps(document))
+        mode['reasoning'] = True
+        try: await alpha.ask('Continue')
+        except ModelError: pass
+        else: raise AssertionError('Reasoning accepted')
+        assert alpha.history == history
+        mode['reasoning'] = False
+        mode['error'] = True; before = len(calls)
+        try: models.embed(['test'], 'embedding')
+        except ModelError as exc: assert 'SECRET-UPSTREAM' not in str(exc) and 'PRIVATE-KEY' not in str(exc)
+        else: raise AssertionError('HTTP error accepted')
+        assert len(calls) == before+1
+        mode['error'] = False
+        alpha.history.clear(); assert not alpha.history
+        (root/'alpha.md').unlink(); (root/'beta.md').unlink()
+        assert build(root,index,models,'embedding') == (0,0)
+        before = len([1 for p,_,_ in calls if p.endswith('/embeddings')])
+        _, hits, _ = await alpha.ask('Any instructions?')
+        assert not hits and len([1 for p,_,_ in calls if p.endswith('/embeddings')]) == before
+        settings['embedding_model']=''
+        save(settings_path, settings)
+        # Real CLI startup and /new /status /exit; stdin contains no model request.
+        cli = subprocess.run([sys.executable,'-m','support','--knowledge',str(root),'--state',str(state),'--ticket','alpha','--mcp-url',alpha_url], input='/new\n/status\n/exit\n', text=True, capture_output=True, timeout=20)
+        assert cli.returncode == 0 and 'Conversation cleared' in cli.stdout
+        assert 'PRIVATE-KEY' not in cli.stdout + cli.stderr
+    fails(lambda: scan(directory/'missing'), OSError)
+    assert client_options('http://127.0.0.1:8010') == {'trust_env':False}
+    with patch('shared_models.transport.proxy_bypass', return_value=False), patch('shared_models.transport.getproxies', return_value={'https':'http://proxy.invalid:8080'}):
+        assert 'proxy' in client_options('https://model.invalid/v1')
+    assert generation_payload({'reasoning_effort':'high'})['reasoning_effort'] == 'none'
 
 
-if __name__ == '__main__':
-    main_checks()
+def main():
+    with tempfile.TemporaryDirectory() as directory, model_server() as (url,calls,mode):
+        asyncio.run(scenario(Path(directory), url,calls,mode))
+    print('OK: offline support, RAG cache, isolation, actual HTTP MCP and model transport')
+
+
+if __name__ == '__main__': main()

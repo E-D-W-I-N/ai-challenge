@@ -56,8 +56,10 @@ class Models:
     def answer(self, messages):
         s = self.settings
         if not s['chat_model']: raise ModelError('Explicit chat model is required')
-        payload = generation_payload(dict(model=s['chat_model'], messages=messages,
-            temperature=s['temperature'], max_tokens=s['max_tokens']), reasoning_enabled=s['reasoning_enabled'])
+        controls = dict(model=s['chat_model'], messages=messages, temperature=s['temperature'])
+        if s['max_tokens'] is not None:
+            controls['max_tokens'] = s['max_tokens']
+        payload = generation_payload(controls, reasoning_enabled=s['reasoning_enabled'])
         body = self.request('POST', '/chat/completions', payload)
         if not s['reasoning_enabled'] and reports_reasoning(body):
             raise ModelError('Server reported reasoning while disabled; response rejected')
