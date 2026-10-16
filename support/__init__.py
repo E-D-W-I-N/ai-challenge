@@ -1,1 +1,0 @@
-"""Selected-ticket support assistant."""

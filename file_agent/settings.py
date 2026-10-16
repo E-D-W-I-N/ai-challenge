@@ -1,4 +1,4 @@
-"""Private atomic settings, independent of knowledge and ticket JSON."""
+"""Private atomic settings, outside the target project."""
 import getpass
 import hashlib
 import json
@@ -13,10 +13,10 @@ from shared_models.client import Models
 
 def state_directory(root, explicit=None):
     root = Path(root).resolve(strict=True)
-    base = Path(explicit).expanduser() if explicit else Path.home() / '.local/state/support-assistant' / hashlib.sha256(str(root).encode()).hexdigest()[:24]
+    base = Path(explicit).expanduser() if explicit else Path.home() / '.local/state/file-assistant' / hashlib.sha256(str(root).encode()).hexdigest()[:24]
     base = base.resolve()
     if base.is_relative_to(root):
-        raise ValueError('State directory must be outside knowledge directory')
+        raise ValueError('State directory must be outside project')
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     return base
 
@@ -31,7 +31,7 @@ def validate_generation(settings):
 
 def load(path):
     if not path.exists():
-        return dict(connection=Connection(), chat_model='', embedding_model='', temperature=0.2, max_tokens=1024, reasoning_enabled=False)
+        return dict(connection=Connection(), chat_model='', temperature=0.2, max_tokens=1024, reasoning_enabled=False)
     try:
         if path.stat().st_size > 16384: raise ValueError()
         data = json.loads(path.read_text())
@@ -42,8 +42,8 @@ def load(path):
         if not isinstance(config['api_key'], str) or len(config['api_key']) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in config['api_key']):
             raise ValueError()
         connection = Connection(**config)
-        if set(data) != {'chat_model', 'embedding_model', 'temperature', 'max_tokens', 'reasoning_enabled'}: raise ValueError()
-        if any(not isinstance(data[k], str) for k in ('chat_model', 'embedding_model')): raise ValueError()
+        if set(data) != {'chat_model', 'temperature', 'max_tokens', 'reasoning_enabled'}: raise ValueError()
+        if any(not isinstance(data[k], str) for k in ('chat_model',)): raise ValueError()
         if type(data['reasoning_enabled']) is not bool: raise ValueError()
         validate_generation(data)
         return dict(data, connection=connection)
@@ -70,7 +70,7 @@ def choose_models(settings):
     for i, name in enumerate(ids, 1): print(f'{i}: {name}')
     if not ids: raise ValueError('Empty model catalog')
     selected = dict(settings)
-    for key in ('chat_model', 'embedding_model'):
+    for key in ('chat_model',):
         try:
             number = int(input(f'{key} number: '))
         except ValueError:

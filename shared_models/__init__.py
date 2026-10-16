@@ -1,8 +1,6 @@
 """Compatible model connection and reasoning contracts; no dotenv imports."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -35,20 +33,6 @@ class Connection:
 
     def public(self):
         return {"base_url": self.base_url, "has_api_key": bool(self.api_key), "revision": self.revision}
-
-
-def load_connection(path=None):
-    try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        secret = value.get("api_key", "")
-        revision = value.get("revision", 0)
-        if not isinstance(secret, str) or len(secret) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in secret):
-            raise ValueError()
-        if type(revision) is not int or revision < 0:
-            raise ValueError()
-        return Connection(validate_url(value["base_url"]), secret.strip(), revision)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        raise ValueError("Invalid model connection file") from None
 
 
 def generation_payload(payload: dict, *, reasoning_enabled: bool = False) -> dict:
