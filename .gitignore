@@ -22,13 +22,9 @@ venv/
 *.log
 .cache/
 
-# База агентов: в ней лежат тексты диалогов, а репозиторий публичный.
-# WAL-режим кладёт рядом с базой ещё два файла — их ловим отдельно,
-# иначе половина истории уехала бы в репозиторий в *.db-wal.
+# Private state from earlier days remains ignored; never import or migrate it.
 *.db
 *.db-wal
 *.db-shm
 /data/
-
-# Результаты пайплайна (save_file): тексты ответов, репозиторий публичный
 /files/
